@@ -133,7 +133,7 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
 # -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
                                   turn_len: int | None = None, ipopt_opts: dict | None = None):
-    """RHC rollout with optional attitude-in-state. φ is read from the state."""
+    """RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖."""
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
@@ -143,23 +143,23 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)         # MX
     else:
-        Ad_tr, Bd_tr = double_integrator(D=D, dt=dt)
+        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
 
-    # --- optional attitude augmentation ---
+    # --- optional attitude augmentation (roll in state) ---
     att_cfg = cfg.get("att", {})
     use_att = bool(att_cfg)
     if use_att:
         Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
         nx, nu = idx["nx"], idx["nu"]
-        i_phi  = idx["i_phi"]
+        i_phi  = idx["i_phi"]      # index of φ in x
     else:
         Ad_mx, Bd_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
         i_phi  = None
 
-    # --- rollout length ---
+    # --- rollout length / turn length ---
     sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
     if steps is None:
         steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
@@ -167,15 +167,15 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # --- build constraints with fixed Ad,Bd ---
+    # --- constraints (with fixed Ad,Bd) ---
     gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
     x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
     if use_att:
         x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
-    # --- symbols & solver ---
-    nprim    = T*nx + (T-1)*nu
+    # --- solver (KKT residual objective) ---
+    nprim     = T*nx + (T-1)*nu
     taus_syms = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
     tau_sym   = ca.vcat(taus_syms)
     theta_sym = ca.MX.sym('theta', nx*N)
@@ -183,7 +183,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     fs    = cost_builder(nx, nu, T, N, cfg)
     gtil  = gtil_fun(tau_sym, theta_sym)
     htil  = htil_fun(tau_sym, theta_sym)
-
     lam_t = ca.MX.sym('lam_t', gtil.shape[0])
     mu_t  = ca.MX.sym('mu_t',  htil.shape[0])
 
@@ -205,12 +204,12 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     lbz = -BIG*np.ones(z_sym.shape[0]); ubz = BIG*np.ones(z_sym.shape[0])
     lbz[N*nprim + gtil.shape[0]:] = 0.0
 
-    # --- initial states (pad with φ[/w] if needed) ---
+    # --- initial states (pad with φ if needed) ---
     x1 = pad_x0_with_att(cfg["x0"][0], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][0], float)[:nx].copy()
     x2 = pad_x0_with_att(cfg["x0"][1], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][1], float)[:nx].copy()
     theta_curr = np.r_[x1, x2]
 
-    # --- numeric stepper ---
+    # --- numeric stepper (MX→np) ---
     Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
     def step_plant(x, u):
         return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
@@ -221,70 +220,104 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     exec_xyz1,  exec_xyz2  = [], []
     exec_att1,  exec_att2  = [], []
     phi_hist1,  phi_hist2  = [], []
+    fov_axis_hist, fov_seen_mask = [], []
 
-    # FOV bookkeeping
-    fov_cfg = cfg.get("fov", {"enabled": False})
+    # --- FOV config ---
+    fov_cfg     = cfg.get("fov", {"enabled": False})
     fov_enabled = bool(fov_cfg.get("enabled", False))
     fov_agent   = int(fov_cfg.get("agent", 2))
-    fov_axis_hist, fov_seen_mask = [], []
-    prev_axis1 = None
-    prev_axis2 = None
 
-    # --- small helpers ---
-    def pos3_from_state_row(x_row):
+    # -------------------- helpers --------------------
+    def _p3_row(x_row):
         return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
-    def pos3_from_state_vec(x_vec):
+    def _p3_vec(x_vec):
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    def attitude_from_state(x, prev_axis):
-        # axis from velocity (hold when slow)
-        min_speed = float(att_cfg.get("min_speed_for_axis",
-                           cfg.get("fov",{}).get("min_speed_for_axis", 1e-3)))
-        axis = fov_axis_from_vel(x, D, prev_axis=prev_axis, min_speed=min_speed)
-        # roll from state (or 0 if not used)
-        phi  = float(x[i_phi]) if use_att else 0.0
-        R    = world_to_body_R(axis, 3, align=att_cfg.get("align","x"), up=att_cfg.get("up",[0,0,1]))
-        R    = apply_roll_about_axis(R, phi, align=att_cfg.get("align","x"))
-        return R, axis, phi
+    def attitude_from_state(x, prev_axisD):
+        """Boresight from velocity (hold when slow); roll from state if present."""
+        vmin = float(att_cfg.get("min_speed_for_axis",
+                                 cfg.get("fov", {}).get("min_speed_for_axis", 1e-3)))
+        axisD = fov_axis_from_vel(x, D, prev_axis=prev_axisD, min_speed=vmin)   # D-dim
+        axis3 = axisD if D==3 else np.array([axisD[0], axisD[1], 0.0], float)
+        phi   = float(x[i_phi]) if (use_att and i_phi is not None) else 0.0
+        R     = world_to_body_R(axis3, 3, align=att_cfg.get("align", "x"), up=att_cfg.get("up", [0,0,1]))
+        R     = apply_roll_about_axis(R, phi, align=att_cfg.get("align", "x"))
+        return R, axisD, phi
 
-    def plan_attitudes_from_X(X, prev_axis):
+    def plan_attitudes_from_X(X, prev_axisD):
         att_list = []
-        ax_prev  = prev_axis
+        ax_prev  = prev_axisD
         for t in range(T):
-            phi_t = float(X[t, i_phi]) if use_att else 0.0
-            R, ax_prev, _ = attitude_from_state(X[t], ax_prev)
-            # attitude_from_state will read phi from X[t] anyway; keep it explicit in record:
+            R, ax_prev, phi_t = attitude_from_state(X[t], ax_prev)
             att_list.append({"R": R, "phi": phi_t})
         return att_list, ax_prev
 
-    # --- first plan ---
+    # --- t=0 attitude seed from initial velocity (so first frame draws correctly) ---
+    align    = att_cfg.get("align", "x")
+    world_up = att_cfg.get("up", [0,0,1])
+    vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
+    def _axis_from_vel_t0(x):
+        v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
+        aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
+        return aD, (aD if D==3 else np.array([aD[0], aD[1], 0.0], float))
+    prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
+    prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
+    phi1_0 = float(x1[i_phi]) if (use_att and i_phi is not None) else 0.0
+    phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
+    R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
+    R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
+
+    # log true t=0 snapshot
+    exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
+    exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
+    exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
+    if fov_enabled:
+        a_defD = prev_axis2D if fov_agent == 2 else prev_axis1D
+        x_def  = x2         if fov_agent == 2 else x1
+        x_tgt  = x1         if fov_agent == 2 else x2
+        a_def3 = a_defD if D==3 else np.array([a_defD[0], a_defD[1], 0.0], float)
+        fov_axis_hist.append(a_def3)
+        cam_cfg = cfg.get("camera", None)
+        if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
+            _,_,_,ok0 = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def3, cam_cfg=cam_cfg)
+            fov_seen_mask.append(bool(ok0))
+        else:
+            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_defD, fov_cfg, D)
+            fov_seen_mask.append(bool(seen0))
+    else:
+        fov_axis_hist.append(None); fov_seen_mask.append(False)
+
+    # --- first plan (uses current θ and previous boresights) ---
     z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
-    def replan(theta_vec, z_init, prev1, prev2):
-        sol = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
+    def replan(theta_vec, z_init, prev1D, prev2D):
+        sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
         z_new = np.array(sol['x']).squeeze()
-        taus = split_players_from_z(z_new, N, T, nx, nu)
+        taus  = split_players_from_z(z_new, N, T, nx, nu)
         X1, U1 = unpack_tau_flat(taus[0], nx, nu, T)
         X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
-        plan1 = [pos3_from_state_row(X1[t,:]) for t in range(T)]
-        plan2 = [pos3_from_state_row(X2[t,:]) for t in range(T)]
-        att1, prev1_out = plan_attitudes_from_X(X1, prev1)
-        att2, prev2_out = plan_attitudes_from_X(X2, prev2)
+        plan1  = [_p3_row(X1[t,:]) for t in range(T)]
+        plan2  = [_p3_row(X2[t,:]) for t in range(T)]
+        att1, prev1_out = plan_attitudes_from_X(X1, prev1D)
+        att2, prev2_out = plan_attitudes_from_X(X2, prev2D)
         return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out
 
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1, prev_axis2 = replan(theta_curr, z_last, prev_axis1, prev_axis2)
+    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D = \
+        replan(theta_curr, z_last, prev_axis1D, prev_axis2D)
     step_in_turn = 0
 
-    # --- rollout ---
+    # -------------------- rollout --------------------
     for k in range(steps):
+        # replan each turn
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1, prev_axis2 = \
-                replan(theta_curr, z_last, prev_axis1, prev_axis2)
+            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D = \
+                replan(theta_curr, z_last, prev_axis1D, prev_axis2D)
             step_in_turn = 0
 
+        # log current plan (for this step)
         plan_hist1.append(plan1); plan_hist2.append(plan2)
         plan_att1.append(att1);   plan_att2.append(att2)
 
-        # Controls for this exec step (augmented if use_att)
+        # controls for this step
         u1 = U1[min(step_in_turn, len(U1)-1)]
         u2 = U2[min(step_in_turn, len(U2)-1)]
         step_in_turn += 1
@@ -294,53 +327,50 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         x2 = step_plant(x2, u2)
         theta_curr = np.r_[x1, x2]
 
-        # 2) attitude from current state
-        R1, axis1, phi1_now = attitude_from_state(x1, prev_axis1)
-        R2, axis2, phi2_now = attitude_from_state(x2, prev_axis2)
-        prev_axis1, prev_axis2 = axis1, axis2
+        # 2) attitude from updated states
+        R1, axis1D, phi1_now = attitude_from_state(x1, prev_axis1D)
+        R2, axis2D, phi2_now = attitude_from_state(x2, prev_axis2D)
+        prev_axis1D, prev_axis2D = axis1D, axis2D
         phi_hist1.append(phi1_now); phi_hist2.append(phi2_now)
 
-        # 3) log
+        # 3) log executed pose + attitude
         exec_att1.append({"R": R1, "phi": phi1_now})
         exec_att2.append({"R": R2, "phi": phi2_now})
-        exec_xyz1.append(pos3_from_state_vec(x1))
-        exec_xyz2.append(pos3_from_state_vec(x2))
+        exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
 
-        # 4) FOV (defender axis = current attitude axis)
-        # 4) FOV (defender axis = current attitude axis)
+        # 4) FOV (selected agent)
         if fov_enabled:
-            a_def = axis2 if fov_agent == 2 else axis1
-            x_def = x2   if fov_agent == 2 else x1
-            x_tgt = x1   if fov_agent == 2 else x2
-            fov_axis_hist.append(a_def)
+            a_defD = axis2D if fov_agent == 2 else axis1D
+            x_def  = x2     if fov_agent == 2 else x1
+            x_tgt  = x1     if fov_agent == 2 else x2
+            a_def3 = a_defD if D==3 else np.array([a_defD[0], a_defD[1], 0.0], float)
+            fov_axis_hist.append(a_def3)
 
             cam_cfg = cfg.get("camera", None)
-            if fov_cfg.get("type", "cone") == "pinhole" and (cam_cfg is not None):
-                # Pinhole: project target and check pixel box + near/far
-                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def, cam_cfg=cam_cfg)
+            if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
+                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def3, cam_cfg=cam_cfg)
                 fov_seen_mask.append(bool(ok))
             else:
-                # Legacy cone
-                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def, fov_cfg, D)
+                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_defD, fov_cfg, D)
                 fov_seen_mask.append(bool(seen))
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-
     return {
         'plan_hist1': plan_hist1,
         'plan_hist2': plan_hist2,
-        'plan_att1' : plan_att1,   # each: list over T of {"R","phi"}
+        'plan_att1' : plan_att1,     # list over T of {"R","phi"}
         'plan_att2' : plan_att2,
         'exec1_xyz' : exec_xyz1,
         'exec2_xyz' : exec_xyz2,
-        'exec_att1' : exec_att1,   # list over executed steps of {"R","phi"}
+        'exec_att1' : exec_att1,     # list over executed steps of {"R","phi"}
         'exec_att2' : exec_att2,
         'phi_hist1' : phi_hist1,
         'phi_hist2' : phi_hist2,
         'fov_axis_hist': fov_axis_hist,
         'fov_seen_mask': fov_seen_mask,
     }
+
 
 
 
@@ -641,6 +671,8 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
     triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
     triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
+    L_tri = tuple(cfg.get("viz", {}).get("triad_len", (0.35, 0.35, 0.55)))
+
 
     plan_hist1 = frames_dict.get('plan_hist1', [])
     plan_hist2 = frames_dict.get('plan_hist2', [])
@@ -827,10 +859,10 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         if show_axes:
             if att1_lines:
                 R1 = _R_exec(1, f)
-                update_body_axes_artists_3d(att1_lines, np.array([x1,y1,z1]), R1, L=(0.35,0.35,0.55))
+                update_body_axes_artists_3d(att1_lines, np.array([x1,y1,z1]), R1, L=L_tri)
             if att2_lines:
                 R2 = _R_exec(2, f)
-                update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=(0.35,0.35,0.55))
+                update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
 
         # FOV (selected agent)
         p_def = _pos3(_def_pos(f)); a_def = _def_axis(f)
@@ -874,6 +906,8 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
     triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
     triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
     triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
+    L_tri = tuple(cfg.get("viz", {}).get("triad_len", (0.35, 0.35, 0.55)))
+
 
     plan_hist1 = frames_dict.get('plan_hist1_3d', frames_dict.get('plan_hist1', []))
     plan_hist2 = frames_dict.get('plan_hist2_3d', frames_dict.get('plan_hist2', []))
@@ -1073,8 +1107,8 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
 
         # triads (both agents)
         if t_axes.value:
-            if att1_lines: update_body_axes_artists_3d(att1_lines, p1, _R_exec(1, f), L=(0.35,0.15,0.15))
-            if att2_lines: update_body_axes_artists_3d(att2_lines, p2, _R_exec(2, f), L=(0.35,0.15,0.15))
+            if att1_lines: update_body_axes_artists_3d(att1_lines, p1, _R_exec(1, f), L=L_tri)
+            if att2_lines: update_body_axes_artists_3d(att2_lines, p2, _R_exec(2, f), L=L_tri)
         else:
             for L in (att1_lines, att2_lines):
                 if L:
@@ -1113,5 +1147,4 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
     if keep_legend is not None:
         ax.add_artist(keep_legend)
     return leg_axes
-
 
