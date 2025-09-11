@@ -38,6 +38,9 @@ __all__ = [
     "draw_fov_cone_3d"
 ]
 
+__all__ += ["draw_camera_frustum_3d", "project_point_pinhole", "points_in_fov_mask"]
+
+
 # -------------------- 3D solver entrypoint --------------------
 def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     """Solve once (open-loop) with optional roll augmentation inside the state."""
@@ -52,7 +55,7 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
         n = hcw_mean_motion(cfg.get("hcw", {}))
         Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)     # MX
     else:
-        Ad_tr, Bd_tr = double_integrator(D=D, dt=dt)  # MX (already discrete)
+        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX (already discrete)
 
     # --- optional attitude augmentation ---
     att_cfg = cfg.get("att", {})
@@ -304,15 +307,25 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         exec_xyz2.append(pos3_from_state_vec(x2))
 
         # 4) FOV (defender axis = current attitude axis)
+        # 4) FOV (defender axis = current attitude axis)
         if fov_enabled:
             a_def = axis2 if fov_agent == 2 else axis1
             x_def = x2   if fov_agent == 2 else x1
             x_tgt = x1   if fov_agent == 2 else x2
             fov_axis_hist.append(a_def)
-            seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def, fov_cfg, D)
-            fov_seen_mask.append(bool(seen))
+
+            cam_cfg = cfg.get("camera", None)
+            if fov_cfg.get("type", "cone") == "pinhole" and (cam_cfg is not None):
+                # Pinhole: project target and check pixel box + near/far
+                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def, cam_cfg=cam_cfg)
+                fov_seen_mask.append(bool(ok))
+            else:
+                # Legacy cone
+                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def, fov_cfg, D)
+                fov_seen_mask.append(bool(seen))
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
+
 
     return {
         'plan_hist1': plan_hist1,
@@ -412,31 +425,197 @@ def update_body_axes_artists_3d(lines, p, R_wb, L=(0.4,0.4,0.6)):
         ln.set_3d_properties([p[2], q[2]])
 
 def draw_fov_cone_3d(ax, x_def, axis, fov_cfg, n=24, color='C1', alpha=0.12, align="x"):
+    """
+    Draw a circular cone aligned with `axis` and apex at x_def[:3].
+    fov_cfg: {"range": float, "hfov_deg": float}  # interpreted as a circular half-angle
+    """
     p0   = np.asarray(x_def[:3], float)
-    axis = _unit(axis)
-    R    = world_to_body_R(axis, 3, align=align)  # rows: x_b,y_b,z_b
+    axis = _unit(np.asarray(axis, float))
+    R    = world_to_body_R(axis, 3, align=align)  # rows: x_b,y_b,z_b (world→body)
 
     rng  = float(fov_cfg["range"])
+    assert rng > 0.0
     half = 0.5*np.deg2rad(float(fov_cfg["hfov_deg"]))
     radius = rng * np.tan(half)
 
-    ts = np.linspace(0, 2*np.pi, n, endpoint=True)
+    n = max(int(n), 3)
+    ts = np.linspace(0, 2*np.pi, n, endpoint=False)
 
     if align == "x":
-        # circle in y–z plane at x = rng
-        circ_b = np.vstack([np.full_like(ts, rng), radius*np.cos(ts), radius*np.sin(ts)])
+        # circle in y–z plane at x = rng (x-forward)
+        circ_b = np.vstack([np.full_like(ts, rng),
+                            radius*np.cos(ts),
+                            radius*np.sin(ts)])
     else:
-        # legacy: circle in x–y plane at z = rng
-        circ_b = np.vstack([radius*np.cos(ts), radius*np.sin(ts), np.full_like(ts, rng)])
+        # circle in x–y plane at z = rng (z-forward)
+        circ_b = np.vstack([radius*np.cos(ts),
+                            radius*np.sin(ts),
+                            np.full_like(ts, rng)])
 
+    # body→world
     circ_w = (R.T @ circ_b).T + p0[None, :]
 
-    # side faces (triangles)
+    # side faces (triangles fan)
     verts = [[p0, circ_w[i], circ_w[(i+1) % len(circ_w)]] for i in range(len(circ_w))]
     coll  = Poly3DCollection(verts, facecolors=color, alpha=alpha, edgecolors='none')
     ax.add_collection3d(coll)
+
     rim_line, = ax.plot(circ_w[:,0], circ_w[:,1], circ_w[:,2], color=color, alpha=0.4, lw=1)
     return coll, rim_line
+
+def _image_corners_px(W, H):
+    # (u, v) pixel corners in order: TL, TR, BR, BL
+    return np.array([[0,   0],
+                     [W-1, 0],
+                     [W-1, H-1],
+                     [0,   H-1]], dtype=float)
+
+def _corner_rays_camera(corners_px, fx, fy, cx, cy, align="z"):
+    """
+    Return 4 direction vectors (not normalized) in camera frame that
+    pass through image corners. For align='z', rays are [ (u-cx)/fx, (v-cy)/fy, 1 ].
+    For align='x', rays are [ 1, (u-cx)/fx, (v-cy)/fy ].
+    """
+    u = corners_px[:, 0]
+    v = corners_px[:, 1]
+    if align == "z":
+        return np.stack([(u - cx)/fx, (v - cy)/fy, np.ones_like(u)], axis=1)
+    else:  # align == "x"
+        return np.stack([np.ones_like(u), (u - cx)/fx, (v - cy)/fy], axis=1)
+
+def _scale_rays_to_plane(rays, depth, align="z"):
+    """
+    Scale each ray so that it intersects the plane at 'depth':
+    If align='z': set Z = depth.
+    If align='x': set X = depth.
+    """
+    rays = np.asarray(rays, float)
+    out = rays.copy()
+    if align == "z":
+        s = depth / rays[:, 2]  # Z component
+        out *= s[:, None]
+    else:  # align == "x"
+        s = depth / rays[:, 0]  # X component
+        out *= s[:, None]
+    return out
+
+def draw_camera_frustum_3d(ax, x_def, axis, cam_cfg,
+                           color='C2', alpha=0.10,
+                           draw_edges=True, draw_rays=True,
+                           lw=1.0, rim_alpha=0.55, ray_alpha=0.35):
+    """
+    Draw a pinhole camera frustum using intrinsics and near/far planes.
+
+    Args
+    ----
+    ax      : Matplotlib 3D axes
+    x_def   : state vector; camera position at x_def[:3]
+    axis    : boresight direction in WORLD coords
+    cam_cfg : dict with keys {W,H,fx,fy,cx,cy,near,far,align}
+              align is 'x' (x-forward) or 'z' (z-forward)
+
+    Returns
+    -------
+    coll  : Poly3DCollection for filled frustum (near/far + 4 side quads)
+    edges : list of Line3D objects for rims/rays (for later removal)
+    """
+    # --- pose + rotation conventions ---
+    p_cam = np.asarray(x_def[:3], float)
+    axis  = _unit(np.asarray(axis, float))
+    align = cam_cfg.get("align", "z")  # must match your boresight convention
+
+    # world→camera; use transpose for camera→world
+    R_wc = world_to_body_R(axis, 3, align=align)
+
+    def cam_to_world(Pc):
+        return (R_wc.T @ Pc.T).T + p_cam[None, :]
+
+    # --- intrinsics / depth bounds ---
+    W, H = float(cam_cfg["W"]), float(cam_cfg["H"])
+    fx, fy = float(cam_cfg["fx"]), float(cam_cfg["fy"])
+    cx, cy = float(cam_cfg["cx"]), float(cam_cfg["cy"])
+    near, far = float(cam_cfg["near"]), float(cam_cfg["far"])
+    assert near > 0.0 and far > near, "Require 0 < near < far"
+    assert fx != 0.0 and fy != 0.0, "fx/fy must be nonzero"
+
+    # --- corner rays (TL, TR, BR, BL) in camera frame ---
+    corners_px = _image_corners_px(W, H)
+    rays_c     = _corner_rays_camera(corners_px, fx, fy, cx, cy, align=align)
+
+    # scale rays to near/far planes (depth along align axis)
+    near_c = _scale_rays_to_plane(rays_c, near, align=align)  # (4,3)
+    far_c  = _scale_rays_to_plane(rays_c,  far,  align=align)  # (4,3)
+
+    # transform to world
+    near_w = cam_to_world(near_c)
+    far_w  = cam_to_world(far_c)
+
+    # --- build faces: 4 side quads + caps ---
+    # consistent winding using TL(0)->TR(1)->BR(2)->BL(3)
+    quads = []
+    for i, j in [(0,1), (1,2), (2,3), (3,0)]:
+        quads.append([near_w[i], near_w[j], far_w[j], far_w[i]])   # sides
+    quads.append([near_w[0], near_w[1], near_w[2], near_w[3]])     # near cap
+    quads.append([far_w[0],  far_w[1],  far_w[2],  far_w[3]])      # far cap
+
+    coll = Poly3DCollection(quads, facecolors=color, alpha=alpha, edgecolors='none')
+    ax.add_collection3d(coll)
+
+    # --- optional edges/rays for clarity (return handles so we can remove later) ---
+    edges = []
+    if draw_edges:
+        (ln_far,)  = ax.plot(*far_w[[0,1,2,3,0]].T,  color=color, alpha=rim_alpha, lw=lw)
+        (ln_near,) = ax.plot(*near_w[[0,1,2,3,0]].T, color=color, alpha=rim_alpha*0.9, lw=max(0.8*lw, 0.6))
+        edges.extend([ln_far, ln_near])
+
+    if draw_rays:
+        for k in range(4):
+            (ln,) = ax.plot(*np.vstack([p_cam, far_w[k]]).T, color=color, alpha=ray_alpha, lw=lw)
+            edges.append(ln)
+
+    return coll, edges
+
+
+def project_point_pinhole(X_w, x_def, axis, cam_cfg):
+    """
+    Project a world point into pixel coordinates.
+    Returns (u, v, depth, visible_bool).
+    depth = Z_cam if align='z', or X_cam if align='x'.
+    """
+    p_cam = np.asarray(x_def[:3], float)
+    axis  = _unit(np.asarray(axis, float))
+    align = cam_cfg.get("align", "z")
+    R_wc  = world_to_body_R(axis, 3, align=align)  # world→camera
+
+    # world → camera
+    X_c = R_wc @ (np.asarray(X_w, float) - p_cam)
+    if align == "z":
+        depth = X_c[2]
+        if depth <= 0:
+            return None, None, depth, False
+        u = cam_cfg["fx"] * (X_c[0] / depth) + cam_cfg["cx"]
+        v = cam_cfg["fy"] * (X_c[1] / depth) + cam_cfg["cy"]
+    else:  # align == 'x'
+        depth = X_c[0]
+        if depth <= 0:
+            return None, None, depth, False
+        u = cam_cfg["fx"] * (X_c[1] / depth) + cam_cfg["cx"]
+        v = cam_cfg["fy"] * (X_c[2] / depth) + cam_cfg["cy"]
+
+    W,H   = cam_cfg["W"], cam_cfg["H"]
+    near, far = cam_cfg["near"], cam_cfg["far"]
+
+    in_front   = (depth >= near) and (depth <= far)
+    in_pixels  = (0 <= u < W) and (0 <= v < H)
+    return float(u), float(v), float(depth), (in_front and in_pixels)
+
+def points_in_fov_mask(Xw_list, x_def, axis, cam_cfg):
+    """Vector helper: returns a boolean mask for many points."""
+    mask = []
+    for X in Xw_list:
+        _, _, _, ok = project_point_pinhole(X, x_def, axis, cam_cfg)
+        mask.append(ok)
+    return np.array(mask, dtype=bool)
 
 
 # -------------------- animation & interactive --------------------
@@ -543,6 +722,10 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             dv = p - pp; n = np.linalg.norm(dv)
             return _axis3(dv/(n+1e-12)) if n > 1e-9 else np.array([1,0,0])
         return np.array([1,0,0])
+    
+    fov_art = {'coll': None, 'rim': None, 'edges': []}
+
+
 
     def _clear_fov():
         for k in ('coll','rim'):
@@ -551,18 +734,37 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 try: art.remove()
                 except Exception: pass
                 fov_art[k] = None
+        # remove edge lines
+        for ln in fov_art.get('edges', []):
+            try: ln.remove()
+            except Exception: pass
+        fov_art['edges'] = []
+
 
     def _set_fov(p, axis, idx):
         if not (show_fov and fov_cfg.get("enabled", False)):
             _clear_fov(); return
+
         col = fov_cfg.get("color","C1")
         if seen_mask and idx < len(seen_mask) and bool(seen_mask[idx]):
             col = 'tab:green'
+
         x_def = np.r_[p, [0,0,0]]
-        coll, rim = draw_fov_cone_3d(ax, x_def, axis, fov_cfg,
-                                     color=col, alpha=fov_cfg.get("alpha",0.15),
-                                     align=att_cfg.get('align','x'))
-        fov_art['coll'], fov_art['rim'] = coll, rim
+
+        if fov_cfg.get("type","cone") == "pinhole" and cfg.get("camera") is not None:
+            coll, edges = draw_camera_frustum_3d(
+                ax, x_def=x_def, axis=axis, cam_cfg=cfg["camera"],
+                color=col, alpha=fov_cfg.get("alpha",0.15)
+            )
+            fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
+        else:
+            coll, rim = draw_fov_cone_3d(
+                ax, x_def, axis, fov_cfg,
+                color=col, alpha=fov_cfg.get("alpha",0.15),
+                align=att_cfg.get('align','x')
+            )
+            fov_art['coll'], fov_art['rim'] = coll, rim
+
 
     def _R_exec(agent, idx):
         key = 'exec_att1' if agent == 1 else 'exec_att2'
@@ -747,7 +949,8 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
     att1_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
     att2_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
 
-    fov_art = {'coll': None, 'rim': None}
+    fov_art = {'coll': None, 'rim': None, 'edges': []}
+
     def _clear_fov():
         for k in ('coll','rim'):
             art = fov_art.get(k)
@@ -755,6 +958,11 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
                 try: art.remove()
                 except Exception: pass
                 fov_art[k] = None
+        for ln in fov_art.get('edges', []):
+            try: ln.remove()
+            except Exception: pass
+        fov_art['edges'] = []
+
 
     # helpers
     def _pos3(p_like):
@@ -802,14 +1010,27 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
         _clear_fov()
         if not (t_fov.value and fov_cfg.get("enabled", False)):
             return
+
         col = fov_cfg.get("color","C1")
         if seen_mask and f < len(seen_mask) and bool(seen_mask[f]):
             col = 'tab:green'
+
         x_def = np.r_[p, [0,0,0]]
-        coll, rim = draw_fov_cone_3d(ax, x_def, axis, fov_cfg,
-                                     color=col, alpha=fov_cfg.get("alpha",0.15),
-                                     align=att_cfg.get('align','x'))
-        fov_art['coll'], fov_art['rim'] = coll, rim
+
+        if fov_cfg.get("type","cone") == "pinhole" and cfg.get("camera") is not None:
+            coll, edges = draw_camera_frustum_3d(
+                ax, x_def=x_def, axis=axis, cam_cfg=cfg["camera"],
+                color=col, alpha=fov_cfg.get("alpha",0.15)
+            )
+            fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
+        else:
+            coll, rim = draw_fov_cone_3d(
+                ax, x_def, axis, fov_cfg,
+                color=col, alpha=fov_cfg.get("alpha",0.15),
+                align=att_cfg.get('align','x')
+            )
+            fov_art['coll'], fov_art['rim'] = coll, rim
+
 
     # Widgets
     s_frame = W.IntSlider(min=0, max=n_frames-1, step=1, value=0, description='frame')
