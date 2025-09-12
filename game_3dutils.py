@@ -24,7 +24,7 @@ from game_sharedutils import (
     step_phi,                     # <-- import this, not step_roll
     frame_from_axis, 
     apply_roll_about_axis,
-    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att
+    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous
 
 )
 
@@ -233,24 +233,39 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     def _p3_vec(x_vec):
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    def attitude_from_state(x, prev_axisD):
-        """Boresight from velocity (hold when slow); roll from state if present."""
-        vmin = float(att_cfg.get("min_speed_for_axis",
-                                 cfg.get("fov", {}).get("min_speed_for_axis", 1e-3)))
-        axisD = fov_axis_from_vel(x, D, prev_axis=prev_axisD, min_speed=vmin)   # D-dim
+    # --- attitude_from_state: keep prev_R and return R for chaining ---
+    def attitude_from_state(x, prev_axisD, prev_R):
+        vmin  = float(att_cfg.get("min_speed_for_axis",
+                                cfg.get("fov", {}).get("min_speed_for_axis", 1e-3)))
+        axisD = fov_axis_from_vel(x, D, prev_axis=prev_axisD, min_speed=vmin)
         axis3 = axisD if D==3 else np.array([axisD[0], axisD[1], 0.0], float)
-        phi   = float(x[i_phi]) if (use_att and i_phi is not None) else 0.0
-        R     = world_to_body_R(axis3, 3, align=att_cfg.get("align", "x"), up=att_cfg.get("up", [0,0,1]))
-        R     = apply_roll_about_axis(R, phi, align=att_cfg.get("align", "x"))
+
+        R = frame_from_axis_continuous(
+            axis3,
+            R_prev=prev_R,
+            align=att_cfg.get("align","x"),
+            world_up=np.asarray(att_cfg.get("up",[0,0,1]), float)
+        )
+
+
+        phi = float(x[i_phi]) if (use_att and i_phi is not None and att_cfg.get("roll_enabled", True)) else 0.0
+        if att_cfg.get("roll_enabled", True):
+            R = apply_roll_about_axis(R, phi, align=att_cfg.get("align","x"))
         return R, axisD, phi
 
-    def plan_attitudes_from_X(X, prev_axisD):
+
+
+    # --- plan side: carry R_prev through the horizon ---
+    def plan_attitudes_from_X(X, prev_axisD, prev_R):
         att_list = []
         ax_prev  = prev_axisD
+        R_prev   = prev_R
         for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], ax_prev)
+            R, ax_prev, phi_t = attitude_from_state(X[t], ax_prev, prev_R=R_prev)
             att_list.append({"R": R, "phi": phi_t})
-        return att_list, ax_prev
+            R_prev = R
+        return att_list, ax_prev, R_prev
+
 
     # --- t=0 attitude seed from initial velocity (so first frame draws correctly) ---
     align    = att_cfg.get("align", "x")
@@ -266,30 +281,40 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
     R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
     R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
+    prev_R1, prev_R2 = R1_0, R2_0
+
 
     # log true t=0 snapshot
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
     exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
     exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
     if fov_enabled:
-        a_defD = prev_axis2D if fov_agent == 2 else prev_axis1D
-        x_def  = x2         if fov_agent == 2 else x1
-        x_tgt  = x1         if fov_agent == 2 else x2
-        a_def3 = a_defD if D==3 else np.array([a_defD[0], a_defD[1], 0.0], float)
+        # pick defending agent's executed attitude at t=0
+        R_def0 = R2_0 if fov_agent == 2 else R1_0
+        x_def  = x2    if fov_agent == 2 else x1
+        x_tgt  = x1    if fov_agent == 2 else x2
+
+        # (optional: keep this for plotting fallback history)
+        a_def3 = R_def0[0] if align == 'x' else R_def0[2]
         fov_axis_hist.append(a_def3)
+
         cam_cfg = cfg.get("camera", None)
         if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-            _,_,_,ok0 = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def3, cam_cfg=cam_cfg)
+            _, _, _, ok0 = project_point_pinhole(
+                X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def0
+            )
             fov_seen_mask.append(bool(ok0))
         else:
-            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_defD, fov_cfg, D)
+            # cone visibility is axis-only; roll doesn't change the boolean
+            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
             fov_seen_mask.append(bool(seen0))
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
+
     # --- first plan (uses current θ and previous boresights) ---
     z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
-    def replan(theta_vec, z_init, prev1D, prev2D):
+    def replan(theta_vec, z_init, prev1D, prev2D, prevR1, prevR2):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
         z_new = np.array(sol['x']).squeeze()
         taus  = split_players_from_z(z_new, N, T, nx, nu)
@@ -297,21 +322,22 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
         plan1  = [_p3_row(X1[t,:]) for t in range(T)]
         plan2  = [_p3_row(X2[t,:]) for t in range(T)]
-        att1, prev1_out = plan_attitudes_from_X(X1, prev1D)
-        att2, prev2_out = plan_attitudes_from_X(X2, prev2D)
-        return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out
+        att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev1D, prevR1)
+        att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev2D, prevR2)
+        return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
 
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D = \
-        replan(theta_curr, z_last, prev_axis1D, prev_axis2D)
+    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+        replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
     step_in_turn = 0
 
     # -------------------- rollout --------------------
     for k in range(steps):
         # replan each turn
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D = \
-                replan(theta_curr, z_last, prev_axis1D, prev_axis2D)
+            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+                replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
             step_in_turn = 0
+
 
         # log current plan (for this step)
         plan_hist1.append(plan1); plan_hist2.append(plan2)
@@ -328,10 +354,15 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         theta_curr = np.r_[x1, x2]
 
         # 2) attitude from updated states
-        R1, axis1D, phi1_now = attitude_from_state(x1, prev_axis1D)
-        R2, axis2D, phi2_now = attitude_from_state(x2, prev_axis2D)
+        R1, axis1D, phi1_now = attitude_from_state(x1, prev_axis1D, prev_R1)
+        R2, axis2D, phi2_now = attitude_from_state(x2, prev_axis2D, prev_R2)
         prev_axis1D, prev_axis2D = axis1D, axis2D
-        phi_hist1.append(phi1_now); phi_hist2.append(phi2_now)
+        prev_R1, prev_R2 = R1, R2
+
+        phi_hist1.append(phi1_now)
+        phi_hist2.append(phi2_now)
+
+
 
         # 3) log executed pose + attitude
         exec_att1.append({"R": R1, "phi": phi1_now})
@@ -340,21 +371,27 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
         # 4) FOV (selected agent)
         if fov_enabled:
-            a_defD = axis2D if fov_agent == 2 else axis1D
-            x_def  = x2     if fov_agent == 2 else x1
-            x_tgt  = x1     if fov_agent == 2 else x2
-            a_def3 = a_defD if D==3 else np.array([a_defD[0], a_defD[1], 0.0], float)
+            # executed attitude this step
+            R_def = R2 if fov_agent == 2 else R1
+            x_def = x2 if fov_agent == 2 else x1
+            x_tgt = x1 if fov_agent == 2 else x2
+
+            # (optional history for plotting)
+            a_def3 = R_def[0] if align == 'x' else R_def[2]
             fov_axis_hist.append(a_def3)
 
             cam_cfg = cfg.get("camera", None)
             if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, axis=a_def3, cam_cfg=cam_cfg)
+                _, _, _, ok = project_point_pinhole(
+                    X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def
+                )
                 fov_seen_mask.append(bool(ok))
             else:
-                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_defD, fov_cfg, D)
+                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
                 fov_seen_mask.append(bool(seen))
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
+
 
     return {
         'plan_hist1': plan_hist1,
@@ -529,10 +566,11 @@ def _scale_rays_to_plane(rays, depth, align="z"):
         out *= s[:, None]
     return out
 
-def draw_camera_frustum_3d(ax, x_def, axis, cam_cfg,
+def draw_camera_frustum_3d(ax, x_def, axis=None, cam_cfg=None,
                            color='C2', alpha=0.10,
                            draw_edges=True, draw_rays=True,
-                           lw=1.0, rim_alpha=0.55, ray_alpha=0.35):
+                           lw=1.0, rim_alpha=0.55, ray_alpha=0.35,
+                           R_wb=None):
     """
     Draw a pinhole camera frustum using intrinsics and near/far planes.
 
@@ -551,11 +589,14 @@ def draw_camera_frustum_3d(ax, x_def, axis, cam_cfg,
     """
     # --- pose + rotation conventions ---
     p_cam = np.asarray(x_def[:3], float)
-    axis  = _unit(np.asarray(axis, float))
-    align = cam_cfg.get("align", "z")  # must match your boresight convention
+    align = cam_cfg.get("align", "x")  # must match your boresight convention
 
     # world→camera; use transpose for camera→world
-    R_wc = world_to_body_R(axis, 3, align=align)
+    if R_wb is None:
+        axis = _unit(np.asarray(axis, float))
+        R_wc = world_to_body_R(axis, 3, align=align)
+    else:
+        R_wc = np.asarray(R_wb, float)
 
     def cam_to_world(Pc):
         return (R_wc.T @ Pc.T).T + p_cam[None, :]
@@ -606,19 +647,19 @@ def draw_camera_frustum_3d(ax, x_def, axis, cam_cfg,
     return coll, edges
 
 
-def project_point_pinhole(X_w, x_def, axis, cam_cfg):
+def project_point_pinhole(X_w, x_def, cam_cfg, axis=None, R_wb=None):
     """
     Project a world point into pixel coordinates.
     Returns (u, v, depth, visible_bool).
     depth = Z_cam if align='z', or X_cam if align='x'.
     """
     p_cam = np.asarray(x_def[:3], float)
-    axis  = _unit(np.asarray(axis, float))
     align = cam_cfg.get("align", "z")
-    R_wc  = world_to_body_R(axis, 3, align=align)  # world→camera
+    R_wc  = np.asarray(R_wb, float) if R_wb is not None else \
+            world_to_body_R(_unit(np.asarray(axis,float)), 3, align=align)
+    X_c = R_wc @ (np.asarray(X_w, float) - p_cam)
 
     # world → camera
-    X_c = R_wc @ (np.asarray(X_w, float) - p_cam)
     if align == "z":
         depth = X_c[2]
         if depth <= 0:
@@ -773,29 +814,29 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         fov_art['edges'] = []
 
 
-    def _set_fov(p, axis, idx):
+    def _set_fov(p, R_wb, idx):
         if not (show_fov and fov_cfg.get("enabled", False)):
             _clear_fov(); return
-
         col = fov_cfg.get("color","C1")
         if seen_mask and idx < len(seen_mask) and bool(seen_mask[idx]):
             col = 'tab:green'
-
         x_def = np.r_[p, [0,0,0]]
-
         if fov_cfg.get("type","cone") == "pinhole" and cfg.get("camera") is not None:
             coll, edges = draw_camera_frustum_3d(
-                ax, x_def=x_def, axis=axis, cam_cfg=cfg["camera"],
-                color=col, alpha=fov_cfg.get("alpha",0.15)
+                ax, x_def=x_def, cam_cfg=cfg["camera"],
+                color=col, alpha=fov_cfg.get("alpha",0.15),
+                R_wb=R_wb
             )
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
             coll, rim = draw_fov_cone_3d(
-                ax, x_def, axis, fov_cfg,
+                ax, x_def, fov_cfg,
                 color=col, alpha=fov_cfg.get("alpha",0.15),
-                align=att_cfg.get('align','x')
+                align=att_cfg.get('align','x'),
+                R_wb=R_wb
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
+
 
 
     def _R_exec(agent, idx):
@@ -865,8 +906,10 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
 
         # FOV (selected agent)
-        p_def = _pos3(_def_pos(f)); a_def = _def_axis(f)
-        _clear_fov(); _set_fov(p_def, a_def, f)
+        p_def = _pos3(_def_pos(f))
+        R_def = _R_exec(agent_id, f)  # 1 or 2
+        _clear_fov(); _set_fov(p_def, R_def, f)
+
         return plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2
 
     # Render
@@ -1040,30 +1083,30 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
                                       align=att_cfg.get('align','x'))
         return R
 
-    def _draw_fov(f, p, axis):
+    def _draw_fov(f, p, R_wb):
         _clear_fov()
         if not (t_fov.value and fov_cfg.get("enabled", False)):
             return
-
         col = fov_cfg.get("color","C1")
         if seen_mask and f < len(seen_mask) and bool(seen_mask[f]):
             col = 'tab:green'
-
         x_def = np.r_[p, [0,0,0]]
-
         if fov_cfg.get("type","cone") == "pinhole" and cfg.get("camera") is not None:
             coll, edges = draw_camera_frustum_3d(
-                ax, x_def=x_def, axis=axis, cam_cfg=cfg["camera"],
-                color=col, alpha=fov_cfg.get("alpha",0.15)
+                ax, x_def=x_def, cam_cfg=cfg["camera"],
+                color=col, alpha=fov_cfg.get("alpha",0.15),
+                R_wb=R_wb
             )
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
             coll, rim = draw_fov_cone_3d(
-                ax, x_def, axis, fov_cfg,
+                ax, x_def, fov_cfg,
                 color=col, alpha=fov_cfg.get("alpha",0.15),
-                align=att_cfg.get('align','x')
+                align=att_cfg.get('align','x'),
+                R_wb=R_wb
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
+
 
 
     # Widgets
@@ -1117,8 +1160,10 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
 
         # FOV
         p_def = np.array(_pos3(exec2[f] if agent_id == 2 else exec1[f]))
-        a_def = _def_axis(f)
-        _draw_fov(f, p_def, a_def)
+        R_def = _R_exec(agent_id, f)
+        _draw_fov(f, p_def, R_def)
+
+
 
         ax.view_init(elev=s_elev.value, azim=s_azim.value)
         fig.canvas.draw_idle()

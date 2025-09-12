@@ -241,24 +241,43 @@ def step_phi(phi: float, dt: float, att_cfg: dict):
     return phi
 
 
-def frame_from_axis(axis, align="z", world_up=(0,0,1)):
+def frame_from_axis(axis, align="x", world_up=(0,0,1), stabilize_up=False, prev_R=None):
     """
-    Build body frame rows [x_b; y_b; z_b] given desired axis alignment.
-    align='z' -> z_b aligned to axis (current default)
-    align='x' -> x_b aligned to axis
+    Build body frame rows [x_b; y_b; z_b].
+    - align="x": x_b is along `axis` (boresight).
+    - stabilize_up=False: do NOT force yaw to be 'up' (reduces flipping).
+    - stabilize_up=True: tries to keep z_b close to world_up (can flip near poles).
+    - prev_R: optional previous frame; used only to survive singularities.
     """
-    axis = _unit(axis)
-    if align == "z":
-        return world_to_body_R(axis, 3)
-    # align x_b to axis: construct like world_to_body_R but swap roles
-    ref = np.array([1,0,0], float) if abs(axis[0]) < 0.9 else np.array([0,1,0], float)
-    z_b = _unit(np.cross(ref, axis))
-    if np.linalg.norm(z_b) < 1e-9:   # fallback if parallel
-        ref = np.array([0,0,1.0])
-        z_b = _unit(np.cross(ref, axis))
-    y_b = _unit(np.cross(z_b, axis))
-    x_b = axis
+    a = _unit(np.asarray(axis, float))
+
+    if align != "x":
+        # keep your existing 'z'-forward behavior if you use it elsewhere
+        return world_to_body_R(a, 3, align=align)
+
+    x_b = a
+    if stabilize_up:
+        up = _unit(np.asarray(world_up, float))
+        y_tmp = np.cross(up, x_b)       # “upright” y
+        n = np.linalg.norm(y_tmp)
+        if n < 1e-8:
+            # boresight ~ up; reuse previous y to avoid a jump, or pick a safe ref
+            if prev_R is not None:
+                y_b = _unit(prev_R[1])
+            else:
+                ref = np.array([0,1,0]) if abs(x_b[1]) < 0.9 else np.array([0,0,1])
+                y_b = _unit(np.cross(ref, x_b))
+        else:
+            y_b = y_tmp / n
+        z_b = _unit(np.cross(x_b, y_b))
+    else:
+        # “free” mode: choose a fixed reference that avoids degeneracy; no up preference
+        ref = np.array([0,0,1]) if abs(x_b[2]) < 0.9 else np.array([0,1,0])
+        y_b = _unit(np.cross(ref, x_b))
+        z_b = _unit(np.cross(x_b, y_b))
+
     return np.vstack([x_b, y_b, z_b])
+
 
 def apply_roll_about_axis(R_wb, phi: float, align: str = "x"):
     """
@@ -629,29 +648,71 @@ def minimal_rotation(a, b, eps: float = 1e-9):
     angle = np.arctan2(s, c)
     return np.eye(3) + np.sin(angle)*K + (1 - np.cos(angle))*(K @ K)
 
-def frame_from_axis_continuous(a_cur, R_prev=None, world_up=np.array([0,0,1.0])):
+
+def frame_from_axis_continuous(axis,
+                               R_prev=None,
+                               align: str = "x",
+                               world_up=np.array([0.0, 0.0, 1.0])):
     """
-    Build/propagate a continuous body frame with z_b aligned to a_cur.
-    If R_prev is given, apply minimal rotation; else build from world_up.
-    Returns 3x3 with rows [x_b; y_b; z_b].
+    Build/propagate a continuous body frame with minimal spin about the boresight.
+    Returns rows [x_b; y_b; z_b] expressed in WORLD.
+    - align='x': x_b is boresight (x-forward).
+    - align='z': z_b is boresight (legacy).
+    Uses minimal_rotation(prev_boresight, new_boresight) to avoid flips.
     """
-    a_cur = _unit(a_cur)
+    a = _unit(np.asarray(axis, float))
+    up = _unit(np.asarray(world_up, float))
+
     if R_prev is not None:
-        z_prev = R_prev[2]
-        Rdel = minimal_rotation(z_prev, a_cur)
-        R = Rdel @ R_prev
-        # re-orthonormalize
-        z_b = _unit(R[2])
-        x_b = _unit(R[0] - z_b*np.dot(R[0], z_b))
-        y_b = _unit(np.cross(z_b, x_b))
-        return np.vstack([x_b, y_b, z_b])
-    # first frame
-    if abs(np.dot(a_cur, world_up)) > 0.98:
-        world_up = np.array([1,0,0], float)
-    x_b = _unit(np.cross(world_up, a_cur))
-    y_b = _unit(np.cross(a_cur, x_b))
-    z_b = a_cur
-    return np.vstack([x_b, y_b, z_b])
+        if align == "x":
+            # rotate previous frame so x_prev -> a with minimum angle
+            x_prev = _unit(R_prev[0])
+            Rdel = minimal_rotation(x_prev, a)   # Rdel @ x_prev ≈ a
+            R = Rdel @ R_prev
+
+            # re-orthonormalize while preserving x_b ~ a
+            x_b = a
+            y_tmp = R[1] - x_b*np.dot(R[1], x_b)
+            if np.linalg.norm(y_tmp) < 1e-8:
+                # singular: pick a safe reference not parallel to x_b
+                ref = up if abs(np.dot(up, x_b)) < 0.98 else np.array([0,1,0], float)
+                y_tmp = np.cross(ref, x_b)
+            y_b = _unit(y_tmp)
+            z_b = _unit(np.cross(x_b, y_b))
+            y_b = _unit(np.cross(z_b, x_b))  # final Gram-Schmidt pass
+            return np.vstack([x_b, y_b, z_b])
+
+        else:  # align == "z"
+            z_prev = _unit(R_prev[2])
+            Rdel = minimal_rotation(z_prev, a)  # Rdel @ z_prev ≈ a
+            R = Rdel @ R_prev
+
+            z_b = a
+            x_tmp = R[0] - z_b*np.dot(R[0], z_b)
+            if np.linalg.norm(x_tmp) < 1e-8:
+                ref = up if abs(np.dot(up, z_b)) < 0.98 else np.array([1,0,0], float)
+                x_tmp = np.cross(ref, z_b)
+            x_b = _unit(x_tmp)
+            y_b = _unit(np.cross(z_b, x_b))
+            x_b = _unit(np.cross(y_b, z_b))
+            return np.vstack([x_b, y_b, z_b])
+
+    # First frame (no R_prev): construct from world_up safely
+    if align == "x":
+        if abs(np.dot(a, up)) > 0.98:
+            up = np.array([0,1,0], float) if abs(a[1]) < 0.9 else np.array([1,0,0], float)
+        y_b = _unit(np.cross(up, a))
+        z_b = _unit(np.cross(a, y_b))
+        return np.vstack([a, y_b, z_b])
+    else:
+        if abs(np.dot(a, up)) > 0.98:
+            up = np.array([1,0,0], float)
+        x_b = _unit(np.cross(up, a))
+        y_b = _unit(np.cross(a, x_b))
+        return np.vstack([x_b, y_b, a])
+
+
+
 
 # in game_sharedutils.py
 def world_to_body_R(axis, D: int = 3, align: str = "x", up=(0.0, 0.0, 1.0)):
