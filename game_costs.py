@@ -37,7 +37,7 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
         [f1, f2] where each f(tau, theta) returns a scalar MX.
     """
     setting = (cfg.get("setting", "baseline") or "baseline").lower()
-    D = nx // 2
+    D = int(cfg.get("D", 3))               # trust the config
     assert D in (2, 3), "build_costs supports D in {2,3}"
     assert N == 2, "Current build_costs assumes N=2"
     nprim = T*nx + (T-1)*nu

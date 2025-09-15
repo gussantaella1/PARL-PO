@@ -8,10 +8,11 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.lines import Line2D
 
 
-import importlib, game_sharedutils, game_3dutils, game_costs
+import importlib, game_sharedutils, game_3dutils, game_costs, game_attquat
 importlib.reload(game_sharedutils)
 importlib.reload(game_3dutils)
 importlib.reload(game_costs)
+importlib.reload(game_attquat)
 
 
 
@@ -24,8 +25,17 @@ from game_sharedutils import (
     step_phi,                     # <-- import this, not step_roll
     frame_from_axis, 
     apply_roll_about_axis,
-    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous
+    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous,
+    augment_bounds_with_quat, build_g_tilde_tr_plus_quat,
 
+    augment_bounds_with_quat, build_g_tilde_tr_plus_quat,
+    build_g_tilde_tr_plus_quat_locked_boresight,   # NEW
+)
+
+
+from game_attquat import (
+    AttState, q_to_R, R_to_q, step_attitude_quat,
+    tau_point_boresight, saturate_norm
 )
 
 
@@ -42,139 +52,184 @@ __all__ += ["draw_camera_frustum_3d", "project_point_pinhole", "points_in_fov_ma
 
 
 # -------------------- 3D solver entrypoint --------------------
-def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
-    """Solve once (open-loop) with optional roll augmentation inside the state."""
-    N = 2
-    D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
-    nx_tr, nu_tr = dims_from_D(D)
-    T, dt  = int(cfg["T"]), float(cfg["dt"])
 
-    # --- translational Ad,Bd (MX) ---
-    dyn = (cfg.get("dynamics") or "double").lower()
-    if dyn == "hcw":
-        n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)     # MX
-    else:
-        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX (already discrete)
+def _unit(v):
+    n = float(np.linalg.norm(v))
+    return v if n == 0.0 else (v / n)
 
-    # --- optional attitude augmentation ---
-    att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg)
-    if use_att:
-        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
-        nx, nu = idx["nx"], idx["nu"]
-    else:
-        Ad_mx, Bd_mx = Ad_tr, Bd_tr
-        nx, nu = nx_tr, nu_tr
+def _axis_from_vel(xtr, D, align="x", min_speed=1e-3, prev_axis=None):
+    v = np.asarray(xtr[D:2*D], float)
+    n = float(np.linalg.norm(v))
+    if n < min_speed:
+        if prev_axis is not None:
+            return prev_axis
+        return np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float)
+    a = v/n
+    if D == 2: a = np.array([a[0], a[1], 0.0], float)
+    if prev_axis is not None and np.dot(a, prev_axis) < 0.0:
+        a = -a  # hysteresis: keep co-directional to avoid 180 flips
+    return a
 
-    # --- constraints builders (use linear builder with fixed Ad,Bd) ---
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
+def _world_to_body_continuous(a, world_up, align="x", R_prev=None, a_prev=None, alpha=1.0):
+    a = _unit(a)
+    # 1) Try transporting the previous frame
+    R_tr = _transport_R(R_prev, a_prev, a) if (R_prev is not None and a_prev is not None) else None
+    # 2) If no prev frame, build a seed once (project-up is fine just for seeding)
+    if R_tr is None:
+        y0 = world_up - a*np.dot(world_up, a)
+        if np.linalg.norm(y0) < 1e-8:
+            # pick a stable basis axis least aligned with a
+            e = np.eye(3)[np.argmin(np.abs(a))]
+            y0 = e - a*np.dot(e, a)
+        R_nom = _R_from_axis_tangent(a, _unit(y0), align)
+        return R_nom
+    # 3) Optional smoothing toward transported frame
+    return _slerp_R(R_prev, R_tr, alpha=alpha)
 
-    # --- bounds (augment if attitude is on) ---
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    if use_att:
-        x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-    htil_fun  = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
-
-    # --- symbols ---
-    nprim = T*nx + (T-1)*nu
-    taus  = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
-    tau   = ca.vcat(taus)
-    theta = ca.MX.sym('theta', nx*N)
-
-    # --- costs & KKT residual objective ---
-    fs   = cost_builder(nx, nu, T, N, cfg)
-    gtil = gtil_fun(tau, theta)
-    htil = htil_fun(tau, theta)
-
-    lam_t = ca.MX.sym('lam_t', gtil.shape[0])
-    mu_t  = ca.MX.sym('mu_t',  htil.shape[0])
-
-    grads = []
-    for i in range(N):
-        Li = fs[i](tau, theta) - lam_t.T @ gtil - mu_t.T @ htil
-        grads.append(ca.gradient(Li, taus[i]))
-    FB  = ca.vcat([fb(htil[i], mu_t[i]) for i in range(htil.shape[0])])
-    G   = ca.vcat(grads + [gtil, FB])
-    z   = ca.vcat(taus + [lam_t, mu_t])
-    obj = 0.5 * ca.dot(G, G)
-
-    opts = {'ipopt.print_level': 0, 'print_time': 0}
-    if ipopt_opts: opts.update(ipopt_opts)
-    solver = ca.nlpsol('solver', 'ipopt', {'x': z, 'p': theta, 'f': obj}, opts)
-
-    # --- initial parameter theta (pad with φ[/w] if needed) ---
-    x0_rows = np.asarray(cfg["x0"], float)
-    assert x0_rows.shape[0] == N, f"cfg['x0'] must have {N} rows (one per agent)"
-    theta_parts = []
-    for i in range(N):
-        x0_i = pad_x0_with_att(x0_rows[i], att_cfg, D)[:nx] if use_att else x0_rows[i][:nx]
-        theta_parts.append(x0_i)
-    theta0 = np.hstack(theta_parts)
-
-    # --- simple bounds on KKT multipliers (μ ≥ 0) ---
-    lbz = -np.inf*np.ones(z.shape[0]); ubz =  np.inf*np.ones(z.shape[0])
-    lbz[N*nprim + gtil.shape[0]:] = 0.0
-
-    # --- solve ---
-    sol = solver(x0=np.zeros(z.shape[0]), lbx=lbz, ubx=ubz, p=theta0)
-    zstar = np.array(sol['x']).squeeze()
-    residual = float(sol['f'])
-    print(f"[3D] Objective residual (0.5||G||^2): {residual:.3e}")
-    print(f"[3D] z dim: {z.shape[0]} (taus={N*nprim}, lam={gtil.shape[0]}, mu={htil.shape[0]})")
-
-    return dict(
-        z=zstar, residual=residual,
-        meta=dict(T=T, nx=nx, nu=nu, N=N, D=D, nprim=nprim,
-                  n_g=gtil.shape[0], n_h=htil.shape[0])
+def attitude_from_state(x, prev_axisD, prev_R):
+    R, axisD, extra = transported_R_from_state(
+        x=x, D=D, att_cfg=att_cfg,
+        prev_axisD=prev_axisD, prev_R=prev_R
     )
+    # For legacy callers that expect 'phi' (roll models)
+    phi = float(extra.get("phi", 0.0))
+    return R, axisD, phi
 
 
-# -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
-def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
-                                  turn_len: int | None = None, ipopt_opts: dict | None = None):
-    """RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖."""
+
+def _closest_tangent(a, up, y_prev=None):
+    a = a/ (np.linalg.norm(a)+1e-12)
+    up = up/ (np.linalg.norm(up)+1e-12)
+    y = up - a*np.dot(up, a)     # project up onto plane ⟂ a
+    if np.linalg.norm(y) < 1e-9:
+        # pick any orthogonal
+        tmp = np.array([0,1,0]) if abs(a[2])>0.9 else np.array([0,0,1])
+        y = tmp - a*np.dot(tmp, a)
+    y = y / (np.linalg.norm(y)+1e-12)
+    if y_prev is not None and np.dot(y, y_prev) < 0.0:
+        y = -y  # flip tangent to stay close to previous
+    return y
+
+def _R_from_axis_tangent(a, y, align="x"):
+    a = a/ (np.linalg.norm(a)+1e-12)
+    y = y/ (np.linalg.norm(y)+1e-12)
+    z = np.cross(a, y); z /= (np.linalg.norm(z)+1e-12)
+    # rows [x_b;y_b;z_b] in world (like your existing convention)
+    if align == "x":
+        return np.vstack([a, y, z])
+    else:  # align boresight with +z row
+        x = np.cross(y, a); x /= (np.linalg.norm(x)+1e-12)
+        return np.vstack([x, y, a])
+    
+def _log_SO3(R):
+    # rotation vector (axis*angle). stable for small angles
+    tr = np.clip((np.trace(R)-1)/2.0, -1.0, 1.0)
+    th = np.arccos(tr)
+    if th < 1e-8:
+        return np.zeros(3)
+    w = np.array([R[2,1]-R[1,2], R[0,2]-R[2,0], R[1,0]-R[0,1]])/(2*np.sin(th))
+    return w*th
+
+def _exp_SO3(w):
+    th = float(np.linalg.norm(w))
+    if th < 1e-8:
+        return np.eye(3)
+    k = w/th
+    K = np.array([[0,-k[2],k[1]],[k[2],0,-k[0]],[-k[1],k[0],0]], float)
+    return np.eye(3) + np.sin(th)*K + (1-np.cos(th))*(K@K)
+
+def _slerp_R(R_prev, R_nom, alpha=1.0):
+    if R_prev is None or alpha >= 0.9999:
+        return R_nom
+    Rdel = R_prev.T @ R_nom
+    w = _log_SO3(Rdel)
+    return R_prev @ _exp_SO3(alpha*w)
+
+def _quat_cont(q, q_prev):
+    # keep quaternion sign continuous
+    if q_prev is not None and float(np.dot(q, q_prev)) < 0.0:
+        return -q
+    return q
+
+def _unwrap_angle(prev, now):
+    # keep angle continuous across ±π
+    d = now - prev
+    d = (d + np.pi) % (2*np.pi) - np.pi
+    return prev + d
+
+def _make_continuous_R0(R_prev, R_cand, align="x"):
+    """Flip whole rows to keep the nominal frame consistent with the previous one."""
+    if R_prev is None:
+        return R_cand
+    R = R_cand.copy()
+    if align == "x":
+        if np.dot(R_prev[0], R[0]) < 0.0:
+            R[0] *= -1.0; R[1] *= -1.0
+        if np.dot(R_prev[1], R[1]) < 0.0:
+            R[1] *= -1.0; R[2] *= -1.0
+    else:  # align == "z"
+        if np.dot(R_prev[2], R[2]) < 0.0:
+            R[1] *= -1.0; R[2] *= -1.0
+        if np.dot(R_prev[1], R[1]) < 0.0:
+            R[0] *= -1.0; R[1] *= -1.0
+    return R
+
+# -------------------- 3D solver entrypoint (NONLINEAR quat-ready) --------------------
+def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
+    """
+    Open-loop solve with *linear* small-angle attitude:
+      - att.mode == "lin3d"     → add δθ(3), δω(3) and τ(3)
+      - att.mode == "lin2d_roll"→ same size; roll is 1D, pitch/yaw is 2D block
+    Inequality bounds (h~) remain *translation-only* to keep things easy.
+    """
+    import numpy as np
+    import casadi as ca
+
+    # ---------- sizes / timing ----------
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
-    T, dt  = int(cfg["T"]), float(cfg["dt"])
+    T, dt = int(cfg["T"]), float(cfg["dt"])
 
-    # --- translational Ad,Bd (MX) ---
+    # ---------- translation dynamics (MX) ----------
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)         # MX
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)
     else:
-        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
+        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)
 
-    # --- optional attitude augmentation (roll in state) ---
-    att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg)
-    if use_att:
-        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
-        nx, nu = idx["nx"], idx["nu"]
-        i_phi  = idx["i_phi"]      # index of φ in x
+    # ---------- attitude mode ----------
+    att_cfg  = cfg.get("att", {})
+    mode     = (att_cfg.get("mode") or "lin3d").lower()
+    use_lin  = mode in ("lin3d", "lin2d_roll")
+    J = att_cfg.get("J", [12.0, 10.0, 8.0])
+
+    if use_lin:
+        A_att, B_att = _att_blocks_linear_mx(mode, dt, J)        # 6x6, 6x3
+        nx,  nu  = nx_tr + 6, nu_tr + 3
+        A_mx = _blkdiag_mx(Ad_tr, A_att)
+        B_mx = _blkdiag_mx(Bd_tr, B_att)
     else:
-        Ad_mx, Bd_mx = Ad_tr, Bd_tr
-        nx, nu = nx_tr, nu_tr
-        i_phi  = None
+        # Fallback: pure translation (legacy)
+        A_mx, B_mx = Ad_tr, Bd_tr
+        nx,  nu    = nx_tr, nu_tr
 
-    # --- rollout length / turn length ---
-    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
-    if steps is None:
-        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
-    if turn_len is None:
-        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
-                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
+    # ---------- equality constraints g~ (linear builder) ----------
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
 
-    # --- constraints (with fixed Ad,Bd) ---
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    if use_att:
-        x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
+    # ---------- inequality bounds h~ (translation-only when attitude is on) ----------
+    x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
+    if use_lin:
+        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only(
+            x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr
+        )
+    else:
+        x_lb, x_ub, u_lb, u_ub = x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr
+
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
-    # --- solver (KKT residual objective) ---
+    # ---------- KKT residual objective ----------
     nprim     = T*nx + (T-1)*nu
     taus_syms = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
     tau_sym   = ca.vcat(taus_syms)
@@ -193,28 +248,213 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     FB   = ca.vcat([fb(htil[i], mu_t[i]) for i in range(htil.shape[0])])
     G    = ca.vcat(grads + [gtil, FB])
     z_sym = ca.vcat(taus_syms + [lam_t, mu_t])
-    obj  = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)
+    obj   = 0.5 * ca.dot(G, G)
 
-    opts = {'ipopt.print_level': 0, 'print_time': 0}
+    opts = {'ipopt.print_level': 0, 'print_time': 0, 'expand': True}
     if ipopt_opts: opts.update(ipopt_opts)
     solver = ca.nlpsol('solver', 'ipopt', {'x': z_sym, 'p': theta_sym, 'f': obj}, opts)
 
-    # --- simple bounds on KKT multipliers (μ ≥ 0) ---
+    # ---------- theta seed (x0 per agent) ----------
+    x0_rows = np.asarray(cfg["x0"], float)
+    assert x0_rows.shape[0] == N, f"cfg['x0'] must have {N} rows"
+    theta_parts = []
+    for i in range(N):
+        xtr = x0_rows[i][:nx_tr]
+        if use_lin:
+            delta_theta0 = np.zeros(3)  # [δφ, δθ_y, δθ_z]
+            delta_omega0 = np.zeros(3)  # [δω_x, δω_y, δω_z]
+            x0_i = np.hstack([xtr, delta_theta0, delta_omega0])
+        else:
+            x0_i = xtr
+        theta_parts.append(x0_i)
+    theta0 = np.hstack(theta_parts)
+
+    # ---------- μ ≥ 0 ----------
+    lbz = -np.inf*np.ones(z_sym.shape[0]); ubz = np.inf*np.ones(z_sym.shape[0])
+    lbz[N*nprim + gtil.shape[0]:] = 0.0
+
+    # ---------- solve ----------
+    sol = solver(x0=np.zeros(z_sym.shape[0]), lbx=lbz, ubx=ubz, p=theta0)
+    zstar = np.array(sol['x']).squeeze()
+    residual = float(sol['f'])
+    print(f"[solve] residual 0.5||G||^2 = {residual:.3e}")
+    print(f"[solve] dims: nx={nx}, nu={nu}, T={T}, z={int(z_sym.shape[0])}")
+
+    return dict(
+        z=zstar, residual=residual,
+        meta=dict(T=T, nx=nx, nu=nu, N=N, D=D, nx_tr=nx_tr, nu_tr=nu_tr,
+                  nprim=nprim, n_g=int(gtil.shape[0]), n_h=int(htil.shape[0]),
+                  use_lin=use_lin, att_mode=mode)
+    )
+
+def _att_blocks_linear_mx(mode, dt, J):
+    """
+    Discrete linear 6-state small-angle attitude:
+      δθ_{k+1} = δθ_k + dt δω_k
+      δω_{k+1} = δω_k + dt J^{-1} τ_k
+    """
+    # J can be list/np → DM diag; or already MX/DM 3x3
+    if isinstance(J, (list, tuple, np.ndarray)):
+        Jm = ca.diag(ca.DM([float(J[0]), float(J[1]), float(J[2])]))
+    else:
+        Jm = J
+    I3 = ca.MX.eye(3); O3 = ca.MX.zeros(3,3)
+    A  = ca.blockcat([[I3, dt*I3],
+                      [O3,    I3]])
+    Bin = ca.mtimes(ca.inv(Jm), I3)
+    B  = ca.blockcat([[O3],
+                      [dt*Bin]])
+    return A, B
+
+
+
+def _skew_np(e):
+    ex, ey, ez = float(e[0]), float(e[1]), float(e[2])
+    return np.array([[   0, -ez,  ey],
+                     [  ez,   0, -ex],
+                     [ -ey,  ex,   0]], float)
+
+def _eps3_from_statevec(x_like, nx_tr):
+    """Return δθ (3,) if present, else zeros(3,)."""
+    x_like = np.asarray(x_like, float).reshape(-1)
+    return (x_like[nx_tr:nx_tr+3] if x_like.size >= nx_tr+3 else np.zeros(3))
+
+
+def _apply_small_angle(R0, eps):
+    eps = np.asarray(eps, float).reshape(-1)
+    if eps.size < 3:
+        eps = np.zeros(3)
+    return R0 @ (np.eye(3) + _skew_np(eps))
+
+
+def _blkdiag_mx(A, B):
+    """Block-diagonal for MX."""
+    ar, ac = A.shape
+    br, bc = B.shape
+    Z_ab = ca.MX.zeros(ar, bc)
+    Z_ba = ca.MX.zeros(br, ac)
+    return ca.blockcat([[A, Z_ab],
+                        [Z_ba, B]])
+
+def _pad_trans_bounds_only(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr):
+    """Embed translation bounds; leave attitude unbounded."""
+    x_lb = np.full(nx, -np.inf); x_ub = np.full(nx,  np.inf)
+    u_lb = np.full(nu, -np.inf); u_ub = np.full(nu,  np.inf)
+    x_lb[:nx_tr] = np.asarray(x_lb_tr, float)
+    x_ub[:nx_tr] = np.asarray(x_ub_tr, float)
+    u_lb[:nu_tr] = np.asarray(u_lb_tr, float)
+    u_ub[:nu_tr] = np.asarray(u_ub_tr, float)
+    return x_lb, x_ub, u_lb, u_ub
+
+
+# -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
+# -------------------- RHC with execution & FOV (quat-aware) --------------------
+def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
+                                  turn_len: int | None = None, ipopt_opts: dict | None = None):
+    """
+    RHC rollout. With small-angle attitude (att.mode in {'lin3d','lin2d_roll'}), per-agent:
+      x = [x_tr; δθ(3); δω(3)], u = [u_tr; τ(3)].
+    g~ is linear (Ax+Bu for translation+attitude). h~ is translation-only.
+    Rendering uses a continuous nominal frame R0 from velocity, corrected by δθ.
+    """
+    import numpy as np
+    import casadi as ca
+
+    # ---------- sizes / timing ----------
+    N = 2
+    D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
+    nx_tr, nu_tr = dims_from_D(D)
+    T, dt  = int(cfg["T"]), float(cfg["dt"])
+
+    # ---------- translation dynamics ----------
+    dyn = (cfg.get("dynamics") or "double").lower()
+    if dyn == "hcw":
+        n = hcw_mean_motion(cfg.get("hcw", {}))
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)
+    else:
+        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)
+
+    # ---------- attitude blocks ----------
+    att_cfg = cfg.get("att", {})
+    mode    = (att_cfg.get("mode") or "lin3d").lower()
+    use_lin = mode in ("lin3d", "lin2d_roll")
+    J_diag  = att_cfg.get("J", [12.0, 10.0, 8.0])
+
+    if use_lin:
+        A_att, B_att = _att_blocks_linear_mx(mode, dt, J_diag)
+        nx, nu = nx_tr + 6, nu_tr + 3
+        A_mx = _blkdiag_mx(Ad_tr, A_att)
+        B_mx = _blkdiag_mx(Bd_tr, B_att)
+    else:
+        A_mx, B_mx = Ad_tr, Bd_tr
+        nx, nu = nx_tr, nu_tr
+
+    # ---------- rollout schedule ----------
+    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
+    if steps is None:
+        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
+    if turn_len is None:
+        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
+                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
+
+    # ---------- inequality bounds (translation-only when attitude on) ----------
+    x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
+    if use_lin:
+        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only(
+            x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr
+        )
+    else:
+        x_lb, x_ub, u_lb, u_ub = x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr
+
+    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
+
+    # ---------- solver (KKT residual) ----------
+    nprim     = T*nx + (T-1)*nu
+    taus_syms = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
+    tau_sym   = ca.vcat(taus_syms)
+    theta_sym = ca.MX.sym('theta', nx*N)
+
+    fs    = cost_builder(nx, nu, T, N, cfg)
+    gtil  = gtil_fun(tau_sym, theta_sym)
+    htil  = htil_fun(tau_sym, theta_sym)
+    lam_t = ca.MX.sym('lam_t', gtil.shape[0])
+    mu_t  = ca.MX.sym('mu_t',  htil.shape[0])
+
+    grads = []
+    for i in range(N):
+        Li = fs[i](tau_sym, theta_sym) - lam_t.T @ gtil - mu_t.T @ htil
+        grads.append(ca.gradient(Li, taus_syms[i]))
+    FB   = ca.vcat([fb(htil[i], mu_t[i]) for i in range(htil.shape[0])])
+    G    = ca.vcat(grads + [gtil, FB])
+    z_sym = ca.vcat(taus_syms + [lam_t, mu_t])
+    obj   = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)  # tiny Tikhonov
+
+    opts = {'ipopt.print_level': 0, 'print_time': 0, 'expand': True}
+    if ipopt_opts: opts.update(ipopt_opts)
+    solver = ca.nlpsol('solver', 'ipopt', {'x': z_sym, 'p': theta_sym, 'f': obj}, opts)
+
+    # ---------- μ ≥ 0 ----------
     BIG = 1e8
     lbz = -BIG*np.ones(z_sym.shape[0]); ubz = BIG*np.ones(z_sym.shape[0])
     lbz[N*nprim + gtil.shape[0]:] = 0.0
 
-    # --- initial states (pad with φ if needed) ---
-    x1 = pad_x0_with_att(cfg["x0"][0], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][0], float)[:nx].copy()
-    x2 = pad_x0_with_att(cfg["x0"][1], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][1], float)[:nx].copy()
+    # ---------- initial states ----------
+    x0_rows = np.asarray(cfg["x0"], float)
+    x1_tr = x0_rows[0][:nx_tr].copy()
+    x2_tr = x0_rows[1][:nx_tr].copy()
+    if use_lin:
+        x1 = np.hstack([x1_tr, np.zeros(3), np.zeros(3)])  # δθ=0, δω=0
+        x2 = np.hstack([x2_tr, np.zeros(3), np.zeros(3)])
+    else:
+        x1, x2 = x1_tr, x2_tr
     theta_curr = np.r_[x1, x2]
 
-    # --- numeric stepper (MX→np) ---
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-    def step_plant(x, u):
-        return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
+    # ---------- numeric stepper ----------
+    Ad_np = as_numpy_const(A_mx); Bd_np = as_numpy_const(B_mx)
+    def _step_plant(x, u): return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
 
-    # --- logs ---
+    # ---------- logs ----------
     plan_hist1, plan_hist2 = [], []
     plan_att1,  plan_att2  = [], []
     exec_xyz1,  exec_xyz2  = [], []
@@ -222,194 +462,165 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
-    # --- FOV config ---
+    # ---------- rendering / continuity ----------
+    align    = att_cfg.get("align","x")
+    world_up = np.asarray(att_cfg.get("up",[0,0,1]), float)
+    vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
+    alpha    = float(att_cfg.get("boresight_lpf_alpha", 1.0))
+
+    R0_prev = [None, None]  # carry nominal frames per agent
+
+    def _R0_from_xtr_cont(xtr, agent_idx):
+        v = np.asarray(xtr[D:2*D], float)
+        if float(np.linalg.norm(v)) < vmin and (R0_prev[agent_idx] is not None):
+            return R0_prev[agent_idx]
+
+        prev_b = None
+        if R0_prev[agent_idx] is not None:
+            prev_b = R0_prev[agent_idx][0] if align == "x" else R0_prev[agent_idx][2]
+
+        a = _axis_from_vel(xtr, D, align=align, min_speed=vmin, prev_axis=prev_b)
+        R0 = _world_to_body_continuous(a, world_up, align, R_prev=R0_prev[agent_idx], alpha=alpha)
+        R0_prev[agent_idx] = R0
+        return R0
+
+
+    def _render_R_from_state(x, agent_idx):
+        xtr = x[:nx_tr]
+        R0  = _R0_from_xtr_cont(xtr, agent_idx)
+        eps = _eps3_from_statevec(x, nx_tr) if use_lin else np.zeros(3)
+        return _apply_small_angle(R0, eps), float(eps[0])
+
+
+    def _p3_from_state(x):
+        return (float(x[0]), float(x[1]), float(x[2] if D==3 else 0.0))
+
+    # ---------- t=0 snapshot ----------
+    R1_0, phi1_0 = _render_R_from_state(x1, 0)
+    R2_0, phi2_0 = _render_R_from_state(x2, 1)
+    exec_xyz1.append(_p3_from_state(x1)); exec_xyz2.append(_p3_from_state(x2))
+    exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
+    exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
+
+    # ---------- FOV at t=0 ----------
     fov_cfg     = cfg.get("fov", {"enabled": False})
     fov_enabled = bool(fov_cfg.get("enabled", False))
     fov_agent   = int(fov_cfg.get("agent", 2))
-
-    # -------------------- helpers --------------------
-    def _p3_row(x_row):
-        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
-    def _p3_vec(x_vec):
-        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
-
-    # --- attitude_from_state: keep prev_R and return R for chaining ---
-    def attitude_from_state(x, prev_axisD, prev_R):
-        vmin  = float(att_cfg.get("min_speed_for_axis",
-                                cfg.get("fov", {}).get("min_speed_for_axis", 1e-3)))
-        axisD = fov_axis_from_vel(x, D, prev_axis=prev_axisD, min_speed=vmin)
-        axis3 = axisD if D==3 else np.array([axisD[0], axisD[1], 0.0], float)
-
-        R = frame_from_axis_continuous(
-            axis3,
-            R_prev=prev_R,
-            align=att_cfg.get("align","x"),
-            world_up=np.asarray(att_cfg.get("up",[0,0,1]), float)
-        )
-
-
-        phi = float(x[i_phi]) if (use_att and i_phi is not None and att_cfg.get("roll_enabled", True)) else 0.0
-        if att_cfg.get("roll_enabled", True):
-            R = apply_roll_about_axis(R, phi, align=att_cfg.get("align","x"))
-        return R, axisD, phi
-
-
-
-    # --- plan side: carry R_prev through the horizon ---
-    def plan_attitudes_from_X(X, prev_axisD, prev_R):
-        att_list = []
-        ax_prev  = prev_axisD
-        R_prev   = prev_R
-        for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], ax_prev, prev_R=R_prev)
-            att_list.append({"R": R, "phi": phi_t})
-            R_prev = R
-        return att_list, ax_prev, R_prev
-
-
-    # --- t=0 attitude seed from initial velocity (so first frame draws correctly) ---
-    align    = att_cfg.get("align", "x")
-    world_up = att_cfg.get("up", [0,0,1])
-    vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
-    def _axis_from_vel_t0(x):
-        v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
-        aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        return aD, (aD if D==3 else np.array([aD[0], aD[1], 0.0], float))
-    prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
-    prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
-    phi1_0 = float(x1[i_phi]) if (use_att and i_phi is not None) else 0.0
-    phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
-    R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
-    R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
-    prev_R1, prev_R2 = R1_0, R2_0
-
-
-    # log true t=0 snapshot
-    exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-    exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
-    exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
     if fov_enabled:
-        # pick defending agent's executed attitude at t=0
         R_def0 = R2_0 if fov_agent == 2 else R1_0
         x_def  = x2    if fov_agent == 2 else x1
         x_tgt  = x1    if fov_agent == 2 else x2
-
-        # (optional: keep this for plotting fallback history)
         a_def3 = R_def0[0] if align == 'x' else R_def0[2]
         fov_axis_hist.append(a_def3)
-
         cam_cfg = cfg.get("camera", None)
         if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-            _, _, _, ok0 = project_point_pinhole(
-                X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def0
-            )
+            Xw = np.array([x_tgt[0], x_tgt[1], (x_tgt[2] if D==3 else 0.0)], float)
+            _, _, _, ok0 = project_point_pinhole(X_w=Xw, x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def0)
             fov_seen_mask.append(bool(ok0))
         else:
-            # cone visibility is axis-only; roll doesn't change the boolean
-            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
+            seen0, _ = in_fov((x_tgt[:D]), (x_def[:D]), a_def3, fov_cfg, D)
             fov_seen_mask.append(bool(seen0))
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-
-    # --- first plan (uses current θ and previous boresights) ---
+    # ---------- planning wrapper ----------
     z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
-    def replan(theta_vec, z_init, prev1D, prev2D, prevR1, prevR2):
+
+    def _plan_attitudes_from_X_lin(X, agent_idx):
+        out = []
+        R0p = R0_prev[agent_idx]
+        cols = X.shape[1]
+        has_att = (cols >= nx_tr+3)
+        for t in range(T):
+            xtr_t = X[t, :nx_tr]
+            v = np.asarray(xtr_t[D:2*D], float)
+
+            if float(np.linalg.norm(v)) < vmin and (R0p is not None):
+                R0_t = R0p
+            else:
+                prev_b = None
+                if R0p is not None:
+                    prev_b = R0p[0] if align == "x" else R0p[2]
+                a_t  = _axis_from_vel(xtr_t, D, align=align, min_speed=vmin, prev_axis=prev_b)
+                R0_t = _world_to_body_continuous(a_t, world_up, align, R_prev=R0p, alpha=alpha)
+
+            eps_t = (X[t, nx_tr:nx_tr+3] if has_att else np.zeros(3))
+            out.append({"R": _apply_small_angle(R0_t, eps_t), "phi": float(eps_t[0])})
+            R0p = R0_t
+        return out, R0p
+
+
+
+    def replan(theta_vec, z_init):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
         z_new = np.array(sol['x']).squeeze()
         taus  = split_players_from_z(z_new, N, T, nx, nu)
         X1, U1 = unpack_tau_flat(taus[0], nx, nu, T)
         X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
-        plan1  = [_p3_row(X1[t,:]) for t in range(T)]
-        plan2  = [_p3_row(X2[t,:]) for t in range(T)]
-        att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev1D, prevR1)
-        att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev2D, prevR2)
-        return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
+        plan1  = [(float(X1[t,0]), float(X1[t,1]), float(X1[t,2] if D==3 else 0.0)) for t in range(T)]
+        plan2  = [(float(X2[t,0]), float(X2[t,1]), float(X2[t,2] if D==3 else 0.0)) for t in range(T)]
+        att1_plan, R0_prev[0] = _plan_attitudes_from_X_lin(X1, 0)
+        att2_plan, R0_prev[1] = _plan_attitudes_from_X_lin(X2, 1)
+        return z_new, plan1, plan2, U1, U2, att1_plan, att2_plan
 
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-        replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+    # initial plan
+    z_last, plan1, plan2, U1, U2, att1_plan, att2_plan = replan(theta_curr, z_last)
     step_in_turn = 0
 
-    # -------------------- rollout --------------------
+    # ---------- rollout ----------
     for k in range(steps):
-        # replan each turn
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-                replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+            z_last, plan1, plan2, U1, U2, att1_plan, att2_plan = replan(theta_curr, z_last)
             step_in_turn = 0
 
-
-        # log current plan (for this step)
         plan_hist1.append(plan1); plan_hist2.append(plan2)
-        plan_att1.append(att1);   plan_att2.append(att2)
+        plan_att1.append(att1_plan); plan_att2.append(att2_plan)
 
-        # controls for this step
         u1 = U1[min(step_in_turn, len(U1)-1)]
         u2 = U2[min(step_in_turn, len(U2)-1)]
         step_in_turn += 1
 
-        # 1) plant step
-        x1 = step_plant(x1, u1)
-        x2 = step_plant(x2, u2)
+        x1 = _step_plant(x1, u1)
+        x2 = _step_plant(x2, u2)
         theta_curr = np.r_[x1, x2]
 
-        # 2) attitude from updated states
-        R1, axis1D, phi1_now = attitude_from_state(x1, prev_axis1D, prev_R1)
-        R2, axis2D, phi2_now = attitude_from_state(x2, prev_axis2D, prev_R2)
-        prev_axis1D, prev_axis2D = axis1D, axis2D
-        prev_R1, prev_R2 = R1, R2
+        R1, ph1 = _render_R_from_state(x1, 0)
+        R2, ph2 = _render_R_from_state(x2, 1)
+        exec_att1.append({"R": R1, "phi": ph1}); phi_hist1.append(ph1)
+        exec_att2.append({"R": R2, "phi": ph2}); phi_hist2.append(ph2)
+        exec_xyz1.append(_p3_from_state(x1)); exec_xyz2.append(_p3_from_state(x2))
 
-        phi_hist1.append(phi1_now)
-        phi_hist2.append(phi2_now)
-
-
-
-        # 3) log executed pose + attitude
-        exec_att1.append({"R": R1, "phi": phi1_now})
-        exec_att2.append({"R": R2, "phi": phi2_now})
-        exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-
-        # 4) FOV (selected agent)
         if fov_enabled:
-            # executed attitude this step
-            R_def = R2 if fov_agent == 2 else R1
-            x_def = x2 if fov_agent == 2 else x1
-            x_tgt = x1 if fov_agent == 2 else x2
-
-            # (optional history for plotting)
-            a_def3 = R_def[0] if align == 'x' else R_def[2]
+            R_def = (exec_att2[-1]["R"] if fov_agent == 2 else exec_att1[-1]["R"])
+            x_def = (x2 if fov_agent == 2 else x1)
+            x_tgt = (x1 if fov_agent == 2 else x2)
+            a_def3 = (R_def[0] if align == 'x' else R_def[2])
             fov_axis_hist.append(a_def3)
-
             cam_cfg = cfg.get("camera", None)
             if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-                _, _, _, ok = project_point_pinhole(
-                    X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def
-                )
+                Xw = np.array([x_tgt[0], x_tgt[1], (x_tgt[2] if D==3 else 0.0)], float)
+                _, _, _, ok = project_point_pinhole(X_w=Xw, x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def)
                 fov_seen_mask.append(bool(ok))
             else:
-                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
+                seen, _ = in_fov((x_tgt[:D]), (x_def[:D]), a_def3, fov_cfg, D)
                 fov_seen_mask.append(bool(seen))
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-
     return {
         'plan_hist1': plan_hist1,
         'plan_hist2': plan_hist2,
-        'plan_att1' : plan_att1,     # list over T of {"R","phi"}
+        'plan_att1' : plan_att1,
         'plan_att2' : plan_att2,
         'exec1_xyz' : exec_xyz1,
         'exec2_xyz' : exec_xyz2,
-        'exec_att1' : exec_att1,     # list over executed steps of {"R","phi"}
+        'exec_att1' : exec_att1,
         'exec_att2' : exec_att2,
         'phi_hist1' : phi_hist1,
         'phi_hist2' : phi_hist2,
         'fov_axis_hist': fov_axis_hist,
         'fov_seen_mask': fov_seen_mask,
     }
-
-
-
 
 # -------------------- plotting --------------------
 def plot_planned_trajectories(sol, cfg: dict):
@@ -490,45 +701,6 @@ def update_body_axes_artists_3d(lines, p, R_wb, L=(0.4,0.4,0.6)):
     for (ln, q) in zip((lines['bx'], lines['by'], lines['bz']), ends):
         ln.set_data([p[0], q[0]], [p[1], q[1]])
         ln.set_3d_properties([p[2], q[2]])
-
-def draw_fov_cone_3d(ax, x_def, axis, fov_cfg, n=24, color='C1', alpha=0.12, align="x"):
-    """
-    Draw a circular cone aligned with `axis` and apex at x_def[:3].
-    fov_cfg: {"range": float, "hfov_deg": float}  # interpreted as a circular half-angle
-    """
-    p0   = np.asarray(x_def[:3], float)
-    axis = _unit(np.asarray(axis, float))
-    R    = world_to_body_R(axis, 3, align=align)  # rows: x_b,y_b,z_b (world→body)
-
-    rng  = float(fov_cfg["range"])
-    assert rng > 0.0
-    half = 0.5*np.deg2rad(float(fov_cfg["hfov_deg"]))
-    radius = rng * np.tan(half)
-
-    n = max(int(n), 3)
-    ts = np.linspace(0, 2*np.pi, n, endpoint=False)
-
-    if align == "x":
-        # circle in y–z plane at x = rng (x-forward)
-        circ_b = np.vstack([np.full_like(ts, rng),
-                            radius*np.cos(ts),
-                            radius*np.sin(ts)])
-    else:
-        # circle in x–y plane at z = rng (z-forward)
-        circ_b = np.vstack([radius*np.cos(ts),
-                            radius*np.sin(ts),
-                            np.full_like(ts, rng)])
-
-    # body→world
-    circ_w = (R.T @ circ_b).T + p0[None, :]
-
-    # side faces (triangles fan)
-    verts = [[p0, circ_w[i], circ_w[(i+1) % len(circ_w)]] for i in range(len(circ_w))]
-    coll  = Poly3DCollection(verts, facecolors=color, alpha=alpha, edgecolors='none')
-    ax.add_collection3d(coll)
-
-    rim_line, = ax.plot(circ_w[:,0], circ_w[:,1], circ_w[:,2], color=color, alpha=0.4, lw=1)
-    return coll, rim_line
 
 def _image_corners_px(W, H):
     # (u, v) pixel corners in order: TL, TR, BR, BL
@@ -647,6 +819,29 @@ def draw_camera_frustum_3d(ax, x_def, axis=None, cam_cfg=None,
     return coll, edges
 
 
+def _transport_R(prev_R, a_prev, a_new):
+    """Minimal rotation that maps a_prev → a_new, then carry y/z with it."""
+    if prev_R is None:
+        return None  # caller will seed with a standard frame
+    a_prev = _unit(a_prev); a_new = _unit(a_new)
+    c = float(np.clip(np.dot(a_prev, a_new), -1.0, 1.0))
+    v = np.cross(a_prev, a_new); s = float(np.linalg.norm(v))
+    if s < 1e-8:
+        # almost identical or 180°: choose rotation about previous y to break tie
+        if c > 0.0:  # tiny motion
+            Rdel = np.eye(3)
+        else:       # ~180°, rotate π about prev y (any axis ⟂ a_prev is valid)
+            y_axis = prev_R[1] - a_prev*np.dot(prev_R[1], a_prev)
+            y_axis = _unit(y_axis) if np.linalg.norm(y_axis) > 1e-9 else _unit(np.array([1,0,0]) - a_prev*a_prev[0])
+            K = _skew_np(y_axis)
+            Rdel = np.eye(3) + 2*K@K   # Rodrigues with θ=π
+    else:
+        k = v / s
+        K = _skew_np(k)
+        Rdel = np.eye(3) + K*s + K@K*((1-c))  # Rodrigues
+    return Rdel @ prev_R
+
+
 def project_point_pinhole(X_w, x_def, cam_cfg, axis=None, R_wb=None):
     """
     Project a world point into pixel coordinates.
@@ -654,7 +849,7 @@ def project_point_pinhole(X_w, x_def, cam_cfg, axis=None, R_wb=None):
     depth = Z_cam if align='z', or X_cam if align='x'.
     """
     p_cam = np.asarray(x_def[:3], float)
-    align = cam_cfg.get("align", "z")
+    align = cam_cfg.get("align", "x")
     R_wc  = np.asarray(R_wb, float) if R_wb is not None else \
             world_to_body_R(_unit(np.asarray(axis,float)), 3, align=align)
     X_c = R_wc @ (np.asarray(X_w, float) - p_cam)
@@ -699,6 +894,9 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     if cfg is None:
         raise ValueError("cfg must be provided")
+    
+    R_prev_anim = [None, None]
+
 
     fov_cfg  = cfg.get("fov", {})
     att_cfg  = cfg.get("att", {})
@@ -821,6 +1019,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         if seen_mask and idx < len(seen_mask) and bool(seen_mask[idx]):
             col = 'tab:green'
         x_def = np.r_[p, [0,0,0]]
+
         if fov_cfg.get("type","cone") == "pinhole" and cfg.get("camera") is not None:
             coll, edges = draw_camera_frustum_3d(
                 ax, x_def=x_def, cam_cfg=cfg["camera"],
@@ -829,13 +1028,16 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             )
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
+            # derive cone axis from the executed rotation (consistent with viz)
+            align = att_cfg.get('align','x')
+            axis  = R_wb[0] if align == 'x' else R_wb[2]
             coll, rim = draw_fov_cone_3d(
-                ax, x_def, fov_cfg,
+                ax, x_def, axis, fov_cfg,
                 color=col, alpha=fov_cfg.get("alpha",0.15),
-                align=att_cfg.get('align','x'),
-                R_wb=R_wb
+                align=align
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
+
 
 
 
@@ -844,24 +1046,39 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         L = frames_dict.get(key, [])
         if L and idx < len(L) and 'R' in L[idx]:
             return np.asarray(L[idx]['R'], float)
-        # fallback: vel boresight + roll
+
+        # fallback: velocity-derived boresight with continuity
         pos_seq = exec1 if agent == 1 else exec2
         if idx > 0:
             p  = np.array(_pos3(pos_seq[idx]))
             pp = np.array(_pos3(pos_seq[idx-1]))
             dv = p - pp
-            axis = _unit(dv) if np.linalg.norm(dv) > 1e-9 else np.array([1,0,0], float)
         else:
-            axis = np.array([1,0,0], float)
-        R = world_to_body_R(axis, 3,
-                            align=att_cfg.get('align','x'),
-                            up=att_cfg.get('up',[0,0,1]))
+            dv = np.array([1,0,0], float)
+
+        axis = _unit(dv) if np.linalg.norm(dv) > 1e-9 else (
+            (R_prev_anim[agent-1][0] if att_cfg.get('align','x')=='x' else R_prev_anim[agent-1][2])
+            if R_prev_anim[agent-1] is not None else np.array([1,0,0], float)
+        )
+
+        R = _world_to_body_continuous(
+            axis,
+            att_cfg.get('up',[0,0,1]),
+            att_cfg.get('align','x'),
+            R_prev=R_prev_anim[agent-1],
+            alpha=float(att_cfg.get('boresight_lpf_alpha', 1.0))
+        )
+
+        # apply roll if available
         phi_key = 'phi_hist1' if agent == 1 else 'phi_hist2'
         phis = frames_dict.get(phi_key, [])
         if phis and idx < len(phis):
-            R = apply_roll_about_axis(R, float(phis[idx]),
-                                      align=att_cfg.get('align','x'))
+            R = apply_roll_about_axis(R, float(phis[idx]), align=att_cfg.get('align','x'))
+
+        R_prev_anim[agent-1] = R
         return R
+
+
 
     # ---------- animation callbacks ----------
     def init():
@@ -936,6 +1153,9 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
                            show_fov=True, show_axes=True):
     import ipywidgets as W
     from IPython.display import display
+
+    R_prev_ui = [None, None]
+
 
     fov_cfg  = cfg.get("fov", {})
     att_cfg  = cfg.get("att", {})
@@ -1073,15 +1293,16 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
             axis = dv/(np.linalg.norm(dv)+1e-12) if np.linalg.norm(dv) > 1e-9 else np.array([1,0,0], float)
         else:
             axis = np.array([1,0,0], float)
-        R = world_to_body_R(axis, 3,
-                            align=att_cfg.get('align','x'),
-                            up=att_cfg.get('up',[0,0,1]))
-        phi_key = 'phi_hist1' if agent == 1 else 'phi_hist2'
-        phis = frames_dict.get(phi_key, [])
-        if phis and idx < len(phis):
-            R = apply_roll_about_axis(R, float(phis[idx]),
-                                      align=att_cfg.get('align','x'))
+        R = _world_to_body_continuous(
+                axis,
+                att_cfg.get('up',[0,0,1]),
+                att_cfg.get('align','x'),
+                R_prev=R_prev_ui[agent-1],
+                alpha=float(att_cfg.get('boresight_lpf_alpha', 1.0))
+            )
+        R_prev_ui[agent-1] = R
         return R
+
 
     def _draw_fov(f, p, R_wb):
         _clear_fov()
