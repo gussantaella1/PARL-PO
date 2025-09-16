@@ -19,17 +19,10 @@ importlib.reload(game_attquat)
 from game_sharedutils import (
     dims_from_D, step_double_integrator_D, fb,
     pack_trajectory, unpack_trajectory, unpack_tau_flat, split_players_from_z,
-    make_bounds, polygon_halfspaces, build_g_tilde, build_h_tilde, build_g_tilde_linear,
+    make_bounds, build_h_tilde, build_g_tilde_linear,
     world_to_body_R, fov_axis_from_vel, in_fov, _unit,
     as_numpy_const, hcw_mean_motion, hcw_discrete_mats,
-    step_phi,                     # <-- import this, not step_roll
-    frame_from_axis, 
-    apply_roll_about_axis,
-    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous,
-    augment_bounds_with_quat, build_g_tilde_tr_plus_quat,
-
-    augment_bounds_with_quat, build_g_tilde_tr_plus_quat,
-    build_g_tilde_tr_plus_quat_locked_boresight,   # NEW
+    apply_roll_about_axis, fb_eps
 )
 
 
@@ -145,42 +138,34 @@ def _slerp_R(R_prev, R_nom, alpha=1.0):
     w = _log_SO3(Rdel)
     return R_prev @ _exp_SO3(alpha*w)
 
-def _quat_cont(q, q_prev):
-    # keep quaternion sign continuous
-    if q_prev is not None and float(np.dot(q, q_prev)) < 0.0:
-        return -q
-    return q
+# ---- roll-only helpers ----
+def _att_roll1d_blocks_linear_mx(dt, Jx):
+    import casadi as ca
+    I1 = ca.MX(1,1); I1[0,0] = 1.0
+    O1 = ca.MX(1,1); O1[0,0] = 0.0
+    A  = ca.blockcat([[I1, dt*I1],
+                      [O1,    I1]])
+    Bin = 1.0/float(Jx)
+    B  = ca.blockcat([[O1],
+                      [dt*Bin*I1]])
+    return A, B  # A:2x2, B:2x1
 
-def _unwrap_angle(prev, now):
-    # keep angle continuous across ±π
-    d = now - prev
-    d = (d + np.pi) % (2*np.pi) - np.pi
-    return prev + d
+def _phi_from_statevec(x_like, nx_tr):
+    x_like = np.asarray(x_like, float).reshape(-1)
+    return float(x_like[nx_tr]) if x_like.size >= nx_tr+1 else 0.0
 
-def _make_continuous_R0(R_prev, R_cand, align="x"):
-    """Flip whole rows to keep the nominal frame consistent with the previous one."""
-    if R_prev is None:
-        return R_cand
-    R = R_cand.copy()
-    if align == "x":
-        if np.dot(R_prev[0], R[0]) < 0.0:
-            R[0] *= -1.0; R[1] *= -1.0
-        if np.dot(R_prev[1], R[1]) < 0.0:
-            R[1] *= -1.0; R[2] *= -1.0
-    else:  # align == "z"
-        if np.dot(R_prev[2], R[2]) < 0.0:
-            R[1] *= -1.0; R[2] *= -1.0
-        if np.dot(R_prev[1], R[1]) < 0.0:
-            R[0] *= -1.0; R[1] *= -1.0
-    return R
+def _phidot_from_statevec(x_like, nx_tr):
+    x_like = np.asarray(x_like, float).reshape(-1)
+    return float(x_like[nx_tr+1]) if x_like.size >= nx_tr+2 else 0.0
 
 # -------------------- 3D solver entrypoint (NONLINEAR quat-ready) --------------------
 def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     """
-    Open-loop solve with *linear* small-angle attitude:
-      - att.mode == "lin3d"     → add δθ(3), δω(3) and τ(3)
-      - att.mode == "lin2d_roll"→ same size; roll is 1D, pitch/yaw is 2D block
-    Inequality bounds (h~) remain *translation-only* to keep things easy.
+    Open-loop solve.
+      - att.mode == "lin3d" / "lin2d_roll" → small-angle δθ, δω, τ (6 states, 3 torques)
+      - att.mode == "roll1d"               → roll φ, φdot, τx (2 states, 1 torque)
+      - else                               → translation only
+    Inequality bounds (h~) are translation-only by default.
     """
     import numpy as np
     import casadi as ca
@@ -202,34 +187,48 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     # ---------- attitude mode ----------
     att_cfg  = cfg.get("att", {})
     mode     = (att_cfg.get("mode") or "lin3d").lower()
-    use_lin  = mode in ("lin3d", "lin2d_roll")
-    J = att_cfg.get("J", [12.0, 10.0, 8.0])
 
-    if use_lin:
-        A_att, B_att = _att_blocks_linear_mx(mode, dt, J)        # 6x6, 6x3
+    if mode in ("lin3d", "lin2d_roll"):
+        J = att_cfg.get("J", [12.0, 10.0, 8.0])
+        A_att, B_att = _att_blocks_linear_mx(mode, dt, J)
         nx,  nu  = nx_tr + 6, nu_tr + 3
         A_mx = _blkdiag_mx(Ad_tr, A_att)
         B_mx = _blkdiag_mx(Bd_tr, B_att)
+        att_kind = "lin6"
+    elif mode == "roll1d":
+        Jx = float(att_cfg.get("Jx", 10.0))
+        A_roll, B_roll = _att_roll1d_blocks_linear_mx(dt, Jx)  # 2x2, 2x1
+        nx,  nu  = nx_tr + 2, nu_tr + 1
+        A_mx = _blkdiag_mx(Ad_tr, A_roll)
+        B_mx = _blkdiag_mx(Bd_tr, B_roll)
+        att_kind = "roll1d"
     else:
-        # Fallback: pure translation (legacy)
         A_mx, B_mx = Ad_tr, Bd_tr
         nx,  nu    = nx_tr, nu_tr
+        att_kind   = "none"
 
     # ---------- equality constraints g~ (linear builder) ----------
     gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
 
-    # ---------- inequality bounds h~ (translation-only when attitude is on) ----------
+    # ---------- inequality bounds (translation-only when attitude on) ----------
     x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
     if use_lin:
-        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only(
-            x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr
+        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only_finite(
+            x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr, BIG=1e6
         )
     else:
-        x_lb, x_ub, u_lb, u_ub = x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr
+        # even here, avoid ±inf
+        def _clip_inf(v, BIG=1e6): 
+            vv = np.asarray(v, float).copy()
+            vv[~np.isfinite(vv)] = 0.0
+            return np.clip(vv, -BIG, BIG)
+        x_lb, x_ub, u_lb, u_ub = _clip_inf(x_lb_tr), _clip_inf(x_ub_tr), _clip_inf(u_lb_tr), _clip_inf(u_ub_tr)
 
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
 
-    # ---------- KKT residual objective ----------
+
+    # ---------- solver (KKT residual) ----------
     nprim     = T*nx + (T-1)*nu
     taus_syms = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
     tau_sym   = ca.vcat(taus_syms)
@@ -238,17 +237,25 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     fs    = cost_builder(nx, nu, T, N, cfg)
     gtil  = gtil_fun(tau_sym, theta_sym)
     htil  = htil_fun(tau_sym, theta_sym)
+
     lam_t = ca.MX.sym('lam_t', gtil.shape[0])
     mu_t  = ca.MX.sym('mu_t',  htil.shape[0])
 
+    # Gradients per player
     grads = []
     for i in range(N):
-        Li = fs[i](tau_sym, theta_sym) - lam_t.T @ gtil - mu_t.T @ htil
+        Li = fs[i](tau_sym, theta_sym) - lam_t.T @ gtil  # L_i excludes inequalities
         grads.append(ca.gradient(Li, taus_syms[i]))
-    FB   = ca.vcat([fb(htil[i], mu_t[i]) for i in range(htil.shape[0])])
+
+    # Smoothed FB map (no NaNs if h, mu are finite)
+    FB = ca.vcat([_fb_eps(htil[i], mu_t[i], eps=1e-8) for i in range(htil.shape[0])])
+
+    # Full residual vector: [∂L1/∂τ1; ∂L2/∂τ2; g_tilde; FB]
     G    = ca.vcat(grads + [gtil, FB])
     z_sym = ca.vcat(taus_syms + [lam_t, mu_t])
-    obj   = 0.5 * ca.dot(G, G)
+
+    # Tiny Tikhonov and multiplier regularization
+    obj   = 0.5 * ca.dot(G, G) + 1e-12 * ca.dot(z_sym, z_sym) + 1e-10 * ca.dot(mu_t, mu_t)
 
     opts = {'ipopt.print_level': 0, 'print_time': 0, 'expand': True}
     if ipopt_opts: opts.update(ipopt_opts)
@@ -260,10 +267,10 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     theta_parts = []
     for i in range(N):
         xtr = x0_rows[i][:nx_tr]
-        if use_lin:
-            delta_theta0 = np.zeros(3)  # [δφ, δθ_y, δθ_z]
-            delta_omega0 = np.zeros(3)  # [δω_x, δω_y, δω_z]
-            x0_i = np.hstack([xtr, delta_theta0, delta_omega0])
+        if att_kind == "lin6":
+            x0_i = np.hstack([xtr, np.zeros(3), np.zeros(3)])  # δθ, δω
+        elif att_kind == "roll1d":
+            x0_i = np.hstack([xtr, 0.0, 0.0])                  # φ, φdot
         else:
             x0_i = xtr
         theta_parts.append(x0_i)
@@ -284,8 +291,9 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
         z=zstar, residual=residual,
         meta=dict(T=T, nx=nx, nu=nu, N=N, D=D, nx_tr=nx_tr, nu_tr=nu_tr,
                   nprim=nprim, n_g=int(gtil.shape[0]), n_h=int(htil.shape[0]),
-                  use_lin=use_lin, att_mode=mode)
+                  att_mode=mode, att_kind=att_kind)
     )
+
 
 def _att_blocks_linear_mx(mode, dt, J):
     """
@@ -346,16 +354,35 @@ def _pad_trans_bounds_only(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu
     u_ub[:nu_tr] = np.asarray(u_ub_tr, float)
     return x_lb, x_ub, u_lb, u_ub
 
+def _pad_trans_bounds_only_finite(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr,
+                                  nx, nu, nx_tr, nu_tr, BIG=1e6):
+    x_lb = -BIG*np.ones(nx); x_ub = BIG*np.ones(nx)
+    u_lb = -BIG*np.ones(nu); u_ub = BIG*np.ones(nu)
+    x_lb[:nx_tr] = np.asarray(x_lb_tr, float)
+    x_ub[:nx_tr] = np.asarray(x_ub_tr, float)
+    u_lb[:nu_tr] = np.asarray(u_lb_tr, float)
+    u_ub[:nu_tr] = np.asarray(u_ub_tr, float)
+    return x_lb, x_ub, u_lb, u_ub
+
+
 
 # -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
 # -------------------- RHC with execution & FOV (quat-aware) --------------------
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
                                   turn_len: int | None = None, ipopt_opts: dict | None = None):
     """
-    RHC rollout. With small-angle attitude (att.mode in {'lin3d','lin2d_roll'}), per-agent:
-      x = [x_tr; δθ(3); δω(3)], u = [u_tr; τ(3)].
-    g~ is linear (Ax+Bu for translation+attitude). h~ is translation-only.
-    Rendering uses a continuous nominal frame R0 from velocity, corrected by δθ.
+    Receding-horizon rollout.
+
+    Attitude modes:
+      - "lin3d" / "lin2d_roll": small-angle δθ(3), δω(3) with τ(3)  → nx += 6, nu += 3
+      - "roll1d":               roll φ, φdot with τx                 → nx += 2, nu += 1
+      - anything else:          translation only
+
+    g~ is linear (Ax+Bu over translation + attitude block).
+    h~ is translation-only by default (attitude states/inputs left unbounded).
+    Rendering: nominal frame from velocity (continuous), then:
+      - lin6:   apply small-angle δθ via first-order exp
+      - roll1d: apply roll φ about boresight
     """
     import numpy as np
     import casadi as ca
@@ -377,17 +404,25 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     # ---------- attitude blocks ----------
     att_cfg = cfg.get("att", {})
     mode    = (att_cfg.get("mode") or "lin3d").lower()
-    use_lin = mode in ("lin3d", "lin2d_roll")
-    J_diag  = att_cfg.get("J", [12.0, 10.0, 8.0])
 
-    if use_lin:
+    if mode in ("lin3d", "lin2d_roll"):
+        J_diag  = att_cfg.get("J", [12.0, 10.0, 8.0])
         A_att, B_att = _att_blocks_linear_mx(mode, dt, J_diag)
         nx, nu = nx_tr + 6, nu_tr + 3
         A_mx = _blkdiag_mx(Ad_tr, A_att)
         B_mx = _blkdiag_mx(Bd_tr, B_att)
+        att_kind = "lin6"
+    elif mode == "roll1d":
+        Jx = float(att_cfg.get("Jx", 10.0))
+        A_roll, B_roll = _att_roll1d_blocks_linear_mx(dt, Jx)  # 2x2, 2x1
+        nx, nu = nx_tr + 2, nu_tr + 1
+        A_mx = _blkdiag_mx(Ad_tr, A_roll)
+        B_mx = _blkdiag_mx(Bd_tr, B_roll)
+        att_kind = "roll1d"
     else:
         A_mx, B_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
+        att_kind = "none"
 
     # ---------- rollout schedule ----------
     sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
@@ -397,10 +432,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # ---------- inequality bounds (translation-only when attitude on) ----------
+    # ---------- inequality bounds (translation-only when attitude present) ----------
     x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
-    if use_lin:
-        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only(
+    if att_kind in ("lin6", "roll1d"):
+        x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only_finite(
             x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr
         )
     else:
@@ -425,7 +460,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     for i in range(N):
         Li = fs[i](tau_sym, theta_sym) - lam_t.T @ gtil - mu_t.T @ htil
         grads.append(ca.gradient(Li, taus_syms[i]))
-    FB   = ca.vcat([fb(htil[i], mu_t[i]) for i in range(htil.shape[0])])
+    FB   = ca.vcat([fb_eps(htil[i], mu_t[i]) for i in range(htil.shape[0])])
     G    = ca.vcat(grads + [gtil, FB])
     z_sym = ca.vcat(taus_syms + [lam_t, mu_t])
     obj   = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)  # tiny Tikhonov
@@ -443,9 +478,12 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     x0_rows = np.asarray(cfg["x0"], float)
     x1_tr = x0_rows[0][:nx_tr].copy()
     x2_tr = x0_rows[1][:nx_tr].copy()
-    if use_lin:
-        x1 = np.hstack([x1_tr, np.zeros(3), np.zeros(3)])  # δθ=0, δω=0
+    if att_kind == "lin6":
+        x1 = np.hstack([x1_tr, np.zeros(3), np.zeros(3)])  # δθ, δω
         x2 = np.hstack([x2_tr, np.zeros(3), np.zeros(3)])
+    elif att_kind == "roll1d":
+        x1 = np.hstack([x1_tr, 0.0, 0.0])                  # φ, φdot
+        x2 = np.hstack([x2_tr, 0.0, 0.0])
     else:
         x1, x2 = x1_tr, x2_tr
     theta_curr = np.r_[x1, x2]
@@ -474,23 +512,27 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         v = np.asarray(xtr[D:2*D], float)
         if float(np.linalg.norm(v)) < vmin and (R0_prev[agent_idx] is not None):
             return R0_prev[agent_idx]
-
         prev_b = None
         if R0_prev[agent_idx] is not None:
             prev_b = R0_prev[agent_idx][0] if align == "x" else R0_prev[agent_idx][2]
-
         a = _axis_from_vel(xtr, D, align=align, min_speed=vmin, prev_axis=prev_b)
         R0 = _world_to_body_continuous(a, world_up, align, R_prev=R0_prev[agent_idx], alpha=alpha)
         R0_prev[agent_idx] = R0
         return R0
 
-
     def _render_R_from_state(x, agent_idx):
         xtr = x[:nx_tr]
-        R0  = _R0_from_xtr_cont(xtr, agent_idx)
-        eps = _eps3_from_statevec(x, nx_tr) if use_lin else np.zeros(3)
-        return _apply_small_angle(R0, eps), float(eps[0])
-
+        R0  = _R0_from_xtr_cont(xtr, agent_idx)  # boresight from velocity
+        if att_kind == "lin6":
+            eps = _eps3_from_statevec(x, nx_tr)
+            R   = _apply_small_angle(R0, eps); phi = float(eps[0])
+            return R, phi
+        elif att_kind == "roll1d":
+            phi = _phi_from_statevec(x, nx_tr)
+            R   = apply_roll_about_axis(R0, phi, align=align)
+            return R, float(phi)
+        else:
+            return R0, 0.0
 
     def _p3_from_state(x):
         return (float(x[0]), float(x[1]), float(x[2] if D==3 else 0.0))
@@ -523,14 +565,13 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    # ---------- planning wrapper ----------
-    z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
+    # ---------- planning helpers ----------
+    z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3  # μ init > 0
 
-    def _plan_attitudes_from_X_lin(X, agent_idx):
+    def _plan_attitudes_from_X(X, agent_idx):
         out = []
         R0p = R0_prev[agent_idx]
         cols = X.shape[1]
-        has_att = (cols >= nx_tr+3)
         for t in range(T):
             xtr_t = X[t, :nx_tr]
             v = np.asarray(xtr_t[D:2*D], float)
@@ -544,12 +585,18 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                 a_t  = _axis_from_vel(xtr_t, D, align=align, min_speed=vmin, prev_axis=prev_b)
                 R0_t = _world_to_body_continuous(a_t, world_up, align, R_prev=R0p, alpha=alpha)
 
-            eps_t = (X[t, nx_tr:nx_tr+3] if has_att else np.zeros(3))
-            out.append({"R": _apply_small_angle(R0_t, eps_t), "phi": float(eps_t[0])})
+            if att_kind == "lin6":
+                eps_t = (X[t, nx_tr:nx_tr+3] if cols >= nx_tr+3 else np.zeros(3))
+                R_t   = _apply_small_angle(R0_t, eps_t); phi_t = float(eps_t[0])
+            elif att_kind == "roll1d":
+                phi_t = (float(X[t, nx_tr]) if cols >= nx_tr+1 else 0.0)
+                R_t   = apply_roll_about_axis(R0_t, phi_t, align=align)
+            else:
+                R_t, phi_t = R0_t, 0.0
+
+            out.append({"R": R_t, "phi": phi_t})
             R0p = R0_t
         return out, R0p
-
-
 
     def replan(theta_vec, z_init):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
@@ -559,11 +606,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
         plan1  = [(float(X1[t,0]), float(X1[t,1]), float(X1[t,2] if D==3 else 0.0)) for t in range(T)]
         plan2  = [(float(X2[t,0]), float(X2[t,1]), float(X2[t,2] if D==3 else 0.0)) for t in range(T)]
-        att1_plan, R0_prev[0] = _plan_attitudes_from_X_lin(X1, 0)
-        att2_plan, R0_prev[1] = _plan_attitudes_from_X_lin(X2, 1)
+        att1_plan, R0_prev[0] = _plan_attitudes_from_X(X1, 0)
+        att2_plan, R0_prev[1] = _plan_attitudes_from_X(X2, 1)
         return z_new, plan1, plan2, U1, U2, att1_plan, att2_plan
 
-    # initial plan
+    # ---------- initial plan ----------
     z_last, plan1, plan2, U1, U2, att1_plan, att2_plan = replan(theta_curr, z_last)
     step_in_turn = 0
 
@@ -622,32 +669,8 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         'fov_seen_mask': fov_seen_mask,
     }
 
+
 # -------------------- plotting --------------------
-def plot_planned_trajectories(sol, cfg: dict):
-    """2D quick plot; used as fallback when D=2 from 3D meta."""
-    z = sol['z']; meta = sol['meta']
-    T, nx, nu, N = meta['T'], meta['nx'], meta['nu'], meta['N']
-    taus = split_players_from_z(z, N, T, nx, nu)
-    X1, U1 = unpack_tau_flat(taus[0], nx, nu, T)
-    X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
-    fig, ax = plt.subplots(figsize=(6,6))
-    ax.set_aspect('equal'); ax.grid(True, ls=':')
-    ar = cfg.get("arena", None)
-    if ar is not None and "xmin" in ar:
-        ax.set_xlim(ar["xmin"]-0.5, ar["xmax"]+0.5)
-        ax.set_ylim(ar["ymin"]-0.5, ar["ymax"]+0.5)
-        ax.add_patch(plt.Rectangle((ar["xmin"], ar["ymin"]),
-                                   ar["xmax"]-ar["xmin"], ar["ymax"]-ar["ymin"],
-                                   fill=False, lw=1.5, ls='-', alpha=0.6))
-    for circ in cfg.get("circles", []):
-        ax.add_patch(plt.Circle((circ["cx"], circ["cy"]), circ["r"],
-                                 fill=False, lw=1.2, ls='--', alpha=0.6))
-    ax.plot(X1[:,0], X1[:,1], '-o', label='P1')
-    ax.plot(X2[:,0], X2[:,1], '-o', label='P2')
-    ax.scatter([X1[0,0], X2[0,0]], [X1[0,1], X2[0,1]], s=80, marker='*', zorder=5)
-    ax.set_xlabel('x'); ax.set_ylabel('y')
-    ax.legend(loc='upper right'); ax.set_title('Planned trajectories (horizon)')
-    plt.show()
 
 def plot_planned_trajectories_3d(sol: dict, cfg: dict):
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
@@ -930,6 +953,13 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             n_frames = 2
         else:
             raise ValueError("No frames to animate.")
+        
+    # Seed previous-R cache from stored exec attitudes if present
+    ea1 = frames_dict.get('exec_att1', [])
+    ea2 = frames_dict.get('exec_att2', [])
+    R_prev_anim[0] = np.asarray(ea1[0]['R'], float) if ea1 and 'R' in ea1[0] else None
+    R_prev_anim[1] = np.asarray(ea2[0]['R'], float) if ea2 and 'R' in ea2[0] else None
+
 
     fig = plt.figure(figsize=(7,6))
     ax  = fig.add_subplot(111, projection='3d')
@@ -1044,39 +1074,23 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     def _R_exec(agent, idx):
         key = 'exec_att1' if agent == 1 else 'exec_att2'
         L = frames_dict.get(key, [])
-        if L and idx < len(L) and 'R' in L[idx]:
-            return np.asarray(L[idx]['R'], float)
+        # If we have any stored attitudes, clamp to last and return it.
+        if L:
+            j = min(idx, len(L) - 1)
+            R = L[j].get('R', None)
+            if R is not None:
+                return np.asarray(R, float)
+        # As a final fallback (should be rare), reuse previous animation R
+        if R_prev_anim[agent-1] is not None:
+            return R_prev_anim[agent-1]
+        # Absolute last resort: identity aligned with +align axis
+        align = cfg.get('att', {}).get('align', 'x')
+        return np.vstack([
+            np.array([1,0,0]) if align=='x' else np.array([1,0,0]),
+            np.array([0,1,0]),
+            np.array([0,0,1]) if align=='x' else np.array([0,0,1]),
+        ])
 
-        # fallback: velocity-derived boresight with continuity
-        pos_seq = exec1 if agent == 1 else exec2
-        if idx > 0:
-            p  = np.array(_pos3(pos_seq[idx]))
-            pp = np.array(_pos3(pos_seq[idx-1]))
-            dv = p - pp
-        else:
-            dv = np.array([1,0,0], float)
-
-        axis = _unit(dv) if np.linalg.norm(dv) > 1e-9 else (
-            (R_prev_anim[agent-1][0] if att_cfg.get('align','x')=='x' else R_prev_anim[agent-1][2])
-            if R_prev_anim[agent-1] is not None else np.array([1,0,0], float)
-        )
-
-        R = _world_to_body_continuous(
-            axis,
-            att_cfg.get('up',[0,0,1]),
-            att_cfg.get('align','x'),
-            R_prev=R_prev_anim[agent-1],
-            alpha=float(att_cfg.get('boresight_lpf_alpha', 1.0))
-        )
-
-        # apply roll if available
-        phi_key = 'phi_hist1' if agent == 1 else 'phi_hist2'
-        phis = frames_dict.get(phi_key, [])
-        if phis and idx < len(phis):
-            R = apply_roll_about_axis(R, float(phis[idx]), align=att_cfg.get('align','x'))
-
-        R_prev_anim[agent-1] = R
-        return R
 
 
 
@@ -1413,4 +1427,3 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
     if keep_legend is not None:
         ax.add_artist(keep_legend)
     return leg_axes
-
