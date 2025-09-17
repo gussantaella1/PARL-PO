@@ -46,9 +46,89 @@ __all__ += ["draw_camera_frustum_3d", "project_point_pinhole", "points_in_fov_ma
 
 # -------------------- 3D solver entrypoint --------------------
 
-def _unit(v):
-    n = float(np.linalg.norm(v))
-    return v if n == 0.0 else (v / n)
+def _unit(v, eps=1e-12):
+    v = np.asarray(v, float)
+    n = np.linalg.norm(v)
+    return v if n < eps else v/n
+
+def _seed_from_boresight(a, world_up=(0,0,1), align='x'):
+    # One-shot TRIAD seed when no previous R exists.
+    a = _unit(a); u = _unit(world_up)
+    if align == 'x':
+        y = u - a*np.dot(u, a)
+        if np.linalg.norm(y) < 1e-8:  # pick something ⟂ a
+            e = np.eye(3)[np.argmin(np.abs(a))]
+            y = e - a*np.dot(e, a)
+        y = _unit(y)
+        z = _unit(np.cross(a, y))
+        return np.vstack([a, y, z])
+    else:  # align == 'z'
+        x = u - a*np.dot(u, a)
+        if np.linalg.norm(x) < 1e-8:
+            e = np.eye(3)[np.argmin(np.abs(a))]
+            x = e - a*np.dot(e, a)
+        x = _unit(x)
+        y = _unit(np.cross(a, x))
+        return np.vstack([x, y, a])
+    
+def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
+               k_roll=0.0, eps=1e-9):
+    """
+    Minimal-rotation DCM update that keeps boresight glued to a_des,
+    with optional small roll stabilization about the boresight.
+    """
+    a = _unit(a_des)
+    if R_prev is None:
+        R = _seed_from_boresight(a, world_up, align)
+    else:
+        # current boresight in world from previous frame
+        b_prev = R_prev[0] if align == 'x' else R_prev[2]
+
+        # minimal rotation b_prev -> a
+        v = np.cross(b_prev, a); s = np.linalg.norm(v); c = np.clip(np.dot(b_prev, a), -1.0, 1.0)
+        if s < 1e-8:
+            if c > 0.0:
+                R_align = np.eye(3)         # no change
+            else:
+                # 180°: rotate π about a stable axis ⟂ b_prev (use prev y projected)
+                y_prev = R_prev[1]
+                axis = y_prev - b_prev*np.dot(y_prev, b_prev)
+                if np.linalg.norm(axis) < 1e-8:
+                    # fallback axis
+                    axis = _unit(np.array([1,0,0]) - b_prev*b_prev[0])
+                axis = _unit(axis)
+                K = _skew_np(axis)
+                R_align = np.eye(3) + 2*K@K   # Rodrigues for θ=π
+        else:
+            k = v/s; K = _skew_np(k); th = np.arctan2(s, c)
+            R_align = np.eye(3) + np.sin(th)*K + (1-np.cos(th))*(K@K)
+
+        R = R_align @ R_prev
+
+        # optional: small roll correction about the new boresight a
+        if k_roll != 0.0:
+            # desired tangent from projected world_up
+            t_des = world_up - a*np.dot(world_up, a)
+            if np.linalg.norm(t_des) > eps:
+                t_des = _unit(t_des)
+                # pick which body tangent we control (y for align='x'; x for align='z')
+                t_cur = R[1] if align == 'x' else R[0]
+                # signed angle about a
+                num = np.dot(np.cross(t_cur, t_des), a)
+                den = np.clip(np.dot(t_cur, t_des), -1.0, 1.0)
+                dphi = k_roll * np.arctan2(num, den)
+                if abs(dphi) > 1e-12:
+                    Ka = _skew_np(a)
+                    R_roll = np.eye(3) + np.sin(dphi)*Ka + (1-np.cos(dphi))*(Ka@Ka)
+                    R = R_roll @ R
+
+    # re-orthonormalize (polar decomposition via SVD)
+    U, _, Vt = np.linalg.svd(R)
+    R = U @ Vt
+    if np.linalg.det(R) < 0:  # enforce proper rotation
+        U[:, -1] *= -1
+        R = U @ Vt
+    return R
 
 def _axis_from_vel(xtr, D, align="x", min_speed=1e-3, prev_axis=None):
     v = np.asarray(xtr[D:2*D], float)
@@ -896,6 +976,27 @@ def points_in_fov_mask(Xw_list, x_def, axis, cam_cfg):
 
 
 # -------------------- animation & interactive --------------------
+
+def _proj_horizon_tangent(a, up, t_ref=None, eps=1e-9):
+    a = _unit(a); up = _unit(up)
+    t = up - a*np.dot(up, a)             # project 'up' onto plane ⟂ a
+    n = np.linalg.norm(t)
+    if n < eps:
+        # boresight ~ up: keep previous tangent if we have one; else pick any ⟂ a
+        if t_ref is not None:
+            return _unit(t_ref)
+        e = np.eye(3)[np.argmin(np.abs(a))]
+        t = e - a*np.dot(e, a)
+        n = np.linalg.norm(t)
+        if n < eps:
+            t = np.array([0,1,0])  # final fallback
+    t = t / n
+    # sign continuity: make t close to t_ref
+    if t_ref is not None and np.dot(t, t_ref) < 0.0:
+        t = -t
+    return t
+
+
 # -------------------- animation (triads + triad legend) --------------------
 def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                        show_fov=True, show_axes=True):
@@ -905,9 +1006,6 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     if cfg is None:
         raise ValueError("cfg must be provided")
-    
-    R_prev_anim = [None, None]
-
 
     fov_cfg  = cfg.get("fov", {})
     att_cfg  = cfg.get("att", {})
@@ -922,7 +1020,6 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
     triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
     L_tri = tuple(cfg.get("viz", {}).get("triad_len", (0.35, 0.35, 0.55)))
-
 
     plan_hist1 = frames_dict.get('plan_hist1', [])
     plan_hist2 = frames_dict.get('plan_hist2', [])
@@ -941,13 +1038,17 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             n_frames = 2
         else:
             raise ValueError("No frames to animate.")
-        
-    # Seed previous-R cache from stored exec attitudes if present
+
+    # ---- attitude cache (per-agent) ----
+    _anim_cache = [{'R': None}, {'R': None}]
+
+    # Seed cache from stored exec attitudes if present
     ea1 = frames_dict.get('exec_att1', [])
     ea2 = frames_dict.get('exec_att2', [])
-    R_prev_anim[0] = np.asarray(ea1[0]['R'], float) if ea1 and 'R' in ea1[0] else None
-    R_prev_anim[1] = np.asarray(ea2[0]['R'], float) if ea2 and 'R' in ea2[0] else None
-
+    if ea1 and isinstance(ea1[0], dict) and ('R' in ea1[0]) and (ea1[0]['R'] is not None):
+        _anim_cache[0]['R'] = np.asarray(ea1[0]['R'], float)
+    if ea2 and isinstance(ea2[0], dict) and ('R' in ea2[0]) and (ea2[0]['R'] is not None):
+        _anim_cache[1]['R'] = np.asarray(ea2[0]['R'], float)
 
     fig = plt.figure(figsize=(7,6))
     ax  = fig.add_subplot(111, projection='3d')
@@ -987,34 +1088,18 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     att1_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
     att2_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
 
-    fov_art = {'coll': None, 'rim': None}
-
     # ---------- helpers ----------
     def _pos3(p_like):
         p = np.asarray(p_like, float).ravel()
         return p[:3] if p.size >= 3 else np.array([p[0], p[1], 0.0], float)
 
-    def _axis3(a_like):
+    def _unit3(a_like):
         a = np.asarray(a_like, float).ravel()
         if a.size < 3: a = np.array([a[0], a[1], 0.0], float)
-        return _unit(a)
+        n = np.linalg.norm(a)
+        return a if n < 1e-12 else a/n
 
-    def _def_pos(f):
-        return exec2[f] if agent_id == 2 else exec1[f]
-
-    def _def_axis(f):
-        if axis_hist and f < len(axis_hist):
-            return _axis3(axis_hist[f])
-        if f > 0:
-            p  = np.array(_pos3(_def_pos(f)))
-            pp = np.array(_pos3(_def_pos(f-1)))
-            dv = p - pp; n = np.linalg.norm(dv)
-            return _axis3(dv/(n+1e-12)) if n > 1e-9 else np.array([1,0,0])
-        return np.array([1,0,0])
-    
     fov_art = {'coll': None, 'rim': None, 'edges': []}
-
-
 
     def _clear_fov():
         for k in ('coll','rim'):
@@ -1023,12 +1108,10 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 try: art.remove()
                 except Exception: pass
                 fov_art[k] = None
-        # remove edge lines
         for ln in fov_art.get('edges', []):
             try: ln.remove()
             except Exception: pass
         fov_art['edges'] = []
-
 
     def _set_fov(p, R_wb, idx):
         if not (show_fov and fov_cfg.get("enabled", False)):
@@ -1046,7 +1129,6 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             )
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
-            # derive cone axis from the executed rotation (consistent with viz)
             align = att_cfg.get('align','x')
             axis  = R_wb[0] if align == 'x' else R_wb[2]
             coll, rim = draw_fov_cone_3d(
@@ -1056,31 +1138,41 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
 
-
-
-
+    # ---- Attitude at frame f (uses DCM evolution with continuity) ----
     def _R_exec(agent, idx):
+        align = att_cfg.get('align','x')
+        up    = np.asarray(att_cfg.get('up',[0,0,1]), float)
+        kroll = float(att_cfg.get('roll_gain', 0.0))  # 0 = no roll stabilization
+
+        # Prefer stored attitudes if present
         key = 'exec_att1' if agent == 1 else 'exec_att2'
         L = frames_dict.get(key, [])
-        # If we have any stored attitudes, clamp to last and return it.
         if L:
-            j = min(idx, len(L) - 1)
+            j = min(idx, len(L)-1)
             R = L[j].get('R', None)
             if R is not None:
-                return np.asarray(R, float)
-        # As a final fallback (should be rare), reuse previous animation R
-        if R_prev_anim[agent-1] is not None:
-            return R_prev_anim[agent-1]
-        # Absolute last resort: identity aligned with +align axis
-        align = cfg.get('att', {}).get('align', 'x')
-        return np.vstack([
-            np.array([1,0,0]) if align=='x' else np.array([1,0,0]),
-            np.array([0,1,0]),
-            np.array([0,0,1]) if align=='x' else np.array([0,0,1]),
-        ])
+                _anim_cache[agent-1]['R'] = np.asarray(R, float)
+                return _anim_cache[agent-1]['R']
 
+        # Otherwise evolve from previous using desired boresight (vel or axis_hist)
+        pos_seq = exec1 if agent == 1 else exec2
+        if axis_hist and idx < len(axis_hist) and axis_hist[idx] is not None:
+            a_des = _unit3(axis_hist[idx])
+        else:
+            if idx > 0:
+                p  = np.asarray(pos_seq[idx], float)
+                pp = np.asarray(pos_seq[idx-1], float)
+                a_des = _unit3(p - pp)
+            else:
+                a_des = np.array([1,0,0]) if align=='x' else np.array([0,0,1])
 
+        R_prev = _anim_cache[agent-1]['R']
+        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up, k_roll=kroll)
+        _anim_cache[agent-1]['R'] = R_new
+        return R_new
 
+    # ---------- drawing setup ----------
+    # planned/executed lines and markers already created above
 
     # ---------- animation callbacks ----------
     def init():
@@ -1103,7 +1195,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         if plan_hist2 and f < len(plan_hist2) and plan_hist2[f]:
             xs, ys, zs = zip(*plan_hist2[f]); plan2_ln.set_data(xs, ys); plan2_ln.set_3d_properties(zs)
 
-        # executed
+        # executed path to frame f
         xs1 = [p[0] for p in exec1[:f+1]]; ys1 = [p[1] for p in exec1[:f+1]]; zs1 = [p[2] for p in exec1[:f+1]]
         xs2 = [p[0] for p in exec2[:f+1]]; ys2 = [p[1] for p in exec2[:f+1]]; zs2 = [p[2] for p in exec2[:f+1]]
         exe1_ln.set_data(xs1, ys1); exe1_ln.set_3d_properties(zs1)
@@ -1115,7 +1207,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         dot1.set_data([x1], [y1]); dot1.set_3d_properties([z1])
         dot2.set_data([x2], [y2]); dot2.set_3d_properties([z2])
 
-        # triads for BOTH agents
+        # triads
         if show_axes:
             if att1_lines:
                 R1 = _R_exec(1, f)
@@ -1125,8 +1217,8 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
 
         # FOV (selected agent)
-        p_def = _pos3(_def_pos(f))
-        R_def = _R_exec(agent_id, f)  # 1 or 2
+        p_def = np.asarray(_pos3(exec2[f] if agent_id == 2 else exec1[f]))
+        R_def = _R_exec(agent_id, f)
         _clear_fov(); _set_fov(p_def, R_def, f)
 
         return plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2
@@ -1149,6 +1241,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     finally:
         plt.close(fig)
     print(f"Saved 3D animation to {out_path}")
+
 
 # -------------------- interactive (triads + triad legend) --------------------
 def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
@@ -1284,26 +1377,40 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
         return np.array([1,0,0])
 
     def _R_exec(agent, idx):
+        align = att_cfg.get('align','x')
+        up    = np.asarray(att_cfg.get('up',[0,0,1]), float)
+        kroll = float(att_cfg.get('roll_gain', 0.0))  # optional twist stabilization
+
+        # Prefer stored attitudes if available
         key = 'exec_att1' if agent == 1 else 'exec_att2'
         L = frames_dict.get(key, [])
-        if L and idx < len(L) and 'R' in L[idx]:
-            return np.asarray(L[idx]['R'], float)
-        pos_seq = exec1 if agent == 1 else exec2
-        if idx > 0:
-            p  = np.array(_pos3(pos_seq[idx])); pp = np.array(_pos3(pos_seq[idx-1]))
-            dv = p - pp
-            axis = dv/(np.linalg.norm(dv)+1e-12) if np.linalg.norm(dv) > 1e-9 else np.array([1,0,0], float)
+        if L and idx < len(L) and 'R' in L[idx] and L[idx]['R'] is not None:
+            R = np.asarray(L[idx]['R'], float)
+            R_prev_ui[agent-1] = R
+            return R
+
+        # Desired boresight (axis): axis_hist wins; else use velocity direction
+        if axis_hist and idx < len(axis_hist) and axis_hist[idx] is not None:
+            a_des = _unit(axis_hist[idx])
         else:
-            axis = np.array([1,0,0], float)
-        R = _world_to_body_continuous(
-                axis,
-                att_cfg.get('up',[0,0,1]),
-                att_cfg.get('align','x'),
-                R_prev=R_prev_ui[agent-1],
-                alpha=float(att_cfg.get('boresight_lpf_alpha', 1.0))
-            )
-        R_prev_ui[agent-1] = R
-        return R
+            pos_seq = exec1 if agent == 1 else exec2
+            if idx > 0:
+                p  = np.asarray(pos_seq[idx], float)
+                pp = np.asarray(pos_seq[idx-1], float)
+                dv = p - pp
+                a_des = _unit(dv) if np.linalg.norm(dv) > 1e-12 else (
+                    (R_prev_ui[agent-1][0] if (R_prev_ui[agent-1] is not None and align=='x')
+                    else (R_prev_ui[agent-1][2] if R_prev_ui[agent-1] is not None else
+                        (np.array([1,0,0]) if align=='x' else np.array([0,0,1]))))
+                )
+            else:
+                a_des = np.array([1,0,0]) if align=='x' else np.array([0,0,1])
+
+        R_prev = R_prev_ui[agent-1]
+        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up, k_roll=kroll)
+        R_prev_ui[agent-1] = R_new
+        return R_new
+
 
 
     def _draw_fov(f, p, R_wb):
