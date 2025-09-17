@@ -256,17 +256,14 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     solver = ca.nlpsol('solver', 'ipopt', {'x': z_sym, 'p': theta_sym, 'f': obj}, opts)
 
     # ---------- theta seed (x0 per agent) ----------
+    att0_list = _read_att_x0_unified(att_cfg, att_kind, N)
+
     x0_rows = np.asarray(cfg["x0"], float)
     assert x0_rows.shape[0] == N, f"cfg['x0'] must have {N} rows"
     theta_parts = []
     for i in range(N):
         xtr = x0_rows[i][:nx_tr]
-        if att_kind == "lin6":
-            x0_i = np.hstack([xtr, np.zeros(3), np.zeros(3)])  # δθ, δω
-        elif att_kind == "roll1d":
-            x0_i = np.hstack([xtr, 0.0, 0.0])                  # φ, φdot
-        else:
-            x0_i = xtr
+        x0_i = np.hstack([xtr, att0_list[i]]) if att_kind != "none" else xtr
         theta_parts.append(x0_i)
     theta0 = np.hstack(theta_parts)
 
@@ -407,7 +404,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         B_mx = _blkdiag_mx(Bd_tr, B_att)
         att_kind = "lin6"
     elif mode == "roll1d":
-        Jx = float(att_cfg.get("Jx", 10.0))
+        Jx = float(att_cfg.get("J", 12.0)[0])
         A_roll, B_roll = _att_roll1d_blocks_linear_mx(dt, Jx)  # 2x2, 2x1
         nx, nu = nx_tr + 2, nu_tr + 1
         A_mx = _blkdiag_mx(Ad_tr, A_roll)
@@ -469,17 +466,14 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     lbz[N*nprim + gtil.shape[0]:] = 0.0
 
     # ---------- initial states ----------
+
+    att0_list = _read_att_x0_unified(att_cfg, att_kind, N)
+
     x0_rows = np.asarray(cfg["x0"], float)
     x1_tr = x0_rows[0][:nx_tr].copy()
     x2_tr = x0_rows[1][:nx_tr].copy()
-    if att_kind == "lin6":
-        x1 = np.hstack([x1_tr, np.zeros(3), np.zeros(3)])  # δθ, δω
-        x2 = np.hstack([x2_tr, np.zeros(3), np.zeros(3)])
-    elif att_kind == "roll1d":
-        x1 = np.hstack([x1_tr, 0.0, 0.0])                  # φ, φdot
-        x2 = np.hstack([x2_tr, 0.0, 0.0])
-    else:
-        x1, x2 = x1_tr, x2_tr
+    x1 = np.hstack([x1_tr, att0_list[0]]) if att_kind != "none" else x1_tr
+    x2 = np.hstack([x2_tr, att0_list[1]]) if att_kind != "none" else x2_tr
     theta_curr = np.r_[x1, x2]
 
     # ---------- numeric stepper ----------
@@ -1421,3 +1415,39 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
     if keep_legend is not None:
         ax.add_artist(keep_legend)
     return leg_axes
+
+def _read_att_x0_unified(att_cfg, att_kind, N):
+    """
+    Unified attitude initializer:
+      - Accepts att.init.rpy0 and att.init.rpy_rate0 (either (3,) or (N,3))
+      - Optional att.init.degrees=True to interpret inputs as degrees
+      - Returns per-agent blocks that match the chosen attitude state layout.
+
+    att_kind:
+      "lin6"   -> returns [δθ0(3), δω0(3)] per agent  (6 vals)
+      "roll1d" -> returns [φ0, φdot0] per agent       (2 vals)
+      "none"   -> returns [] per agent
+    """
+    init = att_cfg.get("init", {})
+    rpy0 = np.asarray(init.get("rpy0", [0.0, 0.0, 0.0]), dtype=float)
+    rpy_rate0 = np.asarray(init.get("rpy_rate0", [0.0, 0.0, 0.0]), dtype=float)
+    use_deg = bool(init.get("degrees", False))
+
+    # broadcast shapes
+    if rpy0.ndim == 1:       rpy0 = np.tile(rpy0[None, :], (N, 1))
+    if rpy_rate0.ndim == 1:  rpy_rate0 = np.tile(rpy_rate0[None, :], (N, 1))
+
+    assert rpy0.shape == (N, 3),      f"att.init.rpy0 must be (N,3) or (3,), got {rpy0.shape}"
+    assert rpy_rate0.shape == (N, 3), f"att.init.rpy_rate0 must be (N,3) or (3,), got {rpy_rate0.shape}"
+
+    if use_deg:
+        rpy0 = np.deg2rad(rpy0)
+        rpy_rate0 = np.deg2rad(rpy_rate0)
+
+    if att_kind == "lin6":
+        # small-angle offsets around nominal frame
+        return [np.hstack([rpy0[i], rpy_rate0[i]]) for i in range(N)]
+    elif att_kind == "roll1d":
+        return [np.array([rpy0[i, 0], rpy_rate0[i, 0]], dtype=float) for i in range(N)]
+    else:
+        return [np.array([], dtype=float) for _ in range(N)]
