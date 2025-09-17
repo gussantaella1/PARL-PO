@@ -69,24 +69,62 @@ def _seed_from_boresight(a, world_up=(0,0,1), align='x'):
         x = _unit(x)
         y = _unit(np.cross(a, x))
         return np.vstack([x, y, a])
-    
-def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
-               k_roll=0.0, yaw_lock=False, eps=1e-9, yaw_gain=1.0):
+
+def _frame_from_a_up_roll(a, up, phi, align='x', t_ref=None, eps=1e-9):
     """
-    Rows-as-axes convention:
-      R[0] = x_b in world, R[1] = y_b in world, R[2] = z_b in world.
-    Step 1: minimal transport (RIGHT-multiply by Q.T).
-    Step 2: yaw-only horizon lock using the TRANSPORTED tangent as the sign reference.
+    Build a body frame with boresight = a and a constant roll = phi
+    about that boresight, where zero roll is defined by projecting `up`
+    onto the plane ⟂ a. Uses t_ref as a sign/continuity reference.
+    Rows-as-axes: returns [x_b; y_b; z_b] in WORLD.
+    """
+    a  = _unit(a); up = _unit(up)
+    t  = up - a*np.dot(up, a)            # horizon tangent
+    n  = float(np.linalg.norm(t))
+    if n < eps:
+        # near singular: try ref tangent projected; else any ⟂ a
+        if t_ref is not None:
+            t = t_ref - a*np.dot(t_ref, a)
+            n = float(np.linalg.norm(t))
+        if n < eps:
+            e = np.eye(3)[np.argmin(np.abs(a))]
+            t = e - a*np.dot(e, a)
+            n = float(np.linalg.norm(t))
+    t = t / n
+    s = _unit(np.cross(a, t))            # 90° ahead of t around +a
+    cph, sph = np.cos(phi), np.sin(phi)
+    y = cph*t + sph*s                    # rotate horizon tangent by +phi
+    # continuity: keep close to reference sign
+    if t_ref is not None and np.dot(y, t_ref) < 0.0:
+        y = -y
+    if align == 'x':
+        z = _unit(np.cross(a, y))
+        return np.vstack([a, y, z])
+    else:  # align == 'z'
+        x = _unit(np.cross(y, a))
+        return np.vstack([x, y, a])
+
+
+def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
+               k_roll=0.0, yaw_lock=False, eps=1e-9, yaw_gain=1.0,
+               roll_lock=False, roll_ref=0.0):
+    """
+    Rows-as-axes convention (R[0]=x_b, R[1]=y_b, R[2]=z_b in WORLD).
+
+    Step 1: minimally transport R_prev so the boresight aligns to a_des.
+    Step 2: either
+      (A) roll_lock=True  → set y_b to a constant-roll frame using roll_ref
+      (B) yaw_lock=True   → horizon lock (zero roll wrt world_up)
+      (C) else            → leave transported frame (optionally small roll trim)
     """
     I  = np.eye(3)
     a  = _unit(a_des)
     up = _unit(world_up)
 
-    # ---- Step 1: transport previous frame to align boresight (rows convention) ----
+    # ---- Step 1: minimal transport (right-multiply by Q^T; rows-as-axes) ----
     if R_prev is None:
         R_tr = _seed_from_boresight(a, up, align)
     else:
-        b_prev = (R_prev[0] if align == 'x' else R_prev[2])  # previous boresight (world)
+        b_prev = (R_prev[0] if align == 'x' else R_prev[2])
         v = np.cross(b_prev, a); s = float(np.linalg.norm(v))
         c = float(np.clip(np.dot(b_prev, a), -1.0, 1.0))
         if s < 1e-8:
@@ -96,46 +134,50 @@ def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
                 # 180°: rotate π about previous tangent to break tie
                 axis = _unit(R_prev[1] if align == 'x' else R_prev[0])
                 K = _skew_np(axis)
-                Q = I + 2.0*(K @ K)         # Rodrigues for θ=π
-                R_tr = R_prev @ Q.T         # <-- rows-as-axes: right-multiply by Q^T
+                Q = I + 2.0*(K @ K)      # Rodrigues θ=π
+                R_tr = R_prev @ Q.T
         else:
             k  = v / s
             K  = _skew_np(k)
             th = np.arctan2(s, c)
             Q  = I + np.sin(th)*K + (1.0 - np.cos(th))*(K @ K)
-            R_tr = R_prev @ Q.T            # <-- rows-as-axes
+            R_tr = R_prev @ Q.T
 
-    # ---- Step 2: yaw lock or tiny roll trim (about boresight) ----
-    if yaw_lock:
-        # transported tangent as sign reference
-        y_ref = (R_tr[1] if align == 'x' else R_tr[0])
+    # transported tangent (for sign continuity in steps below)
+    y_ref = (R_tr[1] if align == 'x' else R_tr[0])
 
-        t = up - a*np.dot(up, a)           # project 'up' onto plane ⟂ a
-        n = float(np.linalg.norm(t))
+    # ---- Step 2: roll-lock / horizon-lock / free ----
+    if roll_lock:
+        # keep the same roll (phi=roll_ref) about boresight for all time
+        R = _frame_from_a_up_roll(a, up, float(roll_ref), align=align, t_ref=y_ref, eps=eps)
+        # optional blend back toward transported frame if desired
+        if 0.0 < yaw_gain < 1.0:
+            R = _slerp_R(R_tr.T, R.T, yaw_gain).T
+
+    elif yaw_lock:
+        # zero-roll wrt horizon, sign referenced by transported tangent
+        t = up - a*np.dot(up, a); n = float(np.linalg.norm(t))
         if n > eps:
             t = t / n
-            # pick sign closest to transported tangent to avoid π jumps
-            if np.dot(t, y_ref) < 0.0:
+            if np.dot(t, y_ref) < 0.0:  # sign continuity
                 t = -t
             if align == 'x':
                 y = t
                 z = _unit(np.cross(a, y))
                 R = np.vstack([a, y, z])
-            else:  # align == 'z'
+            else:
                 y = t
                 x = _unit(np.cross(y, a))
                 R = np.vstack([x, y, a])
         else:
-            # a ~ ±up: no reliable horizon; keep transported frame
             R = R_tr
-
-        # optional partial lock (damping)
         if 0.0 < yaw_gain < 1.0:
-            # slerp between transported and locked frames (world left, rows-as-axes via SO(3) log/exp on R^T)
             R = _slerp_R(R_tr.T, R.T, yaw_gain).T
+
     else:
         R = R_tr
         if k_roll != 0.0:
+            # tiny roll trim toward horizon tangent
             y_cur = (R_tr[1] if align == 'x' else R_tr[0])
             t = up - a*np.dot(up, a)
             n = float(np.linalg.norm(t))
@@ -147,18 +189,15 @@ def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
                 if abs(dphi) > 1e-12:
                     Ka = _skew_np(a)
                     Q  = I + np.sin(dphi)*Ka + (1.0 - np.cos(dphi))*(Ka @ Ka)
-                    R  = R @ Q.T            # <-- rows-as-axes
-            # else: keep R as-is
+                    R  = R @ Q.T
 
-    # ---- Step 3: safety re-orthonormalization ----
+    # ---- Step 3: re-orthonormalize (safety) ----
     U, _, Vt = np.linalg.svd(R)
     R = U @ Vt
     if np.linalg.det(R) < 0:
         U[:, -1] *= -1
         R = U @ Vt
     return R
-
-
 
 
 def _log_SO3(R):
@@ -452,7 +491,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # ---------- inequality bounds ----------
+    # ---------- per-step bounds ----------
     x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
     if att_kind in ("lin6", "roll1d"):
         x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only_finite(
@@ -461,6 +500,30 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     else:
         x_lb, x_ub, u_lb, u_ub = x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr
 
+    # ---------- HARD ROLL LOCK (optional, per-step) ----------
+    # Lock roll *rate* and *torque* so the initial roll angle is preserved.
+    roll_hard_lock = bool(att_cfg.get("roll_hard_lock", False))
+    if roll_hard_lock and att_kind in ("lin6", "roll1d"):
+        align = (att_cfg.get("align") or "x").lower()
+
+        if att_kind == "roll1d":
+            # state: [ x_tr , φ, φdot ] ; control: [ u_tr , τx ]
+            idx_phi_dot = nx_tr + 1
+            idx_tau_x   = nu_tr + 0
+            x_lb[idx_phi_dot] = x_ub[idx_phi_dot] = 0.0
+            u_lb[idx_tau_x]   = u_ub[idx_tau_x]   = 0.0
+
+        else:  # att_kind == "lin6"
+            # state: [ x_tr , δθx,δθy,δθz,  ωx,ωy,ωz ]
+            # control: [ u_tr , τx,τy,τz ]
+            roll_idx    = 0 if align == "x" else 2   # roll is boresight axis
+            idx_w_roll  = nx_tr + 3 + roll_idx       # ω_roll
+            idx_tau_roll = nu_tr + roll_idx          # τ_roll
+            x_lb[idx_w_roll]   = x_ub[idx_w_roll]   = 0.0
+            u_lb[idx_tau_roll] = u_ub[idx_tau_roll] = 0.0
+    # ----------------------------------------------------------
+
+    # ---------- inequality / equality maps ----------
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
     gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
 
@@ -539,12 +602,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             return a
         return axis_cache[agent_idx] if axis_cache[agent_idx] is not None else _default_boresight()
 
-
     def _R_nom_from_xtr(xtr, agent_idx):
         a = _boresight_from_xtr(xtr, agent_idx)
         R_new = evolve_dcm(R_prev[agent_idx], a,
                            align=align, world_up=world_up,
-                           k_roll=roll_gain, yaw_lock=yaw_lock)
+                           k_roll=roll_gain, yaw_lock=yaw_lock,roll_lock=True)
         R_prev[agent_idx] = R_new
         return R_new
 
@@ -597,56 +659,31 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3  # μ init > 0
 
     def _plan_attitudes_from_X(X, agent_idx):
-        """
-        Build a nominal orientation sequence for the planned states X WITHOUT
-        mutating the execution baseline R_prev[agent_idx].
-
-        Returns
-        -------
-        out   : list of dicts per t, each {"R": 3x3 DCM, "phi": float}
-        R_end : final nominal DCM after stepping through the plan (not written back)
-        """
-        Tloc = int(X.shape[0])
-        out  = []
-
-        # Local read-only seed; do NOT assign to R_prev here.
-        Rloc = R_prev[agent_idx]
-
-        # Keep a local last-used boresight for low-speed frames inside this plan pass
+        Tloc = int(X.shape[0]); out  = []
+        Rloc = R_prev[agent_idx]   # read-only seed (don’t write back)
         last_axis = None
 
         for t in range(Tloc):
             xtr_t = X[t, :nx_tr]
-
-            # ----- choose boresight w/ graceful low-speed handling -----
             v   = np.asarray(xtr_t[D:2*D], float)
             spd = float(np.linalg.norm(v))
             if spd >= vmin:
                 a_t = v / spd
-                if D == 2:  # lift to 3D if working in 2D
-                    a_t = np.array([a_t[0], a_t[1], 0.0], float)
+                if D == 2: a_t = np.array([a_t[0], a_t[1], 0.0], float)
                 last_axis = a_t
             else:
-                if last_axis is not None:
-                    a_t = last_axis
-                elif Rloc is not None:
-                    a_t = (Rloc[0] if align == 'x' else Rloc[2])
-                else:
-                    a_t = np.array([1,0,0], float) if align == 'x' else np.array([0,0,1], float)
+                if last_axis is not None: a_t = last_axis
+                elif Rloc is not None:    a_t = (Rloc[0] if align == 'x' else Rloc[2])
+                else:                     a_t = np.array([1,0,0], float) if align == 'x' else np.array([0,0,1], float)
 
-            # ----- evolve nominal DCM (minimal-rotation + yaw lock/roll trim) -----
-            R_nom = evolve_dcm(
-                Rloc, a_t,
-                align=align, world_up=world_up,
-                k_roll=roll_gain, yaw_lock=yaw_lock
-            )
-            Rloc = R_nom  # advance local nominal only
+            R_nom = evolve_dcm(Rloc, a_t, align=align, world_up=world_up,
+                               k_roll=roll_gain, yaw_lock=yaw_lock,roll_lock=True)
+            Rloc = R_nom
 
-            # ----- apply attitude state on top of nominal -----
             if att_kind == "lin6":
-                eps_t = _eps3_from_statevec(X[t], nx_tr)  # δθ about body axes (small-angle)
+                eps_t = _eps3_from_statevec(X[t], nx_tr)
                 R_t   = _apply_small_angle(R_nom, eps_t)
-                phi_t = float(eps_t[0])  # keep for plotting/debug (matches prior use)
+                phi_t = float(eps_t[0])
             elif att_kind == "roll1d":
                 phi_t = float(X[t, nx_tr]) if X.shape[1] >= nx_tr+1 else 0.0
                 R_t   = apply_roll_about_axis(R_nom, phi_t, align=align)
@@ -655,9 +692,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
             out.append({"R": R_t, "phi": phi_t})
 
-        # IMPORTANT: do not assign back to R_prev[agent_idx] here.
         return out, Rloc
-
 
     def replan(theta_vec, z_init):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
@@ -1134,7 +1169,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
         R_prev = _anim_cache[agent-1]
         R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up,
-                            k_roll=roll_gain, yaw_lock=yaw_lock)
+                            k_roll=roll_gain, yaw_lock=yaw_lock,roll_lock=True)
         _anim_cache[agent-1] = R_new
         return R_new
 
@@ -1376,7 +1411,7 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
 
         R_prev = R_prev_ui[agent-1]
         R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up,
-                            k_roll=roll_gain, yaw_lock=yaw_lock)
+                            k_roll=roll_gain, yaw_lock=yaw_lock,roll_lock=True)
         R_prev_ui[agent-1] = R_new
         return R_new
 
