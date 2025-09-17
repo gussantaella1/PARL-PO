@@ -10,7 +10,7 @@ __all__ = [
     # dims & dynamics
     "dims_from_D", "double_integrator", "step_double_integrator_D",
     # complementarity
-    "fb",
+    "fb", "fb_eps",
     # trajectory pack/unpack
     "pack_trajectory", "unpack_trajectory", "unpack_tau_flat", "split_players_from_z",
     # bounds & geometry
@@ -476,6 +476,11 @@ def pad_x0_with_att(x0_row: np.ndarray, att_cfg: dict, D: int):
 def fb(a, b, eps: float = 1e-6):
     """Smooth Fischer–Burmeister complementarity φ(a,b)≈0 enforcing a≥0 ⟂ b≥0."""
     return ca.sqrt(a*a + b*b + 2*eps) - a - b
+
+def fb_eps(a, b, eps=1e-8):
+    # Works with MX/DM scalars or elementwise on arrays
+    s = ca.sqrt(a*a + b*b + 2*eps)
+    return s - (a + b)
 
 # -------------------- pack/unpack helpers --------------------
 def pack_trajectory(xs, us):
