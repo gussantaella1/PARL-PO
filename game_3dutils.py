@@ -212,21 +212,15 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
 
     # ---------- inequality bounds (translation-only when attitude on) ----------
     x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
-    if use_lin:
+
+    if att_kind in ("roll1d","lin6"):        # <-- FIX the undefined 'use_lin' bug
         x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only_finite(
             x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr, BIG=1e6
         )
     else:
-        # even here, avoid ±inf
-        def _clip_inf(v, BIG=1e6): 
-            vv = np.asarray(v, float).copy()
-            vv[~np.isfinite(vv)] = 0.0
-            return np.clip(vv, -BIG, BIG)
-        x_lb, x_ub, u_lb, u_ub = _clip_inf(x_lb_tr), _clip_inf(x_ub_tr), _clip_inf(u_lb_tr), _clip_inf(u_ub_tr)
+        x_lb, x_ub, u_lb, u_ub = x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr
 
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, A_mx, B_mx)
-
 
     # ---------- solver (KKT residual) ----------
     nprim     = T*nx + (T-1)*nu
