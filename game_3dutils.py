@@ -72,92 +72,68 @@ def _seed_from_boresight(a, world_up=(0,0,1), align='x'):
         return np.vstack([x, y, a])
     
 def evolve_dcm(R_prev, a_des, *, align='x', world_up=(0,0,1),
-               k_roll=0.0, eps=1e-9):
+               k_roll=0.0, yaw_lock=True, eps=1e-9):
     """
-    Minimal-rotation DCM update that keeps boresight glued to a_des,
-    with optional small roll stabilization about the boresight.
+    Minimal-rotation DCM update that keeps boresight glued to a_des.
+    If yaw_lock=True, rebuild the horizon tangent from world_up for
+    absolute yaw (no 2π flip). Else, do optional small roll trim.
     """
     a = _unit(a_des)
+
+    # Seed if needed
     if R_prev is None:
         R = _seed_from_boresight(a, world_up, align)
     else:
-        # current boresight in world from previous frame
-        b_prev = R_prev[0] if align == 'x' else R_prev[2]
-
         # minimal rotation b_prev -> a
-        v = np.cross(b_prev, a); s = np.linalg.norm(v); c = np.clip(np.dot(b_prev, a), -1.0, 1.0)
+        b_prev = R_prev[0] if align == 'x' else R_prev[2]
+        v = np.cross(b_prev, a); s = np.linalg.norm(v)
+        c = float(np.clip(np.dot(b_prev, a), -1.0, 1.0))
         if s < 1e-8:
             if c > 0.0:
-                R_align = np.eye(3)         # no change
+                R_align = np.eye(3)
             else:
-                # 180°: rotate π about a stable axis ⟂ b_prev (use prev y projected)
                 y_prev = R_prev[1]
                 axis = y_prev - b_prev*np.dot(y_prev, b_prev)
-                if np.linalg.norm(axis) < 1e-8:
-                    # fallback axis
-                    axis = _unit(np.array([1,0,0]) - b_prev*b_prev[0])
-                axis = _unit(axis)
-                K = _skew_np(axis)
-                R_align = np.eye(3) + 2*K@K   # Rodrigues for θ=π
+                axis = _unit(axis) if np.linalg.norm(axis) > 1e-8 else _unit(np.array([1,0,0]) - b_prev*b_prev[0])
+                K = _skew_np(axis); R_align = np.eye(3) + 2*K@K
         else:
             k = v/s; K = _skew_np(k); th = np.arctan2(s, c)
             R_align = np.eye(3) + np.sin(th)*K + (1-np.cos(th))*(K@K)
-
         R = R_align @ R_prev
 
-        # optional: small roll correction about the new boresight a
-        if k_roll != 0.0:
-            # desired tangent from projected world_up
-            t_des = world_up - a*np.dot(world_up, a)
-            if np.linalg.norm(t_des) > eps:
-                t_des = _unit(t_des)
-                # pick which body tangent we control (y for align='x'; x for align='z')
-                t_cur = R[1] if align == 'x' else R[0]
-                # signed angle about a
-                num = np.dot(np.cross(t_cur, t_des), a)
-                den = np.clip(np.dot(t_cur, t_des), -1.0, 1.0)
-                dphi = k_roll * np.arctan2(num, den)
-                if abs(dphi) > 1e-12:
-                    Ka = _skew_np(a)
-                    R_roll = np.eye(3) + np.sin(dphi)*Ka + (1-np.cos(dphi))*(Ka@Ka)
-                    R = R_roll @ R
+    # --- horizon lock OR tiny roll trim ---
+    if yaw_lock:
+        # rebuild tangent from world_up with continuity
+        t_ref = (R[1] if align=='x' else R[0])
+        t_des = _proj_horizon_tangent(a, np.asarray(world_up,float), t_ref=t_ref, eps=eps)
+        if align == 'x':
+            y = t_des
+            z = _unit(np.cross(a, y))
+            R = np.vstack([a, y, z])
+        else:  # align z
+            y = t_des
+            x = _unit(np.cross(y, a))
+            R = np.vstack([x, y, a])
+    elif k_roll != 0.0:
+        t_des = world_up - a*np.dot(world_up, a)
+        if np.linalg.norm(t_des) > eps:
+            t_des = _unit(t_des)
+            t_cur = R[1] if align == 'x' else R[0]
+            num = np.dot(np.cross(t_cur, t_des), a)
+            den = float(np.clip(np.dot(t_cur, t_des), -1.0, 1.0))
+            dphi = k_roll * np.arctan2(num, den)
+            if abs(dphi) > 1e-12:
+                Ka = _skew_np(a)
+                R = (np.eye(3) + np.sin(dphi)*Ka + (1-np.cos(dphi))*(Ka@Ka)) @ R
 
-    # re-orthonormalize (polar decomposition via SVD)
+    # re-orthonormalize
     U, _, Vt = np.linalg.svd(R)
     R = U @ Vt
-    if np.linalg.det(R) < 0:  # enforce proper rotation
+    if np.linalg.det(R) < 0:
         U[:, -1] *= -1
         R = U @ Vt
     return R
 
-def _axis_from_vel(xtr, D, align="x", min_speed=1e-3, prev_axis=None):
-    v = np.asarray(xtr[D:2*D], float)
-    n = float(np.linalg.norm(v))
-    if n < min_speed:
-        if prev_axis is not None:
-            return prev_axis
-        return np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float)
-    a = v/n
-    if D == 2: a = np.array([a[0], a[1], 0.0], float)
-    if prev_axis is not None and np.dot(a, prev_axis) < 0.0:
-        a = -a  # hysteresis: keep co-directional to avoid 180 flips
-    return a
-
-def _world_to_body_continuous(a, world_up, align="x", R_prev=None, a_prev=None, alpha=1.0):
-    a = _unit(a)
-    # 1) Try transporting the previous frame
-    R_tr = _transport_R(R_prev, a_prev, a) if (R_prev is not None and a_prev is not None) else None
-    # 2) If no prev frame, build a seed once (project-up is fine just for seeding)
-    if R_tr is None:
-        y0 = world_up - a*np.dot(world_up, a)
-        if np.linalg.norm(y0) < 1e-8:
-            # pick a stable basis axis least aligned with a
-            e = np.eye(3)[np.argmin(np.abs(a))]
-            y0 = e - a*np.dot(e, a)
-        R_nom = _R_from_axis_tangent(a, _unit(y0), align)
-        return R_nom
-    # 3) Optional smoothing toward transported frame
-    return _slerp_R(R_prev, R_tr, alpha=alpha)
 
 def attitude_from_state(x, prev_axisD, prev_R):
     R, axisD, extra = transported_R_from_state(
@@ -415,16 +391,6 @@ def _blkdiag_mx(A, B):
     return ca.blockcat([[A, Z_ab],
                         [Z_ba, B]])
 
-def _pad_trans_bounds_only(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr, nx, nu, nx_tr, nu_tr):
-    """Embed translation bounds; leave attitude unbounded."""
-    x_lb = np.full(nx, -np.inf); x_ub = np.full(nx,  np.inf)
-    u_lb = np.full(nu, -np.inf); u_ub = np.full(nu,  np.inf)
-    x_lb[:nx_tr] = np.asarray(x_lb_tr, float)
-    x_ub[:nx_tr] = np.asarray(x_ub_tr, float)
-    u_lb[:nu_tr] = np.asarray(u_lb_tr, float)
-    u_ub[:nu_tr] = np.asarray(u_ub_tr, float)
-    return x_lb, x_ub, u_lb, u_ub
-
 def _pad_trans_bounds_only_finite(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr,
                                   nx, nu, nx_tr, nu_tr, BIG=1e6):
     x_lb = -BIG*np.ones(nx); x_ub = BIG*np.ones(nx)
@@ -442,18 +408,14 @@ def _pad_trans_bounds_only_finite(x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr,
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
                                   turn_len: int | None = None, ipopt_opts: dict | None = None):
     """
-    Receding-horizon rollout.
-
+    Receding-horizon rollout using evolve_dcm() for attitude baseline.
     Attitude modes:
-      - "lin3d" / "lin2d_roll": small-angle δθ(3), δω(3) with τ(3)  → nx += 6, nu += 3
-      - "roll1d":               roll φ, φdot with τx                 → nx += 2, nu += 1
-      - anything else:          translation only
-
-    g~ is linear (Ax+Bu over translation + attitude block).
-    h~ is translation-only by default (attitude states/inputs left unbounded).
-    Rendering: nominal frame from velocity (continuous), then:
-      - lin6:   apply small-angle δθ via first-order exp
-      - roll1d: apply roll φ about boresight
+      - "lin3d"/"lin2d_roll": small-angle δθ(3), δω(3) + τ(3)  → nx += 6, nu += 3
+      - "roll1d":            roll φ, φdot + τx                 → nx += 2, nu += 1
+      - anything else:       translation only
+    Inequality bounds are translation-only when attitude is present.
+    Rendering baseline attitude comes from velocity → evolve_dcm(yaw_lock=True),
+    then we apply δθ (lin6) or φ (roll1d) on top.
     """
     import numpy as np
     import casadi as ca
@@ -462,7 +424,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
-    T, dt  = int(cfg["T"]), float(cfg["dt"])
+    T, dt = int(cfg["T"]), float(cfg["dt"])
 
     # ---------- translation dynamics ----------
     dyn = (cfg.get("dynamics") or "double").lower()
@@ -484,7 +446,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         B_mx = _blkdiag_mx(Bd_tr, B_att)
         att_kind = "lin6"
     elif mode == "roll1d":
-        Jx = float(att_cfg.get("J", 12.0)[0])
+        Jx = float(att_cfg.get("Jx", 10.0))
         A_roll, B_roll = _att_roll1d_blocks_linear_mx(dt, Jx)  # 2x2, 2x1
         nx, nu = nx_tr + 2, nu_tr + 1
         A_mx = _blkdiag_mx(Ad_tr, A_roll)
@@ -503,7 +465,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # ---------- inequality bounds (translation-only when attitude present) ----------
+    # ---------- inequality bounds ----------
     x_lb_tr, x_ub_tr, u_lb_tr, u_ub_tr = make_bounds(cfg)
     if att_kind in ("lin6", "roll1d"):
         x_lb, x_ub, u_lb, u_ub = _pad_trans_bounds_only_finite(
@@ -531,10 +493,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     for i in range(N):
         Li = fs[i](tau_sym, theta_sym) - lam_t.T @ gtil - mu_t.T @ htil
         grads.append(ca.gradient(Li, taus_syms[i]))
+
     FB   = ca.vcat([fb_eps(htil[i], mu_t[i]) for i in range(htil.shape[0])])
     G    = ca.vcat(grads + [gtil, FB])
     z_sym = ca.vcat(taus_syms + [lam_t, mu_t])
-    obj   = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)  # tiny Tikhonov
+    obj   = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)
 
     opts = {'ipopt.print_level': 0, 'print_time': 0, 'expand': True}
     if ipopt_opts: opts.update(ipopt_opts)
@@ -546,9 +509,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     lbz[N*nprim + gtil.shape[0]:] = 0.0
 
     # ---------- initial states ----------
-
     att0_list = _read_att_x0_unified(att_cfg, att_kind, N)
-
     x0_rows = np.asarray(cfg["x0"], float)
     x1_tr = x0_rows[0][:nx_tr].copy()
     x2_tr = x0_rows[1][:nx_tr].copy()
@@ -568,39 +529,52 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
-    # ---------- rendering / continuity ----------
-    align    = att_cfg.get("align","x")
-    world_up = np.asarray(att_cfg.get("up",[0,0,1]), float)
-    vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
-    alpha    = float(att_cfg.get("boresight_lpf_alpha", 1.0))
+    # ---------- attitude baseline via evolve_dcm ----------
+    align     = att_cfg.get("align","x")
+    world_up  = np.asarray(att_cfg.get("up",[0,0,1]), float)
+    vmin      = float(att_cfg.get("min_speed_for_axis", 1e-3))
+    yaw_lock  = bool(att_cfg.get("horizon_lock", True))
+    roll_gain = float(att_cfg.get("roll_gain", 0.0))
 
-    R0_prev = [None, None]  # carry nominal frames per agent
+    # carry previous baseline DCM per agent
+    R_prev = [None, None]
 
-    def _R0_from_xtr_cont(xtr, agent_idx):
+    def _default_boresight():
+        return np.array([1,0,0]) if align == 'x' else np.array([0,0,1])
+
+    def _boresight_from_xtr(xtr, agent_idx):
         v = np.asarray(xtr[D:2*D], float)
-        if float(np.linalg.norm(v)) < vmin and (R0_prev[agent_idx] is not None):
-            return R0_prev[agent_idx]
-        prev_b = None
-        if R0_prev[agent_idx] is not None:
-            prev_b = R0_prev[agent_idx][0] if align == "x" else R0_prev[agent_idx][2]
-        a = _axis_from_vel(xtr, D, align=align, min_speed=vmin, prev_axis=prev_b)
-        R0 = _world_to_body_continuous(a, world_up, align, R_prev=R0_prev[agent_idx], alpha=alpha)
-        R0_prev[agent_idx] = R0
-        return R0
+        spd = float(np.linalg.norm(v))
+        if spd < vmin:
+            if R_prev[agent_idx] is not None:
+                return (R_prev[agent_idx][0] if align == 'x' else R_prev[agent_idx][2])
+            return _default_boresight()
+        a = v / spd
+        if D == 2:
+            a = np.array([a[0], a[1], 0.0], float)
+        return a
+
+    def _R_nom_from_xtr(xtr, agent_idx):
+        a = _boresight_from_xtr(xtr, agent_idx)
+        R_new = evolve_dcm(R_prev[agent_idx], a,
+                           align=align, world_up=world_up,
+                           k_roll=roll_gain, yaw_lock=yaw_lock)
+        R_prev[agent_idx] = R_new
+        return R_new
 
     def _render_R_from_state(x, agent_idx):
         xtr = x[:nx_tr]
-        R0  = _R0_from_xtr_cont(xtr, agent_idx)  # boresight from velocity
+        R_nom = _R_nom_from_xtr(xtr, agent_idx)
         if att_kind == "lin6":
             eps = _eps3_from_statevec(x, nx_tr)
-            R   = _apply_small_angle(R0, eps); phi = float(eps[0])
+            R   = _apply_small_angle(R_nom, eps); phi = float(eps[0])
             return R, phi
         elif att_kind == "roll1d":
             phi = _phi_from_statevec(x, nx_tr)
-            R   = apply_roll_about_axis(R0, phi, align=align)
+            R   = apply_roll_about_axis(R_nom, phi, align=align)
             return R, float(phi)
         else:
-            return R0, 0.0
+            return R_nom, 0.0
 
     def _p3_from_state(x):
         return (float(x[0]), float(x[1]), float(x[2] if D==3 else 0.0))
@@ -638,33 +612,28 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
     def _plan_attitudes_from_X(X, agent_idx):
         out = []
-        R0p = R0_prev[agent_idx]
-        cols = X.shape[1]
+        # local forward-pass with evolve_dcm for continuity
+        Rloc = R_prev[agent_idx]
         for t in range(T):
             xtr_t = X[t, :nx_tr]
-            v = np.asarray(xtr_t[D:2*D], float)
+            # re-create baseline
+            a_t = _boresight_from_xtr(xtr_t, agent_idx)
+            R_nom = evolve_dcm(Rloc, a_t, align=align, world_up=world_up,
+                               k_roll=roll_gain, yaw_lock=yaw_lock)
+            Rloc = R_nom
 
-            if float(np.linalg.norm(v)) < vmin and (R0p is not None):
-                R0_t = R0p
-            else:
-                prev_b = None
-                if R0p is not None:
-                    prev_b = R0p[0] if align == "x" else R0p[2]
-                a_t  = _axis_from_vel(xtr_t, D, align=align, min_speed=vmin, prev_axis=prev_b)
-                R0_t = _world_to_body_continuous(a_t, world_up, align, R_prev=R0p, alpha=alpha)
-
+            # apply small-angle / roll
             if att_kind == "lin6":
-                eps_t = (X[t, nx_tr:nx_tr+3] if cols >= nx_tr+3 else np.zeros(3))
-                R_t   = _apply_small_angle(R0_t, eps_t); phi_t = float(eps_t[0])
+                eps_t = _eps3_from_statevec(X[t], nx_tr)
+                R_t   = _apply_small_angle(R_nom, eps_t); phi_t = float(eps_t[0])
             elif att_kind == "roll1d":
-                phi_t = (float(X[t, nx_tr]) if cols >= nx_tr+1 else 0.0)
-                R_t   = apply_roll_about_axis(R0_t, phi_t, align=align)
+                phi_t = (float(X[t, nx_tr]) if X.shape[1] >= nx_tr+1 else 0.0)
+                R_t   = apply_roll_about_axis(R_nom, phi_t, align=align)
             else:
-                R_t, phi_t = R0_t, 0.0
-
+                R_t, phi_t = R_nom, 0.0
             out.append({"R": R_t, "phi": phi_t})
-            R0p = R0_t
-        return out, R0p
+        R_prev[agent_idx] = Rloc
+        return out, Rloc
 
     def replan(theta_vec, z_init):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
@@ -672,10 +641,12 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         taus  = split_players_from_z(z_new, N, T, nx, nu)
         X1, U1 = unpack_tau_flat(taus[0], nx, nu, T)
         X2, U2 = unpack_tau_flat(taus[1], nx, nu, T)
-        plan1  = [(float(X1[t,0]), float(X1[t,1]), float(X1[t,2] if D==3 else 0.0)) for t in range(T)]
-        plan2  = [(float(X2[t,0]), float(X2[t,1]), float(X2[t,2] if D==3 else 0.0)) for t in range(T)]
-        att1_plan, R0_prev[0] = _plan_attitudes_from_X(X1, 0)
-        att2_plan, R0_prev[1] = _plan_attitudes_from_X(X2, 1)
+
+        plan1 = [(float(X1[t,0]), float(X1[t,1]), float(X1[t,2] if D==3 else 0.0)) for t in range(T)]
+        plan2 = [(float(X2[t,0]), float(X2[t,1]), float(X2[t,2] if D==3 else 0.0)) for t in range(T)]
+
+        att1_plan, _ = _plan_attitudes_from_X(X1, 0)
+        att2_plan, _ = _plan_attitudes_from_X(X2, 1)
         return z_new, plan1, plan2, U1, U2, att1_plan, att2_plan
 
     # ---------- initial plan ----------
@@ -1001,6 +972,8 @@ def _proj_horizon_tangent(a, up, t_ref=None, eps=1e-9):
 def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                        show_fov=True, show_axes=True):
     import shutil
+    import numpy as np
+    import matplotlib.pyplot as plt
     from matplotlib import animation
     from matplotlib.animation import FFMpegWriter, PillowWriter
 
@@ -1012,10 +985,8 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     viz_cfg  = cfg.get("viz", {})
     agent_id = int(fov_cfg.get("agent", 2))
 
-    triad_colors = tuple(viz_cfg.get('triad_colors',
-                                     ('tab:red','tab:green','tab:blue')))
-    triad_labels = tuple(viz_cfg.get('triad_labels',
-                                     ('x_b (boresight)', 'y_b', 'z_b')))
+    triad_colors = tuple(viz_cfg.get('triad_colors', ('tab:red','tab:green','tab:blue')))
+    triad_labels = tuple(viz_cfg.get('triad_labels', ('x_b (boresight)', 'y_b', 'z_b')))
     triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
     triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
     triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
@@ -1039,16 +1010,8 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         else:
             raise ValueError("No frames to animate.")
 
-    # ---- attitude cache (per-agent) ----
-    _anim_cache = [{'R': None}, {'R': None}]
-
-    # Seed cache from stored exec attitudes if present
-    ea1 = frames_dict.get('exec_att1', [])
-    ea2 = frames_dict.get('exec_att2', [])
-    if ea1 and isinstance(ea1[0], dict) and ('R' in ea1[0]) and (ea1[0]['R'] is not None):
-        _anim_cache[0]['R'] = np.asarray(ea1[0]['R'], float)
-    if ea2 and isinstance(ea2[0], dict) and ('R' in ea2[0]) and (ea2[0]['R'] is not None):
-        _anim_cache[1]['R'] = np.asarray(ea2[0]['R'], float)
+    # attitude cache per agent (for evolve_dcm continuity)
+    _anim_cache = [None, None]
 
     fig = plt.figure(figsize=(7,6))
     ax  = fig.add_subplot(111, projection='3d')
@@ -1073,7 +1036,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     dot2,     = ax.plot([], [], [], 'o',  ms=6)
     leg_main  = ax.legend(loc='upper left')
 
-    # Triad legend (x/y/z color mapping)
+    # Triad legend
     leg_axes = None
     if show_axes:
         leg_axes = add_triad_legend(ax,
@@ -1088,16 +1051,10 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     att1_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
     att2_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
 
-    # ---------- helpers ----------
+    # helpers
     def _pos3(p_like):
         p = np.asarray(p_like, float).ravel()
         return p[:3] if p.size >= 3 else np.array([p[0], p[1], 0.0], float)
-
-    def _unit3(a_like):
-        a = np.asarray(a_like, float).ravel()
-        if a.size < 3: a = np.array([a[0], a[1], 0.0], float)
-        n = np.linalg.norm(a)
-        return a if n < 1e-12 else a/n
 
     fov_art = {'coll': None, 'rim': None, 'edges': []}
 
@@ -1112,6 +1069,50 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             try: ln.remove()
             except Exception: pass
         fov_art['edges'] = []
+
+    align    = att_cfg.get('align','x')
+    up       = np.asarray(att_cfg.get('up',[0,0,1]), float)
+    yaw_lock = bool(att_cfg.get('horizon_lock', True))
+    roll_gain = float(att_cfg.get('roll_gain', 0.0))
+    vmin     = float(att_cfg.get('min_speed_for_axis', 1e-3))
+
+    def _default_boresight():
+        return np.array([1,0,0]) if align == 'x' else np.array([0,0,1])
+
+    def _R_exec(agent, idx):
+        # use stored exec attitudes if present
+        key = 'exec_att1' if agent == 1 else 'exec_att2'
+        L = frames_dict.get(key, [])
+        if L and idx < len(L) and 'R' in L[idx] and L[idx]['R'] is not None:
+            _anim_cache[agent-1] = np.asarray(L[idx]['R'], float)
+            return _anim_cache[agent-1]
+
+        # otherwise derive boresight and evolve
+        pos_seq = exec1 if agent == 1 else exec2
+        if axis_hist and idx < len(axis_hist) and axis_hist[idx] is not None:
+            a_des = np.asarray(axis_hist[idx], float)
+            if a_des.shape[0] == 2: a_des = np.array([a_des[0], a_des[1], 0.0], float)
+            n = np.linalg.norm(a_des); a_des = a_des if n < 1e-12 else a_des/n
+        else:
+            if idx > 0:
+                p  = np.asarray(pos_seq[idx], float)
+                pp = np.asarray(pos_seq[idx-1], float)
+                dv = p - pp; n = np.linalg.norm(dv)
+                if n < vmin:
+                    if _anim_cache[agent-1] is not None:
+                        a_des = (_anim_cache[agent-1][0] if align=='x' else _anim_cache[agent-1][2])
+                    else:
+                        a_des = _default_boresight()
+                else:
+                    a_des = dv/n
+            else:
+                a_des = _default_boresight()
+
+        R_prev = _anim_cache[agent-1]
+        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up,
+                            k_roll=roll_gain, yaw_lock=yaw_lock)
+        _anim_cache[agent-1] = R_new
+        return R_new
 
     def _set_fov(p, R_wb, idx):
         if not (show_fov and fov_cfg.get("enabled", False)):
@@ -1129,8 +1130,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             )
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
-            align = att_cfg.get('align','x')
-            axis  = R_wb[0] if align == 'x' else R_wb[2]
+            axis = R_wb[0] if align == 'x' else R_wb[2]
             coll, rim = draw_fov_cone_3d(
                 ax, x_def, axis, fov_cfg,
                 color=col, alpha=fov_cfg.get("alpha",0.15),
@@ -1138,55 +1138,12 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
 
-    # ---- Attitude at frame f (uses DCM evolution with continuity) ----
-    def _R_exec(agent, idx):
-        align = att_cfg.get('align','x')
-        up    = np.asarray(att_cfg.get('up',[0,0,1]), float)
-        kroll = float(att_cfg.get('roll_gain', 0.0))  # 0 = no roll stabilization
-
-        # Prefer stored attitudes if present
-        key = 'exec_att1' if agent == 1 else 'exec_att2'
-        L = frames_dict.get(key, [])
-        if L:
-            j = min(idx, len(L)-1)
-            R = L[j].get('R', None)
-            if R is not None:
-                _anim_cache[agent-1]['R'] = np.asarray(R, float)
-                return _anim_cache[agent-1]['R']
-
-        # Otherwise evolve from previous using desired boresight (vel or axis_hist)
-        pos_seq = exec1 if agent == 1 else exec2
-        if axis_hist and idx < len(axis_hist) and axis_hist[idx] is not None:
-            a_des = _unit3(axis_hist[idx])
-        else:
-            if idx > 0:
-                p  = np.asarray(pos_seq[idx], float)
-                pp = np.asarray(pos_seq[idx-1], float)
-                a_des = _unit3(p - pp)
-            else:
-                a_des = np.array([1,0,0]) if align=='x' else np.array([0,0,1])
-
-        R_prev = _anim_cache[agent-1]['R']
-        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up, k_roll=kroll)
-        _anim_cache[agent-1]['R'] = R_new
-        return R_new
-
-    # ---------- drawing setup ----------
-    # planned/executed lines and markers already created above
-
     # ---------- animation callbacks ----------
     def init():
         for ln in (plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2):
             ln.set_data([], []); ln.set_3d_properties([])
-        for L in (att1_lines, att2_lines):
-            if L:
-                for ln in (L['bx'], L['by'], L['bz']):
-                    ln.set_data([], []); ln.set_3d_properties([])
-        _clear_fov()
-        artists = [plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2]
-        if leg_main: artists.append(leg_main)
-        if leg_axes: artists.append(leg_axes)
-        return tuple(artists)
+        if leg_main: ax.add_artist(leg_main)
+        return plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2
 
     def update(f):
         # planned
@@ -1209,13 +1166,9 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
         # triads
         if show_axes:
-            if att1_lines:
-                R1 = _R_exec(1, f)
-                update_body_axes_artists_3d(att1_lines, np.array([x1,y1,z1]), R1, L=L_tri)
-            if att2_lines:
-                R2 = _R_exec(2, f)
-                update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
-
+            R1 = _R_exec(1, f); R2 = _R_exec(2, f)
+            if att1_lines: update_body_axes_artists_3d(att1_lines, np.array([x1,y1,z1]), R1, L=L_tri)
+            if att2_lines: update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
         # FOV (selected agent)
         p_def = np.asarray(_pos3(exec2[f] if agent_id == 2 else exec1[f]))
         R_def = _R_exec(agent_id, f)
@@ -1243,29 +1196,29 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     print(f"Saved 3D animation to {out_path}")
 
 
+
 # -------------------- interactive (triads + triad legend) --------------------
 def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
                            show_fov=True, show_axes=True):
+    import numpy as np
     import ipywidgets as W
+    import matplotlib.pyplot as plt
     from IPython.display import display
 
+    # local evolve cache
     R_prev_ui = [None, None]
-
 
     fov_cfg  = cfg.get("fov", {})
     att_cfg  = cfg.get("att", {})
     viz_cfg  = cfg.get("viz", {})
     agent_id = int(fov_cfg.get("agent", 2))
 
-    triad_colors = tuple(viz_cfg.get('triad_colors',
-                                     ('tab:red','tab:green','tab:blue')))
-    triad_labels = tuple(viz_cfg.get('triad_labels',
-                                     ('x_b (boresight)', 'y_b', 'z_b')))
+    triad_colors = tuple(viz_cfg.get('triad_colors', ('tab:red','tab:green','tab:blue')))
+    triad_labels = tuple(viz_cfg.get('triad_labels', ('x_b (boresight)', 'y_b', 'z_b')))
     triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
     triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
     triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
     L_tri = tuple(cfg.get("viz", {}).get("triad_len", (0.35, 0.35, 0.55)))
-
 
     plan_hist1 = frames_dict.get('plan_hist1_3d', frames_dict.get('plan_hist1', []))
     plan_hist2 = frames_dict.get('plan_hist2_3d', frames_dict.get('plan_hist2', []))
@@ -1291,9 +1244,7 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
 
     fig = plt.figure(figsize=(7,6))
     ax  = fig.add_subplot(111, projection='3d')
-    ax.set_title(title)
-    ax.grid(True)
-    ax.set_box_aspect((1,1,1))
+    ax.set_title(title); ax.grid(True); ax.set_box_aspect((1,1,1))
 
     # Bounds
     ar = cfg.get("arena", {})
@@ -1319,12 +1270,12 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
             ax.set_xlim(lo[0],hi[0]); ax.set_ylim(lo[1],hi[1]); ax.set_zlim(lo[2],hi[2])
 
     # Lines + main legend
-    plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1',color = 'blue')
-    plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2',color = 'orange')
-    exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1',color='green')
-    exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2',color = 'red')
-    dot1,     = ax.plot([], [], [], 'o',  ms=6,color='cyan', mec='k', mew=0.6)
-    dot2,     = ax.plot([], [], [], 'o',  ms=6,color='orange', mec='k', mew=0.6)
+    plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1', color='blue')
+    plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2', color='orange')
+    exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1', color='green')
+    exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2', color='red')
+    dot1,     = ax.plot([], [], [], 'o',  ms=6, color='cyan',   mec='k', mew=0.6)
+    dot2,     = ax.plot([], [], [], 'o',  ms=6, color='orange', mec='k', mew=0.6)
     leg_main  = ax.legend(loc='upper left')
 
     # Triad legend
@@ -1355,33 +1306,22 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
             except Exception: pass
         fov_art['edges'] = []
 
-
     # helpers
     def _pos3(p_like):
         p = np.asarray(p_like, float).ravel()
         return p[:3] if p.size >= 3 else np.array([p[0], p[1], 0.0], float)
-    def _axis3(a_like):
-        a = np.asarray(a_like, float).ravel()
-        if a.size < 3: a = np.array([a[0], a[1], 0.0], float)
-        return a/(np.linalg.norm(a)+1e-12)
-    def _def_pos(f):
-        return exec2[f] if agent_id == 2 else exec1[f]
-    def _def_axis(f):
-        if axis_hist and f < len(axis_hist):
-            return _axis3(axis_hist[f])
-        if f > 0:
-            p  = np.array(_pos3(_def_pos(f)))
-            pp = np.array(_pos3(_def_pos(f-1)))
-            dv = p - pp
-            return _axis3(dv) if np.linalg.norm(dv) > 1e-9 else np.array([1,0,0])
-        return np.array([1,0,0])
+
+    align     = att_cfg.get('align','x')
+    up        = np.asarray(att_cfg.get('up',[0,0,1]), float)
+    yaw_lock  = bool(att_cfg.get('horizon_lock', True))
+    roll_gain = float(att_cfg.get('roll_gain', 0.0))
+    vmin      = float(att_cfg.get('min_speed_for_axis', 1e-3))
+
+    def _default_boresight():
+        return np.array([1,0,0]) if align == 'x' else np.array([0,0,1])
 
     def _R_exec(agent, idx):
-        align = att_cfg.get('align','x')
-        up    = np.asarray(att_cfg.get('up',[0,0,1]), float)
-        kroll = float(att_cfg.get('roll_gain', 0.0))  # optional twist stabilization
-
-        # Prefer stored attitudes if available
+        # Prefer stored exec attitudes
         key = 'exec_att1' if agent == 1 else 'exec_att2'
         L = frames_dict.get(key, [])
         if L and idx < len(L) and 'R' in L[idx] and L[idx]['R'] is not None:
@@ -1389,29 +1329,32 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
             R_prev_ui[agent-1] = R
             return R
 
-        # Desired boresight (axis): axis_hist wins; else use velocity direction
+        # Otherwise derive from path / axis_hist and evolve
         if axis_hist and idx < len(axis_hist) and axis_hist[idx] is not None:
-            a_des = _unit(axis_hist[idx])
+            a_des = np.asarray(axis_hist[idx], float)
+            if a_des.shape[0] == 2: a_des = np.array([a_des[0], a_des[1], 0.0], float)
+            n = np.linalg.norm(a_des); a_des = a_des if n < 1e-12 else a_des/n
         else:
             pos_seq = exec1 if agent == 1 else exec2
             if idx > 0:
                 p  = np.asarray(pos_seq[idx], float)
                 pp = np.asarray(pos_seq[idx-1], float)
-                dv = p - pp
-                a_des = _unit(dv) if np.linalg.norm(dv) > 1e-12 else (
-                    (R_prev_ui[agent-1][0] if (R_prev_ui[agent-1] is not None and align=='x')
-                    else (R_prev_ui[agent-1][2] if R_prev_ui[agent-1] is not None else
-                        (np.array([1,0,0]) if align=='x' else np.array([0,0,1]))))
-                )
+                dv = p - pp; n = np.linalg.norm(dv)
+                if n < vmin:
+                    if R_prev_ui[agent-1] is not None:
+                        a_des = (R_prev_ui[agent-1][0] if align=='x' else R_prev_ui[agent-1][2])
+                    else:
+                        a_des = _default_boresight()
+                else:
+                    a_des = dv/n
             else:
-                a_des = np.array([1,0,0]) if align=='x' else np.array([0,0,1])
+                a_des = _default_boresight()
 
         R_prev = R_prev_ui[agent-1]
-        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up, k_roll=kroll)
+        R_new  = evolve_dcm(R_prev, a_des, align=align, world_up=up,
+                            k_roll=roll_gain, yaw_lock=yaw_lock)
         R_prev_ui[agent-1] = R_new
         return R_new
-
-
 
     def _draw_fov(f, p, R_wb):
         _clear_fov()
@@ -1430,14 +1373,10 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
             fov_art['coll'], fov_art['rim'], fov_art['edges'] = coll, None, edges
         else:
             coll, rim = draw_fov_cone_3d(
-                ax, x_def, fov_cfg,
-                color=col, alpha=fov_cfg.get("alpha",0.15),
-                align=att_cfg.get('align','x'),
-                R_wb=R_wb
+                ax, x_def, (R_wb[0] if align=='x' else R_wb[2]),
+                fov_cfg, color=col, alpha=fov_cfg.get("alpha",0.15), align=align
             )
             fov_art['coll'], fov_art['rim'] = coll, rim
-
-
 
     # Widgets
     s_frame = W.IntSlider(min=0, max=n_frames-1, step=1, value=0, description='frame')
@@ -1493,8 +1432,6 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
         R_def = _R_exec(agent_id, f)
         _draw_fov(f, p_def, R_def)
 
-
-
         ax.view_init(elev=s_elev.value, azim=s_azim.value)
         fig.canvas.draw_idle()
 
@@ -1509,6 +1446,7 @@ def interactive_rollout_3d(frames_dict, cfg, title="Interactive 3D rollout",
     redraw(0)
     ui = W.VBox([W.HBox([play, s_frame]), W.HBox([s_azim, s_elev, t_plan, t_axes, t_fov])])
     display(ui)  # intentionally not displaying 'fig' to avoid a static duplicate
+
 
 
 def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
