@@ -8,10 +8,11 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.lines import Line2D
 
 
-import importlib, game_sharedutils, game_3dutils, game_costs
+import importlib, game_sharedutils, game_3dutils, game_costs, neos_path_game
 importlib.reload(game_sharedutils)
 importlib.reload(game_3dutils)
 importlib.reload(game_costs)
+importlib.reload(neos_path_game)
 
 
 
@@ -40,10 +41,234 @@ __all__ = [
 
 __all__ += ["draw_camera_frustum_3d", "project_point_pinhole", "points_in_fov_mask"]
 
+try:
+    from neos_path_game import (
+        build_mcp_two_player_one_shot,
+        solve_with_local_path,
+        extract_trajectories,
+    )
+
+
+    HAS_PATH = True
+except Exception:
+    HAS_PATH = False
+
+
+def _pack_tau_numpy(X, U):
+    # X: (T, nx), U: (T-1, nu) as numpy arrays
+    return np.concatenate([X.reshape(-1), U.reshape(-1)])
+
+
+
+# ---- PATH/MCP: path-inequality builders (h(k) >= 0) -------------------------
+# game_3dutils.py  (replace your build_h_builders with this)
+def build_h_builders(cfg, nx, D):
+    """
+    Return a list of callables h(m,k) >= 0 built from whatever keys
+    actually exist in cfg (arena, sep_min/min_sep, vmax/speed_max).
+    """
+    ar = (cfg.get("arena") or {})
+    funcs = []
+
+    def _x(m, agent, k, j):
+        return m.x1[k, j] if agent == 1 else m.x2[k, j]
+
+    # -------- arena --------
+    # Box if explicit bounds present
+    if {"xmin","xmax","ymin","ymax"} <= set(ar.keys()):
+        xmin, xmax = float(ar["xmin"]), float(ar["xmax"])
+        ymin, ymax = float(ar["ymin"]), float(ar["ymax"])
+        have_z     = (D == 3) and ("zmin" in ar and "zmax" in ar)
+        zmin, zmax = (float(ar["zmin"]), float(ar["zmax"])) if have_z else (None, None)
+
+        for agent in (1, 2):
+            funcs.append(lambda m,k,_a=agent,_b=xmin: _x(m,_a,k,0) - _b)  # x >= xmin
+            funcs.append(lambda m,k,_a=agent,_b=xmax: _b - _x(m,_a,k,0))  # xmax - x
+            if D >= 2:
+                funcs.append(lambda m,k,_a=agent,_b=ymin: _x(m,_a,k,1) - _b)
+                funcs.append(lambda m,k,_a=agent,_b=ymax: _b - _x(m,_a,k,1))
+            if have_z:
+                funcs.append(lambda m,k,_a=agent,_b=zmin: _x(m,_a,k,2) - _b)
+                funcs.append(lambda m,k,_a=agent,_b=zmax: _b - _x(m,_a,k,2))
+
+    # Sphere if given (your CONFIG uses this)
+    elif {"cx","cy","cz","r"} <= set(ar.keys()) or ar.get("type") == "sphere":
+        cx = float(ar.get("cx", 0.0))
+        cy = float(ar.get("cy", 0.0))
+        cz = float(ar.get("cz", 0.0))
+        R2 = float(ar.get("r", 1.0))**2
+
+        def _sphere_h(agent):
+            def h(m,k,_a=agent,_cx=cx,_cy=cy,_cz=cz,_R2=R2):
+                px = _x(m,_a,k,0) - _cx
+                py = _x(m,_a,k,1) - _cy if D >= 2 else 0.0
+                pz = _x(m,_a,k,2) - _cz if D == 3 else 0.0
+                return _R2 - (px*px + py*py + pz*pz)  # inside sphere
+            return h
+        funcs += [_sphere_h(1), _sphere_h(2)]
+
+    # -------- min separation --------
+    sep = cfg["sep_min"] if "sep_min" in cfg else (cfg["min_sep"] if "min_sep" in cfg else None)
+    if sep is not None:
+        d2 = float(sep)**2
+        def h_sep(m,k,_d2=d2):
+            s = 0
+            for j in range(D):
+                s += (_x(m,1,k,j) - _x(m,2,k,j))**2
+            return s - _d2  # >= 0
+        funcs.append(h_sep)
+
+    # -------- speed cap --------
+    vmax = cfg["vmax"] if "vmax" in cfg else (cfg["speed_max"] if "speed_max" in cfg else None)
+    if vmax is not None:
+        vmax2 = float(vmax)**2
+        vel_idx = list(range(D, 2*D))
+        def _speed_h(agent):
+            def h(m,k,_a=agent,_v=vel_idx,_v2=vmax2):
+                vsq = 0
+                for j in _v:
+                    vsq += (m.x1[k,j] if _a == 1 else m.x2[k,j])**2
+                return _v2 - vsq  # >= 0
+            return h
+        funcs += [_speed_h(1), _speed_h(2)]
+
+    return funcs
+
+
 
 # -------------------- 3D solver entrypoint --------------------
-def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
-    """Solve once (open-loop) with optional roll augmentation inside the state."""
+
+def _solve_once_with_path(cfg, Ad_mx, Bd_mx, T, nx, nu, D, x0_1, x0_2,
+                          x_lb=None, x_ub=None, u_lb=None, u_ub=None):
+    if not HAS_PATH:
+        raise RuntimeError("PATH/NEOS not available. Did you create neos_path_game.py and install pyomo?")
+
+    # --- helpers ---
+    def _finite(arr, big=1e6):
+        a = np.asarray(arr, float)
+        mask = ~np.isfinite(a)
+        if mask.any():
+            a[mask] = np.sign(a[mask]) * big
+        return a
+
+    def _ensure_bounds(x_lb, x_ub, u_lb, u_ub):
+        # Controls MUST be finite for a well-posed VI; default if missing.
+        if (u_lb is None) or (u_ub is None):
+            umax = float(cfg.get("u_max", 0.25))   # reasonable accel bound for dt≈0.1–0.2
+            u_lb = -umax * np.ones(nu)
+            u_ub =  umax * np.ones(nu)
+        else:
+            u_lb = _finite(u_lb[:nu]); u_ub = _finite(u_ub[:nu])
+
+        # State bounds: if missing, derive a safe box from the arena or fall back to big finite
+        if (x_lb is None) or (x_ub is None):
+            ar = cfg.get("arena", {})
+            if ({"xmin","xmax","ymin","ymax"} <= set(ar.keys())):
+                lo = [ar["xmin"], ar["ymin"]] + [-np.inf]*(nx-2)
+                hi = [ar["xmax"], ar["ymax"]] + [ np.inf]*(nx-2)
+                if D == 3:
+                    lo = [ar.get("xmin",-3), ar.get("ymin",-3), ar.get("zmin",-3)] + [-np.inf]*(nx-3)
+                    hi = [ar.get("xmax", 3), ar.get("ymax", 3), ar.get("zmax", 3)] + [ np.inf]*(nx-3)
+                x_lb = np.array(lo, float); x_ub = np.array(hi, float)
+            else:
+                x_lb = -1e3*np.ones(nx); x_ub = 1e3*np.ones(nx)
+        else:
+            x_lb = _finite(x_lb[:nx]); x_ub = _finite(x_ub[:nx])
+        return (x_lb, x_ub), (u_lb, u_ub)
+
+    def _pick_cost_kind(cfg):
+        setting = str(cfg.get("setting", "lqr")).lower()
+        if setting in {"chase_escape_tail", "tail", "chase-escape", "ce"}:
+            return "chase_escape_tail"
+        return "lqr"
+
+    # --- numeric data ---
+    Ad_np = as_numpy_const(Ad_mx); Bd_np = as_numpy_const(Bd_mx)
+    (x_bounds, u_bounds) = _ensure_bounds(x_lb, x_ub, u_lb, u_ub)
+
+    # --- path-inequalities (arena+sep+speed) ---
+    h_list = build_h_builders(cfg, nx, D)
+
+    # --- build MCP ---
+    cost_kind = _pick_cost_kind(cfg)
+    m = build_mcp_two_player(
+        Ad_np, Bd_np, T, nx, nu,
+        x0_1, x0_2,
+        Q=np.eye(nx), R1=np.eye(nu), R2=np.eye(nu),   # only used for LQ fallback
+        D=D,
+        x_bounds=x_bounds, u_bounds=u_bounds,
+        h_builders=h_list,
+        cost_kind=cost_kind,
+        cost_cfg=cfg,
+    )
+
+    # --- warm start: roll forward zero-controls to seed x; zeros for u, λ ---
+    #   This massively stabilizes PATH on the first solve.
+    def _roll(A, B, x0):
+        X = np.zeros((T+1, nx)); U = np.zeros((T, nu))
+        X[0] = x0
+        for k in range(T):
+            X[k+1] = A @ X[k] + B @ U[k]
+        return X, U
+
+    X1_0, U1_0 = _roll(Ad_np, Bd_np, np.asarray(x0_1, float))
+    X2_0, U2_0 = _roll(Ad_np, Bd_np, np.asarray(x0_2, float))
+
+    for k in range(T+1):
+        for i in range(nx):
+            m.x1[k, i].value = float(np.clip(X1_0[k, i], x_bounds[0][i], x_bounds[1][i]))
+            m.x2[k, i].value = float(np.clip(X2_0[k, i], x_bounds[0][i], x_bounds[1][i]))
+        if k < T:
+            for j in range(nu):
+                m.u1[k, j].value = 0.0
+                m.u2[k, j].value = 0.0
+    for k in range(T+1):
+        for i in range(nx):
+            m.lam1[k, i].value = 0.0
+            m.lam2[k, i].value = 0.0
+
+    # --- solve with PATH ---
+    path_exe = (cfg.get("solvers", {}) or {}).get("pathampl")
+    print(f"[PATH] cost_kind={cost_kind}, |H|={len(h_list)}, bounds: "
+          f"u∈[{u_bounds[0].min():.3g},{u_bounds[1].max():.3g}] "
+          f"x-box finite? {np.isfinite(x_bounds[0]).all() and np.isfinite(x_bounds[1]).all()}")
+    res = solve_with_local_path(
+            m,
+            path_exe="/Users/gussantaella/Documents/UTAustin/Research/Code/Research_Repo/path_5/ampl/pathampl",
+            tee=True,
+        )
+
+
+    # --- extract and sanity-check ---
+    X1, U1, X2, U2 = extract_trajectories(m)
+
+    # quick post-check on path-ineqs
+    def _min_h(hfun):
+        v = +np.inf
+        for k in range(T+1):
+            try:
+                v = min(v, float(value(hfun(m, k))))
+            except Exception:
+                pass
+        return v
+
+    if h_list:
+        mins = [_min_h(hf) for hf in h_list]
+        print("[PATH] min h over horizon:", ", ".join(f"{v:.2e}" for v in mins))
+
+    return X1, U1, X2, U2
+
+
+
+def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None,
+                       solver_kind: str = "ipopt"):
+    """
+    Solve once (open-loop) with optional roll augmentation inside the state.
+
+    solver_kind:
+      - "ipopt": original KKT-residual least-squares (default)
+      - "path" : solve an MCP via PATH/NEOS (LQ assumptions in the helper)
+    """
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
@@ -67,22 +292,56 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
         Ad_mx, Bd_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
 
-    # --- constraints builders (use linear builder with fixed Ad,Bd) ---
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
-
     # --- bounds (augment if attitude is on) ---
     x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
     if use_att:
         x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-    htil_fun  = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
-    # --- symbols ---
+    # --- constraints builders (fixed Ad,Bd) ---
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
+    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
+
+    # --- theta (initial param; pad with φ if needed) ---
+    x0_rows = np.asarray(cfg["x0"], float)
+    assert x0_rows.shape[0] == N, f"cfg['x0'] must have {N} rows (one per agent)"
+    theta_parts = []
+    for i in range(N):
+        x0_i = pad_x0_with_att(x0_rows[i], att_cfg, D)[:nx] if use_att else x0_rows[i][:nx]
+        theta_parts.append(x0_i)
+    theta0 = np.hstack(theta_parts)
+
+    # --- PATH branch (optional) ---
+    if (solver_kind or "").lower() == "path":
+        # solve via MCP (PATH/NEOS) and pack into z so plotting stays intact
+        x0_1, x0_2 = theta0[:nx], theta0[nx:2*nx]
+        X1, U1, X2, U2 = _solve_once_with_path(
+            cfg, Ad_mx, Bd_mx, T, nx, nu, D, x0_1, x0_2,
+            x_lb=x_lb, x_ub=x_ub, u_lb=u_lb, u_ub=u_ub
+        )
+
+        nprim = T*nx + (T-1)*nu
+        tau1 = _pack_tau_numpy(X1, U1)
+        tau2 = _pack_tau_numpy(X2, U2)
+
+        # sizes for lam, mu (we provide zeros as placeholders)
+        t_sym  = ca.MX.sym('t', N*nprim); th_sym = ca.MX.sym('th', nx*N)
+        n_g    = int(gtil_fun(t_sym, th_sym).shape[0])
+        n_h    = int(htil_fun(t_sym, th_sym).shape[0])
+
+        zstar = np.r_[tau1, tau2, np.zeros(n_g), np.zeros(n_h)]
+        print("[3D/PATH] Solved MCP with PATH/NEOS; packing plan for plotting.")
+        return dict(
+            z=zstar, residual=np.nan,
+            meta=dict(T=T, nx=nx, nu=nu, N=N, D=D, nprim=nprim,
+                      n_g=n_g, n_h=n_h)
+        )
+
+    # -------------------- IPOPT branch (your original) --------------------
     nprim = T*nx + (T-1)*nu
     taus  = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
     tau   = ca.vcat(taus)
     theta = ca.MX.sym('theta', nx*N)
 
-    # --- costs & KKT residual objective ---
     fs   = cost_builder(nx, nu, T, N, cfg)
     gtil = gtil_fun(tau, theta)
     htil = htil_fun(tau, theta)
@@ -99,8 +358,6 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     z   = ca.vcat(taus + [lam_t, mu_t])
     obj = 0.5 * ca.dot(G, G)
 
-    # opts = {'ipopt.print_level': 0, 'print_time': 0}
-
     opts = {
         "ipopt.tol": 1e-4,
         "ipopt.acceptable_tol": 1e-3,
@@ -108,24 +365,14 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
         "ipopt.print_level": 0,
         "print_time": 0
     }
-
     if ipopt_opts: opts.update(ipopt_opts)
     solver = ca.nlpsol('solver', 'ipopt', {'x': z, 'p': theta, 'f': obj}, opts)
 
-    # --- initial parameter theta (pad with φ[/w] if needed) ---
-    x0_rows = np.asarray(cfg["x0"], float)
-    assert x0_rows.shape[0] == N, f"cfg['x0'] must have {N} rows (one per agent)"
-    theta_parts = []
-    for i in range(N):
-        x0_i = pad_x0_with_att(x0_rows[i], att_cfg, D)[:nx] if use_att else x0_rows[i][:nx]
-        theta_parts.append(x0_i)
-    theta0 = np.hstack(theta_parts)
-
-    # --- simple bounds on KKT multipliers (μ ≥ 0) ---
+    # μ ≥ 0
     lbz = -np.inf*np.ones(z.shape[0]); ubz =  np.inf*np.ones(z.shape[0])
     lbz[N*nprim + gtil.shape[0]:] = 0.0
 
-    # --- solve ---
+    # solve
     sol = solver(x0=np.zeros(z.shape[0]), lbx=lbz, ubx=ubz, p=theta0)
     zstar = np.array(sol['x']).squeeze()
     residual = float(sol['f'])
@@ -139,10 +386,18 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None):
     )
 
 
+
 # -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
-                                  turn_len: int | None = None, ipopt_opts: dict | None = None):
-    """RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖."""
+                                  turn_len: int | None = None, ipopt_opts: dict | None = None,
+                                  solver_kind: str = "ipopt"):
+    """
+    RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.
+
+    solver_kind:
+      - "ipopt": original KKT-residual replans
+      - "path" : one big MCP via PATH, persistent model + warm starts
+    """
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
@@ -183,7 +438,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
-    # --- solver (KKT residual objective) ---
+    # --- symbols & IPOPT solver (only used in IPOPT branch) ---
     nprim     = T*nx + (T-1)*nu
     taus_syms = [ca.MX.sym(f"tau{i+1}", nprim) for i in range(N)]
     tau_sym   = ca.vcat(taus_syms)
@@ -205,11 +460,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     obj  = 0.5 * ca.dot(G, G) + 1e-10 * ca.dot(z_sym, z_sym)
 
     opts = {'ipopt.print_level': 0, 'print_time': 0}
-    
     if ipopt_opts: opts.update(ipopt_opts)
     solver = ca.nlpsol('solver', 'ipopt', {'x': z_sym, 'p': theta_sym, 'f': obj}, opts)
 
-    # --- simple bounds on KKT multipliers (μ ≥ 0) ---
+    # bounds on decision vector for IPOPT (μ ≥ 0)
     BIG = 1e8
     lbz = -BIG*np.ones(z_sym.shape[0]); ubz = BIG*np.ones(z_sym.shape[0])
     lbz[N*nprim + gtil.shape[0]:] = 0.0
@@ -245,26 +499,16 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
     # --- attitude_from_state: keep prev_R and return R for chaining ---
     def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, use_att=True, i_phi=None):
-        """
-        Compute body attitude from current state, with continuity when velocity ~ 0.
-        - x: state vector (includes velocity and possibly φ if use_att)
-        - prev_R: previous rotation matrix (fallback for continuity)
-        - prev_axisD: previous boresight axis (D-dim, fallback when velocity small)
-        - att_cfg: dict with align, up, min_speed_for_axis, etc.
-        - use_att: whether φ roll is part of the state
-        - i_phi: index of φ inside x
-        """
         if att_cfg is None:
             att_cfg = {}
         align    = att_cfg.get("align", "x")
         world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
         vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
 
-        D = 3 if len(x) >= 6 else 2  # crude: detect state dimension
-        v  = np.asarray(x[D:2*D], float)  # velocity slice
+        DD = 3 if len(x) >= 6 else 2
+        v  = np.asarray(x[DD:2*DD], float)
         n  = np.linalg.norm(v)
 
-        # Step 1: axis from velocity if valid, else previous
         if n > vmin:
             axisD = v / n
         elif prev_axisD is not None:
@@ -272,24 +516,16 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         else:
             axisD = np.array([1, 0, 0]) if align == "x" else np.array([0, 0, 1])
 
-        axis3 = axisD if D == 3 else np.array([axisD[0], axisD[1], 0.0], float)
+        axis3 = axisD if DD == 3 else np.array([axisD[0], axisD[1], 0.0], float)
 
-        # Step 2: make frame, continuous if possible
-        R = frame_from_axis_continuous(axis3,
-                                    R_prev=prev_R,
-                                    align=align,
-                                    world_up=world_up)
+        R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
 
-        # Step 3: roll
         phi = 0.0
         if use_att and i_phi is not None and i_phi < len(x):
             phi = float(x[i_phi])
             R   = apply_roll_about_axis(R, phi, align=align)
 
         return R, axisD, phi
-
-
-
 
     # --- plan side: carry R_prev through the horizon ---
     def plan_attitudes_from_X(X, prev_axisD, prev_R):
@@ -301,7 +537,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             att_list.append({"R": R, "phi": phi_t})
             R_prev = R
         return att_list, ax_prev, R_prev
-
 
     # --- t=0 attitude seed from initial velocity (so first frame draws correctly) ---
     align    = att_cfg.get("align", "x")
@@ -319,21 +554,16 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
     prev_R1, prev_R2 = R1_0, R2_0
 
-
     # log true t=0 snapshot
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
     exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
     exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
     if fov_enabled:
-        # pick defending agent's executed attitude at t=0
         R_def0 = R2_0 if fov_agent == 2 else R1_0
         x_def  = x2    if fov_agent == 2 else x1
         x_tgt  = x1    if fov_agent == 2 else x2
-
-        # (optional: keep this for plotting fallback history)
         a_def3 = R_def0[0] if align == 'x' else R_def0[2]
         fov_axis_hist.append(a_def3)
-
         cam_cfg = cfg.get("camera", None)
         if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
             _, _, _, ok0 = project_point_pinhole(
@@ -341,16 +571,87 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             )
             fov_seen_mask.append(bool(ok0))
         else:
-            # cone visibility is axis-only; roll doesn't change the boolean
             seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
             fov_seen_mask.append(bool(seen0))
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
+    # -------------------- PATH (one persistent MCP) --------------------
+    use_path = (solver_kind or "").lower() == "path"
+    path_ctx = None
+    if use_path:
+        # Wide var boxes; real limits go into h(x) >= 0
+        x_var_box = (-1e6, 1e6)
+        u_var_box = (-1e3, 1e3)
+        h_list    = build_h_builders(cfg, nx, D)
 
-    # --- first plan (uses current θ and previous boresights) ---
-    z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
-    def replan(theta_vec, z_init, prev1D, prev2D, prevR1, prevR2):
+        # Build once, keep across replans
+        m_path = build_mcp_two_player_one_shot(
+            Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
+            T=T, nx=nx, nu=nu, D=D,
+            x0_1=x1, x0_2=x2,
+            x_var_box=x_var_box, u_var_box=u_var_box,
+            h_builders=h_list,
+            cost_kind=cfg.get("setting","chase_escape_tail"),
+            cost_cfg=cfg,
+        )
+        path_ctx = {
+            "m": m_path,
+            "A": as_numpy_const(Ad_mx),
+            "B": as_numpy_const(Bd_mx),
+            "X1_guess": None, "U1_guess": None,
+            "X2_guess": None, "U2_guess": None,
+        }
+
+    # --- small warm-start utils (PATH) ---
+    def _shift_controls_one_step(U_prev, target_len, fill=0.0):
+        """
+        Shift controls forward by one step for warm-starting PATH.
+        Returns an array with shape (target_len, nu).
+        - copies U_prev[1:] into the front
+        - fills the tail with `fill` (default 0.0)
+        """
+        U_prev = np.asarray(U_prev, float)
+        if U_prev.ndim != 2:
+            raise ValueError(f"_shift_controls_one_step expects 2D array, got {U_prev.shape}")
+        old_len, nu = U_prev.shape
+        U_new = np.full((target_len, nu), float(fill))
+        if old_len >= 2:
+            take = min(target_len-1, old_len-1)
+            if take > 0:
+                U_new[:take, :] = U_prev[1:1+take, :]
+        # else: nothing to copy; stays filled with `fill`
+        return U_new
+
+    def _forward_sim_x(A, B, x0, U):
+        A = np.asarray(A, float); B = np.asarray(B, float)
+        x0 = np.asarray(x0, float)
+        Tm1, _ = U.shape
+        nx_ = A.shape[0]
+        X = np.zeros((Tm1+1, nx_), float)
+        X[0,:] = x0
+        for k in range(Tm1):
+            X[k+1,:] = A @ X[k,:] + B @ U[k,:]
+        return X
+
+    def _seed_model_from_guess(m, X1, U1, X2, U2):
+        # X* shape: (T+1, nx); U* shape: (T, nu)
+        for k in list(m.Kx):
+            ki = int(k)
+            for i in list(m.S):
+                ii = int(i)
+                m.x1[k, i].value = float(X1[ki, ii])
+                m.x2[k, i].value = float(X2[ki, ii])
+        for k in list(m.Ku):
+            kk = int(k)
+            for j in list(m.U):
+                jj = int(j)
+                m.u1[k, j].value = float(U1[kk, jj])
+                m.u2[k, j].value = float(U2[kk, jj])
+
+
+    # --- replanners ---
+    def replan_ipopt(theta_vec, z_init, prev1D, prev2D, prevR1, prevR2):
         sol  = solver(x0=z_init, lbx=lbz, ubx=ubz, p=theta_vec)
         z_new = np.array(sol['x']).squeeze()
         taus  = split_players_from_z(z_new, N, T, nx, nu)
@@ -362,18 +663,79 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev2D, prevR2)
         return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
 
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-        replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+    def replan_path(theta_vec, prev1D, prev2D, prevR1, prevR2):
+        x0_1 = theta_vec[:nx]
+        x0_2 = theta_vec[nx:2*nx]
+
+        m = path_ctx["m"]
+        A = path_ctx["A"]; B = path_ctx["B"]
+
+        # --- refresh IC params (mutable) + seed x(0) to match
+        for i in range(nx):
+            m.x01[i] = float(x0_1[i])
+            m.x02[i] = float(x0_2[i])
+            m.x1[0, i].value = float(x0_1[i])
+            m.x2[0, i].value = float(x0_2[i])
+
+        # --- warm-start controls (length = |Ku| = T)
+        Ku_len = len(list(m.Ku))
+        if path_ctx["U1_guess"] is None:
+            U1g = np.zeros((Ku_len, nu))
+            U2g = np.zeros((Ku_len, nu))
+        else:
+            # make sure the shifter returns (Ku_len, nu)
+            U1g = _shift_controls_one_step(path_ctx["U1_guess"], target_len=Ku_len)
+            U2g = _shift_controls_one_step(path_ctx["U2_guess"], target_len=Ku_len)
+
+        # --- forward-sim to get X guesses (length = |Kx| = T+1)
+        X1g = _forward_sim_x(A, B, x0_1, U1g)  # expect shape (Ku_len+1, nx)
+        X2g = _forward_sim_x(A, B, x0_2, U2g)
+
+        # --- seed model values (uses Kx/Ku, not K)
+        _seed_model_from_guess(m, X1g, U1g, X2g, U2g)
+
+        # --- solve
+        solve_with_local_path(
+            m,
+            path_exe="/Users/gussantaella/Documents/UTAustin/Research/Code/Research_Repo/path_5/ampl/pathampl",
+            tee=True,
+        )
+
+        # --- extract + cache warm start for next turn
+        X1, U1, X2, U2 = extract_trajectories(m)
+        path_ctx["X1_guess"], path_ctx["U1_guess"] = X1, U1
+        path_ctx["X2_guess"], path_ctx["U2_guess"] = X2, U2
+
+        # --- pack outputs for viz/exec (use first T states for planning visuals)
+        plan1 = [_p3_row(X1[t, :]) for t in range(T)]
+        plan2 = [_p3_row(X2[t, :]) for t in range(T)]
+        att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev1D, prevR1)
+        att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev2D, prevR2)
+        z_new = np.zeros(1)  # dummy (PATH branch doesn't use z)
+        return z_new, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
+
+
+    # --- first plan (uses current θ and previous boresights) ---
+    z_last = np.zeros(z_sym.shape[0]); z_last[N*nprim + gtil.shape[0]:] = 1e-3
+    if use_path:
+        z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+            replan_path(theta_curr, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+    else:
+        z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+            replan_ipopt(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
     step_in_turn = 0
 
     # -------------------- rollout --------------------
     for k in range(steps):
         # replan each turn
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-                replan(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+            if use_path:
+                z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+                    replan_path(theta_curr, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
+            else:
+                z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
+                    replan_ipopt(theta_curr, z_last, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
             step_in_turn = 0
-
 
         # log current plan (for this step)
         plan_hist1.append(plan1); plan_hist2.append(plan2)
@@ -403,8 +765,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         phi_hist1.append(phi1_now)
         phi_hist2.append(phi2_now)
 
-
-
         # 3) log executed pose + attitude
         exec_att1.append({"R": R1, "phi": phi1_now})
         exec_att2.append({"R": R2, "phi": phi2_now})
@@ -412,12 +772,9 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
         # 4) FOV (selected agent)
         if fov_enabled:
-            # executed attitude this step
             R_def = R2 if fov_agent == 2 else R1
             x_def = x2 if fov_agent == 2 else x1
             x_tgt = x1 if fov_agent == 2 else x2
-
-            # (optional history for plotting)
             a_def3 = R_def[0] if align == 'x' else R_def[2]
             fov_axis_hist.append(a_def3)
 
@@ -433,7 +790,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-
     return {
         'plan_hist1': plan_hist1,
         'plan_hist2': plan_hist2,
@@ -448,8 +804,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         'fov_axis_hist': fov_axis_hist,
         'fov_seen_mask': fov_seen_mask,
     }
-
-
 
 
 # -------------------- plotting --------------------
