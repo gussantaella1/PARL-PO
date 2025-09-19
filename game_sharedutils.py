@@ -343,141 +343,93 @@ def blkdiag2D(A, B):
     return np.block([[A, np.zeros((A.shape[0], B.shape[1]))],
                      [np.zeros((B.shape[0], A.shape[1])), B]])
 
-def augment_AB_for_att(Ad_tr_mx, Bd_tr_mx, dt: float, att_cfg: dict):
-    Ad_tr = as_numpy_const(Ad_tr_mx)
-    Bd_tr = as_numpy_const(Bd_tr_mx)
-    nx_tr = Ad_tr.shape[0]
-    nu_tr = Bd_tr.shape[1]
-
-    model = (att_cfg.get("model") or "roll1").lower()
-
-    if model in ("roll1", "roll2", "roll2_tau"):
-        A_att, B_att = att_roll_AB(dt, att_cfg)   # your existing roll variants
-        nxa, nua = A_att.shape[0], B_att.shape[1]
-    elif model == "lin3d":
-        A_att, B_att = att_lin3d_AB(dt, att_cfg)  # NEW
-        nxa, nua = A_att.shape[0], B_att.shape[1]
-    else:
-        raise ValueError(f"Unknown att.model={model}")
-
-    # augmented A, B
-    Ad_aug = np.block([
-        [Ad_tr,                         np.zeros((nx_tr, nxa))],
-        [np.zeros((nxa, Ad_tr.shape[1])), A_att               ],
-    ])
-    Bd_aug = np.block([
-        [Bd_tr,                         np.zeros((nx_tr, nua))],
-        [np.zeros((nxa, nu_tr)),        B_att                 ],
-    ])
-
-    idx = dict(
-        nx_tr=nx_tr, nu_tr=nu_tr,
-        nx=nx_tr + nxa, nu=nu_tr + nua,
-        model=model,
-        i_phi=None,
-        i_w=None,
-        i_dtheta=(nx_tr, nx_tr+3) if model=="lin3d" else None,
-        i_w3=(nx_tr+3, nx_tr+6)   if model=="lin3d" else None,
-        i_u_att=(nu_tr, nu_tr+nua)
-    )
-    return ca.MX(Ad_aug), ca.MX(Bd_aug), idx
-
-
-
-def augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg: dict):
+def augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg):
     """
-    Append attitude bounds to the existing translational bounds.
-    Expected keys (examples):
-      roll1 : att.phi_min/max, att.omega_max
-      roll2 : att.phi_min/max, att.w_max, att.alpha_max
-    If a bound is omitted, we use a safe default.
+    Augment translational Ad,Bd with attitude states [φ, θ, ψ].
+    Each evolves with a simple integrator: angle_{k+1} = angle_k + dt * rate.
     """
-    model = (att_cfg.get("model") or "roll1").lower()
-    if model == "roll1":
-        phi_min = float(att_cfg.get("phi_min", -np.pi))
-        phi_max = float(att_cfg.get("phi_max",  np.pi))
-        omg_max = float(att_cfg.get("omega_max", 0.0))  # rad/s (input)
-        x_lb_att = np.array([phi_min], float)
-        x_ub_att = np.array([phi_max], float)
-        u_lb_att = np.array([-omg_max], float)
-        u_ub_att = np.array([ omg_max], float)
+    Ad_tr = ca.MX(Ad_tr)
+    Bd_tr = ca.MX(Bd_tr)
+    nx_tr = Ad_tr.size1()
+    nu_tr = Bd_tr.size2()
 
-    elif model == "roll2":
-        phi_min = float(att_cfg.get("phi_min", -np.pi))
-        phi_max = float(att_cfg.get("phi_max",  np.pi))
-        w_max   = float(att_cfg.get("w_max",   0.6))     # rad/s (state)
-        a_max   = float(att_cfg.get("alpha_max", 0.0))   # rad/s^2 (input)
-        x_lb_att = np.array([phi_min, -w_max], float)
-        x_ub_att = np.array([phi_max,  w_max], float)
-        u_lb_att = np.array([-a_max], float)
-        u_ub_att = np.array([ a_max], float)
+    n_att = 3   # roll, pitch, yaw
+    n_ctrl = 3  # their rates
 
-    elif model == "roll2_tau":
-        phi_min = float(att_cfg.get("phi_min", -np.pi))
-        phi_max = float(att_cfg.get("phi_max",  np.pi))
-        w_max   = float(att_cfg.get("w_max",   0.6))     # rad/s (state)
-        tau_max = float(att_cfg.get("tau_max", 0.05))    # N·m (input)
-        x_lb_att = np.array([phi_min, -w_max], float)
-        x_ub_att = np.array([phi_max,  w_max], float)
-        u_lb_att = np.array([-tau_max], float)
-        u_ub_att = np.array([ tau_max], float)
+    # --- Augmented A ---
+    Ad_aug = ca.MX.zeros(nx_tr + n_att, nx_tr + n_att)
+    Ad_aug[:nx_tr, :nx_tr] = Ad_tr
+    Ad_aug[nx_tr:, nx_tr:] = ca.MX_eye(n_att)  # φ,θ,ψ → themselves
 
-    elif model == "lin3d":
-        dth_max = np.asarray(att_cfg.get("dtheta_bounds", [0.25, 0.25, 0.25]), float)  # rad
-        w_max   = np.asarray(att_cfg.get("w_bounds",      [0.6,  0.6,  0.6 ]),  float) # rad/s
-        tau_max = np.asarray(att_cfg.get("tau_bounds",    [0.05, 0.05, 0.05]), float) # N·m
-        x_lb_att = np.r_[-dth_max, -w_max]
-        x_ub_att = np.r_[ dth_max,  w_max]
-        u_lb_att = -tau_max
-        u_ub_att =  tau_max
+    # --- Augmented B ---
+    Bd_aug = ca.MX.zeros(nx_tr + n_att, nu_tr + n_ctrl)
+    Bd_aug[:nx_tr, :nu_tr] = Bd_tr              # translational part unchanged
+    Bd_aug[nx_tr:, nu_tr:] = dt * ca.MX_eye(n_att)  # angle += dt * rate
 
-    else:
-        raise ValueError(f"Unknown att.model={model}")
+    idx = {
+        "nx": nx_tr + n_att,
+        "nu": nu_tr + n_ctrl,
+        "i_phi":   nx_tr + 0,
+        "i_theta": nx_tr + 1,
+        "i_psi":   nx_tr + 2,
+        "i_u_phi": nu_tr + 0,
+        "i_u_theta": nu_tr + 1,
+        "i_u_psi": nu_tr + 2,
+    }
+    return Ad_aug, Bd_aug, idx
 
-    return (np.r_[x_lb, x_lb_att],
-            np.r_[x_ub, x_ub_att],
-            np.r_[u_lb, u_lb_att],
-            np.r_[u_ub, u_ub_att])
-
-def pad_x0_with_att(x0_row: np.ndarray, att_cfg: dict, D: int):
+def augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg):
     """
-    Ensure x0 includes attitude entries based on att.model:
-      - roll1      : x_att = [phi]
-      - roll2      : x_att = [phi, w]
-      - roll2_tau  : x_att = [phi, w]
-      - lin3d      : x_att = [dtheta(3), w(3)]
+    Expand bounds to include φ, θ, ψ states and their rates.
     """
-    import numpy as np
-    nx_tr, _ = dims_from_D(D)
-    model = (att_cfg.get("model") or "roll1").lower()
-    x0 = np.asarray(x0_row, float).copy()
+    x_lb = np.asarray(x_lb, float).ravel()
+    x_ub = np.asarray(x_ub, float).ravel()
+    u_lb = np.asarray(u_lb, float).ravel()
+    u_ub = np.asarray(u_ub, float).ravel()
 
-    if model == "roll1":
-        phi0 = float(att_cfg.get("phi0", 0.0))
-        x0_att = np.array([phi0], dtype=float)
-        return np.r_[x0[:nx_tr], x0_att]
+    # Angle limits (can tweak via att_cfg)
+    phi_lim   = att_cfg.get("phi_lim",   (-np.pi, np.pi))
+    theta_lim = att_cfg.get("theta_lim", (-np.pi/2, np.pi/2))
+    psi_lim   = att_cfg.get("psi_lim",   (-np.pi, np.pi))
 
-    if model in ("roll2", "roll2_tau"):
-        phi0 = float(att_cfg.get("phi0", 0.0))
-        w0   = float(att_cfg.get("w0",   0.0))
-        x0_att = np.array([phi0, w0], dtype=float)
-        return np.r_[x0[:nx_tr], x0_att]
+    # Rate limits
+    phi_dot_lim   = att_cfg.get("phi_dot_lim",   (-1.0, 1.0))
+    theta_dot_lim = att_cfg.get("theta_dot_lim", (-1.0, 1.0))
+    psi_dot_lim   = att_cfg.get("psi_dot_lim",   (-1.0, 1.0))
 
-    if model == "lin3d":
-        dtheta0 = np.asarray(att_cfg.get("dtheta0", [0.0, 0.0, 0.0]), dtype=float).reshape(3,)
-        w0      = np.asarray(att_cfg.get("w0",      [0.0, 0.0, 0.0]), dtype=float).reshape(3,)
-        return np.r_[x0[:nx_tr], dtheta0, w0]
+    # Expand state bounds
+    x_lb = np.concatenate([x_lb, [phi_lim[0],   theta_lim[0],   psi_lim[0]]])
+    x_ub = np.concatenate([x_ub, [phi_lim[1],   theta_lim[1],   psi_lim[1]]])
 
-    raise ValueError(f"Unknown att.model={model}")
+    # Expand control bounds
+    u_lb = np.concatenate([u_lb, [phi_dot_lim[0],   theta_dot_lim[0],   psi_dot_lim[0]]])
+    u_ub = np.concatenate([u_ub, [phi_dot_lim[1],   theta_dot_lim[1],   psi_dot_lim[1]]])
+
+    return x_lb, x_ub, u_lb, u_ub
+
+
+def pad_x0_with_att(x0_row, att_cfg, D):
+    """
+    Extend initial state with φ, θ, ψ.
+    Defaults = 0.0 unless att_cfg specifies otherwise.
+    """
+    x0_row = np.asarray(x0_row, float).ravel()
+    phi0   = att_cfg.get("phi0", 0.0)
+    theta0 = att_cfg.get("theta0", 0.0)
+    psi0   = att_cfg.get("psi0", 0.0)
+
+    # Append angles to whatever translational state we have
+    return np.concatenate([x0_row, [phi0, theta0, psi0]])
+
 
 
 
 # -------------------- complementarity --------------------
-def fb(a, b, eps: float = 1e-6):
-    """Smooth Fischer–Burmeister complementarity φ(a,b)≈0 enforcing a≥0 ⟂ b≥0."""
-    return ca.sqrt(a*a + b*b + 2*eps) - a - b
+# def fb(a, b, eps: float = 1e-6):
+#     """Smooth Fischer–Burmeister complementarity φ(a,b)≈0 enforcing a≥0 ⟂ b≥0."""
+#     return ca.sqrt(a*a + b*b + 2*eps) - a - b
 
-def fb_eps(a, b, eps=1e-8):
+def fb(a, b, eps=1e-8):
     # Works with MX/DM scalars or elementwise on arrays
     s = ca.sqrt(a*a + b*b + 2*eps)
     return s - (a + b)
