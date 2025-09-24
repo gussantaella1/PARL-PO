@@ -8,11 +8,12 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from matplotlib.lines import Line2D
 
 
-import importlib, game_sharedutils, game_3dutils, game_costs, neos_path_game
+import importlib, game_sharedutils, game_3dutils, game_costs, neos_path_game, ukf_estimator
 importlib.reload(game_sharedutils)
 importlib.reload(game_3dutils)
 importlib.reload(game_costs)
 importlib.reload(neos_path_game)
+importlib.reload(ukf_estimator)
 
 
 
@@ -28,6 +29,9 @@ from game_sharedutils import (
     augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous
 
 )
+
+from ukf_estimator import AgentUKF as UKF_CV  # alias so the rest of your code stays the same
+
 
 
 
@@ -403,6 +407,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     nx_tr, nu_tr = dims_from_D(D)
     T, dt  = int(cfg["T"]), float(cfg["dt"])
 
+    # === ADD: estimation config & UKF import ===
+    est_cfg = dict(cfg.get('est', {}))
+    do_est = bool(est_cfg.get('enabled', False))
+
+
     # --- translational Ad,Bd (MX) ---
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
@@ -554,10 +563,34 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
     prev_R1, prev_R2 = R1_0, R2_0
 
+    # === ADD: build UKFs and histories ===
+    if do_est:
+        s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
+        P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
+        Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
+        Rm = np.diag([s_az**2, s_el**2])
+        who = (est_cfg.get('who') or 'both').lower()
+        every = int(est_cfg.get('every', 1))
+
+        est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
+
+        ukf12 = UKF_CV(np.r_[x2[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
+        ukf21 = UKF_CV(np.r_[x1[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
+
+        # log initial guesses
+        if ukf12 is not None:
+            est_hist['est12_xyz'].append(ukf12.x[:3].copy())
+            est_hist['meas12_azel'].append(None)
+        if ukf21 is not None:
+            est_hist['est21_xyz'].append(ukf21.x[:3].copy())
+            est_hist['meas21_azel'].append(None)
+
+
     # log true t=0 snapshot
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
     exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
     exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
+
     if fov_enabled:
         R_def0 = R2_0 if fov_agent == 2 else R1_0
         x_def  = x2    if fov_agent == 2 else x1
@@ -770,6 +803,58 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         exec_att2.append({"R": R2, "phi": phi2_now})
         exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
 
+        # 3b) UKF estimation at this executed frame (after R1/R2 exist and exec_* logged)
+        if do_est:
+            idx  = len(exec_xyz1) - 1
+            take = (idx % every) == 0
+
+            def _u_tr(u):
+                u = np.asarray(u, float).ravel()
+                return u[:3] if u.size >= 3 else np.zeros(3)  # translational accel only
+
+
+            # agent 1 estimates agent 2
+
+            if ukf12 is not None:
+                u2_tr = _u_tr(u2)
+                ukf12.predict(dt, u=u2_tr, u_cov=None)
+                if take:
+                    p_obs = np.asarray(exec_xyz1[-1], float)  # P1 observer (world)
+                    p_tgt = np.asarray(exec_xyz2[-1], float)  # P2 target   (world)
+                    d = p_tgt - p_obs
+                    d /= (np.linalg.norm(d) + 1e-12)
+                    b_b = R1 @ d  # R1: world->body (already computed this frame)
+                    az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
+                    el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
+                    p_obs1_world = np.asarray(exec_xyz1[-1], float)  # agent 1 position (world)
+                    ukf12.update(np.array([az, el]), p_obs=p_obs1_world, R_wb=R1)
+                    est_hist['meas12_azel'].append((p_obs.copy(), np.array([az, el])))
+                else:
+                    est_hist['meas12_azel'].append(None)
+                est_hist['est12_xyz'].append(ukf12.x[:3].copy())
+
+
+            # agent 2 estimates agent 1
+
+            if ukf21 is not None:
+                u1_tr = _u_tr(u1)
+                ukf21.predict(dt, u=u1_tr)
+                if take:
+                    p_obs = np.asarray(exec_xyz2[-1], float)  # P2 observer
+                    p_tgt = np.asarray(exec_xyz1[-1], float)  # P1 target
+                    d = p_tgt - p_obs
+                    d /= (np.linalg.norm(d) + 1e-12)
+                    b_b = R2 @ d
+                    az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
+                    el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
+                    p_obs2_world = np.asarray(exec_xyz2[-1], float)  # agent 2 position (world)
+                    ukf21.update(np.array([az, el]), p_obs=p_obs2_world, R_wb=R2)
+                    est_hist['meas21_azel'].append((p_obs.copy(), np.array([az, el])))
+                else:
+                    est_hist['meas21_azel'].append(None)
+                est_hist['est21_xyz'].append(ukf21.x[:3].copy())
+
+
         # 4) FOV (selected agent)
         if fov_enabled:
             R_def = R2 if fov_agent == 2 else R1
@@ -790,20 +875,18 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         else:
             fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    return {
-        'plan_hist1': plan_hist1,
-        'plan_hist2': plan_hist2,
-        'plan_att1' : plan_att1,     # list over T of {"R","phi"}
-        'plan_att2' : plan_att2,
-        'exec1_xyz' : exec_xyz1,
-        'exec2_xyz' : exec_xyz2,
-        'exec_att1' : exec_att1,     # list over executed steps of {"R","phi"}
-        'exec_att2' : exec_att2,
-        'phi_hist1' : phi_hist1,
-        'phi_hist2' : phi_hist2,
-        'fov_axis_hist': fov_axis_hist,
-        'fov_seen_mask': fov_seen_mask,
+
+    ret = {
+        'plan_hist1': plan_hist1, 'plan_hist2': plan_hist2,
+        'plan_att1': plan_att1,   'plan_att2': plan_att2,
+        'exec1_xyz': exec_xyz1,   'exec2_xyz': exec_xyz2,
+        'exec_att1': exec_att1,   'exec_att2': exec_att2,
+        'phi_hist1': phi_hist1,   'phi_hist2': phi_hist2,
+        'fov_axis_hist': fov_axis_hist, 'fov_seen_mask': fov_seen_mask,
     }
+    if do_est:
+        ret.update(est_hist)
+    return ret
 
 
 # -------------------- plotting --------------------
@@ -1117,6 +1200,15 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     axis_hist  = frames_dict.get('fov_axis_hist', [])
     seen_mask  = frames_dict.get('fov_seen_mask', [])
 
+    # === ADD: estimation overlay inputs ===
+    est12 = frames_dict.get('est12_xyz', [])
+    est21 = frames_dict.get('est21_xyz', [])
+    me12  = frames_dict.get('meas12_azel', [])
+    me21  = frames_dict.get('meas21_azel', [])
+    L_meas = float(cfg.get('est', {}).get('meas_ray_len',
+                cfg.get('camera', {}).get('far', 15.0)))
+
+
     n_frames = min(len(exec1), len(exec2))
     if n_frames < 2:
         if n_frames == 1:
@@ -1142,14 +1234,67 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         cx, cy, cz, R = ar["cx"], ar["cy"], ar["cz"], ar["r"]
         ax.set_xlim(cx-R, cx+R); ax.set_ylim(cy-R, cy+R); ax.set_zlim(cz-R, cz+R)
 
-    # Paths/points + main legend
-    plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1')
-    plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2')
-    exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1')
-    exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2')
-    dot1,     = ax.plot([], [], [], 'o',  ms=6)
-    dot2,     = ax.plot([], [], [], 'o',  ms=6)
+    
+    only_est = bool(cfg.get('viz', {}).get('only_est', True))
+    show_meas = bool(cfg.get('viz', {}).get('show_meas', False))
+
+
+    artists_path = []
+    artists_exec = []
+    artists_dots = []
+    artists_meas = []
+    artists_est  = []
+
+    # --- predeclare everything so names always exist ---
+    plan1_ln = plan2_ln = exe1_ln = exe2_ln = dot1 = dot2 = None
+    me12_ln = me21_ln = None
+
+    if not only_est:
+        # create the usual plan/exec/dots
+        plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1')
+        plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2')
+        exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1')
+        exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2')
+        dot1,     = ax.plot([], [], [], 'o',  ms=6)
+        dot2,     = ax.plot([], [], [], 'o',  ms=6)
+        artists_path += [plan1_ln, plan2_ln]
+        artists_exec += [exe1_ln, exe2_ln]
+        artists_dots += [dot1, dot2]
+
+
+    # estimates (always create these)
+    est12_ln, = ax.plot([], [], [], ':', lw=1.8, marker='x', ms=6, mew=1.0, label='P2 est by P1')
+    est21_ln, = ax.plot([], [], [], ':', lw=1.8, marker='x', ms=6, mew=1.0, label='P1 est by P2')
+    artists_est += [est12_ln, est21_ln]
+
+    # measurement rays (optional)
+    if show_meas and not only_est:
+        me12_ln,  = ax.plot([], [], [], '-',  lw=1.0, alpha=0.4)
+        me21_ln,  = ax.plot([], [], [], '-',  lw=1.0, alpha=0.4)
+
+    # measurement “rays” (optional)
+    if not only_est and cfg.get('viz', {}).get('show_meas', False):
+        me12_ln,  = ax.plot([], [], [], '-',  lw=1.0, alpha=0.4)
+        me21_ln,  = ax.plot([], [], [], '-',  lw=1.0, alpha=0.4)
+        artists_meas += [me12_ln, me21_ln]
+
+    # build legend from what’s visible
+    legend_handles = artists_est if only_est else (artists_path + artists_exec + artists_est)
+    leg_main = ax.legend(legend_handles, [h.get_label() for h in legend_handles], loc='upper left')
+
+        # --- Hide plan/exec + measurement overlays so only estimates show ---
+    for ln in (plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2, me12_ln, me21_ln):
+        if ln is not None:
+            ln.set_visible(False)
+
+    # --- Rebuild legend with only visible handles (the two estimate lines) ---
+    vis_handles = [h for h in (est12_ln, est21_ln) if h.get_visible()]
+    leg_main = ax.legend(vis_handles,
+                        [h.get_label() for h in vis_handles],
+                        loc='upper left')
+    
     leg_main  = ax.legend(loc='upper left')
+
 
     # Triad legend (x/y/z color mapping)
     leg_axes = None
@@ -1260,52 +1405,158 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     # ---------- animation callbacks ----------
     def init():
-        for ln in (plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2):
-            ln.set_data([], []); ln.set_3d_properties([])
+        for ln in (plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2,
+                est12_ln, est21_ln, me12_ln, me21_ln):
+            if ln is not None:
+                ln.set_data([], [])
+                ln.set_3d_properties([])
+
         for L in (att1_lines, att2_lines):
             if L:
                 for ln in (L['bx'], L['by'], L['bz']):
                     ln.set_data([], []); ln.set_3d_properties([])
         _clear_fov()
-        artists = [plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2]
+        artists = [plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2,
+                   est12_ln, est21_ln, me12_ln, me21_ln]
         if leg_main: artists.append(leg_main)
         if leg_axes: artists.append(leg_axes)
-        return tuple(artists)
+        return tuple(artists_est + artists_path + artists_exec + artists_dots + artists_meas + ([leg_main] if leg_main else []))
+    
 
     def update(f):
-        # planned
-        if plan_hist1 and f < len(plan_hist1) and plan_hist1[f]:
-            xs, ys, zs = zip(*plan_hist1[f]); plan1_ln.set_data(xs, ys); plan1_ln.set_3d_properties(zs)
-        if plan_hist2 and f < len(plan_hist2) and plan_hist2[f]:
-            xs, ys, zs = zip(*plan_hist2[f]); plan2_ln.set_data(xs, ys); plan2_ln.set_3d_properties(zs)
+        # --- helpers ---
+        def _set3d(ln, xs, ys, zs):
+            if ln is not None:
+                ln.set_data(xs, ys)
+                ln.set_3d_properties(zs)
 
-        # executed
-        xs1 = [p[0] for p in exec1[:f+1]]; ys1 = [p[1] for p in exec1[:f+1]]; zs1 = [p[2] for p in exec1[:f+1]]
-        xs2 = [p[0] for p in exec2[:f+1]]; ys2 = [p[1] for p in exec2[:f+1]]; zs2 = [p[2] for p in exec2[:f+1]]
-        exe1_ln.set_data(xs1, ys1); exe1_ln.set_3d_properties(zs1)
-        exe2_ln.set_data(xs2, ys2); exe2_ln.set_3d_properties(zs2)
+        only_est  = bool(cfg.get('viz', {}).get('only_est', False))
+        show_meas = bool(cfg.get('viz', {}).get('show_meas', False))
 
-        # points
-        x1,y1,z1 = exec1[min(f, len(exec1)-1)]
-        x2,y2,z2 = exec2[min(f, len(exec2)-1)]
-        dot1.set_data([x1], [y1]); dot1.set_3d_properties([z1])
-        dot2.set_data([x2], [y2]); dot2.set_3d_properties([z2])
+        # --- estimates (always update; these lines exist) ---
+        est12 = frames_dict.get('est12_xyz', [])
+        est21 = frames_dict.get('est21_xyz', [])
 
-        # triads for BOTH agents
+        if est12:
+            xs, ys, zs = zip(*est12[:f+1])
+            _set3d(est12_ln, xs, ys, zs)
+        else:
+            _set3d(est12_ln, [], [], [])
+
+        if est21:
+            xs, ys, zs = zip(*est21[:f+1])
+            _set3d(est21_ln, xs, ys, zs)
+        else:
+            _set3d(est21_ln, [], [], [])
+
+        # --- planned / executed / points (skip if only_est) ---
+        if not only_est:
+            # planned
+            if plan_hist1 and f < len(plan_hist1) and plan_hist1[f]:
+                xs, ys, zs = zip(*plan_hist1[f]); _set3d(plan1_ln, xs, ys, zs)
+            else:
+                _set3d(plan1_ln, [], [], [])
+            if plan_hist2 and f < len(plan_hist2) and plan_hist2[f]:
+                xs, ys, zs = zip(*plan_hist2[f]); _set3d(plan2_ln, xs, ys, zs)
+            else:
+                _set3d(plan2_ln, [], [], [])
+
+            # executed trails
+            xs1 = [p[0] for p in exec1[:f+1]]; ys1 = [p[1] for p in exec1[:f+1]]; zs1 = [p[2] for p in exec1[:f+1]]
+            xs2 = [p[0] for p in exec2[:f+1]]; ys2 = [p[1] for p in exec2[:f+1]]; zs2 = [p[2] for p in exec2[:f+1]]
+            _set3d(exe1_ln, xs1, ys1, zs1)
+            _set3d(exe2_ln, xs2, ys2, zs2)
+
+            # current points
+            x1,y1,z1 = exec1[min(f, len(exec1)-1)]
+            x2,y2,z2 = exec2[min(f, len(exec2)-1)]
+            if dot1 is not None:
+                dot1.set_data([x1], [y1]); dot1.set_3d_properties([z1])
+            if dot2 is not None:
+                dot2.set_data([x2], [y2]); dot2.set_3d_properties([z2])
+        else:
+            # when only_est, keep the unused artists blank if they exist
+            for ln in (locals().get('plan1_ln'), locals().get('plan2_ln'),
+                    locals().get('exe1_ln'),  locals().get('exe2_ln')):
+                _set3d(ln, [], [], [])
+            if locals().get('dot1') is not None:
+                dot1.set_data([], []); dot1.set_3d_properties([])
+            if locals().get('dot2') is not None:
+                dot2.set_data([], []); dot2.set_3d_properties([])
+
+        # --- triads (use executed attitudes/poses; just skip if only_est & no artists) ---
         if show_axes:
+            x1,y1,z1 = exec1[min(f, len(exec1)-1)]
+            x2,y2,z2 = exec2[min(f, len(exec2)-1)]
             if att1_lines:
                 R1 = _R_exec(1, f)
                 update_body_axes_artists_3d(att1_lines, np.array([x1,y1,z1]), R1, L=L_tri)
             if att2_lines:
                 R2 = _R_exec(2, f)
                 update_body_axes_artists_3d(att2_lines, np.array([x2,y2,z2]), R2, L=L_tri)
+        else:
+            # clear if present
+            for L in (att1_lines, att2_lines):
+                if L:
+                    for ln in (L['bx'], L['by'], L['bz']):
+                        _set3d(ln, [], [], [])
 
-        # FOV (selected agent)
+        # --- FOV (still allowed with only_est; relies on exec paths) ---
         p_def = _pos3(_def_pos(f))
-        R_def = _R_exec(agent_id, f)  # 1 or 2
+        R_def = _R_exec(agent_id, f)
         _clear_fov(); _set_fov(p_def, R_def, f)
 
-        return plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2
+        # --- measurement rays (optional) ---
+        me12 = frames_dict.get('meas12_azel', [])
+        me21 = frames_dict.get('meas21_azel', [])
+        L_meas = float(cfg.get('viz', {}).get('meas_len', 2.0))
+
+        def _meas_ray(p_obs, R_wb, az, el, L):
+            c = np.cos(el)
+            v_b = np.array([c*np.cos(az), c*np.sin(az), np.sin(el)])  # body dir
+            v_w = R_wb.T @ v_b                                        # body->world
+            pF = p_obs + L * v_w
+            return p_obs, pF
+
+        if show_meas and locals().get('me12_ln') is not None:
+            if me12 and f < len(me12) and me12[f] is not None:
+                p1_meas, z = me12[f]; R1 = _R_exec(1, f)
+                p0, pF = _meas_ray(np.asarray(p1_meas,float), R1, float(z[0]), float(z[1]), L_meas)
+                me12_ln.set_data([p0[0], pF[0]], [p0[1], pF[1]])
+                me12_ln.set_3d_properties([p0[2], pF[2]])
+            else:
+                me12_ln.set_data([], []); me12_ln.set_3d_properties([])
+        if show_meas and locals().get('me21_ln') is not None:
+            if me21 and f < len(me21) and me21[f] is not None:
+                p2_meas, z = me21[f]; R2 = _R_exec(2, f)
+                p0, pF = _meas_ray(np.asarray(p2_meas,float), R2, float(z[0]), float(z[1]), L_meas)
+                me21_ln.set_data([p0[0], pF[0]], [p0[1], pF[1]])
+                me21_ln.set_3d_properties([p0[2], pF[2]])
+            else:
+                me21_ln.set_data([], []); me21_ln.set_3d_properties([])
+
+        # --- return artists Matplotlib should redraw ---
+        artists = []
+
+        def _add(*ls):
+            for ln in ls:
+                if ln is not None:
+                    # if you only want visible ones, use: and ln.get_visible()
+                    artists.append(ln)
+
+        # estimates are always present
+        _add(est12_ln, est21_ln)
+
+        # planned/executed/dots only when not only_est
+        if not only_est:
+            _add(plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2)
+
+        # measurement rays if created
+        if show_meas:
+            _add(me12_ln, me21_ln)
+
+        return tuple(artists)
+
 
     # Render
     out_path = save_path

@@ -1,32 +1,28 @@
-# ukf_estimator.py
+# ukf_cv.py
 from __future__ import annotations
 import numpy as np
 
-# ---- This file expects the following helper functions to exist elsewhere ----
-# def Recef2enu(r0G: np.ndarray) -> np.ndarray: ...
-# def wahbaSolver(aVec: np.ndarray, vIMat: np.ndarray, vBMat: np.ndarray) -> np.ndarray: ...
-# def euler2dcm(e: np.ndarray) -> np.ndarray: ...
-# def h_meas(x: np.ndarray, meas_noise: np.ndarray, RBIBark: np.ndarray,
-#            rXIMat: np.ndarray, mcVeck: np.ndarray, P) -> np.ndarray: ...
-# def f_dynamics(x: np.ndarray, u: np.ndarray, proc_noise: np.ndarray,
-#                delt: float, RBIHatk: np.ndarray, P) -> np.ndarray: ...
-# -----------------------------------------------------------------------------
+# -------------------------------
+# Helpers
+# -------------------------------
 
-def _blkdiag(*mats: np.ndarray) -> np.ndarray:
-    """Lightweight block-diagonal builder (avoids scipy dependency)."""
-    rows = sum(m.shape[0] for m in mats)
-    cols = sum(m.shape[1] for m in mats)
-    out = np.zeros((rows, cols), dtype=float)
-    r, c = 0, 0
-    for m in mats:
-        rr, cc = m.shape
-        out[r:r+rr, c:c+cc] = m
-        r += rr
-        c += cc
-    return out
+# Add control input into time update, if we have overconfidence issue add process bias, 
+
+def _ukf_weights(n: int, alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0):
+    """
+    Julier/Uhlmann UKF weights.
+    Returns (lam, Wm0, Wmi, Wc0, Wci, c) where c = n + lam.
+    """
+    lam = alpha**2 * (n + kappa) - n
+    c = n + lam
+    Wm0 = lam / c
+    Wmi = 1.0 / (2.0 * c)
+    Wc0 = Wm0 + (1.0 - alpha**2 + beta)
+    Wci = Wmi
+    return lam, Wm0, Wmi, Wc0, Wci, c
 
 def _safe_cholesky(A: np.ndarray, jitter: float = 1e-10, max_tries: int = 5) -> np.ndarray:
-    """Cholesky with tiny diagonal jitter for numerical robustness (returns lower-triangular)."""
+    """Cholesky with small diagonal jitter if needed. Returns lower-triangular."""
     k = 0
     while k < max_tries:
         try:
@@ -34,283 +30,193 @@ def _safe_cholesky(A: np.ndarray, jitter: float = 1e-10, max_tries: int = 5) -> 
         except np.linalg.LinAlgError:
             A = A + (jitter * (10.0 ** k)) * np.eye(A.shape[0])
             k += 1
-    # Final try—raise if still not PD
-    return np.linalg.cholesky(A)
+    return np.linalg.cholesky(A)  # last attempt may still raise
 
-def _ukf_weights(n_aug: int, alpha: float, beta: float, kappa: float):
-    """Compute UKF weights and scaling for a given augmented dimension."""
-    lam = alpha**2 * (kappa + n_aug) - n_aug
-    c = np.sqrt(n_aug + lam)
-    Wm0 = lam / (n_aug + lam)
-    Wc0 = Wm0 + (1.0 - alpha**2 + beta)
-    Wmi = 1.0 / (2.0 * (n_aug + lam))
-    Wci = Wmi
-    return lam, c, Wm0, Wmi, Wc0, Wci
+def _symmetrize(M: np.ndarray) -> np.ndarray:
+    return 0.5 * (M + M.T)
 
-class StateEstimatorUKF:
+def _psd_enforce(M: np.ndarray, floor: float = 1e-10) -> np.ndarray:
+    """Force symmetric PSD by eigenvalue flooring."""
+    M = _symmetrize(M)
+    eig, V = np.linalg.eigh(M)
+    eig = np.maximum(eig, floor)
+    return (V * eig) @ V.T
+
+def _normalize_angle(a: float) -> float:
+    return (a + np.pi) % (2*np.pi) - np.pi
+
+def _sigma_points(x: np.ndarray, P: np.ndarray, c_scale: float):
+    """Symmetric sigma points around x using Cholesky of c_scale*P."""
+    n = x.size
+    P = _psd_enforce(P, floor=1e-12)
+    S = _safe_cholesky(c_scale * P + 1e-12*np.eye(n))  # lower
+    Xi = np.zeros((2*n+1, n))
+    Xi[0] = x
+    for i in range(n):
+        Xi[i+1]   = x + S[:, i]
+        Xi[n+i+1] = x - S[:, i]
+    return Xi
+
+def _body_bearing_from_world(p_obs: np.ndarray, R_wb: np.ndarray, p_tgt: np.ndarray):
     """
-    Unscented Kalman Filter for a quadcopter state:
-    x = [ rI(3), vI(3), e(3), ba(3), bg(3) ]  (nx=15)
-    Process noise v has nv=12, grouped as [Qg, Qg2, Qa, Qa2] blocks (3x3 each) per your MATLAB.
+    Unit vector from observer to target, expressed in OBSERVER BODY frame.
+    R_wb maps world -> body (consistent with your animator).
     """
-    def __init__(self, P, alphaUKF: float = 1e-3, betaUKF: float = 2.0, kappaUKF: float = 0.0):
-        self.P = P
-        self.nx = 15
-        self.nv = 12
-        self.alpha = alphaUKF
-        self.beta = betaUKF
-        self.kappa = kappaUKF
+    d_w = np.asarray(p_tgt, float) - np.asarray(p_obs, float)
+    n = np.linalg.norm(d_w)
+    if n < 1e-12:
+        d_w = np.array([1.0, 0.0, 0.0]); n = 1.0
+    b_w = d_w / n
+    return R_wb @ b_w
 
-        # Persistent state
-        self.xBark: np.ndarray | None = None   # (15,)
-        self.PBark: np.ndarray | None = None   # (15,15)
-        self.RBIBark: np.ndarray | None = None # (3,3)
+def _azel_from_body_vec(vb: np.ndarray):
+    x, y, z = vb
+    az = np.arctan2(y, x)
+    el = np.arctan2(z, np.sqrt(max(x*x + y*y, 1e-18)))
+    return az, el
 
-        # Small numeric epsilon (same intent as MATLAB)
-        self.eps = 1e-8
+def _body_vec_from_azel(az: float, el: float):
+    c = np.cos(el)
+    return np.array([c*np.cos(az), c*np.sin(az), np.sin(el)], float)
 
-    def reset(self):
-        self.xBark = None
-        self.PBark = None
-        self.RBIBark = None
 
-    def step(self, S, M, P=None):
+# -------------------------------
+# Agent UKF (bearing-only, CV)
+# -------------------------------
+
+class AgentUKF:
+    """
+    Unscented Kalman Filter for a target with constant-velocity dynamics observed by an agent.
+    State:   x = [px, py, pz, vx, vy, vz]^T   (world frame)
+    Process: x_{k+1} = F(dt) x_k + B(dt)*u_k + w_k
+             where u is interpreted as acceleration in WORLD by default.
+    Meas:    z = [az, el]^T (bearing in OBSERVER BODY frame)
+
+    Usage (backward compatible):
+        ukf.predict(dt)                               # no input (same as before)
+        ukf.predict(dt, u=u_world)                    # accel in world frame
+        ukf.predict(dt, u=u_body, u_frame='body',
+                    R_wb_tgt=R_wb_target)             # accel given in body frame
+        ukf.predict(dt, u=u_world, u_cov=Sigma_u)     # add input uncertainty contribution
+    """
+    def __init__(self, x0, P0, Q, R, dt, alpha=1e-3, beta=2.0, kappa=0.0):
+        self.x  = np.asarray(x0, float).reshape(6)
+        self.P  = _psd_enforce(np.asarray(P0, float))
+        self.Q  = _psd_enforce(np.asarray(Q,  float))
+        self.R  = _psd_enforce(np.asarray(R,  float))
+        self.dt = float(dt)
+        self.n  = 6
+
+        lam, Wm0, Wmi, Wc0, Wci, c = _ukf_weights(self.n, alpha, beta, kappa)
+        self._Wm0, self._Wmi = Wm0, Wmi
+        self._Wc0, self._Wci = Wc0, Wci
+        self._c = c  # note: this is n + lambda (used as the scale on P)
+
+    # ----- linear CV dynamics -----
+    def F(self, dt=None):
+        if dt is None: dt = self.dt
+        F = np.eye(6)
+        F[0,3] = dt; F[1,4] = dt; F[2,5] = dt
+        return F
+
+    def B_accel(self, dt=None):
+        """Input matrix for acceleration input u (3-vector)."""
+        if dt is None: dt = self.dt
+        B = np.zeros((6,3))
+        B[0:3, 0:3] = 0.5 * (dt**2) * np.eye(3)
+        B[3:6, 0:3] = dt * np.eye(3)
+        return B
+
+    def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
         """
-        One complete UKF cycle: measurement update at tk, then propagate to tk+Δt.
-        Inputs:
-          S: object with fields
-             - rXIMat (Nf x 3) feature coordinates in I
-             - delt (float) measurement update interval
-          M: object with fields
-             - tk (float) time of measurements
-             - rpGtilde (3,) primary GNSS ECEF rel. ref antenna
-             - rbGtilde (3,) secondary GNSS ECEF rel. primary antenna (norm=b)
-             - rxMat (Nf x 2) pixel measurements (NaN,NaN if not visible)
-             - ftildeB (3,) accelerometer specific force (m/s^2)
-             - omegaBtilde (3,) gyro rates (rad/s)
-          P: (optional) parameter object with fields:
-             - sensorParams: holds camera, GNSS, IMU, noise params (see MATLAB names)
-        Returns:
-          E: dict with keys {"statek": {...}, "Pk": (15,15)}
+        Deterministic dynamics: x+ = F x + B u  (if u provided).
+        If u_frame='body', convert u_body -> u_world using R_wb_tgt (world->body).
         """
-        if P is None:
-            P = self.P
+        F = self.F(dt)
+        x_next = F @ x
+        if u is not None:
+            u = np.asarray(u, float).reshape(3)
+            if u_frame == 'body':
+                if R_wb_tgt is None:
+                    raise ValueError("u given in 'body' frame but R_wb_tgt is None")
+                # body -> world: v_w = R_wb^T v_b
+                u = R_wb_tgt.T @ u
+            x_next = x_next + self.B_accel(dt) @ u
+        return x_next
 
-        # --- Setup and constants ---
-        RIG = Recef2enu(P.sensorParams.r0G)   # ECEF->I rotation
-        raB = P.sensorParams.raB              # (3x2) antenna locations in body frame
-        rbB = raB[:, 1] - raB[:, 0]
-        rbBu = rbB / np.linalg.norm(rbB)
-        rpB = raB[:, 0]
-        e3 = np.array([0.0, 0.0, 1.0])
+    # ----- measurement: bearing (az,el) in observer body frame -----
+    def h(self, x, p_obs, R_wb):
+        p_tgt = x[:3]
+        v_b = _body_bearing_from_world(p_obs, R_wb, p_tgt)
+        az, el = _azel_from_body_vec(v_b)
+        return np.array([az, el], float)
 
-        nx = self.nx
-        nv = self.nv
-        alpha, beta, kappa = self.alpha, self.beta, self.kappa
+    # ----- UKF steps -----
+    def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
+        """
+        Unscented prediction. If u is provided, apply affine term B u to each sigma point.
+        If u_cov (3x3) is provided, add B * u_cov * B^T to P to model input uncertainty.
+        """
+        if dt is None: dt = self.dt
+        self.P = _psd_enforce(self.P)
 
-        # --- Convert GNSS to I frame ---
-        rpItilde = RIG @ M.rpGtilde          # primary antenna in I
-        rbItilde = RIG @ M.rbGtilde          # baseline vector in I
-        rbItildeu = rbItilde / np.linalg.norm(rbItilde)
+        Xi = _sigma_points(self.x, self.P, self._c)
+        # propagate sigma points with shared input u
+        Xi_pred = np.array([ self.f(xi, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt) for xi in Xi ])
 
-        # --- Initialize (first call) ---
-        if self.xBark is None:
-            # Attitude init via Wahba using {rb, e3} directions
-            vIMat = np.vstack([rbItildeu, e3])  # shape (2,3)
-            vBMat = np.vstack([rbBu,      e3])  # shape (2,3)
-            aVec  = np.ones(2)
-            self.RBIBark = wahbaSolver(aVec, vIMat, vBMat)  # (3,3)
+        # mean
+        x_pred = self._Wm0 * Xi_pred[0] + self._Wmi * Xi_pred[1:].sum(axis=0)
 
-            rIBark = rpItilde - self.RBIBark.T @ rpB
-            self.xBark = np.concatenate([rIBark, np.zeros(12)])
+        # covariance from sigma spread + process noise
+        P_pred = self.Q.copy()
+        dx0 = Xi_pred[0] - x_pred
+        P_pred += self._Wc0 * np.outer(dx0, dx0)
+        for i in range(1, Xi_pred.shape[0]):
+            dxi = Xi_pred[i] - x_pred
+            P_pred += self._Wci * np.outer(dxi, dxi)
 
-            # Steady-state bias covariances
-            # Allow Qa2, Qg2 to be matrices; element-wise division by scalar is OK in numpy.
-            QbaSS = P.sensorParams.Qa2 / (1.0 - P.sensorParams.alphaa**2)
-            QbgSS = P.sensorParams.Qg2 / (1.0 - P.sensorParams.alphag**2)
+        # add input uncertainty if provided
+        if u_cov is not None:
+            Bu = self.B_accel(dt)
+            U = _psd_enforce(np.asarray(u_cov, float))
+            P_pred += Bu @ U @ Bu.T
 
-            # Initial covariance (diag of blocks mimics MATLAB)
-            RpL = P.sensorParams.RpL
-            sigmab = P.sensorParams.sigmab
+        self.x = x_pred
+        self.P = _psd_enforce(_symmetrize(P_pred), floor=1e-12)
 
-            self.PBark = _blkdiag(
-                2.0 * np.diag(np.diag(RpL)),          # position
-                0.001 * np.eye(3),                    # velocity
-                2.0 * (sigmab**2) * np.eye(3),        # attitude error angles (e)
-                QbaSS,                                 # accel bias
-                QbgSS                                  # gyro bias
-            )
+    def update(self, z, p_obs, R_wb):
+        self.P = _psd_enforce(self.P)
+        Xi = _sigma_points(self.x, self.P, self._c)
+        Zsig = np.array([ self.h(xi, p_obs, R_wb) for xi in Xi ])
 
-        # ---------------- Measurement update at tk ----------------
-        # Assemble measurement vector zk: [ rpItilde (3), rbItildeu (3),  {feature unit vectors in C (3 each)} ]
-        zk_parts = [rpItilde, rbItildeu]
-        Rc_list = []         # list of 3x3 covariances for each visible feature’s unit vector
-        rxMat = M.rxMat      # (Nf x 2)
-        Nf = rxMat.shape[0]
-        mcVeck = np.zeros(Nf)  # 1 if feature i is used, else 0
+        # predicted measurement mean (angle-normalized)
+        z_pred = self._Wm0 * Zsig[0] + self._Wmi * Zsig[1:].sum(axis=0)
+        z_pred[0] = _normalize_angle(z_pred[0])
+        z_pred[1] = _normalize_angle(z_pred[1])
 
-        pixelSize = P.sensorParams.pixelSize
-        f = P.sensorParams.f
-        Rc_pix = P.sensorParams.Rc  # 2x2 pixel noise covariance (we use Rc(1,1) like MATLAB)
+        # innovation & cross-cov
+        S   = self.R.copy()
+        Pxz = np.zeros((6, 2))
 
-        for i in range(Nf):
-            if not np.isnan(rxMat[i, 0]):
-                mcVeck[i] = 1.0
-                viCtilde = np.array([pixelSize * rxMat[i, 0],
-                                     pixelSize * rxMat[i, 1],
-                                     f], dtype=float)
-                nrm = np.linalg.norm(viCtilde)
-                viCtildeu = viCtilde / (nrm + 0.0)
+        dz0 = Zsig[0] - z_pred
+        dz0[0] = _normalize_angle(dz0[0]); dz0[1] = _normalize_angle(dz0[1])
+        dx0 = Xi[0] - self.x
+        S   += self._Wc0 * np.outer(dz0, dz0)
+        Pxz += self._Wc0 * np.outer(dx0, dz0)
 
-                zk_parts.append(viCtildeu)
+        for i in range(1, Zsig.shape[0]):
+            dzi = Zsig[i] - z_pred
+            dzi[0] = _normalize_angle(dzi[0]); dzi[1] = _normalize_angle(dzi[1])
+            dxi = Xi[i] - self.x
+            S   += self._Wci * np.outer(dzi, dzi)
+            Pxz += self._Wci * np.outer(dxi, dzi)
 
-                # Unit-vector covariance on the sphere (projected) + epsilon*I
-                sigmac = np.sqrt(Rc_pix[0, 0]) * pixelSize / nrm
-                RcC = sigmac**2 * (np.eye(3) - np.outer(viCtildeu, viCtildeu)) + self.eps * np.eye(3)
-                Rc_list.append(RcC)
+        S = _psd_enforce(_symmetrize(S), floor=1e-12)
+        K = Pxz @ np.linalg.inv(S + 1e-12*np.eye(2))
 
-        zk = np.concatenate(zk_parts)  # length nz
+        y = np.asarray(z, float) - z_pred
+        y[0] = _normalize_angle(y[0]); y[1] = _normalize_angle(y[1])
 
-        # Measurement noise block Rk = blkdiag(RpI, RbI, RcC_1, ..., RcC_Nfk)
-        RpI = P.sensorParams.RpL
-
-        # Baseline direction covariance (in I) around predicted direction
-        rbIu_pred = self.RBIBark.T @ rbBu
-        RbI = (P.sensorParams.sigmab**2) * (np.eye(3) - np.outer(rbIu_pred, rbIu_pred)) + self.eps * np.eye(3)
-
-        if len(Rc_list) > 0:
-            Rk = _blkdiag(RpI, RbI, *_ensure_3x3_list(Rc_list))
-        else:
-            Rk = _blkdiag(RpI, RbI)
-
-        nz = zk.shape[0]
-
-        # UKF weights for measurement update (augmented dimension = nx + nz)
-        _lam_u, c_u, Wm0_u, Wmi_u, Wc0_u, Wci_u = _ukf_weights(nx + nz, alpha, beta, kappa)
-
-        # Augmented a priori state and cov
-        xBarAugk = np.concatenate([self.xBark, np.zeros(nz)])
-        PBarAugk = _blkdiag(self.PBark, Rk)
-        SxBar = _safe_cholesky(PBarAugk)  # lower-triangular
-
-        # Sigma points in augmented space
-        n_aug_u = nx + nz
-        sp0_u = xBarAugk
-        spMat_u = np.zeros((n_aug_u, 2 * n_aug_u))
-        # plus/minus
-        for j in range(n_aug_u):
-            col = c_u * SxBar[:, j]
-            spMat_u[:, j]           = sp0_u +  col
-            spMat_u[:, j + n_aug_u] = sp0_u -  col
-
-        # Push sigma points through measurement function
-        def eval_h(sp):
-            x = sp[:nx]
-            meas_noise = sp[nx:]
-            return h_meas(x, meas_noise, self.RBIBark, S.rXIMat, mcVeck, P)
-
-        zp0 = eval_h(sp0_u)
-        zpMat = np.column_stack([eval_h(spMat_u[:, i]) for i in range(2 * n_aug_u)])
-
-        # Recombine sigma points (measurement mean)
-        zBark = Wm0_u * zp0 + Wmi_u * np.sum(zpMat, axis=1)
-
-        # Covariances
-        def outer(a, b): return np.outer(a, b)
-
-        dz0 = zp0 - zBark
-        Pzz = Wc0_u * outer(dz0, dz0)
-        Pxz = Wc0_u * outer(sp0_u[:nx] - self.xBark, dz0)
-        for i in range(2 * n_aug_u):
-            dzi = zpMat[:, i] - zBark
-            dxi = spMat_u[:nx, i] - self.xBark
-            Pzz += Wci_u * outer(dzi, dzi)
-            Pxz += Wci_u * outer(dxi, dzi)
-
-        # Kalman update (solve instead of explicit inverse)
-        # K = Pxz @ inv(Pzz)
-        K = np.linalg.solve(Pzz.T, Pxz.T).T  # equivalent to Pxz @ inv(Pzz)
-        innov = zk - zBark
-        xHatk = self.xBark + K @ innov
-        Pk = self.PBark - K @ Pzz @ K.T
-
-        # Package output state at tk
-        statek = {}
-        statek["rI"] = xHatk[0:3]
-        statek["vI"] = xHatk[3:6]
-        ek = xHatk[6:9]
-        statek["RBI"] = euler2dcm(ek) @ self.RBIBark
-        statek["ba"] = xHatk[9:12]
-        statek["bg"] = xHatk[12:15]
-        statek["omegaB"] = M.omegaBtilde - statek["bg"]
-
-        E = {"statek": statek, "Pk": Pk}
-
-        # ---------------- Propagate to tk+Δt ----------------
-        RBIHatk = statek["RBI"].copy()
-
-        # Set error Euler angles to zero after attitude injection
-        xHatk_prop = xHatk.copy()
-        xHatk_prop[6:9] = 0.0
-
-        # Process noise covariance Qk (12x12) = blkdiag(Qg, Qg2, Qa, Qa2)
-        Qk = _blkdiag(P.sensorParams.Qg, P.sensorParams.Qg2,
-                      P.sensorParams.Qa, P.sensorParams.Qa2)
-
-        # Augment with process noise
-        xHatAugk = np.concatenate([xHatk_prop, np.zeros(self.nv)])
-        PAugk = _blkdiag(Pk, Qk)
-        Sx = _safe_cholesky(PAugk)  # lower
-
-        # UKF weights for propagation (augmented dimension = nx + nv)
-        _lam_p, c_p, Wm0_p, Wmi_p, Wc0_p, Wci_p = _ukf_weights(nx + nv, alpha, beta, kappa)
-
-        # Sigma points for propagation
-        n_aug_p = nx + nv
-        sp0_p = xHatAugk
-        spMat_p = np.zeros((n_aug_p, 2 * n_aug_p))
-        for j in range(n_aug_p):
-            col = c_p * Sx[:, j]
-            spMat_p[:, j]           = sp0_p +  col
-            spMat_p[:, j + n_aug_p] = sp0_p -  col
-
-        # Push through dynamics
-        u_k = np.concatenate([M.omegaBtilde, M.ftildeB])  # (6,)
-        def eval_f(sp):
-            x = sp[:nx]
-            proc_noise = sp[nx:]
-            return f_dynamics(x, u_k, proc_noise, S.delt, RBIHatk, P)
-
-        xp0 = eval_f(sp0_p)
-        xpMat = np.column_stack([eval_f(spMat_p[:, i]) for i in range(2 * n_aug_p)])
-
-        # Recombine dynamic sigma points
-        xBarkp1 = Wm0_p * xp0 + Wmi_p * np.sum(xpMat, axis=1)
-
-        dx0 = xp0 - xBarkp1
-        PBarkp1 = Wc0_p * outer(dx0, dx0)
-        for i in range(2 * n_aug_p):
-            dxi = xpMat[:, i] - xBarkp1
-            PBarkp1 += Wci_p * outer(dxi, dxi)
-
-        # Inject attitude error and zero the error angles (same as MATLAB)
-        ekp1 = xBarkp1[6:9]
-        RBIBarkp1 = euler2dcm(ekp1) @ RBIHatk
-        xBarkp1 = xBarkp1.copy()
-        xBarkp1[6:9] = 0.0
-
-        # Persist for next call
-        self.RBIBark = RBIBarkp1
-        self.xBark = xBarkp1
-        self.PBark = PBarkp1
-
-        return E
-
-def _ensure_3x3_list(mats):
-    """Helpful assertion to keep shapes tidy."""
-    out = []
-    for m in mats:
-        m = np.asarray(m, dtype=float)
-        assert m.shape == (3, 3), f"Expected 3x3, got {m.shape}"
-        out.append(m)
-    return out
+        self.x = self.x + K @ y
+        self.P = _psd_enforce(_symmetrize(self.P - K @ S @ K.T), floor=1e-12)
+        return self.x, self.P
