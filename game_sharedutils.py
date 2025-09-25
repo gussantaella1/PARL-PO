@@ -7,38 +7,71 @@ import casadi as ca
 
 # ---- exports ----
 __all__ = [
-    # dims & dynamics
-    "dims_from_D", "double_integrator", "step_double_integrator_D",
-    # complementarity
-    "fb", "fb_eps",
-    # trajectory pack/unpack
-    "pack_trajectory", "unpack_trajectory", "unpack_tau_flat", "split_players_from_z",
-    # bounds & geometry
-    "make_bounds", "regular_polygon", "polygon_halfspaces",
-    # constraints
-    "build_g_tilde", "build_h_tilde",
-    # FOV / frames
-    "_unit", "world_to_body_R", "minimal_rotation", "frame_from_axis_continuous",
-    "fov_axis_from_vel", "in_fov",
-]
+    # --- dims & dynamics ---
+    "dims_from_D",
+    "double_integrator",
+    "step_double_integrator_D",
 
-__all__ += ["step_roll", "frame_from_axis", "apply_roll_about_axis",
-            "as_numpy_const", "hcw_mean_motion", "hcw_discrete_mats", "build_g_tilde_linear"]
+    # --- complementarity ---
+    "fb",
+    "fb_eps",  # NOTE: alias kept for compatibility if you define it elsewhere
 
-# --- add to game_sharedutils.py top-level exports ---
-__all__ += ["augment_AB_for_att", "augment_bounds_with_att", "pad_x0_with_att"]
+    # --- trajectory pack/unpack ---
+    "pack_trajectory",
+    "unpack_trajectory",
+    "unpack_tau_flat",
+    "split_players_from_z",
 
-__all__ += ["augment_bounds_with_quat", "build_g_tilde_tr_plus_quat"]
+    # --- bounds & geometry ---
+    "make_bounds",
+    "regular_polygon",
+    "polygon_halfspaces",
 
+    # --- constraints (generic / linear) ---
+    "build_g_tilde",
+    "build_h_tilde",
+    "build_g_tilde_linear",
 
-# add to exports
-__all__ += ["build_g_tilde_tr_plus_quat_locked_boresight"]
+    # --- numerics / conversions ---
+    "as_numpy_const",
 
-__all__ += [
+    # --- orbital / HCW ---
+    "hcw_mean_motion",
+    "hcw_discrete_mats",
+
+    # --- frames & FOV ---
+    "_unit",
+    "minimal_rotation",
+    "frame_from_axis_continuous",
+    "world_to_body_R",
+    "fov_axis_from_vel",
+    "in_fov",
+
+    # --- attitude / body frames ---
+    "frame_from_axis",
+    "apply_roll_about_axis",
+    "step_roll",
+    "step_phi",
+
+    # --- state augmentation (attitude-in-state, Euler angles) ---
+    "augment_AB_for_att",
+    "augment_bounds_with_att",
+    "pad_x0_with_att",
+
+    # --- attitude linear 3D small-angle model ---
+    "att_lin3d_AB",
+
+    # --- quaternion variants ---
     "augment_bounds_with_quat",
     "build_g_tilde_tr_plus_quat",
-    "q_to_R", "R_to_q","transported_R_from_state"
+    "build_g_tilde_tr_plus_quat_locked_boresight",
+    "q_to_R",
+    "R_to_q",
+    "q_euler_step",
+    "transported_R_from_state",
 ]
+
+
 
 
 
