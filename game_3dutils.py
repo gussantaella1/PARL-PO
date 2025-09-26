@@ -16,9 +16,7 @@ importlib.reload(game_3dutils)
 importlib.reload(game_costs)
 importlib.reload(neos_path_game)
 
-# from ukf_estimator import AgentUKF 
-AgentUKF = None
-
+from ukf_estimator import AgentUKF 
 from ekf_estimator import AgentEKF 
 
 
