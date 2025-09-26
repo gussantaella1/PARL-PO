@@ -10,14 +10,21 @@ from matplotlib.lines import Line2D
 
 
 
-import importlib, game_sharedutils, game_3dutils, game_costs, neos_path_game, ukf_estimator
+import importlib, game_sharedutils, game_3dutils, game_costs, neos_path_game, ukf_estimator, ekf_estimator
 importlib.reload(game_sharedutils)
 importlib.reload(game_3dutils)
 importlib.reload(game_costs)
 importlib.reload(neos_path_game)
+
+# from ukf_estimator import AgentUKF 
+AgentUKF = None
+
+from ekf_estimator import AgentEKF 
+
+
+
 importlib.reload(ukf_estimator)
-
-
+importlib.reload(ekf_estimator)
 
 from game_sharedutils import (
     dims_from_D, step_double_integrator_D, fb,
@@ -31,8 +38,6 @@ from game_sharedutils import (
     augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att, frame_from_axis_continuous
 
 )
-
-from ukf_estimator import AgentUKF as UKF_CV  # alias so the rest of your code stays the same
 
 
 
@@ -392,6 +397,54 @@ def solve_game_once_3d(cfg: dict, cost_builder, ipopt_opts: dict | None = None,
     )
 
 
+def _filter_kwargs(fn, kwargs):
+    """Keep only kwargs that `fn` accepts."""
+    import inspect
+    sig = inspect.signature(fn)
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+class KF_CV:
+    """
+    Common interface over AgentUKF / AgentEKF.
+
+    - ctor: KF_CV(x0, P0, Q, R, dt, kind='auto'|'ukf'|'ekf', **ukf_sigma_params)
+    - predict(dt=None, u=None, **kwargs)   # extra kwargs ignored if EKF
+    - update(z, p_obs, R_wb, **kwargs)     # same signature on both; forwards
+    """
+    def __init__(self, x0, P0, Q, R, dt, kind='auto', **kwargs):
+        kind = (kind or 'auto').lower()
+        impl = None
+
+        if kind == 'ekf' and AgentEKF is not None:
+            impl = AgentEKF(x0, P0, Q, R, dt)
+        elif kind in ('ukf', 'auto') and AgentUKF is not None:
+            # pass through optional sigma-point params if provided
+            sp = {k: kwargs[k] for k in ('alpha', 'beta', 'kappa') if k in kwargs}
+            impl = AgentUKF(x0, P0, Q, R, dt, **sp)
+        elif AgentUKF is not None:  # fallback preference: UKF if available
+            impl = AgentUKF(x0, P0, Q, R, dt)
+        elif AgentEKF is not None:
+            impl = AgentEKF(x0, P0, Q, R, dt)
+        else:
+            raise RuntimeError("Neither AgentUKF nor AgentEKF is importable.")
+
+        self._impl = impl  # keep the concrete filter
+
+    # expose state/cov/etc. transparently
+    def __getattr__(self, name):
+        return getattr(self._impl, name)
+
+    # accept superset of kwargs; drop those the impl doesn't support
+    def predict(self, dt=None, u=None, **kwargs):
+        f = getattr(self._impl, 'predict')
+        return f(dt=dt, u=u, **_filter_kwargs(f, kwargs))
+
+    def update(self, z, p_obs, R_wb, **kwargs):
+        f = getattr(self._impl, 'update')
+        return f(z, p_obs=p_obs, R_wb=R_wb, **_filter_kwargs(f, kwargs))
+
+
 
 # -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
@@ -576,8 +629,8 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
         est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
 
-        ukf12 = UKF_CV(np.r_[x2[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
-        ukf21 = UKF_CV(np.r_[x1[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
+        ukf12 = KF_CV(np.r_[x2[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
+        ukf21 = KF_CV(np.r_[x1[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
 
         # log initial guesses
         if ukf12 is not None:
