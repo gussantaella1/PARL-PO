@@ -1644,8 +1644,18 @@ def interactive_rollout_3d(
     est12_ln, = ax.plot([], [], [], ":", lw=1.8, marker="x", ms=6, mew=1.0, label="P2 est by P1")
     est21_ln, = ax.plot([], [], [], ":", lw=1.8, marker="x", ms=6, mew=1.0, label="P1 est by P2")
 
-    me12_ln, = ax.plot([], [], [], "-", lw=1.0, alpha=0.45, label="_nolegend_")
-    me21_ln, = ax.plot([], [], [], "-", lw=1.0, alpha=0.45, label="_nolegend_")
+    def _blank_line3d(ln):
+        # NaNs are the safest "no geometry" sentinel for 3D lines
+        ln.set_data([np.nan], [np.nan])
+        ln.set_3d_properties([np.nan])
+
+    me12_ln, = ax.plot([], [], [], "-", lw=0.8, alpha=0.25, zorder=-10, label="_nolegend_")
+    me21_ln, = ax.plot([], [], [], "-", lw=0.8, alpha=0.25, zorder=-10, label="_nolegend_")
+
+    # start fully blank & hidden unless the checkbox turns them on
+    _blank_line3d(me12_ln); me12_ln.set_visible(False)
+    _blank_line3d(me21_ln); me21_ln.set_visible(False)
+
 
     att1_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
     att2_lines = make_body_axes_artists_3d(ax, colors=triad_colors) if show_axes else None
