@@ -168,21 +168,75 @@ class KF_CV:
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
                                   turn_len: int | None = None):
     """
-    RHC rollout with 3 attitude modes:
-      - none        : attitude inferred from velocity (legacy).
-      - euler_roll  : PATH augments with [φ,θ,ψ] integrators (unchanged).
-      - path_quat   : PATH solves small-angle attitude x_att=[δθ,ω] with τ inputs,
-                      plant executes full quaternion integration with those τ.
+    Receding-horizon rollout with PATH solving *only* translation:
+      - PATH state per agent: x = [p(1..D), v(1..D)], control u = [a(1..D)]
+      - Attitude is computed *outside* the optimizer for visualization/FOV only,
+        using a velocity-aligned, minimal-spin body frame.
 
-    Translational and attitude dynamics are decoupled in the optimizer.
+    Returns logs compatible with previous callers:
+      'plan_hist1/2', 'plan_att1/2', 'exec1_xyz/2', 'exec_att1/2',
+      'phi_hist1/2', 'fov_axis_hist', 'fov_seen_mask', and (if enabled) estimator logs.
     """
-    # -------------------- basic setup --------------------
+    # -------------------- basics --------------------
+    assert HAS_PATH, "PATH interface is not available (import failed)."
     N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
     T, dt  = int(cfg["T"]), float(cfg["dt"])
 
-    # === estimation config (optional) ===
+    # RHC lengths
+    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
+    if steps is None:
+        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
+    if turn_len is None:
+        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
+                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
+
+    # -------------------- dynamics seen by PATH (translation only) --------------------
+    dyn = (cfg.get("dynamics") or "double").lower()
+    if dyn == "hcw":
+        n = hcw_mean_motion(cfg.get("hcw", {}))
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # CasADi MX
+    else:
+        Ad_tr, Bd_tr = _discretize_linear(
+            np.block([[np.zeros((D,D)), np.eye(D)],
+                      [np.zeros((D,D)), np.zeros((D,D))]]),
+            np.vstack([np.zeros((D,D)), np.eye(D)]),
+            dt
+        )
+
+    # PATH dimensions = translation only
+    nx, nu = nx_tr, nu_tr
+    Ad_mx, Bd_mx = Ad_tr, Bd_tr
+
+    # -------------------- bounds / constraints for PATH --------------------
+    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)  # translation only
+
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
+    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
+
+    # -------------------- initial states (PATH-only) --------------------
+    def _pad_x0_tr(x0_row):
+        return np.asarray(x0_row, float)[:nx_tr]
+
+    x1 = _pad_x0_tr(cfg["x0"][0])
+    x2 = _pad_x0_tr(cfg["x0"][1])
+    theta_curr = np.r_[x1, x2]  # concatenated current state for both players
+
+    # -------------------- numeric stepper (plant uses PATH linear model) --------------------
+    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
+    def step_plant(x, u):
+        return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
+
+    # -------------------- logs --------------------
+    plan_hist1, plan_hist2 = [], []
+    plan_att1,  plan_att2  = [], []   # preview attitudes (velocity-aligned) for plans
+    exec_xyz1,  exec_xyz2  = [], []
+    exec_att1,  exec_att2  = [], []   # executed attitudes
+    phi_hist1,  phi_hist2  = [], []   # kept for compatibility (0s)
+    fov_axis_hist, fov_seen_mask = [], []
+
+    # -------------------- (optional) estimator config --------------------
     est_cfg = dict(cfg.get('est', {}))
     do_est  = bool(est_cfg.get('enabled', False))
     if do_est:
@@ -193,205 +247,58 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         who   = (est_cfg.get('who') or 'both').lower()   # 'both'|'1->2'|'2->1'
         every = int(est_cfg.get('every', 1))
         est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
-        ukf12 = KF_CV(np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
-        ukf21 = KF_CV(np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
+        ukf12 = AgentUKF(np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
+        ukf21 = AgentUKF(np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
         if ukf12 is not None:
             est_hist['est12_xyz'].append(ukf12.x[:3].copy()); est_hist['meas12_azel'].append(None)
         if ukf21 is not None:
             est_hist['est21_xyz'].append(ukf21.x[:3].copy()); est_hist['meas21_azel'].append(None)
 
-    # --- translational Ad,Bd (MX) ---
-    dyn = (cfg.get("dynamics") or "double").lower()
-    if dyn == "hcw":
-        n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # MX
-    else:
-        # NOTE: use matrix form for PATH, not stepper function
-        Ad_tr, Bd_tr = _discretize_linear(
-            # xdot=[v; u], so Ac,Bc:
-            np.block([[np.zeros((D,D)), np.eye(D)],
-                      [np.zeros((D,D)), np.zeros((D,D))]]),
-            np.vstack([np.zeros((D,D)), np.eye(D)]),
-            dt
-        )
-
-    # -------------------- attitude mode selection --------------------
-    att_cfg   = dict(cfg.get("att", {}))
-    att_mode  = (att_cfg.get("mode") or "none").lower()   # 'none'|'euler_roll'|'path_quat'
-
-
-    if att_mode == "euler_roll":
-        # (unchanged) integrate [φ,θ,ψ] with commanded rates
-        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
-        nx, nu = idx["nx"], idx["nu"]
-        i_phi  = idx["i_phi"]
-        use_att_path = True
-        use_quat_exec = False
-
-    elif att_mode == "path_quat":
-        # linear small-angle attitude model for PATH
-        A_att, B_att = att_lin3d_AB(dt, att_cfg)         # 6x6, 6x3
-        # block-diagonal per-agent matrices: trans (2D*D) + att (6)
-        Ad_mx = ca.MX(_np_blockdiag(as_numpy_const(Ad_tr), A_att))
-        Bd_mx = ca.MX(_np_blockdiag(as_numpy_const(Bd_tr), B_att))
-        nx = int(Ad_mx.size1())
-        nu = int(Bd_mx.size2())
-        # indices for convenience
-        idx = {
-            "nx": nx, "nu": nu,
-            "i_att_dtheta": nx_tr + 0,
-            "i_att_omega":  nx_tr + 3,
-            "i_u_tau":      nu_tr + 0
-        }
-        i_phi = None
-        use_att_path = True
-        use_quat_exec = True
-
-        # plant (exec) quaternion states per agent
-        q1 = quat_norm(att_cfg.get("q0_1", [1,0,0,0]))
-        q2 = quat_norm(att_cfg.get("q0_2", [1,0,0,0]))
-        w1 = np.array(att_cfg.get("w0_1", [0,0,0]), float)
-        w2 = np.array(att_cfg.get("w0_2", [0,0,0]), float)
-        state_att = {1: {"q": q1, "w": w1},
-                     2: {"q": q2, "w": w2}}
-        J_diag = tuple(att_cfg.get("J", [12.0,10.0,8.0]))
-        D_diag = tuple(att_cfg.get("D", [0.0,0.0,0.0]))
-
-    else:  # 'none'
-        Ad_mx, Bd_mx = Ad_tr, Bd_tr
-        nx, nu = nx_tr, nu_tr
-        i_phi  = None
-        use_att_path = False
-        use_quat_exec = False
-
-    # -------------------- rollout/turn lengths --------------------
-    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
-    if steps is None:
-        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
-    if turn_len is None:
-        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
-                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
-
-    # -------------------- bounds / constraints --------------------
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    if att_mode == "euler_roll":
-        x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-    elif att_mode == "path_quat":
-        # small-angle & torque limits
-        dth_lim = att_cfg.get("dtheta_lim", (-0.5, 0.5))
-        w_lim   = att_cfg.get("w_lim",     (-2.0, 2.0))
-        tau_lim = att_cfg.get("tau_lim",   (-1.0, 1.0))
-        x_lb = np.concatenate([x_lb, [dth_lim[0]]*3 + [w_lim[0]]*3])
-        x_ub = np.concatenate([x_ub, [dth_lim[1]]*3 + [w_lim[1]]*3])
-        u_lb = np.concatenate([u_lb, [tau_lim[0]]*3])
-        u_ub = np.concatenate([u_ub, [tau_lim[1]]*3])
-
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
-    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
-
-    # -------------------- initial states --------------------
-    def _pad_x0(x0_row):
-        base = np.asarray(x0_row, float)[:nx_tr]
-        if att_mode == "euler_roll":
-            return pad_x0_with_att(base, att_cfg, D)[:nx]
-        elif att_mode == "path_quat":
-            dth0 = np.array(att_cfg.get("dtheta0", [0.0,0.0,0.0]), float)
-            w0   = np.array(att_cfg.get("w0",      [0.0,0.0,0.0]), float)
-            return np.r_[base, dth0, w0]
-        else:
-            return base
-
-    x1 = _pad_x0(cfg["x0"][0])
-    x2 = _pad_x0(cfg["x0"][1])
-    theta_curr = np.r_[x1, x2]
-
-    # -------------------- numeric stepper (linear PATH plant) --------------------
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-    def step_plant(x, u):
-        return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
-
-    # -------------------- logs --------------------
-    plan_hist1, plan_hist2 = [], []
-    plan_att1,  plan_att2  = [], []
-    exec_xyz1,  exec_xyz2  = [], []
-    exec_att1,  exec_att2  = [], []
-    phi_hist1,  phi_hist2  = [], []
-    fov_axis_hist, fov_seen_mask = [], []
-
     # -------------------- FOV config --------------------
     fov_cfg     = cfg.get("fov", {"enabled": False})
     fov_enabled = bool(fov_cfg.get("enabled", False))
     fov_agent   = int(fov_cfg.get("agent", 2))
+    att_cfg     = dict(cfg.get("att", {}))
+    att_mode    = (att_cfg.get("mode") or "vel").lower()   # 'hold' | 'vel' | 'none'
+    align       = att_cfg.get("align", "x")
+    world_up    = np.asarray(att_cfg.get("up", [0,0,1]), float)
+    vmin0       = float(att_cfg.get("min_speed_for_axis", 1e-3))
 
-    # -------------------- attitude helpers for viz --------------------
+    # -------------------- attitude helpers (velocity-aligned, minimal spin) --------------------
     def _p3_row(x_row):
         return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
     def _p3_vec(x_vec):
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    def attitude_from_state(x, prev_R=None, prev_axisD=None):
-        # legacy velocity-aligned frame, allowing extra roll φ if present
-        align    = att_cfg.get("align", "x")
-        world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
-        vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
-        DD = 3 if len(x) >= 6 else 2
-        v  = np.asarray(x[DD:2*DD], float)
-        n  = np.linalg.norm(v)
-        if n > vmin:
-            axisD = v / n
-        elif prev_axisD is not None:
-            axisD = np.asarray(prev_axisD, float)
-        else:
-            axisD = np.array([1, 0, 0]) if align == "x" else np.array([0, 0, 1])
-        axis3 = axisD if DD == 3 else np.array([axisD[0], axisD[1], 0.0], float)
-        R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
-        phi = 0.0
-        if (att_mode == "euler_roll") and (i_phi is not None) and (i_phi < len(x)):
-            phi = float(x[i_phi]); R = apply_roll_about_axis(R, phi, align=align)
-        return R, axisD, phi
-
-    def plan_attitudes_from_X(X, prev_axisD, prev_R):
-        att_list, ax_prev, R_prev = [], prev_axisD, prev_R
-        for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev)
-            att_list.append({"R": R, "phi": phi_t})
-            R_prev = R
-        return att_list, ax_prev, R_prev
-
-    # ---- seed attitude at t=0 for viz (or from quaternion if path_quat) ----
-    align    = att_cfg.get("align", "x")
-    world_up = att_cfg.get("up", [0,0,1])
-    vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
-
-    def _axis_from_vel_t0(x):
+    def _axis_from_vel(x):
         v = np.asarray(x[D:2*D], float) if len(x) >= 2*D else np.zeros(D)
         n = float(np.linalg.norm(v))
-        aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        return aD, (aD if D==3 else np.array([aD[0], aD[1], 0.0], float))
+        if n > vmin0:
+            aD = v / n
+        else:
+            aD = np.array([1,0,0], float) if align == "x" else np.array([0,0,1], float)
+        return aD if D==3 else np.array([aD[0], aD[1], 0.0], float)
 
-    if att_mode == "path_quat":
-        R1_0 = quat_to_Rwb_np(state_att[1]["q"])
-        R2_0 = quat_to_Rwb_np(state_att[2]["q"])
-        phi1_0 = phi2_0 = 0.0
-        prev_axis1D, prev_axis2D = np.array([1,0,0]), np.array([1,0,0])  # not used in this mode
-    else:
-        prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
-        prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
-        phi1_0 = float(x1[i_phi]) if (att_mode=="euler_roll" and i_phi is not None) else 0.0
-        phi2_0 = float(x2[i_phi]) if (att_mode=="euler_roll" and i_phi is not None) else 0.0
-        R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
-        R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
+    def _att_from_vel(x, prev_R=None):
+        a3 = _axis_from_vel(x)
+        R  = frame_from_axis_continuous(a3, R_prev=prev_R, align=align, world_up=world_up)
+        return R
+
+    # seed attitude at t=0 from velocity
+    if att_mode == "none":
+        R1_0 = np.eye(3); R2_0 = np.eye(3)
+    elif att_mode == "hold":
+        # compute once from initial velocities and then freeze
+        R1_0 = _att_from_vel(x1, prev_R=None)
+        R2_0 = _att_from_vel(x2, prev_R=None)
+    else:  # 'vel'
+        R1_0 = _att_from_vel(x1, prev_R=None)
+        R2_0 = _att_from_vel(x2, prev_R=None)
 
     prev_R1, prev_R2 = R1_0, R2_0
-
-    # log t=0
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-    if att_mode == "path_quat":
-        exec_att1.append({"R": R1_0, "q": state_att[1]["q"], "w": state_att[1]["w"]})
-        exec_att2.append({"R": R2_0, "q": state_att[2]["q"], "w": state_att[2]["w"]})
-    else:
-        exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
-        exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
+    exec_att1.append({"R": R1_0}); exec_att2.append({"R": R2_0})
+    phi_hist1.append(0.0); phi_hist2.append(0.0)
 
     # FOV t=0
     if fov_enabled:
@@ -410,7 +317,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    # -------------------- PATH persistent MCP --------------------
+    # -------------------- PATH model (persistent MCP) --------------------
     x_var_box = (-1e6, 1e6); u_var_box = (-1e3, 1e3)
     h_list    = build_h_builders(cfg, nx, D)
 
@@ -427,6 +334,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     path_ctx = {"m": m_path, "A": as_numpy_const(Ad_mx), "B": as_numpy_const(Bd_mx),
                 "X1_guess": None, "U1_guess": None, "X2_guess": None, "U2_guess": None}
 
+    # -------------------- helpers --------------------
     def _shift_controls_one_step(U_prev, target_len, fill=0.0):
         U_prev = np.asarray(U_prev, float)
         old_len, nu_ = U_prev.shape if U_prev.ndim == 2 else (0, nu)
@@ -458,7 +366,20 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                 m.u1[k, j].value = float(U1[kk, jj])
                 m.u2[k, j].value = float(U2[kk, jj])
 
-    def replan_path(theta_vec, prev1D, prev2D, prevR1, prevR2):
+    def _plan_attitudes_from_X(X, R_prev):
+        if att_mode in ("none", "hold"):
+            # keep previews constant for visualization consistency
+            return [{"R": R_prev} for _ in range(T)], R_prev
+        # 'vel': velocity-aligned per step
+        att_list = []
+        Rp = R_prev
+        for t in range(T):
+            R = _att_from_vel(X[t], prev_R=Rp)
+            att_list.append({"R": R}); Rp = R
+        return att_list, Rp
+
+
+    def replan_path(theta_vec, prevR1, prevR2):
         x0_1 = theta_vec[:nx]; x0_2 = theta_vec[nx:2*nx]
         m = path_ctx["m"]; A = path_ctx["A"]; B = path_ctx["B"]
 
@@ -480,40 +401,37 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         X2g = _forward_sim_x(A, B, x0_2, U2g)
         _seed_model_from_guess(m, X1g, U1g, X2g, U2g)
 
-        # solve
+        # solve with PATH
         solve_with_local_path(
             m,
-            path_exe="/Users/gussantaella/Documents/UTAustin/Research/Code/Research_Repo/path_5/ampl/pathampl",
-            tee=True,
+            path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
+            tee=bool(cfg.get("path_tee", True)),
         )
+
 
         # extract and cache
         X1, U1, X2, U2 = extract_trajectories(m)
         path_ctx["X1_guess"], path_ctx["U1_guess"] = X1, U1
         path_ctx["X2_guess"], path_ctx["U2_guess"] = X2, U2
 
-        # viz planning (legacy velocity-aligned preview)
+        # viz planning: positions + attitude preview
         plan1 = [_p3_row(X1[t, :]) for t in range(T)]
         plan2 = [_p3_row(X2[t, :]) for t in range(T)]
-        att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev1D, prevR1) if att_mode!="path_quat" else ([], prev1D, prevR1)
-        att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev2D, prevR2) if att_mode!="path_quat" else ([], prev2D, prevR2)
+        att1, prevR1_out = _plan_attitudes_from_X(X1, prevR1)
+        att2, prevR2_out = _plan_attitudes_from_X(X2, prevR2)
         z_dummy = np.zeros(1)
-        return z_dummy, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
+        return z_dummy, plan1, plan2, U1, U2, att1, att2, prevR1_out, prevR2_out
 
     # --- first plan ---
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-        replan_path(theta_curr, prev_axis1D if att_mode!="path_quat" else None,
-                    prev_axis2D if att_mode!="path_quat" else None,
-                    prev_R1, prev_R2)
+    z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = \
+        replan_path(theta_curr, prev_R1, prev_R2)
     step_in_turn = 0
 
     # -------------------- rollout --------------------
     for k in range(steps):
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-                replan_path(theta_curr, prev_axis1D if att_mode!="path_quat" else None,
-                            prev_axis2D if att_mode!="path_quat" else None,
-                            prev_R1, prev_R2)
+            z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = \
+                replan_path(theta_curr, prev_R1, prev_R2)
             step_in_turn = 0
 
         # current plan logs
@@ -525,47 +443,34 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         u2 = U2[min(step_in_turn, len(U2)-1)]
         step_in_turn += 1
 
-        # 1) plant step (linear PATH plant)
+        # 1) plant step (translation only)
         x1 = step_plant(x1, u1)
         x2 = step_plant(x2, u2)
         theta_curr = np.r_[x1, x2]
 
-        # 2) attitude exec
-        if att_mode == "path_quat":
-            # split torque from control tail; translational part is u[:nu_tr]
-            tau1 = np.asarray(u1[nu_tr:nu_tr+3], float)
-            tau2 = np.asarray(u2[nu_tr:nu_tr+3], float)
-
-            q1, w1 = att_step_quat(state_att[1]["q"], state_att[1]["w"], tau1, J_diag, dt, D_diag)
-            q2, w2 = att_step_quat(state_att[2]["q"], state_att[2]["w"], tau2, J_diag, dt, D_diag)
-
-            state_att[1]["q"], state_att[1]["w"] = q1, w1
-            state_att[2]["q"], state_att[2]["w"] = q2, w2
-
-            R1 = quat_to_Rwb_np(q1); R2 = quat_to_Rwb_np(q2)
+        # 2) attitude exec (velocity-aligned, minimal spin)
+        if att_mode == "none":
+            R1 = prev_R1    # identity since t=0 seed
+            R2 = prev_R2
+        elif att_mode == "hold":
+            # do NOT change attitude after t=0
+            R1 = prev_R1
+            R2 = prev_R2
+        else:  # 'vel'
+            R1 = _att_from_vel(x1, prev_R=prev_R1)
+            R2 = _att_from_vel(x2, prev_R=prev_R2)
             prev_R1, prev_R2 = R1, R2
 
-            exec_att1.append({"R": R1, "q": q1, "w": w1})
-            exec_att2.append({"R": R2, "q": q2, "w": w2})
-
-        else:
-            # legacy / euler_roll: infer from state + optional φ
-            R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D)
-            R2, axis2D, phi2_now = attitude_from_state(x2, prev_R=prev_R2, prev_axisD=prev_axis2D)
-            prev_axis1D, prev_axis2D = axis1D, axis2D
-            prev_R1, prev_R2 = R1, R2
-            phi_hist1.append(phi1_now); phi_hist2.append(phi2_now)
-            exec_att1.append({"R": R1, "phi": phi1_now})
-            exec_att2.append({"R": R2, "phi": phi2_now})
+        exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
+        phi_hist1.append(0.0); phi_hist2.append(0.0)
 
         # 3) log executed positions
         exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
 
-        # 4) UKF/EKF estimation (optional)
+        # 4) EKF/UKF estimation (optional)
         if do_est:
             idx_step = len(exec_xyz1) - 1
             take = (idx_step % every) == 0
-
             p1 = np.asarray(exec_xyz1[-1], float)
             p2 = np.asarray(exec_xyz2[-1], float)
             R1_now = np.asarray(exec_att1[-1]["R"], float)
@@ -575,7 +480,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                 u = np.asarray(u, float).ravel()
                 return u[:3] if u.size >= 3 else np.zeros(3)
 
-            if ukf12 is not None:
+            if 'ukf12' in locals() and ukf12 is not None:
                 ukf12.predict(dt, u=_u_tr(u2), u_cov=None)
                 if take:
                     d = (p2 - p1); n = np.linalg.norm(d) + 1e-12
@@ -588,7 +493,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                     est_hist['meas12_azel'].append(None)
                 est_hist['est12_xyz'].append(ukf12.x[:3].copy())
 
-            if ukf21 is not None:
+            if 'ukf21' in locals() and ukf21 is not None:
                 ukf21.predict(dt, u=_u_tr(u1), u_cov=None)
                 if take:
                     d = (p1 - p2); n = np.linalg.norm(d) + 1e-12
@@ -631,6 +536,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     if do_est:
         ret.update(est_hist)
     return ret
+
 
 
 

@@ -411,30 +411,3 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
 
     else:
         raise ValueError(f"Unknown setting '{setting}'.")
-    
-def add_roll_terms(J, tau_i, nx, nu, T, nx_tr, nu_tr, cfg):
-    att  = cfg.get('att', {})
-    if att.get('mode','') != 'roll1d':
-        return J
-
-    w_phi  = float(att.get('w_phi',  0.0))   # upright horizon
-    w_dphi = float(att.get('w_dphi', 0.0))   # smoothness
-    w_tau  = float(att.get('w_tau',  0.0))   # effort
-
-    off_phi   = nx_tr
-    off_u_tau = nu_tr
-
-    # φ and Δφ
-    for t in range(T):
-        phi_t = tau_i[t*nx + off_phi]
-        if w_phi > 0:   J += w_phi * phi_t**2
-        if w_dphi > 0 and t < T-1:
-            phi_n = tau_i[(t+1)*nx + off_phi]
-            J += w_dphi * (phi_n - phi_t)**2
-
-    # τx
-    for t in range(T-1):
-        tau_x = tau_i[T*nx + t*nu + off_u_tau]
-        if w_tau > 0:   J += w_tau * tau_x**2
-
-    return J
