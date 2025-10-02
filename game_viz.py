@@ -378,22 +378,15 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         fov_art['edges'] = []
 
     def _R_exec(agent, idx):
-        key = 'exec_att1' if agent == 1 else 'exec_att2'
-        L = frames_dict.get(key, [])
-        if L and idx < len(L) and 'R' in L[idx]:
-            return np.asarray(L[idx]['R'], float)
-        seq = exec1 if agent == 1 else exec2
-        if idx > 0:
-            dv = np.asarray(_pos3(seq[idx])) - np.asarray(_pos3(seq[idx-1]))
-            axis = dv/(np.linalg.norm(dv)+1e-12) if np.linalg.norm(dv) > 1e-9 else np.array([1,0,0], float)
-        else:
-            axis = np.array([1,0,0], float)
-        R = world_to_body_R(axis, 3, align=att_cfg.get('align','x'), up=att_cfg.get('up',[0,0,1]))
-        phi_key = 'phi_hist1' if agent == 1 else 'phi_hist2'
-        phis = frames_dict.get(phi_key, [])
-        if phis and idx < len(phis):
-            R = apply_roll_about_axis(R, float(phis[idx]), align=att_cfg.get('align','x'))
+        key = "exec_att1" if agent == 1 else "exec_att2"
+        L = frames_dict.get(key)
+        if not L or idx >= len(L) or "R" not in L[idx]:
+            raise KeyError(f"Missing attitude for agent {agent} at frame {idx} (need frames_dict['{key}'][{idx}]['R']).")
+        R = np.asarray(L[idx]["R"], float)
+        if R.shape != (3, 3):
+            raise ValueError(f"Attitude R for agent {agent} at frame {idx} must be 3x3, got {R.shape}.")
         return R
+
 
     def _set_fov(p, R_wb, idx):
         if not (show_fov and fov_cfg.get("enabled", False)):
@@ -663,22 +656,14 @@ def interactive_rollout_3d(
 
     def _R_exec(agent, idx):
         key = "exec_att1" if agent == 1 else "exec_att2"
-        L = frames_dict.get(key, [])
-        if L and idx < len(L) and "R" in L[idx]:
-            return np.asarray(L[idx]["R"], float)
-        seq = exec1 if agent == 1 else exec2
-        if idx > 0:
-            dv = np.asarray(_pos3(seq[idx])) - np.asarray(_pos3(seq[idx - 1]))
-            n = np.linalg.norm(dv)
-            axis = (dv / (n + 1e-12)) if n > 1e-9 else np.array([1, 0, 0], float)
-        else:
-            axis = np.array([1, 0, 0], float)
-        R = world_to_body_R(axis, 3, align=att_cfg.get("align", "x"), up=att_cfg.get("up", [0, 0, 1]))
-        phi_key = "phi_hist1" if agent == 1 else "phi_hist2"
-        phis = frames_dict.get(phi_key, [])
-        if phis and idx < len(phis):
-            R = apply_roll_about_axis(R, float(phis[idx]), align=att_cfg.get("align", "x"))
+        L = frames_dict.get(key)
+        if not L or idx >= len(L) or "R" not in L[idx]:
+            raise KeyError(f"Missing attitude for agent {agent} at frame {idx} (need frames_dict['{key}'][{idx}]['R']).")
+        R = np.asarray(L[idx]["R"], float)
+        if R.shape != (3, 3):
+            raise ValueError(f"Attitude R for agent {agent} at frame {idx} must be 3x3, got {R.shape}.")
         return R
+
 
     def _set3d(ln, xs, ys, zs):
         if ln is not None:
