@@ -4,23 +4,25 @@ from __future__ import annotations
 import numpy as np
 import casadi as ca
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from scipy.linalg import block_diag as _np_blockdiag
 
 
 
-import importlib, game_3dutils, game_costs, neos_path_game, ukf_estimator, ekf_estimator
+import importlib, game_3dutils, game_costs_translation, neos_path_game_translation, ukf_estimator, ekf_estimator
+import game_costs_attitude, neos_path_game_attitude
 importlib.reload(game_3dutils)
-importlib.reload(game_costs)
-importlib.reload(neos_path_game)
+importlib.reload(game_costs_translation)
+importlib.reload(neos_path_game_translation)
+importlib.reload(game_costs_attitude)
+importlib.reload(neos_path_game_attitude)
+importlib.reload(ukf_estimator)
+importlib.reload(ekf_estimator)
+
 
 from ukf_estimator import AgentUKF 
 from ekf_estimator import AgentEKF 
 
 
 
-importlib.reload(ukf_estimator)
-importlib.reload(ekf_estimator)
 
 __all__ = [
      "run_rhc_and_collect_frames_3d",
@@ -28,16 +30,35 @@ __all__ = [
 ]
 
 try:
-    from neos_path_game import (
+    from neos_path_game_translation import (
         build_mcp_two_player_one_shot,
         solve_with_local_path,
         extract_trajectories,
     )
-
-
     HAS_PATH = True
+    # print("Result from translation import: " + HAS_PATH)
 except Exception:
     HAS_PATH = False
+    # print("Result from translation import: " + HAS_PATH)
+
+
+
+
+
+try:
+    from neos_path_game_attitude import (
+        build_mcp_attitude_quat_single,
+        derive_desired_dirs_from_plan,
+    )
+    # print("Result from attitude import: " + HAS_PATH)
+    HAS_PATH_ATT = True
+    
+except Exception:
+    # print("Result from attitude import: " + HAS_PATH)
+    HAS_PATH_ATT = False
+
+
+
 
 
 
@@ -168,14 +189,15 @@ class KF_CV:
 def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
                                   turn_len: int | None = None):
     """
-    Receding-horizon rollout with PATH solving *only* translation:
-      - PATH state per agent: x = [p(1..D), v(1..D)], control u = [a(1..D)]
-      - Attitude is computed *outside* the optimizer for visualization/FOV only,
-        using a velocity-aligned, minimal-spin body frame.
+    Receding-horizon rollout where PATH solves *only* translation.
+    Optional independent PATH attitude game ("path_attitude") plans q,w,τ
+    but stays decoupled from translation.
 
-    Returns logs compatible with previous callers:
-      'plan_hist1/2', 'plan_att1/2', 'exec1_xyz/2', 'exec_att1/2',
-      'phi_hist1/2', 'fov_axis_hist', 'fov_seen_mask', and (if enabled) estimator logs.
+    Modes (cfg['att']['mode']):
+      - "hold" (default): seed attitude from initial velocity and hold fixed
+      - "vel": velocity-aligned, minimal-spin frame every step
+      - "none": identity (no attitude viz)
+      - "path_attitude": run separate quaternion MCP per agent each replan
     """
     # -------------------- basics --------------------
     assert HAS_PATH, "PATH interface is not available (import failed)."
@@ -209,19 +231,17 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     nx, nu = nx_tr, nu_tr
     Ad_mx, Bd_mx = Ad_tr, Bd_tr
 
-    # -------------------- bounds / constraints for PATH --------------------
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)  # translation only
-
+    # -------------------- PATH bounds / constraints (translation only) --------------------
+    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
     gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
     # -------------------- initial states (PATH-only) --------------------
     def _pad_x0_tr(x0_row):
         return np.asarray(x0_row, float)[:nx_tr]
-
     x1 = _pad_x0_tr(cfg["x0"][0])
     x2 = _pad_x0_tr(cfg["x0"][1])
-    theta_curr = np.r_[x1, x2]  # concatenated current state for both players
+    theta_curr = np.r_[x1, x2]
 
     # -------------------- numeric stepper (plant uses PATH linear model) --------------------
     Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
@@ -230,10 +250,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
     # -------------------- logs --------------------
     plan_hist1, plan_hist2 = [], []
-    plan_att1,  plan_att2  = [], []   # preview attitudes (velocity-aligned) for plans
+    plan_att1,  plan_att2  = [], []
     exec_xyz1,  exec_xyz2  = [], []
-    exec_att1,  exec_att2  = [], []   # executed attitudes
-    phi_hist1,  phi_hist2  = [], []   # kept for compatibility (0s)
+    exec_att1,  exec_att2  = [], []
+    phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
     # -------------------- (optional) estimator config --------------------
@@ -254,17 +274,22 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         if ukf21 is not None:
             est_hist['est21_xyz'].append(ukf21.x[:3].copy()); est_hist['meas21_azel'].append(None)
 
-    # -------------------- FOV config --------------------
+    # -------------------- FOV & attitude config --------------------
     fov_cfg     = cfg.get("fov", {"enabled": False})
     fov_enabled = bool(fov_cfg.get("enabled", False))
     fov_agent   = int(fov_cfg.get("agent", 2))
     att_cfg     = dict(cfg.get("att", {}))
-    att_mode    = (att_cfg.get("mode") or "vel").lower()   # 'hold' | 'vel' | 'none'
+    att_mode    = (att_cfg.get("mode") or "hold").lower()   # default "hold"
     align       = att_cfg.get("align", "x")
     world_up    = np.asarray(att_cfg.get("up", [0,0,1]), float)
     vmin0       = float(att_cfg.get("min_speed_for_axis", 1e-3))
 
-    # -------------------- attitude helpers (velocity-aligned, minimal spin) --------------------
+    # attitude PATH game context (only if used)
+    if att_mode == "path_attitude":
+        assert 'HAS_PATH_ATT' in globals() and HAS_PATH_ATT, "Attitude PATH components not importable."
+        att_ctx = {"m1": None, "m2": None, "sol1": None, "sol2": None}
+
+    # -------------------- attitude helpers --------------------
     def _p3_row(x_row):
         return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
     def _p3_vec(x_vec):
@@ -284,13 +309,86 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         R  = frame_from_axis_continuous(a3, R_prev=prev_R, align=align, world_up=world_up)
         return R
 
-    # seed attitude at t=0 from velocity
+    # desired-dir makers for attitude games
+    def _make_dseq(X_self, X_other):
+        track = (cfg.get("att_cost", {}).get("track") or "velocity").lower()
+        # Prefer velocity alignment if helper is available, otherwise LOS
+        try:
+            if track == "velocity" and 'derive_desired_dirs_from_velocity' in globals() and derive_desired_dirs_from_velocity is not None:
+                return derive_desired_dirs_from_velocity(X_self, align=align)
+        except Exception:
+            pass
+        return derive_desired_dirs_from_plan(X_self, X_other, align=align)
+
+    # Solve the separate quaternion MCPs (called on each replan)
+    def _solve_attitude_for_plans(X1, X2):
+        if not HAS_PATH_ATT:
+            return None, None, None, None
+        import pyomo.environ as pyo
+
+        Tloc, dtloc = T, dt
+        att = cfg.get("att", {})
+        ac  = cfg.get("att_cost", {})
+
+        d_seq1 = _make_dseq(X1, X2)
+        d_seq2 = _make_dseq(X2, X1)
+
+        def _build(q0_key, w0_key, d_seq):
+            m = build_mcp_attitude_quat_single(
+                T=Tloc, dt=dtloc,
+                J_diag=tuple(att.get("J", (12.0,10.0,8.0))),
+                D_diag=tuple(att.get("D", (0.0,0.0,0.0))),
+                q0=tuple(att.get(q0_key, (1,0,0,0))),
+                w0=tuple(att.get(w0_key, (0,0,0))),
+                d_seq=d_seq,
+                w_track=float(ac.get("w_track", 50.0)),
+                w_w=float(ac.get("w_w", 1e-2)),
+                w_tau=float(ac.get("w_tau", 1e-3)),
+                w_dw=float(ac.get("w_dw", 1e-2)),
+                wmax=5.0, taumax=5.0,
+            )
+            return m
+
+        m1 = _build("q0_1", "w0_1", d_seq1)
+        m2 = _build("q0_2", "w0_2", d_seq2)
+
+        # Reuse your PATH runner
+        solve_with_local_path(
+            m1, path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
+            tee=bool(cfg.get("path_tee", True)),
+        )
+        solve_with_local_path(
+            m2, path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
+            tee=bool(cfg.get("path_tee", True)),
+        )
+
+        # Extract q,w,tau
+        def _extract(m):
+            q = np.array([[pyo.value(m.q[k,i]) for i in range(4)] for k in range(Tloc)], float)
+            w = np.array([[pyo.value(m.w[k,i]) for i in range(3)] for k in range(Tloc)], float)
+            tau = np.array([[pyo.value(m.tau[k,i]) for i in range(3)] for k in range(Tloc-1)], float)
+            if tau.shape[0] < Tloc: tau = np.vstack([tau, tau[-1]])
+            return q, w, tau
+
+        q1, w1, tau1 = _extract(m1)
+        q2, w2, tau2 = _extract(m2)
+        return (q1, w1, tau1, m1), (q2, w2, tau2, m2)
+
+    # -------------------- seed attitude at t=0 --------------------
     if att_mode == "none":
         R1_0 = np.eye(3); R2_0 = np.eye(3)
     elif att_mode == "hold":
-        # compute once from initial velocities and then freeze
         R1_0 = _att_from_vel(x1, prev_R=None)
         R2_0 = _att_from_vel(x2, prev_R=None)
+    elif att_mode == "path_attitude":
+        # Use q0 if provided; else velocity seed
+        q01 = np.asarray(att_cfg.get("q0_1", (1,0,0,0)), float)
+        q02 = np.asarray(att_cfg.get("q0_2", (1,0,0,0)), float)
+        if np.linalg.norm(q01) > 1e-8 and np.linalg.norm(q02) > 1e-8:
+            R1_0 = quat_to_Rwb_np(q01); R2_0 = quat_to_Rwb_np(q02)
+        else:
+            R1_0 = _att_from_vel(x1, prev_R=None)
+            R2_0 = _att_from_vel(x2, prev_R=None)
     else:  # 'vel'
         R1_0 = _att_from_vel(x1, prev_R=None)
         R2_0 = _att_from_vel(x2, prev_R=None)
@@ -320,7 +418,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     # -------------------- PATH model (persistent MCP) --------------------
     x_var_box = (-1e6, 1e6); u_var_box = (-1e3, 1e3)
     h_list    = build_h_builders(cfg, nx, D)
-
     m_path = build_mcp_two_player_one_shot(
         Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
         T=T, nx=nx, nu=nu, D=D,
@@ -330,7 +427,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         cost_kind=cfg.get("setting","chase_escape_tail"),
         cost_cfg=cfg,
     )
-
     path_ctx = {"m": m_path, "A": as_numpy_const(Ad_mx), "B": as_numpy_const(Bd_mx),
                 "X1_guess": None, "U1_guess": None, "X2_guess": None, "U2_guess": None}
 
@@ -368,16 +464,13 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
     def _plan_attitudes_from_X(X, R_prev):
         if att_mode in ("none", "hold"):
-            # keep previews constant for visualization consistency
             return [{"R": R_prev} for _ in range(T)], R_prev
-        # 'vel': velocity-aligned per step
-        att_list = []
-        Rp = R_prev
+        # 'vel': velocity-aligned preview
+        att_list, Rp = [], R_prev
         for t in range(T):
             R = _att_from_vel(X[t], prev_R=Rp)
             att_list.append({"R": R}); Rp = R
         return att_list, Rp
-
 
     def replan_path(theta_vec, prevR1, prevR2):
         x0_1 = theta_vec[:nx]; x0_2 = theta_vec[nx:2*nx]
@@ -401,37 +494,43 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         X2g = _forward_sim_x(A, B, x0_2, U2g)
         _seed_model_from_guess(m, X1g, U1g, X2g, U2g)
 
-        # solve with PATH
+        # solve PATH (translation)
         solve_with_local_path(
-            m,
-            path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
+            m, path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
             tee=bool(cfg.get("path_tee", True)),
         )
-
 
         # extract and cache
         X1, U1, X2, U2 = extract_trajectories(m)
         path_ctx["X1_guess"], path_ctx["U1_guess"] = X1, U1
         path_ctx["X2_guess"], path_ctx["U2_guess"] = X2, U2
 
-        # viz planning: positions + attitude preview
+        # attitude planning preview
+        if att_mode == "path_attitude" and HAS_PATH_ATT:
+            (q1, w1, tau1, m1), (q2, w2, tau2, m2) = _solve_attitude_for_plans(X1, X2)
+            att_ctx["m1"], att_ctx["m2"] = m1, m2
+            att_ctx["sol1"] = {"q": q1, "w": w1, "tau": tau1}
+            att_ctx["sol2"] = {"q": q2, "w": w2, "tau": tau2}
+            att1 = [{"R": quat_to_Rwb_np(q1[t])} for t in range(T)]
+            att2 = [{"R": quat_to_Rwb_np(q2[t])} for t in range(T)]
+            prevR1_out = att1[-1]["R"]; prevR2_out = att2[-1]["R"]
+        else:
+            att1, prevR1_out = _plan_attitudes_from_X(X1, prevR1)
+            att2, prevR2_out = _plan_attitudes_from_X(X2, prevR2)
+
         plan1 = [_p3_row(X1[t, :]) for t in range(T)]
         plan2 = [_p3_row(X2[t, :]) for t in range(T)]
-        att1, prevR1_out = _plan_attitudes_from_X(X1, prevR1)
-        att2, prevR2_out = _plan_attitudes_from_X(X2, prevR2)
         z_dummy = np.zeros(1)
         return z_dummy, plan1, plan2, U1, U2, att1, att2, prevR1_out, prevR2_out
 
     # --- first plan ---
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = \
-        replan_path(theta_curr, prev_R1, prev_R2)
+    z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = replan_path(theta_curr, prev_R1, prev_R2)
     step_in_turn = 0
 
     # -------------------- rollout --------------------
     for k in range(steps):
         if k % turn_len == 0 and k > 0:
-            z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = \
-                replan_path(theta_curr, prev_R1, prev_R2)
+            z_last, plan1, plan2, U1, U2, att1, att2, prev_R1, prev_R2 = replan_path(theta_curr, prev_R1, prev_R2)
             step_in_turn = 0
 
         # current plan logs
@@ -448,21 +547,34 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         x2 = step_plant(x2, u2)
         theta_curr = np.r_[x1, x2]
 
-        # 2) attitude exec (velocity-aligned, minimal spin)
+        # 2) attitude exec
         if att_mode == "none":
-            R1 = prev_R1    # identity since t=0 seed
-            R2 = prev_R2
+            R1, R2 = prev_R1, prev_R2
         elif att_mode == "hold":
-            # do NOT change attitude after t=0
-            R1 = prev_R1
-            R2 = prev_R2
+            R1, R2 = prev_R1, prev_R2  # frozen from t=0
+        elif att_mode == "path_attitude" and (att_ctx.get("sol1") is not None):
+            t_idx = min(step_in_turn, T-1)  # align with plan time
+            q1_now = att_ctx["sol1"]["q"][t_idx]
+            q2_now = att_ctx["sol2"]["q"][t_idx]
+            R1 = quat_to_Rwb_np(q1_now)
+            R2 = quat_to_Rwb_np(q2_now)
+            exec_att1.append({"R": R1, "q": q1_now, "w": att_ctx["sol1"]["w"][t_idx]})
+            exec_att2.append({"R": R2, "q": q2_now, "w": att_ctx["sol2"]["w"][t_idx]})
+            prev_R1, prev_R2 = R1, R2
+            phi_hist1.append(0.0); phi_hist2.append(0.0)
         else:  # 'vel'
             R1 = _att_from_vel(x1, prev_R=prev_R1)
             R2 = _att_from_vel(x2, prev_R=prev_R2)
             prev_R1, prev_R2 = R1, R2
+            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
+            phi_hist1.append(0.0); phi_hist2.append(0.0)
+            # note: 'hold'/'none' branches append below for consistency
+            continue
 
-        exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
-        phi_hist1.append(0.0); phi_hist2.append(0.0)
+        # ensure logs for 'none'/'hold' branches
+        if att_mode in ("none","hold"):
+            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
+            phi_hist1.append(0.0); phi_hist2.append(0.0)
 
         # 3) log executed positions
         exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
@@ -536,6 +648,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     if do_est:
         ret.update(est_hist)
     return ret
+
 
 
 

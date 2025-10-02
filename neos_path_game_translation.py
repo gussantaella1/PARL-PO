@@ -1,4 +1,4 @@
-# neos_path_game.py — ONE BIG MCP version
+# neos_path_game_translation.py — ONE BIG MCP version
 import os
 import numpy as np
 from pyomo.environ import *

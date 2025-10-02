@@ -1,4 +1,4 @@
-# game_costs.py
+# game_costs_translation.py
 # D-agnostic cost builder for the 2D/3D double-integrator game.
 # Returns a list of per-player CasADi scalar objectives [f1, f2] (N=2).
 from __future__ import annotations
