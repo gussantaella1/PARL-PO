@@ -1,13 +1,29 @@
 # neos_path_game_attitude.py
-import os
 import numpy as np
-from pyomo.environ import *
-from pyomo.mpec import Complementarity, complements
+import pyomo.environ as pyo
+from pyomo.mpec import Complementarity as Comp, complements
 from pyomo.core.expr.calculus.derivatives import differentiate, Modes
+from pyomo.core.expr.visitor import identify_variables
 
+# ---------------------- helpers (unchanged API) ----------------------
 
-# ----------------------- public helpers -----------------------
+def solve_with_ipopt_qp(model, tee=True, options=None, executable=None):
+    opt = pyo.SolverFactory("ipopt", executable=executable) if executable \
+          else pyo.SolverFactory("ipopt")
+    opt.available(exception_flag=True)
+    if options:
+        for k, v in options.items():
+            opt.options[k] = v
+    opt.options.setdefault("tol", 1e-8)
+    opt.options.setdefault("constr_viol_tol", 1e-8)
+    opt.options.setdefault("max_iter", 2000)
+    opt.options.setdefault("linear_solver", "mumps")
+    res = opt.solve(model, tee=tee)
+    model.solutions.load_from(res, default_variable_value=True)
+    return res
+
 def derive_desired_dirs_from_plan(X_self, X_other, align="x"):
+    """Return list of T world-frame unit vectors from self->other (LOS)."""
     T = X_self.shape[0]
     D = 3 if X_self.shape[1] >= 6 else 2
     d_seq = []
@@ -18,131 +34,224 @@ def derive_desired_dirs_from_plan(X_self, X_other, align="x"):
         if D == 2:
             rel = np.array([rel[0], rel[1], 0.0])
         n = np.linalg.norm(rel)
-        d_seq.append(rel / (n + 1e-12) if n > 1e-12 else np.array([1.0,0.0,0.0]))
+        d_seq.append(rel / (n + 1e-12) if n > 1e-12 else np.array([1.0, 0.0, 0.0]))
     return d_seq
 
+def bx_of_q_tuple(q0, q1, q2, q3):
+    """Body x-axis (boresight) expressed in WORLD from q=(w,x,y,z)."""
+    w, x, y, z = q0, q1, q2, q3
+    return (
+        1 - 2*(y*y + z*z),
+        2*(x*y - z*w),
+        2*(x*z + y*w),
+    )
 
-def build_mcp_attitude_quat_single(
-    T, dt, J_diag=(12.0,10.0,8.0), D_diag=(0.0,0.0,0.0),
-    q0=(1,0,0,0), w0=(0,0,0),
-    d_seq=None,
-    w_track=50.0, w_w=1e-2, w_tau=1e-3, w_dw=1e-2,
+# ---------- utility: guard against trivial boolean constraints ----------
+
+def _stationarity_constraint(expr):
+    """
+    Turn a derivative expression into a valid Pyomo constraint.
+    If the expression is constant (no variables), return Constraint.Feasible
+    to avoid creating a trivial boolean (True) constraint.
+    """
+    try:
+        vars_in = list(identify_variables(expr, include_fixed=False))
+    except Exception:
+        vars_in = []
+    if len(vars_in) == 0:
+        return pyo.Constraint.Feasible
+    return expr == 0
+
+# ----------------------- MCP/KKT attitude builder -----------------------
+
+    #     """
+    # Two-player quaternion attitude game as ONE MCP (PATH).
+    # Each agent i has KKT conditions for its own nonlinear OCP (quat step + rigid-body rates),
+    # with box bounds on ω_i and τ_i enforced via complementarity.
+    # Costs can couple the players through ctx (e.g., LOS alignment / misalignment).
+
+    # Variables per agent i ∈ {1,2}:
+    #   q_i[k,0..3], w_i[k,0..2] for k=0..T-1
+    #   s_i[k]≥0 (dq-norm helper) for k=0..T-2
+    #   τ_i[k,0..2] for k=0..T-2
+
+    # Equalities (per agent, per stage):
+    #   r_w^i[k,:] = 0, r_q^i[k,:] = 0, r_s^i[k] = 0, r_unit^i[k] = 0
+
+    # Complementarity (per agent, per stage):
+    #   0 ≤ w_i[k,j]-(-wmax) ⟂ λ^w_lo_i[k,j] ≥ 0
+    #   0 ≤  wmax - w_i[k,j] ⟂ λ^w_hi_i[k,j] ≥ 0
+    #   0 ≤ τ_i[k,j]-(-taumax) ⟂ λ^t_lo_i[k,j] ≥ 0
+    #   0 ≤  taumax - τ_i[k,j] ⟂ λ^t_hi_i[k,j] ≥ 0
+
+    # KKT (Nash): ∂L_i/∂(q_i,w_i,τ_i,s_i)=0 where
+    #   L_i = J_i(q1,w1,q2,w2) + multipliers_i ⋅ residuals_i
+    # """
+
+def quad3(var_ki, k, weights):
+    # var_ki is a 2D Var (e.g., b.dth or b.w)
+    return sum(float(weights[i]) * (var_ki[k, i]**2) for i in range(3))
+
+def _stationarity_constraint(expr):
+    """Return a valid Pyomo equality for stationarity; skip if constant."""
+    try:
+        vars_in = list(identify_variables(expr, include_fixed=False))
+    except Exception:
+        vars_in = []
+    if len(vars_in) == 0:
+        return pyo.Constraint.Feasible
+    return expr == 0
+
+def _ensure_len_T(seq, T, default_vec):
+    """Return a list of length T of 3-vectors (np.array), padding/trimming as needed."""
+    if seq is None:
+        return [np.asarray(default_vec, float).ravel() for _ in range(T)]
+    out = [np.asarray(v, float).ravel() for v in seq]
+    if len(out) == 0:
+        out = [np.asarray(default_vec, float).ravel()]
+    if len(out) < T:
+        out = out + [out[-1]] * (T - len(out))
+    elif len(out) > T:
+        out = out[:T]
+    return out
+
+
+def build_mcp_attitude_linear_two_player_qp(
+    T: int,
+    dt: float,
+    Qth=(1.0, 1.0, 1.0),
+    Qw=(1e-2, 1e-2, 1e-2),
+    Rtau=(1e-3, 1e-3, 1e-3),
+    Qdw=(0.0, 0.0, 0.0),
+    J1_diag=(12.0, 10.0, 8.0), D1_diag=(0.0, 0.0, 0.0),
+    J2_diag=(12.0, 10.0, 8.0), D2_diag=(0.0, 0.0, 0.0),
+    dth10=(0.0, 0.0, 0.0), w10=(0.0, 0.0, 0.0),
+    dth20=(0.0, 0.0, 0.0), w20=(0.0, 0.0, 0.0),
     wmax=5.0, taumax=5.0,
+    d_seq1=None, d_seq2=None,   # kept for compatibility; not used by the cost now
+    dth_ref1=None,              # length-T list/array of 3-vectors
+    dth_ref2=None,              # length-T list/array of 3-vectors
 ):
     """
-    One-agent nonlinear attitude planner for PATH.
-    Variables per stage k: q[k,0..3], w[k,0..2]; controls: tau[k,0..2], k=0..T-2
-    Dynamics:
-      w_{k+1} = w_k + dt * J^{-1}(tau_k - w_k × (Jw_k) - D w_k)
-      q_{k+1} = normalize((I + 0.5*dt*Omega(w_k)) q_k)
-    Constraints:
-      ||q_k||=1; |w_k|<=wmax; |tau_k|<=taumax
-    Cost:
-      Σ_k [ w_track*(1 - d_k^T * b_x(q_k)) + w_w*||w_k||^2 ] + Σ_k w_tau*||tau_k||^2 + Σ_k w_dw*||w_{k+1}-w_k||^2
+    Linear small-angle, rigid-body attitude game (two agents) as a smooth QP.
+
+    Dynamics (per agent):
+        δθ_{k+1} = δθ_k + dt * ω_k
+        ω_{k+1}  = ω_k  + dt * J^{-1} ( τ_k - D ω_k )
+
+    Decision vars:
+        δθ[k,3], ω[k,3] for k=0..T-1
+        τ[k,3]          for k=0..T-2
+
+    Constraints: linear equalities above (for k=0..T-2) + fixed initial state.
+    Bounds:      -wmax ≤ ω ≤ wmax, -τmax ≤ τ ≤ τmax.
+
+    Objective:
+        ∑_k [ 0.5‖δθ_k - δθ_ref,k‖_{Qth}^2 + 0.5‖ω_k‖_{Qw}^2 ]
+      + ∑_{k<T-1} [ 0.5‖τ_k‖_{Rtau}^2 + 0.5‖(ω_{k+1}-ω_k)‖_{Qdw}^2 ]
+
+    Convex if weights ≥ 0 and J-diagonals > 0.
     """
-    import pyomo.environ as pyo
+    assert T >= 2, "Need T>=2 for dynamics with control."
+
+    # defaults / shape checks
+    if d_seq1 is None: d_seq1 = [np.array([1.0,0.0,0.0])] * T
+    if d_seq2 is None: d_seq2 = [np.array([1.0,0.0,0.0])] * T
+    assert len(d_seq1) == T and len(d_seq2) == T, "d_seq length must equal T"
+
+    if dth_ref1 is None: dth_ref1 = [np.zeros(3)] * T
+    if dth_ref2 is None: dth_ref2 = [np.zeros(3)] * T
+    dth_ref1 = [np.asarray(v, float).ravel() for v in dth_ref1]
+    dth_ref2 = [np.asarray(v, float).ravel() for v in dth_ref2]
+    assert len(dth_ref1) == T and len(dth_ref2) == T, "dth_ref length must equal T"
+
+    # model & sets
     m = pyo.ConcreteModel()
+    m.K  = pyo.RangeSet(0, T-1)   # state stages
+    m.Ku = pyo.RangeSet(0, T-2)   # control stages
+    m.A1 = pyo.Block()
+    m.A2 = pyo.Block()
+    m.dt = pyo.Param(initialize=float(dt), mutable=False)
 
-    # Sets
-    m.K  = pyo.RangeSet(0, T-1)
-    m.Ku = pyo.RangeSet(0, T-2)
+    # weights -> tuples of floats
+    Qth  = tuple(float(x) for x in Qth)
+    Qw   = tuple(float(x) for x in Qw)
+    Rtau = tuple(float(x) for x in Rtau)
+    Qdw  = tuple(float(x) for x in Qdw)
 
-    # Parameters
-    d_seq = np.asarray(d_seq, float) if d_seq is not None else np.tile([1,0,0], (T,1))
-    Jx,Jy,Jz = [float(J_diag[i]) for i in range(3)]
-    Dx,Dy,Dz = [float(D_diag[i]) for i in range(3)]
+    J1x,J1y,J1z = map(float, J1_diag)
+    D1x,D1y,D1z = map(float, D1_diag)
+    J2x,J2y,J2z = map(float, J2_diag)
+    D2x,D2y,D2z = map(float, D2_diag)
 
-    # Vars
-    m.q   = pyo.Var(m.K, range(4), initialize=lambda m,k,i: 1.0 if (k==0 and i==0) else 0.0)
-    m.w   = pyo.Var(m.K, range(3), initialize=0.0)
-    m.tau = pyo.Var(m.Ku, range(3), bounds=(-taumax, taumax), initialize=0.0)
+    wB   = (-float(wmax),   float(wmax))
+    tauB = (-float(taumax), float(taumax))
 
-    # IC
-    for i,val in enumerate(q0): m.q[0,i].fix(float(val))
-    for i,val in enumerate(w0): m.w[0,i].fix(float(val))
+    def _build_agent(b, Jxyz, Dxyz, dth0, w0, dth_ref):
+        Jx,Jy,Jz = Jxyz
+        Dx,Dy,Dz = Dxyz
 
-    # Helpers
-    def norm2_q(m,k):
-        return sum(m.q[k,i]**2 for i in range(4))
+        # decision variables
+        b.dth = pyo.Var(m.K,  range(3), initialize=0.0)                            # δθ
+        b.w   = pyo.Var(m.K,  range(3), bounds=lambda _m,k,i: wB,   initialize=0.0) # ω
+        b.tau = pyo.Var(m.Ku, range(3), bounds=lambda _m,k,i: tauB, initialize=0.0) # τ
 
-    def bx_of_q(m,k):
-        # body x row of world R(q)
-        w,x,y,z = (m.q[k,0], m.q[k,1], m.q[k,2], m.q[k,3])
-        # R[0,:] = [1-2(y^2+z^2), 2(xy-zw), 2(xz+yw)]
-        return (
-            1 - 2*(y*y + z*z),
-            2*(x*y - z*w),
-            2*(x*z + y*w),
-        )
+        # initial conditions (fixed)
+        for i, v in enumerate(dth0): b.dth[0, i].fix(float(v))
+        for i, v in enumerate(w0):   b.w[0, i].fix(float(v))
 
-    # Unit norm at all k
-    def unit_norm_rule(m,k):
-        return norm2_q(m,k) == 1.0
-    m.unit_norm = pyo.Constraint(m.K, rule=unit_norm_rule)
+        # linear dynamics
+        def dth_dyn_rule(_m, k, i):
+            if k == T-1: return pyo.Constraint.Skip
+            return b.dth[k+1, i] - (b.dth[k, i] + m.dt * b.w[k, i]) == 0
+        b.r_dth = pyo.Constraint(m.K, range(3), rule=dth_dyn_rule)
 
-    # ω box bounds (path inequalities)
-    # (Pyomo bounds could be used too; inequalities make it explicit)
-    m.w_upper = pyo.Constraint(m.K, range(3), rule=lambda m,k,i:  m.w[k,i] <=  wmax)
-    m.w_lower = pyo.Constraint(m.K, range(3), rule=lambda m,k,i: -m.w[k,i] <=  wmax)
+        def w_dyn_rule(_m, k, i):
+            if k == T-1: return pyo.Constraint.Skip
+            if   i == 0:
+                rhs = b.w[k,i] + m.dt * ((b.tau[k,i] - Dx*b.w[k,i]) / Jx)
+            elif i == 1:
+                rhs = b.w[k,i] + m.dt * ((b.tau[k,i] - Dy*b.w[k,i]) / Jy)
+            else:
+                rhs = b.w[k,i] + m.dt * ((b.tau[k,i] - Dz*b.w[k,i]) / Jz)
+            return b.w[k+1, i] - rhs == 0
+        b.r_w = pyo.Constraint(m.K, range(3), rule=w_dyn_rule)
 
-    # Dynamics
-    def dyn_w_rule(m,k,i):
-        if k == T-1: return pyo.Constraint.Skip
-        Jw = (
-            Jx*m.w[k,0],
-            Jy*m.w[k,1],
-            Jz*m.w[k,2],
-        )
-        # w × (Jw)
-        cx = m.w[k,1]*Jw[2] - m.w[k,2]*Jw[1]
-        cy = m.w[k,2]*Jw[0] - m.w[k,0]*Jw[2]
-        cz = m.w[k,0]*Jw[1] - m.w[k,1]*Jw[0]
-        # D w
-        Dw = (Dx*m.w[k,0], Dy*m.w[k,1], Dz*m.w[k,2])
-        rhs = None
-        if i == 0: rhs = m.w[k,0] + dt*( (m.tau[k,0] - cx - Dw[0]) / Jx )
-        if i == 1: rhs = m.w[k,1] + dt*( (m.tau[k,1] - cy - Dw[1]) / Jy )
-        if i == 2: rhs = m.w[k,2] + dt*( (m.tau[k,2] - cz - Dw[2]) / Jz )
-        return m.w[k+1,i] == rhs
-    m.dyn_w = pyo.Constraint(m.K, range(3), rule=dyn_w_rule)
+        # stage cost (tracks δθ_ref)
+        def _stage_cost(k):
+            expr = 0.0
+            # tracking & rate penalties
+            for i in range(3):
+                expr += 0.5 * Qth[i] * (b.dth[k, i] - float(dth_ref[k][i]))**2
+                expr += 0.5 * Qw[i]  * (b.w[k, i]**2)
+            # effort & smoothness
+            if k <= T-2:
+                for i in range(3):
+                    expr += 0.5 * Rtau[i] * (b.tau[k, i]**2)
+                if any(q > 0 for q in Qdw):
+                    for i in range(3):
+                        expr += 0.5 * Qdw[i] * ((b.w[k+1, i] - b.w[k, i])**2)
+            return expr
 
-    # q^+ ≈ normalize((I + 0.5 dt Ω(w)) q)
-    # We enforce: q[k+1] == (I+0.5dtΩ)q / ||(I+0.5dtΩ)q||
-    # Cross-multiplying by the norm introduces nonlinearity but PATH handles it.
-    def dyn_q_rule(m,k,i):
-        if k == T-1: return pyo.Constraint.Skip
-        wx,wy,wz = m.w[k,0], m.w[k,1], m.w[k,2]
-        # (I + 0.5dt Ω(w)) q
-        # Ω(w)q in (w,x,y,z) order:
-        # [ 0, -wx, -wy, -wz;
-        #   wx, 0,  wz, -wy;
-        #   wy,-wz, 0,  wx;
-        #   wz, wy,-wx, 0 ] * q
-        Omq = [
-            -(wx*m.q[k,1] + wy*m.q[k,2] + wz*m.q[k,3]),
-             wx*m.q[k,0] + wz*m.q[k,2] - wy*m.q[k,3],
-             wy*m.q[k,0] - wz*m.q[k,1] + wx*m.q[k,3],
-             wz*m.q[k,0] + wy*m.q[k,1] - wx*m.q[k,2],
-        ]
-        dq_i = m.q[k,i] + 0.5*dt*Omq[i]
-        # norm of dq
-        dq_norm = pyo.sqrt(sum( (m.q[k,j] + 0.5*dt*Omq[j])**2 for j in range(4) ))
-        return m.q[k+1,i] * dq_norm == dq_i
-    m.dyn_q = pyo.Constraint(m.K, range(4), rule=dyn_q_rule)
+        b.stage_cost = pyo.Expression(m.K, rule=lambda _m, kk: _stage_cost(kk))
 
-    # Objective
-    def obj_rule(m):
-        cost = 0.0
-        for k in m.K:
-            bx = bx_of_q(m,k)
-            d  = d_seq[k]
-            track = 1.0 - (d[0]*bx[0] + d[1]*bx[1] + d[2]*bx[2])   # in [0,2]
-            cost += w_track*track + w_w*sum(m.w[k,i]**2 for i in range(3))
-            if k < T-1:
-                cost += w_tau*sum(m.tau[k,i]**2 for i in range(3))
-        for k in range(T-1):
-            cost += w_dw*sum( (m.w[k+1,i]-m.w[k,i])**2 for i in range(3))
-        return cost
-    m.obj = pyo.Objective(rule=obj_rule, sense=pyo.minimize)
+    # build agents (note: d_seq* kept but unused here)
+    _build_agent(m.A1, (J1x,J1y,J1z), (D1x,D1y,D1z), dth10, w10, dth_ref1)
+    _build_agent(m.A2, (J2x,J2y,J2z), (D2x,D2y,D2z), dth20, w20, dth_ref2)
 
+    # total objective (J1 + J2)
+    def _total_cost(_m):
+        expr = 0.0
+        for k in _m.K:
+            expr += _m.A1.stage_cost[k] + _m.A2.stage_cost[k]
+        return expr
+    m.obj = pyo.Objective(rule=_total_cost, sense=pyo.minimize)
+
+    # metadata
+    m.T = T
+    m.dt_val = float(dt)
+    m.meta = {
+        "Qth": Qth, "Qw": Qw, "Rtau": Rtau, "Qdw": Qdw,
+        "wmax": float(wmax), "taumax": float(taumax),
+    }
     return m
