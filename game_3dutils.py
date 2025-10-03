@@ -49,6 +49,8 @@ try:
         build_mcp_attitude_quat_two_player_kkt   as BuildAtt2P,
         build_mcp_attitude_linear_two_player_qp as BuildAttLin2P,
         derive_desired_dirs_from_plan            as derive_dirs_plan,
+        build_mcp_attitude_two_player_one_shot_linear,
+        make_attitude_h_builders,
         bx_of_q_tuple,
         solve_with_ipopt_qp
     )
@@ -269,11 +271,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     nx, nu = nx_tr, nu_tr
     Ad_mx, Bd_mx = Ad_tr, Bd_tr
 
-    # -------------------- PATH bounds / constraints (translation) --------------------
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)  # (kept for reference; translation MCP builds g~ internally)
-    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)  # used inside translation builder
-
     # -------------------- initial states (translation) --------------------
     def _pad_x0_tr(x0_row):
         return np.asarray(x0_row, float)[:nx_tr]
@@ -403,84 +400,142 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         return refs
 
     def _solve_attitude_for_plans(X1, X2, prevR1, prevR2):
-        # --- config / weights ---
-        att = dict(cfg.get("att", {}))
-        Qth   = tuple(att.get("Qth",  (2.0, 2.0, 2.0)))   # stronger tracking than before
-        Qw    = tuple(att.get("Qw",   (1e-2, 1e-2, 1e-2)))
-        Rtau  = tuple(att.get("Rtau", (1e-3, 1e-3, 1e-3)))
-        Qdw   = tuple(att.get("Qdw",  (0.0, 0.0, 0.0)))
-        J_diag= tuple(att.get("J",    (12.0, 10.0, 8.0)))
-        D_diag= tuple(att.get("D",    (0.0, 0.0, 0.0)))
-        wmax  = float(att.get("wmax", 5.0))
-        taumax= float(att.get("taumax", 5.0))
-        # initial linear states: zero small-angle & zero rate
-        dth10 = tuple(att.get("dth0_1", (0.0, 0.0, 0.0)))
-        dth20 = tuple(att.get("dth0_2", (0.0, 0.0, 0.0)))
-        w10   = tuple(att.get("w0_1",   (0.0, 0.0, 0.0)))
-        w20   = tuple(att.get("w0_2",   (0.0, 0.0, 0.0)))
+        import numpy as np
+        import pyomo.environ as pyo
 
-        # --- desired direction sequences (LOS) ---
+        # ---------------- config / weights ----------------
+        att    = dict(cfg.get("att", {}))
+        Qth    = tuple(att.get("Qth",  (2.0, 2.0, 2.0)))
+        Qw     = tuple(att.get("Qw",   (1e-2, 1e-2, 1e-2)))
+        Rtau   = tuple(att.get("Rtau", (1e-3, 1e-3, 1e-3)))
+        Qdw    = tuple(att.get("Qdw",  (0.0, 0.0, 0.0)))
+        J_diag = tuple(att.get("J",    (12.0, 10.0, 8.0)))
+        D_diag = tuple(att.get("D",    (0.0, 0.0, 0.0)))
+        wmax   = float(att.get("wmax", 5.0))
+        taumax = float(att.get("taumax", 5.0))
+        dth10  = tuple(att.get("dth0_1", (0.0, 0.0, 0.0)))
+        dth20  = tuple(att.get("dth0_2", (0.0, 0.0, 0.0)))
+        w10    = tuple(att.get("w0_1",   (0.0, 0.0, 0.0)))
+        w20    = tuple(att.get("w0_2",   (0.0, 0.0, 0.0)))
+
+        # -------------- desired dirs & small-angle refs --------------
         d_seq1 = _make_dseq(X1, X2)
         d_seq2 = _make_dseq(X2, X1)
 
-        # --- build δθ_ref from current attitude & LOS preview ---
-        # using constant preview around prevR* for the horizon (simple, effective)
-        dth_ref1 = _dth_refs_from_attitude(prevR1, d_seq1, align_axis=align, gain=float(att.get("track_gain", 1.0)))
-        dth_ref2 = _dth_refs_from_attitude(prevR2, d_seq2, align_axis=align, gain=float(att.get("track_gain", 1.0)))
+        # Build δθ_ref from current attitude & LOS preview (length T)
+        gain = float(att.get("track_gain", 1.0))
+        dth_ref1 = _dth_refs_from_attitude(prevR1, d_seq1, align_axis=align, gain=gain)
+        dth_ref2 = _dth_refs_from_attitude(prevR2, d_seq2, align_axis=align, gain=gain)
 
-        # --- build the linear QP and solve with IPOPT ---
-        from neos_path_game_attitude import (
-            build_mcp_attitude_linear_two_player_qp as BuildAttLin2P,
-            solve_with_ipopt_qp,
+        # -------------- linear attitude matrices (nx=6, nu=3) --------------
+        # x = [δθ; ω],  u = τ
+        # δθ_{k+1} = δθ_k + dt ω_k
+        # ω_{k+1}  = (I - dt*J^{-1}D) ω_k + dt*J^{-1} τ_k
+        Jx, Jy, Jz = J_diag
+        Dx, Dy, Dz = D_diag
+        dt_loc = dt
+
+        A11 = np.eye(3)
+        A12 = dt_loc * np.eye(3)
+        A21 = np.zeros((3,3))
+        A22 = np.diag([1.0 - dt_loc*Dx/Jx, 1.0 - dt_loc*Dy/Jy, 1.0 - dt_loc*Dz/Jz])
+        Ad_att = np.block([[A11, A12],
+                        [A21, A22]])
+        Bd_att = np.vstack([np.zeros((3,3)),
+                            np.diag([dt_loc/Jx, dt_loc/Jy, dt_loc/Jz])])
+
+        # initial states (δθ0, ω0)
+        x0_1 = np.r_[np.asarray(dth10, float), np.asarray(w10, float)]
+        x0_2 = np.r_[np.asarray(dth20, float), np.asarray(w20, float)]
+
+        # -------------- shared inequalities h̃ >= 0 -----------------
+        # use wide boxes on Vars; real limits via h_builders
+        from neos_path_game_attitude import make_attitude_h_builders_split
+        HBx, HBu = make_attitude_h_builders_split(
+            T=T,  # <-- required
+            thmax=att.get("thmax", 15.0*np.pi/180.0),  # radians
+            wmax=att.get("wmax", 5.0),                 # rad/s
+            taumax=att.get("taumax", 5.0),             # N·m (or your unit)
+            which_agents=(1,2),
         )
-        m_att = BuildAttLin2P(
-            T=T, dt=dt,
-            Qth=Qth, Qw=Qw, Rtau=Rtau, Qdw=Qdw,
-            J1_diag=J_diag, D1_diag=D_diag,
-            J2_diag=J_diag, D2_diag=D_diag,
-            dth10=dth10, w10=w10,
-            dth20=dth20, w20=w20,
-            d_seq1=d_seq1, d_seq2=d_seq2,     # accepted but not used by the cost
-            dth_ref1=dth_ref1, dth_ref2=dth_ref2,
-            wmax=wmax, taumax=taumax,
+
+
+        # -------------- build MCP (PATH) ----------------------------
+        from neos_path_game_attitude import build_mcp_attitude_two_player_one_shot_linear as BuildAttMCP
+        m_att = BuildAttMCP(
+            Ad=Ad_att, Bd=Bd_att,
+            T=T, nx=6, nu=3,
+            x0_1=x0_1, x0_2=x0_2,
+            x_var_box=(-1e6, 1e6), u_var_box=(-1e3, 1e3),
+            h_builders_kx=HBx,
+            h_builders_ku=HBu,
+            cost_kind="track_ref",
+            cost_cfg={
+                "Qth": Qth, "Qw": Qw, "Rtau": Rtau, "Qdw": Qdw,
+                "dth_ref1": dth_ref1, "dth_ref2": dth_ref2,
+            },
         )
 
-        # IPOPT options (convex QP -> it converges fast)
-        ipopt_opts = {"tol": 1e-8, "constr_viol_tol": 1e-8, "max_iter": 1000, "linear_solver": "mumps"}
-        solve_with_ipopt_qp(m_att, tee=bool(cfg.get("ipopt_tee", False)), options=ipopt_opts)
+        # -------------- solve with PATH (ASL) -----------------------
+        from neos_path_game_translation import solve_with_local_path as solve_with_path
+        solve_with_path(
+            m_att,
+            path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
+            tee=bool(cfg.get("path_tee", True)),
+            path_options=cfg.get("path_options", {
+                "proximal": 0.01, "start": 1, "crash": 1, "major_iteration_limit": 20000
+            }),
+        )
 
-        # ---- extract sequences ----
-        import pyomo.environ as pyo
-        def _extract(A):
-            q_list, w_list, tau_list = [], [], []
-            # reconstruct display quats by integrating small angles over horizon
-            R = prevR1 if A is m_att.A1 else prevR2
-            q_list.append(R)  # we’ll convert to quats below
-            for k in range(T-1):
-                w_k = np.array([pyo.value(A.w[k,i]) for i in range(3)], float)
-                tau_k = np.array([pyo.value(A.tau[k,i]) for i in range(3)], float)
-                # first-order body rotation update: R_{k+1} = R_k * exp([ω_k]× dt) ≈ R_k (I + [ω]× dt)
-                wx, wy, wz = w_k
-                Wx = np.array([[0, -wz, wy],
-                            [wz, 0, -wx],
-                            [-wy, wx, 0]], float)
-                R = R @ (np.eye(3) + Wx * dt)
-                # re-orthonormalize lightly
+        # -------------- extract & integrate ω to R ------------------
+        def _extract_agent(model, agent, R0, dt):
+            # pick the right vars
+            x = model.x1 if agent == 1 else model.x2
+            u = model.u1 if agent == 1 else model.u2
+
+            # sets
+            Kx = list(model.Kx)   # 0..T
+            Ku = list(model.Ku)   # 0..T-1
+            Tn = Kx[-1]           # horizon length T
+
+            # storage
+            dth = np.zeros((Tn+1, 3), float)
+            w   = np.zeros((Tn+1, 3), float)
+            tau = np.zeros((Tn,   3), float)
+
+            # read states/inputs
+            for k in Kx:
+                for i in range(3):
+                    dth[k, i] = pyo.value(x[k, i])       # δθ
+                    w[k,   i] = pyo.value(x[k, 3+i])     # ω
+            for k in Ku:
+                for i in range(3):
+                    tau[k, i] = pyo.value(u[k, i])       # τ
+
+            # integrate ω to rotations for display (body rates, small dt)
+            R = R0.copy()
+            R_list = [R.copy()]
+            for k in Ku:
+                wx, wy, wz = w[k, :]
+                Wx = np.array([[   0, -wz,  wy],
+                            [  wz,   0, -wx],
+                            [ -wy,  wx,   0]], float)
+                R = R @ (np.eye(3) + Wx*dt)
+                # light re-orthonormalization
                 U, _, Vt = np.linalg.svd(R)
                 R = U @ Vt
-                q_list.append(R)
-                w_list.append(w_k)
-                tau_list.append(tau_k)
-            # pad last step
-            w_list.append(w_list[-1] if w_list else np.zeros(3))
-            tau_list.append(tau_list[-1] if tau_list else np.zeros(3))
-            # convert R list to “attitude frames” for the renderer
-            att_frames = [{"R": Rk} for Rk in q_list]
-            sol = {"w": np.asarray(w_list), "tau": np.asarray(tau_list)}
+                R_list.append(R.copy())
+            # pad the last R to have length T+1 already
+            if len(R_list) < Tn+1:
+                R_list.append(R.copy())
+
+            att_frames = [{"R": Rk} for Rk in R_list]
+            sol = {"dth": dth, "w": w, "tau": tau}
             return att_frames, sol
 
-        att1, sol1 = _extract(m_att.A1)
-        att2, sol2 = _extract(m_att.A2)
+        att1, sol1 = _extract_agent(m_att, agent=1, R0=prevR1, dt=dt)
+        att2, sol2 = _extract_agent(m_att, agent=2, R0=prevR2, dt=dt)
+
         return att1, sol1, att2, sol2, m_att
 
 
@@ -932,28 +987,6 @@ def hcw_discrete_mats(n: float, dt: float):
 
     return _discretize_linear(Ac, Bc, dt)
 
-def build_g_tilde_linear(nx, nu, T, N, Ad: ca.MX, Bd: ca.MX):
-    """
-    Linear shared equality constraints with fixed (Ad,Bd):
-      x_t - (Ad x_{t-1} + Bd u_{t-1}) = 0, and x_0 - θᶦ = 0 for each player.
-    Drop-in replacement for build_g_tilde(...).
-    """
-    nprim = T*nx + (T-1)*nu
-
-    def g_tilde(tau, theta):
-        g_list = []
-        ofs = 0
-        for p in range(N):
-            tau_p = tau[ofs:ofs+nprim]; ofs += nprim
-            xs, us = unpack_trajectory(tau_p, nx, nu, T)
-            th_p = theta[p*nx:(p+1)*nx]
-            g_list.append(xs[0] - th_p)  # IC
-            for t in range(1, T):
-                g_list.append(xs[t] - (Ad @ xs[t-1] + Bd @ us[t-1]))
-        return ca.vcat(g_list)
-
-    return g_tilde
-
 
 # ---------- Attitude helpers (shared) ----------
 
@@ -1097,85 +1130,6 @@ def make_bounds(cfg: dict):
     x_ub = np.r_[p_ub, v_ub]
     return x_lb, x_ub, u_lb, u_ub
 
-
-# -------------------- shared constraints builders --------------------
-
-def build_h_tilde(nx: int, nu: int, T: int, N: int, x_lb, x_ub, u_lb, u_ub, cfg: dict):
-    """
-    h̃(τ,θ) ≥ 0: bounds + arena + keep-out + pairwise separation.
-    D-aware; supports 2D (box/circle/polygon + circles) and 3D (box/sphere/polyhedron + spheres).
-    """
-    D = int(cfg.get("D", 3))
-    nprim = T*nx + (T-1)*nu
-    dmin2 = float(cfg["sep_min"])**2
-    arena  = cfg["arena"]
-    artype = arena.get("type", "box")
-
-    # Precompute polygon/polyhedron keep-in if needed
-    polyA = polyb = None
-    if artype == "polygon":
-        assert D == 2, "polygon keep-in is 2D; use polyhedron for 3D."
-        polyA_np, polyb_np = polygon_halfspaces(arena["vertices"])
-        polyA, polyb = ca.MX(polyA_np), ca.MX(polyb_np)
-    elif artype == "polyhedron":
-        polyA = ca.MX(np.asarray(arena["A"], float))
-        polyb = ca.MX(np.asarray(arena["b"], float))
-
-    # obstacle key by D
-    sphere_key = "circles" if D == 2 else "spheres"
-
-    def h_fun(tau, theta):
-        h_list, ofs = [], 0
-        taus = []
-
-        for _ in range(N):
-            tau_p = tau[ofs:ofs+nprim]; ofs += nprim
-            taus.append(tau_p)
-            xs, us = unpack_trajectory(tau_p, nx, nu, T)
-
-            # box bounds
-            for t in range(T):
-                if x_lb is not None: h_list.append(xs[t] - x_lb)
-                if x_ub is not None: h_list.append(x_ub - xs[t])
-            for t in range(T-1):
-                if u_lb is not None: h_list.append(us[t] - u_lb)
-                if u_ub is not None: h_list.append(u_ub - us[t])
-
-            # arena keep-in
-            if artype in ("circle","sphere"):
-                c = ca.MX(np.array([arena.get(k) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])], float))
-                r2 = float(arena["r"])**2
-                for t in range(T):
-                    p = xs[t][0:D]
-                    h_list.append(r2 - ca.sumsqr(p - c))
-            elif artype == "polygon":  # 2D
-                for t in range(T):
-                    p = xs[t][0:2]
-                    h_list.append(polyb - polyA @ p)  # vector
-            elif artype == "polyhedron":  # 3D
-                for t in range(T):
-                    p = xs[t][0:3]
-                    h_list.append(polyb - polyA @ p)  # vector
-
-            # keep-out spheres/circles
-            for sph in cfg.get(sphere_key, []):
-                o = ca.MX(np.array([sph.get(k) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])], float))
-                r2 = float(sph["r"])**2
-                for t in range(T):
-                    p = xs[t][0:D]
-                    h_list.append(ca.sumsqr(p - o) - r2)
-
-        # pairwise separation for N=2
-        if N == 2:
-            xs1, _ = unpack_trajectory(taus[0], nx, nu, T)
-            xs2, _ = unpack_trajectory(taus[1], nx, nu, T)
-            for t in range(T):
-                p1 = xs1[t][0:D]; p2 = xs2[t][0:D]
-                h_list.append(ca.sumsqr(p1 - p2) - dmin2)
-
-        return ca.vcat(h_list)
-
-    return h_fun
 
 # -------------------- frames & FOV --------------------
 def _unit(v, eps: float = 1e-12):
@@ -1409,92 +1363,6 @@ def att_step_quat(q, w, tau, J_diag=(12.0,10.0,8.0), dt=0.05, D_diag=(0.0,0.0,0.
     q_next = quat_mul_np(dq, q)
     return quat_norm(q_next), w_next
 
-def build_g_tilde_tr_plus_quat(Ad_tr, Bd_tr, dt, T, N, J_diag, D_diag):
-    """
-    Shared equality constraints g~(tau,theta)=0 for PATH:
-      - Translation: x_t = Ad_tr x_{t-1} + Bd_tr u_{t-1}
-      - Attitude:    q^+ = norm(q + 0.5*dt*Omega(w)@q)
-                     w^+ = w + dt * J^{-1}(τ - w×(Jw) - D w)
-    State per agent: [x_tr(2D); q(4); w(3)]
-    Ctrl  per agent: [u_tr(D); τ(3)]
-    """
-    import casadi as ca
-    Ad = ca.MX(Ad_tr); Bd = ca.MX(Bd_tr)
-    nx_tr = int(Ad.size1()); nu_tr = int(Bd.size2())
-    nx_att = 7; nu_att = 3
-    nx = nx_tr + nx_att
-    nu = nu_tr + nu_att
-
-    Jx,Jy,Jz = [float(J_diag[i]) for i in range(3)]
-    Dx,Dy,Dz = [float(D_diag[i]) for i in range(3)]
-    J = ca.diag(ca.MX([Jx,Jy,Jz]))
-    Dm = ca.diag(ca.MX([Dx,Dy,Dz]))
-    Jinv = ca.diag(1.0/ca.MX([Jx,Jy,Jz]))
-
-    def g_tilde(tau, theta):
-        g_list = []
-        ofs = 0
-        nprim = T*nx + (T-1)*nu
-
-        def unpack_traj(tau_p):
-            # same layout as before: [x0..xT-1, u0..uT-2] for this player
-            xs = []
-            us = []
-            s_ofs = 0
-            for t in range(T):
-                xs.append(tau_p[s_ofs:s_ofs+nx]); s_ofs += nx
-            for t in range(T-1):
-                us.append(tau_p[s_ofs:s_ofs+nu]); s_ofs += nu
-            return xs, us
-
-        for p in range(N):
-            tau_p = tau[ofs:ofs+nprim]; ofs += nprim
-            xs, us = unpack_traj(tau_p)
-            th_p = theta[p*nx:(p+1)*nx]
-
-            # IC: x_0 - θᶦ = 0
-            g_list.append(xs[0] - th_p)
-
-            # Stage dynamics
-            for t in range(1, T):
-                x_prev = xs[t-1]; x_now = xs[t]
-                u_prev = us[t-1]
-
-                # split tr / att
-                xtr_prev = x_prev[:nx_tr]
-                q_prev   = x_prev[nx_tr:nx_tr+4]
-                w_prev   = x_prev[nx_tr+4:nx_tr+7]
-
-                xtr_now  = x_now[:nx_tr]
-                q_now    = x_now[nx_tr:nx_tr+4]
-                w_now    = x_now[nx_tr+4:nx_tr+7]
-
-                utr_prev = u_prev[:nu_tr]
-                tau_prev = u_prev[nu_tr:nu_tr+3]
-
-                # --- translation (linear) ---
-                g_list.append(xtr_now - (Ad @ xtr_prev + Bd @ utr_prev))
-
-                # --- attitude (nonlinear) ---
-                # wdot = J^{-1}(τ - w×(Jw) - D w)
-                Jw   = J @ w_prev
-                wdot = Jinv @ (tau_prev - ca.cross(w_prev, Jw) - Dm @ w_prev)
-                w_pred = w_prev + dt * wdot
-
-                # q^+ = norm(q + 0.5*dt*Omega(w) q)  (first-order hold on w)
-                Om = _Omega_w_MX(w_prev)
-                dq = (ca.MX_eye(4) + 0.5*dt*Om) @ q_prev
-                dq = dq / (ca.sqrt(ca.sumsqr(dq)) + 1e-12)
-
-                g_list.append(q_now - dq)
-                g_list.append(w_now - w_pred)
-
-        return ca.vcat(g_list)
-
-    # convenience: dimensions for caller
-    dims = {"nx_tr": nx_tr, "nu_tr": nu_tr, "nx": nx, "nu": nu,
-            "nx_att": nx_att, "nu_att": nu_att}
-    return g_tilde, dims
 
 def augment_bounds_with_quat(x_lb, x_ub, u_lb, u_ub, D):
     """

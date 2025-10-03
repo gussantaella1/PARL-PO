@@ -119,7 +119,7 @@ def build_mcp_two_player_one_shot(
     m.u1 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
     m.u2 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
 
-    # ---------- shared equality *expressions* g̃(τ) ----------
+    # ---------- shared equality *expressions* g̃(τ) g tilde ----------
     #   ICs
     def g_ic1_expr(_m, i): return _m.x1[0, i] - _m.x01[i]
     def g_ic2_expr(_m, i): return _m.x2[0, i] - _m.x02[i]
