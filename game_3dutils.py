@@ -361,183 +361,21 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         return R
 
     def _plan_attitudes_from_X(X, R_prev):
-        if att_mode in ("none", "hold"):
+        """
+        For 'hold' and 'vel': build per-step frames with boresight aligned to the
+        path's instantaneous velocity (minimal-spin continuity via R_prev).
+        For 'none': keep R_prev fixed.
+        """
+        if att_mode == "none":
             return [{"R": R_prev} for _ in range(T)], R_prev
-        att_list, Rp = [], R_prev       # 'vel'
+
+        # 'hold' and 'vel' are both kinematic: boresight = velocity direction
+        att_list, Rp = [], R_prev
         for t in range(T):
             R = _att_from_vel(X[t], prev_R=Rp)
-            att_list.append({"R": R}); Rp = R
+            att_list.append({"R": R})
+            Rp = R
         return att_list, Rp
-
-    # -------------------- joint attitude solver (one MCP) --------------------
-
-    from neos_path_game_attitude import build_mcp_attitude_linear_two_player_qp as BuildAttLin2P
-
-
-    def _make_dseq(X_self, X_other):
-        # LOS unit vectors from current translation preview
-        return derive_desired_dirs_from_plan(X_self, X_other, align=align)
-
-    def _dth_refs_from_attitude(R_wb0, d_seq, align_axis="x", gain=1.0):
-        """
-        Small-angle references δθ_ref[k] in BODY frame that rotate current boresight to d_seq[k].
-        δθ_ref ≈ R_bw0 * (b_w × d_w), with b_w = R_wb0 * e_align.
-        """
-        e_align = np.array([1.0, 0.0, 0.0]) if align_axis == "x" else np.array([0.0, 0.0, 1.0])
-        R_bw0 = R_wb0.T
-        b_w = (R_wb0 @ e_align).astype(float)
-        refs = []
-        for d_w in d_seq:
-            d_w = np.asarray(d_w, float).ravel()
-            n = np.linalg.norm(d_w)
-            if n < 1e-12:
-                d_w = np.array([1.0, 0.0, 0.0])
-            else:
-                d_w = d_w / n
-            e_w = np.cross(b_w, d_w)                # world-frame error to rotate b -> d
-            e_b = R_bw0 @ e_w                       # body-frame small-angle
-            refs.append(gain * e_b)
-        return refs
-
-    def _solve_attitude_for_plans(X1, X2, prevR1, prevR2):
-        import numpy as np
-        import pyomo.environ as pyo
-
-        # ---------------- config / weights ----------------
-        att    = dict(cfg.get("att", {}))
-        Qth    = tuple(att.get("Qth",  (2.0, 2.0, 2.0)))
-        Qw     = tuple(att.get("Qw",   (1e-2, 1e-2, 1e-2)))
-        Rtau   = tuple(att.get("Rtau", (1e-3, 1e-3, 1e-3)))
-        Qdw    = tuple(att.get("Qdw",  (0.0, 0.0, 0.0)))
-        J_diag = tuple(att.get("J",    (12.0, 10.0, 8.0)))
-        D_diag = tuple(att.get("D",    (0.0, 0.0, 0.0)))
-        wmax   = float(att.get("wmax", 5.0))
-        taumax = float(att.get("taumax", 5.0))
-        dth10  = tuple(att.get("dth0_1", (0.0, 0.0, 0.0)))
-        dth20  = tuple(att.get("dth0_2", (0.0, 0.0, 0.0)))
-        w10    = tuple(att.get("w0_1",   (0.0, 0.0, 0.0)))
-        w20    = tuple(att.get("w0_2",   (0.0, 0.0, 0.0)))
-
-        # -------------- desired dirs & small-angle refs --------------
-        d_seq1 = _make_dseq(X1, X2)
-        d_seq2 = _make_dseq(X2, X1)
-
-        # Build δθ_ref from current attitude & LOS preview (length T)
-        gain = float(att.get("track_gain", 1.0))
-        dth_ref1 = _dth_refs_from_attitude(prevR1, d_seq1, align_axis=align, gain=gain)
-        dth_ref2 = _dth_refs_from_attitude(prevR2, d_seq2, align_axis=align, gain=gain)
-
-        # -------------- linear attitude matrices (nx=6, nu=3) --------------
-        # x = [δθ; ω],  u = τ
-        # δθ_{k+1} = δθ_k + dt ω_k
-        # ω_{k+1}  = (I - dt*J^{-1}D) ω_k + dt*J^{-1} τ_k
-        Jx, Jy, Jz = J_diag
-        Dx, Dy, Dz = D_diag
-        dt_loc = dt
-
-        A11 = np.eye(3)
-        A12 = dt_loc * np.eye(3)
-        A21 = np.zeros((3,3))
-        A22 = np.diag([1.0 - dt_loc*Dx/Jx, 1.0 - dt_loc*Dy/Jy, 1.0 - dt_loc*Dz/Jz])
-        Ad_att = np.block([[A11, A12],
-                        [A21, A22]])
-        Bd_att = np.vstack([np.zeros((3,3)),
-                            np.diag([dt_loc/Jx, dt_loc/Jy, dt_loc/Jz])])
-
-        # initial states (δθ0, ω0)
-        x0_1 = np.r_[np.asarray(dth10, float), np.asarray(w10, float)]
-        x0_2 = np.r_[np.asarray(dth20, float), np.asarray(w20, float)]
-
-        # -------------- shared inequalities h̃ >= 0 -----------------
-        # use wide boxes on Vars; real limits via h_builders
-        from neos_path_game_attitude import make_attitude_h_builders_split
-        HBx, HBu = make_attitude_h_builders_split(
-            T=T,  # <-- required
-            thmax=att.get("thmax", 15.0*np.pi/180.0),  # radians
-            wmax=att.get("wmax", 5.0),                 # rad/s
-            taumax=att.get("taumax", 5.0),             # N·m (or your unit)
-            which_agents=(1,2),
-        )
-
-
-        # -------------- build MCP (PATH) ----------------------------
-        from neos_path_game_attitude import build_mcp_attitude_two_player_one_shot_linear as BuildAttMCP
-        m_att = BuildAttMCP(
-            Ad=Ad_att, Bd=Bd_att,
-            T=T, nx=6, nu=3,
-            x0_1=x0_1, x0_2=x0_2,
-            x_var_box=(-1e6, 1e6), u_var_box=(-1e3, 1e3),
-            h_builders_kx=HBx,
-            h_builders_ku=HBu,
-            cost_kind="track_ref",
-            cost_cfg={
-                "Qth": Qth, "Qw": Qw, "Rtau": Rtau, "Qdw": Qdw,
-                "dth_ref1": dth_ref1, "dth_ref2": dth_ref2,
-            },
-        )
-
-        # -------------- solve with PATH (ASL) -----------------------
-        from neos_path_game_translation import solve_with_local_path as solve_with_path
-        solve_with_path(
-            m_att,
-            path_exe=cfg.get("path_exe", "/usr/local/bin/pathampl"),
-            tee=bool(cfg.get("path_tee", True)),
-            path_options=cfg.get("path_options", {
-                "proximal": 0.01, "start": 1, "crash": 1, "major_iteration_limit": 20000
-            }),
-        )
-
-        # -------------- extract & integrate ω to R ------------------
-        def _extract_agent(model, agent, R0, dt):
-            # pick the right vars
-            x = model.x1 if agent == 1 else model.x2
-            u = model.u1 if agent == 1 else model.u2
-
-            # sets
-            Kx = list(model.Kx)   # 0..T
-            Ku = list(model.Ku)   # 0..T-1
-            Tn = Kx[-1]           # horizon length T
-
-            # storage
-            dth = np.zeros((Tn+1, 3), float)
-            w   = np.zeros((Tn+1, 3), float)
-            tau = np.zeros((Tn,   3), float)
-
-            # read states/inputs
-            for k in Kx:
-                for i in range(3):
-                    dth[k, i] = pyo.value(x[k, i])       # δθ
-                    w[k,   i] = pyo.value(x[k, 3+i])     # ω
-            for k in Ku:
-                for i in range(3):
-                    tau[k, i] = pyo.value(u[k, i])       # τ
-
-            # integrate ω to rotations for display (body rates, small dt)
-            R = R0.copy()
-            R_list = [R.copy()]
-            for k in Ku:
-                wx, wy, wz = w[k, :]
-                Wx = np.array([[   0, -wz,  wy],
-                            [  wz,   0, -wx],
-                            [ -wy,  wx,   0]], float)
-                R = R @ (np.eye(3) + Wx*dt)
-                # light re-orthonormalization
-                U, _, Vt = np.linalg.svd(R)
-                R = U @ Vt
-                R_list.append(R.copy())
-            # pad the last R to have length T+1 already
-            if len(R_list) < Tn+1:
-                R_list.append(R.copy())
-
-            att_frames = [{"R": Rk} for Rk in R_list]
-            sol = {"dth": dth, "w": w, "tau": tau}
-            return att_frames, sol
-
-        att1, sol1 = _extract_agent(m_att, agent=1, R0=prevR1, dt=dt)
-        att2, sol2 = _extract_agent(m_att, agent=2, R0=prevR2, dt=dt)
-
-        return att1, sol1, att2, sol2, m_att
-
 
 
 
@@ -709,20 +547,19 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         theta_curr = np.r_[x1, x2]
 
         # 2) attitude exec (avoid double-append)
-        if att_mode in ("none", "hold"):
+        if att_mode == "none":
             R1, R2 = prev_R1, prev_R2
             exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
             phi_hist1.append(0.0); phi_hist2.append(0.0)
 
-        elif att_mode == "path_attitude" and (att_ctx.get("sol1") is not None):
-            t_idx = min(step_in_turn, T-1)
-            # grab the rotations from the *current* plan we pushed to plan_att*
-            R1 = np.asarray(plan_att1[-1][t_idx]["R"])
-            R2 = np.asarray(plan_att2[-1][t_idx]["R"])
+        elif att_mode == "hold":
+            # Lock boresight to current velocity (minimal-spin update)
+            R1 = _att_from_vel(x1, prev_R=prev_R1)
+            R2 = _att_from_vel(x2, prev_R=prev_R2)
             prev_R1, prev_R2 = R1, R2
-            exec_att1.append({"R": R1})
-            exec_att2.append({"R": R2})
+            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
             phi_hist1.append(0.0); phi_hist2.append(0.0)
+
 
 
 
