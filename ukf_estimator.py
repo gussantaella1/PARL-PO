@@ -6,8 +6,6 @@ import numpy as np
 # Helpers
 # -------------------------------
 
-# Add control input into time update, if we have overconfidence issue add process bias, 
-
 def _ukf_weights(n: int, alpha: float = 1e-3, beta: float = 2.0, kappa: float = 0.0):
     """
     Julier/Uhlmann UKF weights.
@@ -45,6 +43,15 @@ def _psd_enforce(M: np.ndarray, floor: float = 1e-10) -> np.ndarray:
 def _normalize_angle(a: float) -> float:
     return (a + np.pi) % (2*np.pi) - np.pi
 
+def _normalize_meas_vec(v: np.ndarray) -> np.ndarray:
+    """Normalize az and (optionally) el components depending on length."""
+    v = np.asarray(v, float).copy()
+    if v.size >= 1:
+        v[0] = _normalize_angle(v[0])
+    if v.size >= 2:
+        v[1] = _normalize_angle(v[1])
+    return v
+
 def _sigma_points(x: np.ndarray, P: np.ndarray, c_scale: float):
     """Symmetric sigma points around x using Cholesky of c_scale*P."""
     n = x.size
@@ -60,7 +67,7 @@ def _sigma_points(x: np.ndarray, P: np.ndarray, c_scale: float):
 def _body_bearing_from_world(p_obs: np.ndarray, R_wb: np.ndarray, p_tgt: np.ndarray):
     """
     Unit vector from observer to target, expressed in OBSERVER BODY frame.
-    R_wb maps world -> body (consistent with your animator).
+    R_wb maps world -> body.
     """
     d_w = np.asarray(p_tgt, float) - np.asarray(p_obs, float)
     n = np.linalg.norm(d_w)
@@ -75,10 +82,6 @@ def _azel_from_body_vec(vb: np.ndarray):
     el = np.arctan2(z, np.sqrt(max(x*x + y*y, 1e-18)))
     return az, el
 
-def _body_vec_from_azel(az: float, el: float):
-    c = np.cos(el)
-    return np.array([c*np.cos(az), c*np.sin(az), np.sin(el)], float)
-
 
 # -------------------------------
 # Agent UKF (bearing-only, CV)
@@ -90,14 +93,9 @@ class AgentUKF:
     State:   x = [px, py, pz, vx, vy, vz]^T   (world frame)
     Process: x_{k+1} = F(dt) x_k + B(dt)*u_k + w_k
              where u is interpreted as acceleration in WORLD by default.
-    Meas:    z = [az, el]^T (bearing in OBSERVER BODY frame)
-
-    Usage (backward compatible):
-        ukf.predict(dt)                               # no input (same as before)
-        ukf.predict(dt, u=u_world)                    # accel in world frame
-        ukf.predict(dt, u=u_body, u_frame='body',
-                    R_wb_tgt=R_wb_target)             # accel given in body frame
-        ukf.predict(dt, u=u_world, u_cov=Sigma_u)     # add input uncertainty contribution
+    Meas:
+      - If R is 2x2: z = [az, el]^T   (3D bearing in OBSERVER BODY frame)
+      - If R is 1x1: z = [az]^T       (2D bearing-only)
     """
     def __init__(self, x0, P0, Q, R, dt, alpha=1e-3, beta=2.0, kappa=0.0):
         self.x  = np.asarray(x0, float).reshape(6)
@@ -106,11 +104,13 @@ class AgentUKF:
         self.R  = _psd_enforce(np.asarray(R,  float))
         self.dt = float(dt)
         self.n  = 6
+        # measurement dimension (1 for 2D bearing-only, 2 for az+el)
+        self.m  = int(self.R.shape[0])
 
         lam, Wm0, Wmi, Wc0, Wci, c = _ukf_weights(self.n, alpha, beta, kappa)
         self._Wm0, self._Wmi = Wm0, Wmi
         self._Wc0, self._Wci = Wc0, Wci
-        self._c = c  # note: this is n + lambda (used as the scale on P)
+        self._c = c  # used as the scaling on P for sigma points
 
     # ----- linear CV dynamics -----
     def F(self, dt=None):
@@ -144,11 +144,13 @@ class AgentUKF:
             x_next = x_next + self.B_accel(dt) @ u
         return x_next
 
-    # ----- measurement: bearing (az,el) in observer body frame -----
+    # ----- measurement: bearing in observer body frame -----
     def h(self, x, p_obs, R_wb):
         p_tgt = x[:3]
         v_b = _body_bearing_from_world(p_obs, R_wb, p_tgt)
         az, el = _azel_from_body_vec(v_b)
+        if self.m == 1:
+            return np.array([az], float)
         return np.array([az, el], float)
 
     # ----- UKF steps -----
@@ -186,37 +188,38 @@ class AgentUKF:
 
     def update(self, z, p_obs, R_wb):
         self.P = _psd_enforce(self.P)
+
+        # Sigma points and their measurements
         Xi = _sigma_points(self.x, self.P, self._c)
-        Zsig = np.array([ self.h(xi, p_obs, R_wb) for xi in Xi ])
+        Zsig = np.zeros((Xi.shape[0], self.m))
+        for i in range(Xi.shape[0]):
+            Zsig[i] = _normalize_meas_vec(self.h(Xi[i], p_obs, R_wb))
 
-        # predicted measurement mean (angle-normalized)
+        # Predicted measurement mean
         z_pred = self._Wm0 * Zsig[0] + self._Wmi * Zsig[1:].sum(axis=0)
-        z_pred[0] = _normalize_angle(z_pred[0])
-        z_pred[1] = _normalize_angle(z_pred[1])
+        z_pred = _normalize_meas_vec(z_pred)
 
-        # innovation & cross-cov
+        # Innovation covariance S and cross-covariance Pxz
         S   = self.R.copy()
-        Pxz = np.zeros((6, 2))
+        Pxz = np.zeros((self.n, self.m))
 
-        dz0 = Zsig[0] - z_pred
-        dz0[0] = _normalize_angle(dz0[0]); dz0[1] = _normalize_angle(dz0[1])
+        # i=0
+        dz0 = _normalize_meas_vec(Zsig[0] - z_pred)
         dx0 = Xi[0] - self.x
         S   += self._Wc0 * np.outer(dz0, dz0)
         Pxz += self._Wc0 * np.outer(dx0, dz0)
 
+        # remaining sigma points
         for i in range(1, Zsig.shape[0]):
-            dzi = Zsig[i] - z_pred
-            dzi[0] = _normalize_angle(dzi[0]); dzi[1] = _normalize_angle(dzi[1])
-            dxi = Xi[i] - self.x
-            S   += self._Wci * np.outer(dzi, dzi)
-            Pxz += self._Wci * np.outer(dxi, dzi)
+            dz = _normalize_meas_vec(Zsig[i] - z_pred)
+            dx = Xi[i] - self.x
+            S   += self._Wci * np.outer(dz, dz)
+            Pxz += self._Wci * np.outer(dx, dz)
 
         S = _psd_enforce(_symmetrize(S), floor=1e-12)
-        K = Pxz @ np.linalg.inv(S + 1e-12*np.eye(2))
+        K = Pxz @ np.linalg.inv(S + 1e-12*np.eye(self.m))
 
-        y = np.asarray(z, float) - z_pred
-        y[0] = _normalize_angle(y[0]); y[1] = _normalize_angle(y[1])
-
+        y = _normalize_meas_vec(np.asarray(z, float).reshape(self.m) - z_pred)
         self.x = self.x + K @ y
         self.P = _psd_enforce(_symmetrize(self.P - K @ S @ K.T), floor=1e-12)
         return self.x, self.P

@@ -258,7 +258,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # CasADi MX
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt, cfg.get("D"))        # CasADi MX
     else:
         Ad_tr, Bd_tr = _discretize_linear(
             np.block([[np.zeros((D,D)), np.eye(D)],
@@ -295,19 +295,37 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     est_cfg = dict(cfg.get('est', {}))
     do_est  = bool(est_cfg.get('enabled', False))
     if do_est:
-        s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
         P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
         Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
-        Rm = np.diag([s_az**2, s_el**2])
         who   = (est_cfg.get('who') or 'both').lower()   # 'both'|'1->2'|'2->1'
         every = int(est_cfg.get('every', 1))
         est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
-        ukf12 = AgentUKF(np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
-        ukf21 = AgentUKF(np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
+
+        # 3D vs 2D measurement noise
+        if D == 3:
+            s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
+            Rm = np.diag([s_az**2, s_el**2])
+        else:  # D == 2 → single bearing angle (azimuth) only
+            s_bear = np.deg2rad(est_cfg.get('meas_std_bear_deg', 0.3))
+            Rm = np.array([[s_bear**2]])
+
+        # UKF states are always 3D position+velocity; pad z with zeros if D==2
+        if D == 3:
+            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)]
+            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)]
+        else:
+            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:2], 0.0, 0.0, 0.0, 0.0]
+            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:2], 0.0, 0.0, 0.0, 0.0]
+
+        ukf12 = AgentUKF(x0_12, P0, Q, Rm, dt) if who in ('both','1->2') else None
+        ukf21 = AgentUKF(x0_21, P0, Q, Rm, dt) if who in ('both','2->1') else None
+
         if ukf12 is not None:
-            est_hist['est12_xyz'].append(ukf12.x[:3].copy()); est_hist['meas12_azel'].append(None)
+            est_hist['est12_xyz'].append(x0_12[:3].copy()); est_hist['meas12_azel'].append(None)
         if ukf21 is not None:
-            est_hist['est21_xyz'].append(ukf21.x[:3].copy()); est_hist['meas21_azel'].append(None)
+            est_hist['est21_xyz'].append(x0_21[:3].copy()); est_hist['meas21_azel'].append(None)
+
+
 
     # -------------------- FOV & attitude config --------------------
     fov_cfg     = cfg.get("fov", {"enabled": False})
@@ -583,34 +601,60 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             R2_now = np.asarray(exec_att2[-1]["R"], float)
 
             def _u_tr(u):
+                """Always return a 3D acceleration for the UKF: [ax, ay, az]."""
+                if u is None:
+                    return np.zeros(3)
                 u = np.asarray(u, float).ravel()
-                return u[:3] if u.size >= 3 else np.zeros(3)
+                if u.size >= 3:
+                    return u[:3]
+                if u.size == 2:
+                    return np.array([u[0], u[1], 0.0], float)
+                if u.size == 1:
+                    return np.array([u[0], 0.0, 0.0], float)
+                return np.zeros(3)
 
-            if 'ukf12' in locals() and ukf12 is not None:
-                ukf12.predict(dt, u=_u_tr(u2), u_cov=None)
-                if take:
-                    d = (p2 - p1); n = np.linalg.norm(d) + 1e-12
+
+        if 'ukf12' in locals() and ukf12 is not None:
+            ukf12.predict(dt, u=_u_tr(u2), u_cov=None)
+            if take:
+                d = (p2 - p1); n = np.linalg.norm(d) + 1e-12
+                if D == 3:
                     b_b = R1_now @ (d / n)
                     az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
                     el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
-                    ukf12.update(np.array([az, el]), p_obs=p1, R_wb=R1_now)
-                    est_hist['meas12_azel'].append((p1.copy(), np.array([az, el])))
+                    z = np.array([az, el])
                 else:
-                    est_hist['meas12_azel'].append(None)
-                est_hist['est12_xyz'].append(ukf12.x[:3].copy())
+                    # Work in XY plane; depth uses x_b component
+                    b_w = np.array([d[0]/n, d[1]/n, 0.0])
+                    b_b = R1_now @ b_w
+                    psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
+                    z = np.array([psi])
+                ukf12.update(z, p_obs=p1, R_wb=R1_now)
+                est_hist['meas12_azel'].append((p1.copy(), z.copy()))
+            else:
+                est_hist['meas12_azel'].append(None)
+            est_hist['est12_xyz'].append(ukf12.x[:3].copy())
 
-            if 'ukf21' in locals() and ukf21 is not None:
-                ukf21.predict(dt, u=_u_tr(u1), u_cov=None)
-                if take:
-                    d = (p1 - p2); n = np.linalg.norm(d) + 1e-12
+        if 'ukf21' in locals() and ukf21 is not None:
+            ukf21.predict(dt, u=_u_tr(u1), u_cov=None)
+            if take:
+                d = (p1 - p2); n = np.linalg.norm(d) + 1e-12
+                if D == 3:
                     b_b = R2_now @ (d / n)
                     az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
                     el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
-                    ukf21.update(np.array([az, el]), p_obs=p2, R_wb=R2_now)
-                    est_hist['meas21_azel'].append((p2.copy(), np.array([az, el])))
+                    z = np.array([az, el])
                 else:
-                    est_hist['meas21_azel'].append(None)
-                est_hist['est21_xyz'].append(ukf21.x[:3].copy())
+                    b_w = np.array([d[0]/n, d[1]/n, 0.0])
+                    b_b = R2_now @ b_w
+                    psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
+                    z = np.array([psi])
+                ukf21.update(z, p_obs=p2, R_wb=R2_now)
+                est_hist['meas21_azel'].append((p2.copy(), z.copy()))
+            else:
+                est_hist['meas21_azel'].append(None)
+            est_hist['est21_xyz'].append(ukf21.x[:3].copy())
+
 
         # 5) FOV (selected agent)
         if fov_enabled:
@@ -795,17 +839,37 @@ def _discretize_linear(Ac, Bc, dt, series_terms=18):
     Bd_np = E[:nx, nx:nx+nu]
     return ca.MX(Ad_np), ca.MX(Bd_np)
 
-
-def hcw_discrete_mats(n: float, dt: float):
+def hcw_discrete_mats(n: float, dt: float, D: int = 3):
     """
-    HCW dynamics in LVLH with state x=[dx,dy,dz,vx,vy,vz], input u=[ax,ay,az].
-    Continuous-time:
-      ẍ - 3 n^2 x - 2 n ẏ = ax
-      ÿ + 2 n ẋ           = ay
-      z̈ + n^2 z           = az
-    Returns (Ad, Bd) as CasADi MX for one step Δt.
+    HCW/LR (Clohessy–Wiltshire) discrete-time matrices for one step Δt.
+
+    If D == 3:
+        x = [x,y,z,vx,vy,vz], u = [ax,ay,az]
+    If D == 2 (z-plane suppressed):
+        x = [x,y,vx,vy],      u = [ax,ay]
     """
     n = float(n)
+
+    if D == 2:
+        # Continuous-time in-plane HCW:
+        # xdot = vx
+        # ydot = vy
+        # vxdot = 3 n^2 x + 2 n vy + ax
+        # vydot = -2 n vx + ay
+        Ac = ca.MX.zeros(4,4)
+        Ac[0,2] = 1.0         # xdot depends on vx
+        Ac[1,3] = 1.0         # ydot depends on vy
+        Ac[2,0] = 3*n*n       # vxdot depends on x
+        Ac[2,3] = 2*n         # vxdot depends on vy
+        Ac[3,2] = -2*n        # vydot depends on vx
+
+        Bc = ca.MX.zeros(4,2)
+        Bc[2,0] = 1.0         # ax to vxdot
+        Bc[3,1] = 1.0         # ay to vydot
+
+        return _discretize_linear(Ac, Bc, dt)
+
+    # --- D == 3 (original 6x6 HCW) ---
     Ac = ca.MX.zeros(6,6)
     # kinematics
     Ac[0,3] = 1.0
@@ -823,6 +887,7 @@ def hcw_discrete_mats(n: float, dt: float):
     Bc[5,2] = 1.0
 
     return _discretize_linear(Ac, Bc, dt)
+
 
 
 # ---------- Attitude helpers (shared) ----------
