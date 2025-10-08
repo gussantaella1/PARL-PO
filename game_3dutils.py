@@ -198,47 +198,22 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     """
     Receding-horizon rollout:
       • Translation: two-player dynamic game (single MCP) using PATH.
-      • Attitude (optional): two-player quaternion Nash game (single MCP) using PATH
-        when cfg['att']['mode'] == 'path_attitude'. Otherwise uses simple kinematic
-        preview modes ('hold' | 'vel' | 'none').
-
-    Notes
-    -----
-    - Translation game is solved every turn and executed in the plant.
-    - Attitude game is *decoupled* physically (viz / FOV only) but solved jointly
-      for both players in a single MCP so it is internally consistent.
+      • Attitude (optional preview for viz/FOV): kinematic 'hold'|'vel' or 'none'.
+      • Estimation: EKF/UKF bearing(-only) tracker(s). If cfg['obs_mode']=='est',
+        the latest filter *estimates* of the opponent positions are pushed into
+        the cost via cfg['obs'] each replan (no fallback to truth).
     """
-    import numpy as _np
     import numpy as np
 
     # -------------------- availability --------------------
     assert 'HAS_PATH_TRANS' in globals() and HAS_PATH_TRANS, \
-        f"Translation PATH pieces not importable: {_TRANS_IMPORT_ERR if '_TRANS_IMPORT_ERR' in globals() else ''}"
+        f"Translation PATH not importable: {_TRANS_IMPORT_ERR if '_TRANS_IMPORT_ERR' in globals() else ''}"
 
-    # --- attitude bits (joint two-player MCP builder) ---
-    try:
-        from neos_path_game_attitude import (
-            build_mcp_attitude_quat_two_player_kkt as BuildAtt2P,
-            derive_desired_dirs_from_plan,
-        )
-        _HAS_ATT = True
-        _ATT_ERR = None
-    except Exception as _e:
-        _HAS_ATT = False
-        _ATT_ERR = _e
-
-    # translation mcp helpers (already imported at module-level)
     from neos_path_game_translation import (
         build_mcp_two_player_one_shot as build_mcp_trans_two_player_one_shot,
         solve_with_local_path        as solve_with_local_path_trans,
         extract_trajectories         as extract_trajectories_trans,
     )
-
-    # attitude cost builder
-    try:
-        from game_costs_attitude import build_costs as build_costs_att
-    except Exception:
-        build_costs_att = None
 
     # -------------------- basics --------------------
     N = 2
@@ -254,12 +229,13 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # -------------------- translation dynamics used by PATH --------------------
+    # -------------------- translation dynamics (PATH model) --------------------
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt, cfg.get("D"))        # CasADi MX
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt, cfg.get("D"))
     else:
+        # double integrator (discrete, ZOH)
         Ad_tr, Bd_tr = _discretize_linear(
             np.block([[np.zeros((D,D)), np.eye(D)],
                       [np.zeros((D,D)), np.zeros((D,D))]]),
@@ -267,9 +243,9 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             dt
         )
 
-    # PATH dimensions (translation-only)
     nx, nu = nx_tr, nu_tr
     Ad_mx, Bd_mx = Ad_tr, Bd_tr
+    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
 
     # -------------------- initial states (translation) --------------------
     def _pad_x0_tr(x0_row):
@@ -278,91 +254,24 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     x2 = _pad_x0_tr(cfg["x0"][1])
     theta_curr = np.r_[x1, x2]
 
-    # -------------------- plant stepper (translation) --------------------
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
+    # -------------------- plant stepper (translation only) --------------------
     def step_plant(x, u):
         return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
 
     # -------------------- logs --------------------
     plan_hist1, plan_hist2 = [], []
-    plan_att1,  plan_att2  = [], []
     exec_xyz1,  exec_xyz2  = [], []
     exec_att1,  exec_att2  = [], []
     phi_hist1,  phi_hist2  = [], []
+    plan_att1,  plan_att2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
-    # -------------------- (optional) estimator config --------------------
-    est_cfg = dict(cfg.get('est', {}))
-    do_est  = bool(est_cfg.get('enabled', False))
-    if do_est:
-        P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
-        Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
-        who   = (est_cfg.get('who') or 'both').lower()   # 'both'|'1->2'|'2->1'
-        every = int(est_cfg.get('every', 1))
-        est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
-
-        # 3D vs 2D measurement noise
-        if D == 3:
-            s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
-            Rm = np.diag([s_az**2, s_el**2])
-        else:  # D == 2 → single bearing angle (azimuth) only
-            s_bear = np.deg2rad(est_cfg.get('meas_std_bear_deg', 0.3))
-            Rm = np.array([[s_bear**2]])
-
-        # UKF states are always 3D position+velocity; pad z with zeros if D==2
-        if D == 3:
-            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)]
-            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)]
-        else:
-            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:2], 0.0, 0.0, 0.0, 0.0]
-            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:2], 0.0, 0.0, 0.0, 0.0]
-
-        ukf12 = AgentUKF(x0_12, P0, Q, Rm, dt) if who in ('both','1->2') else None
-        ukf21 = AgentUKF(x0_21, P0, Q, Rm, dt) if who in ('both','2->1') else None
-
-        if ukf12 is not None:
-            est_hist['est12_xyz'].append(x0_12[:3].copy()); est_hist['meas12_azel'].append(None)
-        if ukf21 is not None:
-            est_hist['est21_xyz'].append(x0_21[:3].copy()); est_hist['meas21_azel'].append(None)
-
-
-
-    # -------------------- FOV & attitude config --------------------
-    fov_cfg     = cfg.get("fov", {"enabled": False})
-    fov_enabled = bool(fov_cfg.get("enabled", False))
-    fov_agent   = int(fov_cfg.get("agent", 2))
-    att_cfg     = dict(cfg.get("att", {}))
-    att     = dict(cfg.get("att", {}))
-
-    att_mode    = (att_cfg.get("mode") or "hold").lower()   # 'hold'|'vel'|'none'|'path_attitude'
-    align       = att_cfg.get("align", "x")
-    world_up    = np.asarray(att_cfg.get("up", [0,0,1]), float)
-    vmin0       = float(att_cfg.get("min_speed_for_axis", 1e-3))
-
-    if att_mode == "path_attitude":
-        assert _HAS_ATT and (build_costs_att is not None), f"Attitude PATH not available: {_ATT_ERR}"
-
-    # -------------------- attitude helpers --------------------
-
-    def _make_dseq(X_self, X_other):
-        # LOS by default; can extend later
-        return derive_dirs_plan(X_self, X_other, align=align)
-
-    def _exp_SO3(v):
-        v = np.asarray(v, float)
-        th = float(np.linalg.norm(v))
-        if th < 1e-12:
-            return np.eye(3)
-        k = v / th
-        K = np.array([[   0,  -k[2],  k[1]],
-                    [ k[2],    0,  -k[0]],
-                    [-k[1],  k[0],    0]], float)
-        return np.eye(3) + np.sin(th)*K + (1.0-np.cos(th))*(K @ K)
-    
-    def _p3_row(x_row):
-        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
-    def _p3_vec(x_vec):
-        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
+    # -------------------- attitude preview (optional) --------------------
+    att_cfg   = dict(cfg.get("att", {}))
+    att_mode  = (att_cfg.get("mode") or "hold").lower()  # 'hold'|'vel'|'none'
+    align     = att_cfg.get("align", "x")
+    world_up  = np.asarray(att_cfg.get("up", [0,0,1]), float)
+    vmin0     = float(att_cfg.get("min_speed_for_axis", 1e-3))
 
     def _axis_from_vel(x):
         v = np.asarray(x[D:2*D], float) if len(x) >= 2*D else np.zeros(D)
@@ -375,54 +284,25 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
 
     def _att_from_vel(x, prev_R=None):
         a3 = _axis_from_vel(x)
-        R  = frame_from_axis_continuous(a3, R_prev=prev_R, align=align, world_up=world_up)
-        return R
+        return frame_from_axis_continuous(a3, R_prev=prev_R, align=align, world_up=world_up)
 
-    def _plan_attitudes_from_X(X, R_prev):
-        """
-        For 'hold' and 'vel': build per-step frames with boresight aligned to the
-        path's instantaneous velocity (minimal-spin continuity via R_prev).
-        For 'none': keep R_prev fixed.
-        """
-        if att_mode == "none":
-            return [{"R": R_prev} for _ in range(T)], R_prev
-
-        # 'hold' and 'vel' are both kinematic: boresight = velocity direction
-        att_list, Rp = [], R_prev
-        for t in range(T):
-            R = _att_from_vel(X[t], prev_R=Rp)
-            att_list.append({"R": R})
-            Rp = R
-        return att_list, Rp
-
-
-
-
-
-    # -------------------- seed attitude at t=0 --------------------
+    # seed attitude
     if att_mode == "none":
         R1_0 = np.eye(3); R2_0 = np.eye(3)
-    elif att_mode == "hold":
-        R1_0 = _att_from_vel(x1, prev_R=None)
-        R2_0 = _att_from_vel(x2, prev_R=None)
-    elif att_mode == "path_attitude":
-        q01 = np.asarray(att_cfg.get("q0_1", (1,0,0,0)), float)
-        q02 = np.asarray(att_cfg.get("q0_2", (1,0,0,0)), float)
-        if np.linalg.norm(q01) > 1e-8 and np.linalg.norm(q02) > 1e-8:
-            R1_0 = quat_to_Rwb_np(q01); R2_0 = quat_to_Rwb_np(q02)
-        else:
-            R1_0 = _att_from_vel(x1, prev_R=None)
-            R2_0 = _att_from_vel(x2, prev_R=None)
-    else:  # 'vel'
+    else:
         R1_0 = _att_from_vel(x1, prev_R=None)
         R2_0 = _att_from_vel(x2, prev_R=None)
 
     prev_R1, prev_R2 = R1_0, R2_0
-    exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
+    exec_xyz1.append((float(x1[0]), float(x1[1]), float(x1[2]) if D==3 else 0.0))
+    exec_xyz2.append((float(x2[0]), float(x2[1]), float(x2[2]) if D==3 else 0.0))
     exec_att1.append({"R": R1_0}); exec_att2.append({"R": R2_0})
-    phi_hist1.append(0.0); phi_hist2.append(0.0)
+    phi_hist1.append(0.0);        phi_hist2.append(0.0)
 
-    # FOV t=0
+    # -------------------- FOV config (optional) --------------------
+    fov_cfg     = cfg.get("fov", {"enabled": False})
+    fov_enabled = bool(fov_cfg.get("enabled", False))
+    fov_agent   = int(fov_cfg.get("agent", 2))
     if fov_enabled:
         R_def0 = R2_0 if fov_agent == 2 else R1_0
         x_def  = x2    if fov_agent == 2 else x1
@@ -439,9 +319,52 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    # -------------------- build persistent translation MCP --------------------
+    # -------------------- estimator config (optional) --------------------
+    est_cfg = dict(cfg.get('est', {}))
+    do_est  = bool(est_cfg.get('enabled', False))
+
+    # latest opponent-position *estimates* (world, 3D) for the cost:
+    last_p2_from_1 = None   # Agent1's estimate of Agent2
+    last_p1_from_2 = None   # Agent2's estimate of Agent1
+
+    if do_est:
+        P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
+        Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
+        who   = (est_cfg.get('who') or 'both').lower()   # 'both'|'1->2'|'2->1'
+        every = int(est_cfg.get('every', 1))
+        est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
+
+        # Measurement noise (bearing vs az/el)
+        if D == 3:
+            s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
+            Rm = np.diag([s_az**2, s_el**2])
+        else:
+            s_bear = np.deg2rad(est_cfg.get('meas_std_bear_deg', 0.3))
+            Rm = np.array([[s_bear**2]])
+
+        # 3D UKF/EKF state; pad z if D==2
+        if D == 3:
+            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:3], np.zeros(3)]
+            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:3], np.zeros(3)]
+        else:
+            x0_12 = np.r_[np.asarray(cfg["x0"][1], float)[:2], 0.0, 0.0, 0.0, 0.0]
+            x0_21 = np.r_[np.asarray(cfg["x0"][0], float)[:2], 0.0, 0.0, 0.0, 0.0]
+
+        # Preferred: UKF; fallback EKF if that's what you imported
+        ukf12 = AgentUKF(x0_12, P0, Q, Rm, dt) if who in ('both','1->2') else None
+        ukf21 = AgentUKF(x0_21, P0, Q, Rm, dt) if who in ('both','2->1') else None
+
+        if ukf12 is not None:
+            est_hist['est12_xyz'].append(x0_12[:3].copy()); est_hist['meas12_azel'].append(None)
+            last_p2_from_1 = x0_12[:3].copy()  # seed estimate for first plan if desired
+        if ukf21 is not None:
+            est_hist['est21_xyz'].append(x0_21[:3].copy()); est_hist['meas21_azel'].append(None)
+            last_p1_from_2 = x0_21[:3].copy()
+
+    # -------------------- PATH model (translation) --------------------
     x_var_box = (-1e6, 1e6); u_var_box = (-1e3, 1e3)
     h_list    = build_h_builders(cfg, nx, D)
+
     m_path = build_mcp_trans_two_player_one_shot(
         Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
         T=T, nx=nx, nu=nu, D=D,
@@ -486,10 +409,24 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                 m.u1[k, j].value = float(U1[kk, jj])
                 m.u2[k, j].value = float(U2[kk, jj])
 
-    # -------------------- replan (translation + attitude) --------------------
-    att_ctx = {"m": None, "sol1": None, "sol2": None}
+    # -------------------- replan (translation; inject estimates into costs) ---
+    obs_mode = (cfg.get("obs_mode") or "truth").lower()
 
     def replan_path(theta_vec, prevR1, prevR2):
+        nonlocal last_p2_from_1, last_p1_from_2
+
+        # If using estimator in the cost, require *actual* estimates now.
+        if obs_mode == "est":
+            assert (last_p2_from_1 is not None) and (last_p1_from_2 is not None), \
+                "obs_mode='est' but no opponent-position estimates available yet."
+            # Build ZOH lists of length T (D-vectors) for this solve:
+            p21 = last_p2_from_1[:D].tolist()
+            p12 = last_p1_from_2[:D].tolist()
+            cfg["obs"] = {
+                "p2_from_1": [p21] * T,   # Agent1's view of Agent2
+                "p1_from_2": [p12] * T,   # Agent2's view of Agent1
+            }
+
         x0_1 = theta_vec[:nx]; x0_2 = theta_vec[nx:2*nx]
         m = path_ctx["m"]; A = path_ctx["A"]; B = path_ctx["B"]
 
@@ -498,15 +435,13 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             m.x01[i] = float(x0_1[i]); m.x02[i] = float(x0_2[i])
             m.x1[0, i].value = float(x0_1[i]); m.x2[0, i].value = float(x0_2[i])
 
-        # warm start controls (|Ku|=T)
+        # warm start
         Ku_len = len(list(m.Ku))
         if path_ctx["U1_guess"] is None:
             U1g = np.zeros((Ku_len, nu)); U2g = np.zeros((Ku_len, nu))
         else:
             U1g = _shift_controls_one_step(path_ctx["U1_guess"], target_len=Ku_len)
             U2g = _shift_controls_one_step(path_ctx["U2_guess"], target_len=Ku_len)
-
-        # forward sim to guess X
         X1g = _forward_sim_x(A, B, x0_1, U1g)
         X2g = _forward_sim_x(A, B, x0_2, U2g)
         _seed_model_from_guess(m, X1g, U1g, X2g, U2g)
@@ -522,21 +457,21 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         path_ctx["X1_guess"], path_ctx["U1_guess"] = X1, U1
         path_ctx["X2_guess"], path_ctx["U2_guess"] = X2, U2
 
-        # attitude planning preview (joint MCP once)
-        if att_mode == "path_attitude":
-            att1, sol1, att2, sol2, m_att = _solve_attitude_for_plans(X1, X2, prevR1, prevR2)
-            att_ctx["m"] = m_att
-            att_ctx["sol1"] = sol1
-            att_ctx["sol2"] = sol2
-            prevR1_out = np.asarray(att1[-1]["R"])
-            prevR2_out = np.asarray(att2[-1]["R"])
+        # attitude preview (kinematic)
+        def _plan_attitudes_from_X(X, R_prev):
+            if att_mode == "none":
+                return [{"R": R_prev} for _ in range(T)], R_prev
+            att_list, Rp = [], R_prev
+            for t in range(T):
+                R = _att_from_vel(X[t], prev_R=Rp)
+                att_list.append({"R": R}); Rp = R
+            return att_list, Rp
 
-        else:
-            att1, prevR1_out = _plan_attitudes_from_X(X1, prevR1)
-            att2, prevR2_out = _plan_attitudes_from_X(X2, prevR2)
+        att1, prevR1_out = _plan_attitudes_from_X(X1, prevR1)
+        att2, prevR2_out = _plan_attitudes_from_X(X2, prevR2)
 
-        plan1 = [_p3_row(X1[t, :]) for t in range(T)]
-        plan2 = [_p3_row(X2[t, :]) for t in range(T)]
+        plan1 = [(float(X1[t,0]), float(X1[t,1]), float(X1[t,2]) if D==3 else 0.0) for t in range(T)]
+        plan2 = [(float(X2[t,0]), float(X2[t,1]), float(X2[t,2]) if D==3 else 0.0) for t in range(T)]
         z_dummy = np.zeros(1)
         return z_dummy, plan1, plan2, U1, U2, att1, att2, prevR1_out, prevR2_out
 
@@ -564,32 +499,19 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         x2 = step_plant(x2, u2)
         theta_curr = np.r_[x1, x2]
 
-        # 2) attitude exec (avoid double-append)
+        # 2) attitude kinematics (hold/vel/none)
         if att_mode == "none":
             R1, R2 = prev_R1, prev_R2
-            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
-            phi_hist1.append(0.0); phi_hist2.append(0.0)
-
-        elif att_mode == "hold":
-            # Lock boresight to current velocity (minimal-spin update)
+        else:
             R1 = _att_from_vel(x1, prev_R=prev_R1)
             R2 = _att_from_vel(x2, prev_R=prev_R2)
             prev_R1, prev_R2 = R1, R2
-            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
-            phi_hist1.append(0.0); phi_hist2.append(0.0)
-
-
-
-
-        else:  # 'vel'
-            R1 = _att_from_vel(x1, prev_R=prev_R1)
-            R2 = _att_from_vel(x2, prev_R=prev_R2)
-            prev_R1, prev_R2 = R1, R2
-            exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
-            phi_hist1.append(0.0); phi_hist2.append(0.0)
+        exec_att1.append({"R": R1}); exec_att2.append({"R": R2})
+        phi_hist1.append(0.0);      phi_hist2.append(0.0)
 
         # 3) log executed positions
-        exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
+        exec_xyz1.append((float(x1[0]), float(x1[1]), float(x1[2]) if D==3 else 0.0))
+        exec_xyz2.append((float(x2[0]), float(x2[1]), float(x2[2]) if D==3 else 0.0))
 
         # 4) EKF/UKF estimation (optional)
         if do_est:
@@ -601,62 +523,56 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
             R2_now = np.asarray(exec_att2[-1]["R"], float)
 
             def _u_tr(u):
-                """Always return a 3D acceleration for the UKF: [ax, ay, az]."""
+                """Return 3D acceleration for the UKF: [ax, ay, az]."""
                 if u is None:
                     return np.zeros(3)
                 u = np.asarray(u, float).ravel()
-                if u.size >= 3:
-                    return u[:3]
-                if u.size == 2:
-                    return np.array([u[0], u[1], 0.0], float)
-                if u.size == 1:
-                    return np.array([u[0], 0.0, 0.0], float)
+                if u.size >= 3: return u[:3]
+                if u.size == 2: return np.array([u[0], u[1], 0.0], float)
+                if u.size == 1: return np.array([u[0], 0.0, 0.0], float)
                 return np.zeros(3)
 
-
-        if 'ukf12' in locals() and ukf12 is not None:
-            ukf12.predict(dt, u=_u_tr(u2), u_cov=None)
-            if take:
-                d = (p2 - p1); n = np.linalg.norm(d) + 1e-12
-                if D == 3:
-                    b_b = R1_now @ (d / n)
-                    az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
-                    el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
-                    z = np.array([az, el])
+            if 'ukf12' in locals() and ukf12 is not None:
+                ukf12.predict(dt, u=_u_tr(u2), u_cov=None)
+                if take:
+                    d = (p2 - p1); n = np.linalg.norm(d) + 1e-12
+                    if D == 3:
+                        b_b = R1_now @ (d / n)
+                        az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
+                        el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
+                        z = np.array([az, el])
+                    else:
+                        b_w = np.array([d[0]/n, d[1]/n, 0.0]); b_b = R1_now @ b_w
+                        psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
+                        z = np.array([psi])
+                    ukf12.update(z, p_obs=p1, R_wb=R1_now)
+                    last_p2_from_1 = ukf12.x[:3].copy()              # ← update estimate used in costs
+                    est_hist['meas12_azel'].append((p1.copy(), z.copy()))
                 else:
-                    # Work in XY plane; depth uses x_b component
-                    b_w = np.array([d[0]/n, d[1]/n, 0.0])
-                    b_b = R1_now @ b_w
-                    psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
-                    z = np.array([psi])
-                ukf12.update(z, p_obs=p1, R_wb=R1_now)
-                est_hist['meas12_azel'].append((p1.copy(), z.copy()))
-            else:
-                est_hist['meas12_azel'].append(None)
-            est_hist['est12_xyz'].append(ukf12.x[:3].copy())
+                    est_hist['meas12_azel'].append(None)
+                est_hist['est12_xyz'].append(ukf12.x[:3].copy())
 
-        if 'ukf21' in locals() and ukf21 is not None:
-            ukf21.predict(dt, u=_u_tr(u1), u_cov=None)
-            if take:
-                d = (p1 - p2); n = np.linalg.norm(d) + 1e-12
-                if D == 3:
-                    b_b = R2_now @ (d / n)
-                    az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
-                    el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
-                    z = np.array([az, el])
+            if 'ukf21' in locals() and ukf21 is not None:
+                ukf21.predict(dt, u=_u_tr(u1), u_cov=None)
+                if take:
+                    d = (p1 - p2); n = np.linalg.norm(d) + 1e-12
+                    if D == 3:
+                        b_b = R2_now @ (d / n)
+                        az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
+                        el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
+                        z = np.array([az, el])
+                    else:
+                        b_w = np.array([d[0]/n, d[1]/n, 0.0]); b_b = R2_now @ b_w
+                        psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
+                        z = np.array([psi])
+                    ukf21.update(z, p_obs=p2, R_wb=R2_now)
+                    last_p1_from_2 = ukf21.x[:3].copy()              # ← update estimate used in costs
+                    est_hist['meas21_azel'].append((p2.copy(), z.copy()))
                 else:
-                    b_w = np.array([d[0]/n, d[1]/n, 0.0])
-                    b_b = R2_now @ b_w
-                    psi = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_bear
-                    z = np.array([psi])
-                ukf21.update(z, p_obs=p2, R_wb=R2_now)
-                est_hist['meas21_azel'].append((p2.copy(), z.copy()))
-            else:
-                est_hist['meas21_azel'].append(None)
-            est_hist['est21_xyz'].append(ukf21.x[:3].copy())
+                    est_hist['meas21_azel'].append(None)
+                est_hist['est21_xyz'].append(ukf21.x[:3].copy())
 
-
-        # 5) FOV (selected agent)
+        # 5) FOV (optional)
         if fov_enabled:
             R_def = (np.asarray(exec_att2[-1]["R"]) if fov_agent==2 else np.asarray(exec_att1[-1]["R"]))
             x_def = x2 if fov_agent == 2 else x1
@@ -686,6 +602,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     if do_est:
         ret.update(est_hist)
     return ret
+
 
 
 
