@@ -1,4 +1,4 @@
-# neos_path_game_translation.py — ONE BIG MCP version
+# neos_path_game.py — ONE BIG MCP version
 import os
 import numpy as np
 from pyomo.environ import *
@@ -119,7 +119,7 @@ def build_mcp_two_player_one_shot(
     m.u1 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
     m.u2 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
 
-    # ---------- shared equality *expressions* g̃(τ) g tilde ----------
+    # ---------- shared equality *expressions* g̃(τ) ----------
     #   ICs
     def g_ic1_expr(_m, i): return _m.x1[0, i] - _m.x01[i]
     def g_ic2_expr(_m, i): return _m.x2[0, i] - _m.x02[i]

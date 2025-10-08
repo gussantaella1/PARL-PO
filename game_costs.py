@@ -1,4 +1,4 @@
-# game_costs_translation.py
+# game_costs.py
 # D-agnostic cost builder for the 2D/3D double-integrator game.
 # Returns a list of per-player CasADi scalar objectives [f1, f2] (N=2).
 from __future__ import annotations
@@ -27,16 +27,9 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
           - setting: {"baseline","boundary_hug","center_vs_block","orbit",
                       "rendezvous","antipodal","chase_escape_simple",
                       "fov_tag_simple","chase_escape_tail"}
-          - D: 2 or 3
           - arena: {"type": "box"|"circle"|"sphere", ...}
           - orbit_axis: 3-vector for 3D orbit setting
           - weights like effort_w1, effort_w2, etc.
-          - obs_mode: "truth" (default) | "est"
-              If "est" (STRICT), the opponent position used in *cost terms* must come
-              from cfg["obs"]["p2_from_1"] (Agent1's view of Agent2) and
-              cfg["obs"]["p1_from_2"] (Agent2's view of Agent1), each a list
-              of length >= T with D-vectors. No fallback to truth is performed.
-          - obs: dict with keys {"p2_from_1", "p1_from_2"} as described above.
 
     Returns
     -------
@@ -44,7 +37,7 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
         [f1, f2] where each f(tau, theta) returns a scalar MX.
     """
     setting = (cfg.get("setting", "baseline") or "baseline").lower()
-    D = int(cfg.get("D", 3))
+    D = int(cfg.get("D", 3))               # trust the config
     assert D in (2, 3), "build_costs supports D in {2,3}"
     assert N == 2, "Current build_costs assumes N=2"
     nprim = T*nx + (T-1)*nu
@@ -117,50 +110,6 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
         pyp = ca.dot(p, u2_axis)
         return ca.atan2(pyp, pxp)
 
-    # ---------- STRICT observation (estimate) plumbing ----------
-    obs_mode = (cfg.get("obs_mode") or "truth").lower()
-    obs = cfg.get("obs", {}) or {}
-
-    if obs_mode == "est":
-        # hard checks, no fallback
-        for key in ("p2_from_1", "p1_from_2"):
-            if key not in obs:
-                raise ValueError(
-                    f"obs_mode='est' requires cfg['obs']['{key}'] (length >= T, each a D-vector)."
-                )
-            seq = obs[key]
-            if not isinstance(seq, (list, tuple, np.ndarray)) or len(seq) < T:
-                raise ValueError(
-                    f"obs_mode='est': cfg['obs']['{key}'] must be a list/array with length >= T (got {type(seq)} len={len(seq) if hasattr(seq,'__len__') else 'NA'})."
-                )
-            first = np.asarray(seq[0], float).reshape(-1)
-            if first.size < D:
-                raise ValueError(
-                    f"obs_mode='est': entries in cfg['obs']['{key}'] must have at least D={D} elements."
-                )
-
-        # Convert to MX lists (zero-order-hold across horizon)
-        p2_hat_from_1 = [ca.MX(np.asarray(obs["p2_from_1"][t], float).reshape(-1)[:D]) for t in range(T)]
-        p1_hat_from_2 = [ca.MX(np.asarray(obs["p1_from_2"][t], float).reshape(-1)[:D]) for t in range(T)]
-    else:
-        p2_hat_from_1 = None
-        p1_hat_from_2 = None
-
-    def op_pos_for_agent(agent_id: int, t: int, xs1, xs2):
-        """
-        Position of the opponent as 'seen' by agent_id at stage t.
-        - 'truth': returns decision-variable pos.
-        - 'est'  : returns provided estimate; raises if unavailable.
-        """
-        if obs_mode == "truth":
-            return pos(xs2[t]) if agent_id == 1 else pos(xs1[t])
-
-        # STRICT est mode
-        if agent_id == 1:
-            return p2_hat_from_1[t]
-        else:
-            return p1_hat_from_2[t]
-
     # ---------- Defaults / params ----------
     R = None
     ar = cfg.get("arena", {})
@@ -196,9 +145,8 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p1 = pos(xs1[t])
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)
-                terms.append(ca.sumsqr(p1 - p2_seen) + effort_w1*ca.sumsqr(us1[t]))
+                p1, p2 = pos(xs1[t]), pos(xs2[t])
+                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
             return ca.sum1(ca.vcat(terms))
 
         def f2(tau, theta):
@@ -216,9 +164,8 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p1 = pos(xs1[t])
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)
-                terms.append(ca.sumsqr(p1 - p2_seen) + effort_w1*ca.sumsqr(us1[t]))
+                p1, p2 = pos(xs1[t]), pos(xs2[t])
+                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
             return ca.sum1(ca.vcat(terms))
 
         def f2(tau, theta):
@@ -240,11 +187,10 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p1 = pos(xs1[t])
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)
-                keep_p2_away = -ca.sumsqr(p2_seen)
-                block        = ca.sumsqr(p1 - gamma * p2_seen)
-                chase        = ca.sumsqr(p1 - p2_seen)
+                p1, p2 = pos(xs1[t]), pos(xs2[t])
+                keep_p2_away = -ca.sumsqr(p2)
+                block        = ca.sumsqr(p1 - gamma * p2)
+                chase        = ca.sumsqr(p1 - p2)
                 effort       = effort_w1 * ca.sumsqr(us1[t])
                 terms.append(w_center*keep_p2_away + w_block*block + w_chase*chase + effort)
             return ca.sum1(ca.vcat(terms))
@@ -254,9 +200,8 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, _), (xs2, us2) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p2 = pos(xs2[t])
-                p1_seen = op_pos_for_agent(2, t, xs1, xs2)
-                d2 = ca.sumsqr(p2 - p1_seen)
+                p1, p2 = pos(xs1[t]), pos(xs2[t])
+                d2 = ca.sumsqr(p2 - p1)
                 go_center = ca.sumsqr(p2)
                 avoid_p1  = w_avoid * ca.exp(-alpha * d2)
                 terms.append(go_center + avoid_p1 + effort_w2*ca.sumsqr(us2[t]))
@@ -269,9 +214,8 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p1 = pos(xs1[t])
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)
-                terms.append(ca.sumsqr(p1 - p2_seen) + effort_w1*ca.sumsqr(us1[t]))
+                p1, p2 = pos(xs1[t]), pos(xs2[t])
+                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
             return ca.sum1(ca.vcat(terms))
 
         def f2(tau, theta):
@@ -318,7 +262,7 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             terms = []
             for t in range(T-1):
                 a1 = azimuth_about_axis(pos(xs1[t]))
-                a2 = azimuth_about_axis(op_pos_for_agent(1, t, xs1, xs2))
+                a2 = azimuth_about_axis(pos(xs2[t]))
                 d  = wrap_diff(a1, a2)
                 terms.append(d*d + effort_w1*ca.sumsqr(us1[t]))
             return ca.sum1(ca.vcat(terms))
@@ -327,7 +271,7 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, _), (xs2, us2) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                a1 = azimuth_about_axis(op_pos_for_agent(2, t, xs1, xs2))
+                a1 = azimuth_about_axis(pos(xs1[t]))
                 a2 = azimuth_about_axis(pos(xs2[t]))
                 d  = wrap_diff(a1, a2)
                 terms.append(-(d*d) + effort_w2*ca.sumsqr(us2[t]))
@@ -336,9 +280,9 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
 
     elif setting == "chase_escape_simple":
         # P1 chaser; P2 evader
-        w_close  = float(cfg.get("w_close",  1.0))
-        w_far    = float(cfg.get("w_far",    1.0))
-        w_term   = float(cfg.get("w_term",   1.0))
+        w_close  = float(cfg.get("w_close",  1.0))   # P1 weight to stay close
+        w_far    = float(cfg.get("w_far",    1.0))   # P2 weight to be far
+        w_term   = float(cfg.get("w_term",   1.0))   # terminal distance weight
         eff1     = float(cfg.get("effort_w1", 0.01))
         eff2     = float(cfg.get("effort_w2", 0.01))
 
@@ -346,9 +290,9 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                r = pos(xs1[t]) - op_pos_for_agent(1, t, xs1, xs2)
+                r = pos(xs1[t]) - pos(xs2[t])
                 terms.append(w_close * ca.sumsqr(r) + eff1 * ca.sumsqr(us1[t]))
-            rT = pos(xs1[T-1]) - op_pos_for_agent(1, T-1, xs1, xs2)
+            rT = pos(xs1[T-1]) - pos(xs2[T-1])
             terms.append(w_term * ca.sumsqr(rT))
             return ca.sum1(ca.vcat(terms))
 
@@ -356,9 +300,9 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, _), (xs2, us2) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                r = op_pos_for_agent(2, t, xs1, xs2) - pos(xs2[t])
+                r = pos(xs2[t]) - pos(xs1[t])
                 terms.append(-w_far * ca.sumsqr(r) + eff2 * ca.sumsqr(us2[t]))
-            rT = op_pos_for_agent(2, T-1, xs1, xs2) - pos(xs2[T-1])
+            rT = pos(xs2[T-1]) - pos(xs1[T-1])
             terms.append(-w_term * ca.sumsqr(rT))
             return ca.sum1(ca.vcat(terms))
         return [f1, f2]
@@ -376,13 +320,13 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             return mx / ca.sqrt(ca.sumsqr(mx) + epsu)
 
         def f1(tau, theta):
-            # P1: align boresight (v1) with r = p2_seen - p1 and reduce distance
+            # P1: align boresight (v1) with r = p2 - p1 and reduce distance
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
                 p1, v1 = pos(xs1[t]), vel(xs1[t])
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)
-                r      = p2_seen - p1
+                p2     = pos(xs2[t])
+                r      = p2 - p1
                 rhat   = _unit(r)
                 a1hat  = _unit(v1)
                 align  = ca.dot(a1hat, rhat)
@@ -396,10 +340,9 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             (xs1, _), (xs2, us2) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p2 = pos(xs2[t])
-                p1_seen = op_pos_for_agent(2, t, xs1, xs2)
-                r      = p2 - p1_seen
-                v1     = vel(xs1[t])           # kept from plan; estimates could be added later
+                p1, v1 = pos(xs1[t]), vel(xs1[t])
+                p2     = pos(xs2[t])
+                r      = p2 - p1
                 rhat   = _unit(r)
                 a1hat  = _unit(v1)
                 align  = ca.dot(a1hat, rhat)
@@ -441,32 +384,57 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             return blend * tail_quad + (1.0 - blend) * ca.sumsqr(r)
 
         def f1(tau, theta):
-            # P1 tails P2 (use P2 as SEEN by Agent 1)
+            # P1 tails P2
             (xs1, us1), (xs2, _) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                p2_seen = op_pos_for_agent(1, t, xs1, xs2)  # leader as seen
-                p1      = pos(xs1[t])                       # follower
-                v2      = vel(xs2[t])                       # plan velocity (swap to est v if wired later)
-                terms.append(tail_cost(p2_seen, p1, v2) + eff1 * ca.sumsqr(us1[t]))
+                p2, v2 = pos(xs2[t]), vel(xs2[t])  # leader
+                p1     = pos(xs1[t])               # follower
+                terms.append(tail_cost(p2, p1, v2) + eff1 * ca.sumsqr(us1[t]))
             # terminal tailing
-            p2T_seen = op_pos_for_agent(1, T-1, xs1, xs2)
+            p2T, v2T = pos(xs2[T-1]), vel(xs2[T-1])
             p1T      = pos(xs1[T-1])
-            v2T      = vel(xs2[T-1])
-            terms.append(w_term * tail_cost(p2T_seen, p1T, v2T))
+            terms.append(w_term * tail_cost(p2T, p1T, v2T))
             return ca.sum1(ca.vcat(terms))
 
         def f2(tau, theta):
-            # P2 evades (maximize separation from Agent1 as SEEN by Agent2)
+            # P2 evades (maximize separation)
             (xs1, _), (xs2, us2) = unpack_both(tau)
             terms = []
             for t in range(T-1):
-                r = pos(xs2[t]) - op_pos_for_agent(2, t, xs1, xs2)
+                r = pos(xs2[t]) - pos(xs1[t])
                 terms.append(-w_far * ca.sumsqr(r) + eff2 * ca.sumsqr(us2[t]))
-            rT = pos(xs2[T-1]) - op_pos_for_agent(2, T-1, xs1, xs2)
+            rT = pos(xs2[T-1]) - pos(xs1[T-1])
             terms.append(-w_term * ca.sumsqr(rT))
             return ca.sum1(ca.vcat(terms))
         return [f1, f2]
 
     else:
         raise ValueError(f"Unknown setting '{setting}'.")
+    
+def add_roll_terms(J, tau_i, nx, nu, T, nx_tr, nu_tr, cfg):
+    att  = cfg.get('att', {})
+    if att.get('mode','') != 'roll1d':
+        return J
+
+    w_phi  = float(att.get('w_phi',  0.0))   # upright horizon
+    w_dphi = float(att.get('w_dphi', 0.0))   # smoothness
+    w_tau  = float(att.get('w_tau',  0.0))   # effort
+
+    off_phi   = nx_tr
+    off_u_tau = nu_tr
+
+    # φ and Δφ
+    for t in range(T):
+        phi_t = tau_i[t*nx + off_phi]
+        if w_phi > 0:   J += w_phi * phi_t**2
+        if w_dphi > 0 and t < T-1:
+            phi_n = tau_i[(t+1)*nx + off_phi]
+            J += w_dphi * (phi_n - phi_t)**2
+
+    # τx
+    for t in range(T-1):
+        tau_x = tau_i[T*nx + t*nu + off_u_tau]
+        if w_tau > 0:   J += w_tau * tau_x**2
+
+    return J
