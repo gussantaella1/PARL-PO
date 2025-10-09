@@ -182,7 +182,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # MX
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt, D=D)  # <-- D-aware
     else:
         Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
 
@@ -207,11 +207,9 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
     # --- constraints (fixed Ad,Bd) ---
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
     x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
     if use_att:
         x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
     # --- initial states (pad with φ if needed) ---
     x1 = pad_x0_with_att(cfg["x0"][0], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][0], float)[:nx].copy()
@@ -438,9 +436,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = N
         return z_dummy, plan1, plan2, U1, U2, att1, att2, prev1_out, prev2_out, prevR1_out, prevR2_out
 
     # --- first plan ---
-    z_last = np.zeros(1)  # not used, kept for signature symmetry
-    z_last, plan1, plan2, U1, U2, att1, att2, prev_axis1D, prev_axis2D, prev_R1, prev_R2 = \
-        replan_path(theta_curr, prev_axis1D, prev_axis2D, prev_R1, prev_R2)
     step_in_turn = 0
 
     # -------------------- rollout --------------------
@@ -711,22 +706,41 @@ def _discretize_linear(Ac, Bc, dt, series_terms=18):
     return ca.MX(Ad_np), ca.MX(Bd_np)
 
 
-def hcw_discrete_mats(n: float, dt: float):
+def hcw_discrete_mats(n: float, dt: float, D: int = 3):
     """
-    HCW dynamics in LVLH with state x=[dx,dy,dz,vx,vy,vz], input u=[ax,ay,az].
-    Continuous-time:
-      ẍ - 3 n^2 x - 2 n ẏ = ax
-      ÿ + 2 n ẋ           = ay
-      z̈ + n^2 z           = az
-    Returns (Ad, Bd) as CasADi MX for one step Δt.
+    D-aware HCW/LR (Clohessy–Wiltshire) one-step matrices.
+      If D == 3:
+         x = [x,y,z,vx,vy,vz], u = [ax,ay,az]
+      If D == 2 (in-plane, z suppressed):
+         x = [x,y,vx,vy],      u = [ax,ay]
     """
+    import casadi as ca
     n = float(n)
+
+    if D == 2:
+        # In-plane HCW:
+        # xdot = vx
+        # ydot = vy
+        # vxdot = 3 n^2 x + 2 n vy + ax
+        # vydot = -2 n vx + ay
+        Ac = ca.MX.zeros(4, 4)
+        Ac[0,2] = 1.0      # xdot <- vx
+        Ac[1,3] = 1.0      # ydot <- vy
+        Ac[2,0] = 3*n*n    # vxdot <- x
+        Ac[2,3] = 2*n      # vxdot <- vy
+        Ac[3,2] = -2*n     # vydot <- vx
+
+        Bc = ca.MX.zeros(4, 2)
+        Bc[2,0] = 1.0      # ax -> vxdot
+        Bc[3,1] = 1.0      # ay -> vydot
+
+        return _discretize_linear(Ac, Bc, dt)
+
+    # Full 3D HCW:
     Ac = ca.MX.zeros(6,6)
-    # kinematics
     Ac[0,3] = 1.0
     Ac[1,4] = 1.0
     Ac[2,5] = 1.0
-    # dynamics
     Ac[3,0] = 3*n*n
     Ac[3,4] = 2*n
     Ac[4,3] = -2*n

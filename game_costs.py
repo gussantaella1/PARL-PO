@@ -139,220 +139,7 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
 
     # ------------------ SCENARIOS (ROLE-SWAPPED) ------------------
 
-    if setting == "baseline":
-        # P1 chases P2; P2 tries to go fast
-        def f1(tau, theta):
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, p2 = pos(xs1[t]), pos(xs2[t])
-                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (_, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                v2 = vel(xs2[t])
-                terms.append(-ca.sqrt(0.1 + ca.sumsqr(v2)) + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "boundary_hug":
-        # P1 chases P2; P2 hugs boundary
-        def f1(tau, theta):
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, p2 = pos(xs1[t]), pos(xs2[t])
-                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (_, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p2 = pos(xs2[t])
-                terms.append(-ca.sumsqr(p2) + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "center_vs_block":
-        # P1 blocks; P2 goes center & avoids P1
-        w_avoid = float(cfg.get("w_avoid", 2.0))
-        alpha   = float(cfg.get("avoid_alpha", 1.0))
-
-        def f1(tau, theta):
-            # blocker
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, p2 = pos(xs1[t]), pos(xs2[t])
-                keep_p2_away = -ca.sumsqr(p2)
-                block        = ca.sumsqr(p1 - gamma * p2)
-                chase        = ca.sumsqr(p1 - p2)
-                effort       = effort_w1 * ca.sumsqr(us1[t])
-                terms.append(w_center*keep_p2_away + w_block*block + w_chase*chase + effort)
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            # go center & avoid P1
-            (xs1, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, p2 = pos(xs1[t]), pos(xs2[t])
-                d2 = ca.sumsqr(p2 - p1)
-                go_center = ca.sumsqr(p2)
-                avoid_p1  = w_avoid * ca.exp(-alpha * d2)
-                terms.append(go_center + avoid_p1 + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "orbit":
-        # P1 chases P2; P2 does orbit behavior
-        def f1(tau, theta):
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, p2 = pos(xs1[t]), pos(xs2[t])
-                terms.append(ca.sumsqr(p1 - p2) + effort_w1*ca.sumsqr(us1[t]))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (xs1, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p2, v2 = pos(xs2[t]), vel(xs2[t])
-                if D == 2:
-                    om = omega_2d(p2, v2); plane_term = 0.0
-                else:
-                    om = omega_about_axis(p2, v2, ax_hat)
-                    plane_term = plane_lock_w * (ca.dot(ax_hat, p2)**2) if plane_lock_w > 0.0 else 0.0
-                radial_term = radial_lock_w * (ca.dot(p2, v2) / (ca.sqrt(ca.sumsqr(p2))+eps))**2 if radial_lock_w > 0.0 else 0.0
-                terms.append((om - omega_target)**2 + plane_term + radial_term + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "rendezvous":
-        # both track target (unchanged mathematically; players swapped is symmetric)
-        def f1(tau, theta):
-            (xs1, us1), _ = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1 = pos(xs1[t])
-                terms.append(ca.sumsqr(p1 - target) + effort_w1*ca.sumsqr(us1[t]))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (_, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p2 = pos(xs2[t])
-                terms.append(ca.sumsqr(p2 - target) + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "antipodal":
-        # P1 minimizes azimuth gap; P2 maximizes gap
-        def wrap_diff(a, b):
-            return ca.atan2(ca.sin(a-b), ca.cos(a-b))
-
-        def f1(tau, theta):
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                a1 = azimuth_about_axis(pos(xs1[t]))
-                a2 = azimuth_about_axis(pos(xs2[t]))
-                d  = wrap_diff(a1, a2)
-                terms.append(d*d + effort_w1*ca.sumsqr(us1[t]))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (xs1, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                a1 = azimuth_about_axis(pos(xs1[t]))
-                a2 = azimuth_about_axis(pos(xs2[t]))
-                d  = wrap_diff(a1, a2)
-                terms.append(-(d*d) + effort_w2*ca.sumsqr(us2[t]))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "chase_escape_simple":
-        # P1 chaser; P2 evader
-        w_close  = float(cfg.get("w_close",  1.0))   # P1 weight to stay close
-        w_far    = float(cfg.get("w_far",    1.0))   # P2 weight to be far
-        w_term   = float(cfg.get("w_term",   1.0))   # terminal distance weight
-        eff1     = float(cfg.get("effort_w1", 0.01))
-        eff2     = float(cfg.get("effort_w2", 0.01))
-
-        def f1(tau, theta):
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                r = pos(xs1[t]) - pos(xs2[t])
-                terms.append(w_close * ca.sumsqr(r) + eff1 * ca.sumsqr(us1[t]))
-            rT = pos(xs1[T-1]) - pos(xs2[T-1])
-            terms.append(w_term * ca.sumsqr(rT))
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            (xs1, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                r = pos(xs2[t]) - pos(xs1[t])
-                terms.append(-w_far * ca.sumsqr(r) + eff2 * ca.sumsqr(us2[t]))
-            rT = pos(xs2[T-1]) - pos(xs1[T-1])
-            terms.append(-w_term * ca.sumsqr(rT))
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "fov_tag_simple":
-        # P1 keeps P2 in boresight; P2 escapes & misaligns
-        fov_cost  = cfg.get("fov_cost", {})
-        w_ang2    = float(fov_cost.get("w_ang2",   1.0))  # P1: point at P2
-        w_dist2   = float(fov_cost.get("w_dist2",  0.2))  # P1: get closer
-        w_far1    = float(fov_cost.get("w_far1",   1.0))  # P2: get farther
-        w_ang1    = float(fov_cost.get("w_ang1",   0.5))  # P2: encourage misalignment
-        epsu      = 1e-9
-
-        def _unit(mx):
-            return mx / ca.sqrt(ca.sumsqr(mx) + epsu)
-
-        def f1(tau, theta):
-            # P1: align boresight (v1) with r = p2 - p1 and reduce distance
-            (xs1, us1), (xs2, _) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, v1 = pos(xs1[t]), vel(xs1[t])
-                p2     = pos(xs2[t])
-                r      = p2 - p1
-                rhat   = _unit(r)
-                a1hat  = _unit(v1)
-                align  = ca.dot(a1hat, rhat)
-                dist2  = ca.sumsqr(r)
-                cost_t = ( w_ang2*(1.0 - align) + w_dist2*dist2 + effort_w1*ca.sumsqr(us1[t]) )
-                terms.append(cost_t)
-            return ca.sum1(ca.vcat(terms))
-
-        def f2(tau, theta):
-            # P2: get far and reduce alignment with P1 boresight
-            (xs1, _), (xs2, us2) = unpack_both(tau)
-            terms = []
-            for t in range(T-1):
-                p1, v1 = pos(xs1[t]), vel(xs1[t])
-                p2     = pos(xs2[t])
-                r      = p2 - p1
-                rhat   = _unit(r)
-                a1hat  = _unit(v1)
-                align  = ca.dot(a1hat, rhat)
-                dist2  = ca.sumsqr(r)
-                cost_t = ( -w_far1*dist2 + w_ang1*align + effort_w2*ca.sumsqr(us2[t]) )
-                terms.append(cost_t)
-            return ca.sum1(ca.vcat(terms))
-        return [f1, f2]
-
-    elif setting == "chase_escape_tail":
+    if setting == "chase_escape_tail":
         # P1 tails P2; P2 evades
         w_far   = float(cfg.get("w_far", 1.0))         # P2: push separation
         w_term  = float(cfg.get("w_term", 1.0))        # terminal weight (both)
@@ -408,6 +195,87 @@ def build_costs(nx: int, nu: int, T: int, N: int, cfg: dict):
             terms.append(-w_term * ca.sumsqr(rT))
             return ca.sum1(ca.vcat(terms))
         return [f1, f2]
+
+    elif setting == "guard_center":
+        # ---- params (tune in cfg) ----
+        goal = np.asarray(cfg.get("goal", [0.0]*D), float).reshape(-1)
+        goal_mx = ca.MX(goal)
+
+        # proximity penalties
+        P_def   = float(cfg.get("P_penalty_defender",  1.0))   # defender rewards being close to attacker (to block)
+        P_att   = float(cfg.get("P_penalty_attacker",  1.0))   # attacker dislikes being close to defender
+        eps_div = float(cfg.get("eps_div", 1e-2))               # ε for denominators (meters^2)
+
+        # goal terms
+        w_center   = float(cfg.get("w_center", 1.0))            # stage weight for ||x2 - goal||
+        w_term     = float(cfg.get("w_term_center", 8.0))       # terminal weight for ||x2_T - goal||
+        # optional ramp to emphasize later stages
+        ramp_final = bool(cfg.get("ramp_final", True))
+
+        # regularization
+        w_u1 = float(cfg.get("effort_w1", 0.01))
+        w_u2 = float(cfg.get("effort_w2", 0.01))
+        w_v1 = float(cfg.get("w_v1", 0.0))                      # set >0 if you want velocity damping
+        w_v2 = float(cfg.get("w_v2", 0.0))
+
+        tiny = 1e-9
+
+        def dist(a, b):
+            # smooth Euclidean distance
+            return ca.sqrt(ca.sumsqr(a - b) + tiny)
+
+        def f2(tau, theta):
+            # Attacker: go to goal, keep away from defender, pay effort
+            (xs1, _), (xs2, us2) = unpack_both(tau)
+            terms = []
+            for t in range(T-1):
+                p1, v1 = pos(xs1[t]), vel(xs1[t])
+                p2, v2 = pos(xs2[t]), vel(xs2[t])
+                w_t = (t+1)/T if ramp_final else 1.0
+
+                d12_sq = ca.sumsqr(p2 - p1)
+                go_goal = w_t * w_center * dist(p2, goal_mx)
+                prox_repulse = P_att / (eps_div + d12_sq)       # 1/(ε+||x2-x1||^2)
+                effort = w_u2 * ca.sumsqr(us2[t])
+                vreg   = w_v2 * ca.sumsqr(v2)
+                terms.append(go_goal + prox_repulse + effort + vreg)
+
+            # terminal: strong at goal
+            p2T, v2T = pos(xs2[T-1]), vel(xs2[T-1])
+            terms.append(w_term * dist(p2T, goal_mx) + w_v2 * ca.sumsqr(v2T))
+            return ca.sum1(ca.vcat(terms))
+
+        def f1(tau, theta):
+            # Defender: maximize (attacker near me) + (attacker far from goal), but we minimize,
+            # so we negate those rewards.
+            (xs1, us1), (xs2, _) = unpack_both(tau)
+            terms = []
+            for t in range(T-1):
+                p1, v1 = pos(xs1[t]), vel(xs1[t])
+                p2, v2 = pos(xs2[t]), vel(xs2[t])
+                w_t = (t+1)/T if ramp_final else 1.0
+
+                d12_sq = ca.sumsqr(p2 - p1)
+                # Defender “reward” terms (we place a minus so minimization tries to enlarge them):
+                reward_proximity =  P_def / (eps_div + d12_sq)  # wants attacker close
+                reward_push_out  =  dist(p2, goal_mx)           # wants attacker far from goal
+                # Convert to a minimization objective by negating:
+                J_def_stage = -(reward_proximity + reward_push_out)
+
+                effort = w_u1 * ca.sumsqr(us1[t])
+                vreg   = w_v1 * ca.sumsqr(v1)
+                terms.append(J_def_stage + effort + vreg)
+
+            # terminal: same idea—prefer attacker far from goal (negate so minimization maximizes it)
+            p2T, v1T = pos(xs2[T-1]), vel(xs1[T-1])
+            terms.append(-w_term * dist(p2T, goal_mx) + w_v1 * ca.sumsqr(v1T))
+            return ca.sum1(ca.vcat(terms))
+
+        return [f1, f2]
+
+
+
+
 
     else:
         raise ValueError(f"Unknown setting '{setting}'.")
