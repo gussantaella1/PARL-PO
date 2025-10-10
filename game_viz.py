@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection 
-from game_3dutils import world_to_body_R, _unit, apply_roll_about_axis
+import game_3dutils
 
 
 # Lazy-import heavy libs to keep core light
