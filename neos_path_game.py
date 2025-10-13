@@ -182,6 +182,7 @@ def build_mcp_two_player_one_shot(
             return blend*tail + (1.0 - blend)*_sumsq(r)
 
         def l1_k(_m,k):
+            
             p2 = _pos(_m.x2,k); v2 = _vel(_m.x2,k); p1 = _pos(_m.x1,k)
             u1 = [_m.u1[k,j] for j in _m.U]
             return tail_cost(p2,p1,v2) + (c_eff1 + eps_R)*_sumsq(u1)
@@ -203,6 +204,7 @@ def build_mcp_two_player_one_shot(
 
     else:
         # Simple LQ fallback (diag Q on states; diag R on inputs)
+        
         q = float(cost_cfg.get("Q", 1.0)); r1 = float(cost_cfg.get("R1", 1.0)); r2 = float(cost_cfg.get("R2", 1.0))
         def l1_k(_m,k): return q*sum(_m.x1[k,i]**2 for i in _m.S) + r1*sum(_m.u1[k,j]**2 for j in _m.U)
         def l2_k(_m,k): return q*sum(_m.x2[k,i]**2 for i in _m.S) + r2*sum(_m.u2[k,j]**2 for j in _m.U)
