@@ -163,7 +163,7 @@ class KF_CV:
 
 
 # -------------------- RHC with execution & FOV (3D/2D-aware) --------------------
-def run_rhc_and_collect_frames_3d(cfg: dict, cost_builder, steps: int | None = None,
+def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
                                   turn_len: int | None = None):
     """
     RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.

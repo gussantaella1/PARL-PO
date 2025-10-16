@@ -4,6 +4,8 @@ import numpy as np
 from pyomo.environ import *
 from pyomo.mpec import Complementarity, complements
 from pyomo.core.expr.calculus.derivatives import differentiate, Modes
+from game_costs import build_game_costs
+
 
 
 # ----------------------- public helpers -----------------------
@@ -154,62 +156,7 @@ def build_mcp_two_player_one_shot(
         )
 
     # ---------- costs ----------
-    def _pos(x,k): return [x[k,i] for i in range(D)]
-    def _vel(x,k): return [x[k,D+i] for i in range(D)]
-    def _dot(a,b): return sum(ai*bi for ai,bi in zip(a,b))
-    def _sumsq(v): return sum(vi*vi for vi in v)
-    def _norm(v):  return sqrt(_sumsq(v) + 1e-9)
-
-    ck = (cost_kind or "chase_escape_tail").lower()
-    if ck == "chase_escape_tail":
-        c_eff1  = float(cost_cfg.get("effort_w1",   0.01))
-        c_eff2  = float(cost_cfg.get("effort_w2",   0.01))
-        c_wfar  = float(cost_cfg.get("w_far",       1.0))
-        c_wterm = float(cost_cfg.get("w_term",      1.0))
-        c_ddes  = float(cost_cfg.get("follow_gap",  0.6))
-        c_wlong = float(cost_cfg.get("w_tail_long", 1.0))
-        c_wlat  = float(cost_cfg.get("w_tail_lat",  8.0))
-        c_vref  = float(cost_cfg.get("tail_v_ref",  0.2))
-        eps_R   = float(cost_cfg.get("path_eps_R",  1e-3))
-
-        def tail_cost(pL, pF, vL):
-            speed = _norm(vL); vhat = [vi / (speed + 1e-9) for vi in vL]
-            r  = [pF[i]-pL[i] for i in range(D)]
-            s  = _dot(r, vhat)               # parallel
-            rperp = [r[i] - s*vhat[i] for i in range(D)]
-            tail = c_wlong*(s + c_ddes)**2 + c_wlat*_sumsq(rperp)
-            blend = (speed*speed)/(speed*speed + c_vref*c_vref)
-            return blend*tail + (1.0 - blend)*_sumsq(r)
-
-        def l1_k(_m,k):
-            
-            p2 = _pos(_m.x2,k); v2 = _vel(_m.x2,k); p1 = _pos(_m.x1,k)
-            u1 = [_m.u1[k,j] for j in _m.U]
-            return tail_cost(p2,p1,v2) + (c_eff1 + eps_R)*_sumsq(u1)
-
-        def l2_k(_m,k):
-            p1 = _pos(_m.x1,k); p2 = _pos(_m.x2,k)
-            u2 = [_m.u2[k,j] for j in _m.U]
-            r  = [p2[i]-p1[i] for i in range(D)]
-            return -c_wfar*_sumsq(r) + (c_eff2 + eps_R)*_sumsq(u2)
-
-        def l1_T(_m):
-            p2 = _pos(_m.x2,T); v2 = _vel(_m.x2,T); p1 = _pos(_m.x1,T)
-            return c_wterm*tail_cost(p2,p1,v2)
-
-        def l2_T(_m):
-            p1 = _pos(_m.x1,T); p2 = _pos(_m.x2,T)
-            r  = [p2[i]-p1[i] for i in range(D)]
-            return -c_wterm*_sumsq(r)
-
-    else:
-        # Simple LQ fallback (diag Q on states; diag R on inputs)
-        
-        q = float(cost_cfg.get("Q", 1.0)); r1 = float(cost_cfg.get("R1", 1.0)); r2 = float(cost_cfg.get("R2", 1.0))
-        def l1_k(_m,k): return q*sum(_m.x1[k,i]**2 for i in _m.S) + r1*sum(_m.u1[k,j]**2 for j in _m.U)
-        def l2_k(_m,k): return q*sum(_m.x2[k,i]**2 for i in _m.S) + r2*sum(_m.u2[k,j]**2 for j in _m.U)
-        def l1_T(_m):  return q*sum(_m.x1[T,i]**2 for i in _m.S)
-        def l2_T(_m):  return q*sum(_m.x2[T,i]**2 for i in _m.S)
+    l1_k, l2_k, l1_T, l2_T = build_game_costs(cost_kind, cost_cfg or {}, D, T)
 
     # ---------- helper: shared (Jg^T lam + Jh^T mu) on a given variable ----------
     def _eq_grad_dot_lam_on(_m, var, k_hint=None, agent=None):
