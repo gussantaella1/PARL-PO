@@ -337,7 +337,7 @@ def build_game_costs(
         # numerics
         eps   = 1e-9
         alpha = float(cfg.get("soft_norm_alpha", 0.05))  # softnorm floor
-        d_min = float(cfg.get("d_min", 0.8))             # must match your separation constraint
+        d_min = float(cfg.get("d_min", 0.8))             # must match separation constraint
 
         def _pospart(t):
             return 0.5*(t + sqrt(t*t + eps))  # smooth hinge
@@ -444,3 +444,236 @@ def build_game_costs(
             return q*sum(m.x2[T, i]**2 for i in m.S)
 
         return l1_k, l2_k, l1_T, l2_T
+    
+
+def build_game_costs_N(
+    kind: str,
+    cfg: Dict[str, Any],
+    D: int,
+    T: int,
+    N: int,
+) -> Tuple[List[Callable], List[Callable]]:
+    """
+    Returns:
+      l_k: list of N callables  l_k[p](m,k)    for k=0..T-1
+      l_T: list of N callables  l_T[p](m)      terminal at k=T
+
+    Each callable may reference any m.x[p,*,*] or m.u[p,*,*].
+    """
+    kname = (kind or "generic_n").lower()
+    cfg = cfg or {}
+
+    # Common helpers
+    def _pos(m, p, k): return [m.x[p,k,i] for i in range(D)]
+    def _vel(m, p, k): return [m.x[p,k,i] for i in range(D,2*D)]
+    def _u(m, p, k):   return [m.u[p,k,j] for j in m.U]
+    def _sq(v):        return sum(vi*vi for vi in v)
+    def _norm(v):      return sqrt(_sq(v) + 1e-9)
+
+    
+
+    # ---------------------- generic_n (LQ-ish) ----------------------
+    if kname == "generic_n":
+        q  = float(cfg.get("Q", 1.0))
+        r  = float(cfg.get("R", 1e-2))
+        l_k = []
+        l_T = []
+        for p in range(1, N+1):
+            def _lk(m, k, p=p):
+                return q*sum(m.x[p,k,i]**2 for i in m.S) + r*sum(m.u[p,k,j]**2 for j in m.U)
+            def _lT(m, p=p):
+                return q*sum(m.x[p,T,i]**2 for i in m.S)
+            l_k.append(_lk); l_T.append(_lT)
+        return l_k, l_T
+    
+    # ---------------------- chase_escape_tail (exact 2p behavior only) ----------------------
+    if kname in ("chase_escape_tail", "chase_escape_tail_n") and N == 2:
+        # Same knobs as the legacy 2p version
+        c_eff1  = float(cfg.get("effort_w1",   0.01))
+        c_eff2  = float(cfg.get("effort_w2",   0.01))
+        c_wfar  = float(cfg.get("w_far",       1.0))
+        c_wterm = float(cfg.get("w_term",      1.0))
+        c_ddes  = float(cfg.get("follow_gap",  0.6))
+        c_wlong = float(cfg.get("w_tail_long", 1.0))
+        c_wlat  = float(cfg.get("w_tail_lat",  8.0))
+        c_vref  = float(cfg.get("tail_v_ref",  0.2))
+        eps_R   = float(cfg.get("path_eps_R",  1e-3))
+
+        # Helpers that mirror the legacy scalar ops over Pyomo expressions
+        def _dot(a, b):   return sum(a[i]*b[i] for i in range(len(a)))
+        def _sumsq(a):    return sum(ai*ai for ai in a)
+        def _norm(a):     return sqrt(_sumsq(a) + 1e-9)   # same epsilon as legacy
+
+        # Legacy tail cost, but in N-style (p1=player1, p2=player2)
+        # tail_cost(pL, pF, vL) — follower wants to sit at (s=-d_des, r_perp=0) behind leader
+        def _tail_cost(pL, pF, vL):
+            speed = _norm(vL)
+            vhat = [vi / (speed + 1e-9) for vi in vL]     # identical smoothing
+            r    = [pF[i] - pL[i] for i in range(D)]
+            s    = _dot(r, vhat)                          # parallel component along leader vel
+            rperp = [r[i] - s*vhat[i] for i in range(D)]
+            tail  = c_wlong*(s + c_ddes)**2 + c_wlat*_sumsq(rperp)
+            blend = (speed*speed) / (speed*speed + c_vref*c_vref)
+            return blend*tail + (1.0 - blend)*_sumsq(r)
+
+        # Map roles exactly like legacy:
+        #  - Player 2 is leader (drives away): -w_far*||p2 - p1||^2 + effort2
+        #  - Player 1 is follower (tails leader): tail_cost(p2,p1,v2) + effort1
+        def _l1_k(m, k):
+            p2 = _pos(m, 2, k)
+            v2 = _vel(m, 2, k)
+            p1 = _pos(m, 1, k)
+            u1 = _u(m, 1, k)
+            return _tail_cost(p2, p1, v2) + (c_eff1 + eps_R)*_sq(u1)
+
+        def _l2_k(m, k):
+            p1 = _pos(m, 1, k)
+            p2 = _pos(m, 2, k)
+            u2 = _u(m, 2, k)
+            r  = [p2[i] - p1[i] for i in range(D)]
+            return -c_wfar*_sq(r) + (c_eff2 + eps_R)*_sq(u2)
+
+        def _l1_T(m):
+            p2 = [m.x[2, T, i] for i in range(D)]
+            v2 = [m.x[2, T, i] for i in range(D, 2*D)]
+            p1 = [m.x[1, T, i] for i in range(D)]
+            return c_wterm * _tail_cost(p2, p1, v2)
+
+        def _l2_T(m):
+            p1 = [m.x[1, T, i] for i in range(D)]
+            p2 = [m.x[2, T, i] for i in range(D)]
+            r  = [p2[i] - p1[i] for i in range(D)]
+            return -c_wterm * _sq(r)
+
+        return [_l1_k, _l2_k], [_l1_T, _l2_T]
+
+
+
+    # ---------------------- 3p_center_blocker ----------------------
+    # p=1 is blocker; p=2..N attackers aiming for center; blocker penalizes any attacker near center
+    if kname == "3p_center_blocker":
+        c = [float(ci) for ci in cfg.get("center", [0.0]*D)]
+        R_keep  = float(cfg.get("R_keep", 3.0))
+        w_block = float(cfg.get("w_block", 8.0))
+        w_T     = float(cfg.get("w_T", 12.0))
+        r1      = float(cfg.get("R1", 1e-3))
+        rA      = float(cfg.get("R_att", 3e-3))
+        eps=1e-9
+        def _relu(m): return lambda t: 0.5*(t + sqrt(t*t + eps))
+
+        def _d_center(p):
+            return lambda m,k: _norm([_pos(m,p,k)[i]-c[i] for i in range(D)])
+
+        # attacker stage: go to center + effort
+        def _att_lk(p):
+            d = _d_center(p)
+            return lambda m,k: d(m,k)**2 + rA*_sq(_u(m,p,k))
+
+        def _att_lT(p):
+            dT = lambda m: _norm([m.x[p,T,i] - c[i] for i in range(D)])
+            return lambda m: w_T*dT(m)**2
+
+        # blocker stage: penalize any attacker inside keep-out + small effort
+        def _blk_lk():
+            relu = _relu(None)
+            def f(m,k):
+                pen = 0.0
+                for pa in range(2, N+1):
+                    d = _d_center(pa)(m,k)
+                    pen += w_block * relu(R_keep - d)**2
+                return pen + r1*_sq(_u(m,1,k))
+            return f
+
+        def _blk_lT():
+            relu = _relu(None)
+            def f(m):
+                pen = 0.0
+                for pa in range(2, N+1):
+                    d = _norm([m.x[pa,T,i]-c[i] for i in range(D)])
+                    pen += w_T * relu(R_keep - d)**2
+                return pen
+            return f
+
+        l_k=[None]*N; l_T=[None]*N
+        l_k[0] = _blk_lk(); l_T[0] = _blk_lT()
+        for p in range(2, N+1):
+            l_k[p-1] = _att_lk(p); l_T[p-1] = _att_lT(p)
+        return l_k, l_T
+
+    # ---------------------- 4p_tag (one runner vs 3 chasers) ----------------------
+    if kname == "4p_tag":
+        runner = int(cfg.get("runner", 1))  # which index is runner (1..N)
+        w_sep  = float(cfg.get("w_sep", 4.0))
+        rU     = float(cfg.get("R_u", 1e-2))
+
+        def _pair_sq(m,k,pa,pb):
+            a = _pos(m,pa,k); b = _pos(m,pb,k)
+            return sum((a[i]-b[i])**2 for i in range(D))
+
+        l_k=[None]*N; l_T=[None]*N
+        for p in range(1, N+1):
+            if p == runner:
+                # runner maximizes distance (minimize negative separation)
+                def _lk(m,k,p=p):
+                    sep = 0.0
+                    for q in range(1, N+1):
+                        if q==p: continue
+                        sep += _pair_sq(m,k,p,q)
+                    return -w_sep*sep + rU*_sq(_u(m,p,k))
+                def _lT(m,p=p):
+                    sepT=0.0
+                    for q in range(1,N+1):
+                        if q==p: continue
+                        a=[m.x[p,T,i] for i in range(D)]
+                        b=[m.x[q,T,i] for i in range(D)]
+                        sepT += sum((a[i]-b[i])**2 for i in range(D))
+                    return -w_sep*sepT
+            else:
+                # chaser minimizes distance to runner
+                def _lk(m,k,p=p):
+                    return _pair_sq(m,k,p,runner) + rU*_sq(_u(m,p,k))
+                def _lT(m,p=p):
+                    a=[m.x[p,T,i] for i in range(D)]
+                    b=[m.x[runner,T,i] for i in range(D)]
+                    return sum((a[i]-b[i])**2 for i in range(D))
+            l_k[p-1]=_lk; l_T[p-1]=_lT
+        return l_k, l_T
+
+    # ---------------------- 5p_teams_3v2 (team sums) ----------------------
+    if kname == "5p_teams_3v2":
+        teamA = list(cfg.get("teamA", [1,2,3]))
+        teamB = [p for p in range(1,N+1) if p not in teamA]
+        w_c = float(cfg.get("w_cohesion", 0.2))
+        w_h = float(cfg.get("w_hunt", 1.0))
+        rU  = float(cfg.get("R_u", 1e-2))
+
+        def _centroid(m,k,team):
+            return [ sum(m.x[p,k,i] for p in team)/len(team) for i in range(D) ]
+        def _sq_to_point(v, w):
+            return sum((v[i]-w[i])**2 for i in range(D))
+
+        l_k=[None]*N; l_T=[None]*N
+        for p in range(1,N+1):
+            if p in teamA:
+                # teamA hunts B’s centroid; also keep cohesion to A’s centroid
+                def _lk(m,k,p=p):
+                    cA = _centroid(m,k,teamA); cB = _centroid(m,k,teamB)
+                    return w_h*_sq_to_point(_pos(m,p,k), cB) + w_c*_sq_to_point(_pos(m,p,k), cA) + rU*_sq(_u(m,p,k))
+                def _lT(m,p=p):
+                    cB = [sum(m.x[q,T,i] for q in teamB)/len(teamB) for i in range(D)]
+                    a  = [m.x[p,T,i] for i in range(D)]
+                    return w_h*sum((a[i]-cB[i])**2 for i in range(D))
+            else:
+                # teamB hunts A’s centroid similarly
+                def _lk(m,k,p=p):
+                    cB = _centroid(m,k,teamB); cA = _centroid(m,k,teamA)
+                    return w_h*_sq_to_point(_pos(m,p,k), cA) + w_c*_sq_to_point(_pos(m,p,k), cB) + rU*_sq(_u(m,p,k))
+                def _lT(m,p=p):
+                    cA = [sum(m.x[q,T,i] for q in teamA)/len(teamA) for i in range(D)]
+                    a  = [m.x[p,T,i] for i in range(D)]
+                    return w_h*sum((a[i]-cA[i])**2 for i in range(D))
+            l_k[p-1]=_lk; l_T[p-1]=_lT
+        return l_k, l_T
+
+    # fallback
+    return build_game_costs_N("generic_n", cfg, D, T, N)

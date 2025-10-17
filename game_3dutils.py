@@ -113,6 +113,110 @@ def build_h_builders(cfg, nx, D):
 
     return funcs
 
+def build_h_builders_N(cfg, nx, D, N):
+    """
+    N-player shared-inequality builders h(m,k) >= 0.
+    Supports:
+      - arena keep-in: box or sphere (applied to every player)
+      - min separation: all unordered pairs
+      - speed cap: per player
+      - optional keep-out circles/spheres: applied to every player
+    Works with either the old two-player model (m.x1/m.x2) or the N-player model (m.x[p,...]).
+    """
+    ar = (cfg.get("arena") or {})
+    funcs = []
+
+    # generic accessor: supports both 2P (x1/x2) and N-player (x[p,...])
+    def _x(m, agent, k, j):
+        if hasattr(m, "x"):
+            return m.x[agent, k, j]
+        # 2-player fallback:
+        if agent == 1:
+            return m.x1[k, j]
+        elif agent == 2:
+            return m.x2[k, j]
+        else:
+            raise KeyError("Agent index >2 requires m.x[...] (N-player model).")
+
+    # -------- arena keep-in --------
+    # box
+    if {"xmin","xmax","ymin","ymax"} <= set(ar.keys()):
+        xmin, xmax = float(ar["xmin"]), float(ar["xmax"])
+        ymin, ymax = float(ar["ymin"]), float(ar["ymax"])
+        have_z     = (D == 3) and ("zmin" in ar and "zmax" in ar)
+        zmin, zmax = (float(ar["zmin"]), float(ar["zmax"])) if have_z else (None, None)
+
+        for a in range(1, N+1):
+            funcs.append(lambda m,k,_a=a,_b=xmin: _x(m,_a,k,0) - _b)  # x >= xmin
+            funcs.append(lambda m,k,_a=a,_b=xmax: _b - _x(m,_a,k,0))  # xmax - x
+            if D >= 2:
+                funcs.append(lambda m,k,_a=a,_b=ymin: _x(m,_a,k,1) - _b)
+                funcs.append(lambda m,k,_a=a,_b=ymax: _b - _x(m,_a,k,1))
+            if have_z:
+                funcs.append(lambda m,k,_a=a,_b=zmin: _x(m,_a,k,2) - _b)
+                funcs.append(lambda m,k,_a=a,_b=zmax: _b - _x(m,_a,k,2))
+
+    # sphere
+    elif {"cx","cy","cz","r"} <= set(ar.keys()) or ar.get("type") == "sphere":
+        cx = float(ar.get("cx", 0.0))
+        cy = float(ar.get("cy", 0.0))
+        cz = float(ar.get("cz", 0.0))
+        R2 = float(ar.get("r", 1.0))**2
+
+        def _sphere_h(agent):
+            def h(m,k,_a=agent,_cx=cx,_cy=cy,_cz=cz,_R2=R2):
+                px = _x(m,_a,k,0) - _cx
+                py = _x(m,_a,k,1) - _cy if D >= 2 else 0.0
+                pz = _x(m,_a,k,2) - _cz if D == 3 else 0.0
+                return _R2 - (px*px + py*py + pz*pz)  # inside sphere
+            return h
+        for a in range(1, N+1):
+            funcs.append(_sphere_h(a))
+
+    # -------- min separation (all pairs) --------
+    sep = cfg.get("sep_min", cfg.get("min_sep", None))
+    if sep is not None:
+        d2 = float(sep)**2
+        for a in range(1, N+1):
+            for b in range(a+1, N+1):
+                def h_sep(m,k,_a=a,_b=b,_d2=d2):
+                    s = 0
+                    for j in range(D):
+                        s += (_x(m,_a,k,j) - _x(m,_b,k,j))**2
+                    return s - _d2  # >= 0
+                funcs.append(h_sep)
+
+    # -------- speed cap (per player) --------
+    vmax = cfg.get("vmax", cfg.get("speed_max", None))
+    if vmax is not None:
+        vmax2 = float(vmax)**2
+        vel_idx = list(range(D, 2*D))
+        for a in range(1, N+1):
+            def _speed_h(agent):
+                def h(m,k,_a=agent,_v=vel_idx,_v2=vmax2):
+                    vsq = 0
+                    for j in _v:
+                        vsq += _x(m,_a,k,j)**2
+                    return _v2 - vsq  # >= 0
+                return h
+            funcs.append(_speed_h(a))
+
+    # -------- keep-out obstacles (circles/spheres) applied to each agent --------
+    sphere_key = "circles" if D == 2 else "spheres"
+    for obs in cfg.get(sphere_key, []):
+        oc = [float(obs.get(k, 0.0)) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])]
+        r2 = float(obs["r"])**2
+        for a in range(1, N+1):
+            def h_keepout(m,k,_a=a,_oc=tuple(oc),_r2=r2):
+                s = 0
+                for j in range(D):
+                    s += (_x(m,_a,k,j) - _oc[j])**2
+                return s - _r2  # >= 0 outside obstacle
+            funcs.append(h_keepout)
+
+    return funcs
+
+
 
 def _filter_kwargs(fn, kwargs):
     """Keep only kwargs that `fn` accepts."""
@@ -170,7 +274,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.
     PATH-only: uses a persistent MCP model with warm-starts each turn.
     """
-    N = 2
+    N = int(cfg["N"])
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
     T, dt  = int(cfg["T"]), float(cfg["dt"])
@@ -366,7 +470,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     # Wide var boxes; actual limits go in h(x) >= 0
     x_var_box = (-1e6, 1e6)
     u_var_box = (-1e3, 1e3)
-    h_list    = build_h_builders(cfg, nx, D)
+
+    h_list = build_h_builders(cfg, nx, D)
+
+
 
     m_path = build_mcp_two_player_one_shot(
         Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
@@ -593,6 +700,315 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     if do_est:
         ret.update(est_hist)
     return ret
+
+def run_rhc_multi(cfg: dict, steps: int | None = None, turn_len: int | None = None):
+    """
+    N-player (N>=2) RHC loop using the N-player PATH MCP.
+    Minimal version: translational double-integrator or HCW, no attitude/UKF.
+    Expected cfg keys:
+      N, D, T, dt, x0 (list length N of (2D,)), vmax, umax, arena, sep_min (optional), setting (=cost_kind)
+
+    Returns:
+      {
+        "exec_hist": [list of (x,y,z) per player],       # executed positions per step
+        "plan_hist": [list over steps of horizon plans], # horizon positions per step
+        "U_last":    [np.ndarray per player],            # last horizon controls
+        "X_last":    [np.ndarray per player],            # last horizon states
+        "frames":    [ { "t": k, "exec": [...], "plans": [...] } ]  # snapshots for animation
+      }
+    """
+    assert HAS_PATH, "PATH/ASL solver not available."
+
+    # --- basics ---
+    N = int(cfg.get("N", len(cfg["x0"])))
+    assert N >= 2, "Need N >= 2."
+    D = int(cfg.get("D", np.asarray(cfg["x0"][0]).shape[0] // 2))
+    nx_tr, nu_tr = 2*D, D
+    T, dt = int(cfg["T"]), float(cfg["dt"])
+
+    # --- dynamics (MX) ---
+    dyn = (cfg.get("dynamics") or "double").lower()
+    if dyn == "hcw":
+        n  = hcw_mean_motion(cfg.get("hcw", {}))
+        Ad, Bd = hcw_discrete_mats(n, dt)   # MX
+    else:
+        # You likely already have this helper; if not, swap in your existing A,B builder.
+        Ad, Bd = step_double_integrator_mats(D=D, dt=dt)  # MX
+
+    # --- rollout length / turn length ---
+    sim_time = cfg.get("sim_time", cfg.get("duration"))
+    if steps is None:
+        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
+    if turn_len is None:
+        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
+                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
+
+    # --- bounds (vars kept wide; real limits via h~) ---
+    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
+    # gtil_fun = build_g_tilde_linear(nx_tr, nu_tr, T, N, Ad, Bd)  # equalities enforced in pyomo model
+    # h~ includes arena/obstacles/separation/etc. for N players
+    h_list = build_h_builders_N(cfg, nx_tr, D, N)
+
+    # --- initial states ---
+    x_list = [np.asarray(cfg["x0"][p], float).copy() for p in range(N)]
+    theta  = np.concatenate(x_list, axis=0)
+
+    # --- numeric stepper (MX→np) ---
+    Ad_np, Bd_np = as_numpy_const(Ad), as_numpy_const(Bd)
+    def step_plant(x, u): return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
+
+    def _p3(v):
+        if D == 3:
+            return (float(v[0]), float(v[1]), float(v[2]))
+        return (float(v[0]), float(v[1]), 0.0)
+
+    # --- logs ---
+    exec_hist = [ [_p3(x_list[p][:D])] for p in range(N)]  # executed positions (start at t=0)
+    plan_hist = [ [] for _ in range(N) ]                   # per-step horizons
+    frames    = []                                         # animation snapshots
+
+    preflight_check_x0_feasibility_N(cfg)
+
+
+    # --- build PATH MCP model ---
+    x_var_box = (-1e6, 1e6)
+    u_var_box = (-1e3, 1e3)
+    m = neos_path_game.build_mcp_n_player_one_shot(
+        Ad=as_numpy_const(Ad), Bd=as_numpy_const(Bd),
+        T=T, nx=nx_tr, nu=nu_tr, D=D,
+        x0_list=x_list,
+        x_var_box=x_var_box, u_var_box=u_var_box,
+        h_builders=h_list,
+        cost_kind=cfg.get("setting", "generic_n"),
+        cost_cfg=cfg,
+    )
+
+    path_ctx = {
+        "m": m,
+        "A": as_numpy_const(Ad),
+        "B": as_numpy_const(Bd),
+        "X_guess": None,     # list length N
+        "U_guess": None,     # list length N
+    }
+
+    def _shift_controls_one_step(U_prev, target_len, nu=nu_tr, fill=0.0):
+        if U_prev is None: return np.zeros((target_len, nu))
+        U_prev = np.asarray(U_prev, float)
+        U_new  = np.full((target_len, nu), float(fill))
+        if U_prev.ndim == 2 and U_prev.shape[0] >= 2:
+            take = min(target_len-1, U_prev.shape[0]-1)
+            if take > 0:
+                U_new[:take, :] = U_prev[1:1+take, :]
+        return U_new
+
+    def _forward_sim_x(A, B, x0, U):
+        x0 = np.asarray(x0, float); Tm1, _ = U.shape
+        nx_ = A.shape[0]
+        X = np.zeros((Tm1+1, nx_), float)
+        X[0,:] = x0
+        for kk in range(Tm1):
+            X[kk+1,:] = A @ X[kk,:] + B @ U[kk,:]
+        return X
+
+    def _seed_from_guess(m, Xs, Us, N=N):
+        for p in range(1, N+1):
+            for k in m.Kx:
+                for i in m.S:
+                    m.x[p,k,i].value = float(Xs[p-1][int(k), int(i)])
+            for k in m.Ku:
+                for j in m.U:
+                    m.u[p,k,j].value = float(Us[p-1][int(k), int(j)])
+
+    def _replan(theta_vec):
+        # Unpack theta → per-player x0
+        offs = 0; x0_now=[]
+        for p in range(N):
+            x0_now.append(theta_vec[offs:offs+nx_tr]); offs += nx_tr
+
+        # Refresh IC params + seed k=0
+        for p in range(1, N+1):
+            for i in m.S:
+                m.x0[p,i].set_value(float(x0_now[p-1][int(i)]))
+                m.x[p,0,i].value = float(x0_now[p-1][int(i)])
+
+        # Warm-start
+        Ku_len = len(list(m.Ku))
+        Ug = []
+        if path_ctx["U_guess"] is None:
+            for _ in range(N):
+                Ug.append(np.zeros((Ku_len, nu_tr)))
+        else:
+            for p in range(N):
+                Ug.append(_shift_controls_one_step(path_ctx["U_guess"][p], Ku_len))
+
+        Xg = [ _forward_sim_x(Ad_np, Bd_np, x0_now[p], Ug[p]) for p in range(N) ]
+        _seed_from_guess(m, Xg, Ug)
+
+        # Solve
+        solve_with_local_path(
+            m,
+            path_exe=cfg.get("pathampl"),
+            tee=bool(cfg.get("path_tee", True)),
+            path_options=cfg.get("path_options"),
+        )
+
+        # Extract + cache
+        X, U = neos_path_game.extract_trajectories_N(m, N)
+        path_ctx["X_guess"], path_ctx["U_guess"] = X, U
+
+        # Build horizon position plans
+        plans = []
+        for p in range(N):
+            plans.append([ _p3(X[p][t, :D]) for t in range(T) ])
+        return plans, U
+
+    # --- first plan at t = 0 ---
+    plans, U = _replan(theta)
+
+    # seed plan_hist for t=0, and create initial frame
+    for p in range(N):
+        plan_hist[p].append(plans[p])
+    frames.append({
+        "t": 0,
+        "exec": [exec_hist[p][-1] for p in range(N)],
+        "plans": plans,   # horizons active at t=0
+    })
+
+    step_in_turn = 0
+
+    # --- rollout ---
+    for k in range(steps):
+        if k % turn_len == 0 and k > 0:
+            plans, U = _replan(theta)
+            step_in_turn = 0
+        # log plans used for this step
+        for p in range(N):
+            plan_hist[p].append(plans[p])
+
+        # controls for this step
+        u_now = [ U[p][min(step_in_turn, len(U[p])-1)] for p in range(N) ]
+        step_in_turn += 1
+
+        # plant step + log executed
+        for p in range(N):
+            x_list[p] = step_plant(x_list[p], u_now[p])
+        theta = np.concatenate(x_list, axis=0)
+
+        for p in range(N):
+            exec_pos = _p3(x_list[p][:D])
+            exec_hist[p].append(exec_pos)
+
+        # frame snapshot after applying step k -> k+1
+        frames.append({
+            "t": k+1,
+            "exec": [exec_hist[p][-1] for p in range(N)],
+            "plans": plans,   # still the horizons in effect for this step
+        })
+
+    rollout = {
+        "exec_hist": exec_hist,
+        "plan_hist": plan_hist,
+        "U_last":    U,
+        "X_last":    path_ctx["X_guess"],
+        "frames":    frames,   # <-- new: per-step snapshots for animation
+    }
+
+        # Back-compat shim for the original 2-player animator
+    if N == 2:
+        rollout.update({
+            "plan_hist1": rollout["plan_hist"][0],
+            "plan_hist2": rollout["plan_hist"][1],
+            "exec1_xyz":  rollout["exec_hist"][0],
+            "exec2_xyz":  rollout["exec_hist"][1],
+
+            # If your old animator used these, stub them (we didn't compute attitude/FOV here)
+            "plan_att1": [None] * len(rollout["plan_hist"][0]),
+            "plan_att2": [None] * len(rollout["plan_hist"][1]),
+            "exec_att1": [None] * len(rollout["exec_hist"][0]),
+            "exec_att2": [None] * len(rollout["exec_hist"][1]),
+            "phi_hist1": [0.0]  * len(rollout["exec_hist"][0]),
+            "phi_hist2": [0.0]  * len(rollout["exec_hist"][1]),
+            "fov_axis_hist": [None]  * len(rollout["exec_hist"][0]),
+            "fov_seen_mask": [False] * len(rollout["exec_hist"][0]),
+        })
+
+    return rollout
+
+
+def preflight_check_x0_feasibility_N(cfg, verbose=True):
+    """
+    Evaluate the N-player h>=0 constraints at k=0 using cfg['x0'].
+    Works with both N-player builders that read m.x[p,k,i] and the
+    2-player fallback that reads m.x1[k,i]/m.x2[k,i].
+    Returns a list of (h_index, value) for any h<0 or non-finite.
+    """
+    import numpy as np
+    from math import isfinite
+
+    N = int(cfg.get("N", len(cfg["x0"])))
+    # infer D from x0 row length if not provided
+    D = int(cfg.get("D", np.asarray(cfg["x0"][0]).shape[0] // 2))
+    nx = 2 * D
+
+    # Use the same builders your MCP uses
+    try:
+        h_list = build_h_builders_N(cfg, nx, D, N)
+    except NameError:
+        # If you don't have an N-player builder yet, fall back to 2p
+        h_list = build_h_builders(cfg, nx, D)
+
+    # --- minimal mock model with the right indexing semantics ---
+    class _X3:
+        """Supports m.x[p,k,i] -> x0[p-1][i] (k must be 0 for preflight)."""
+        def __init__(self, rows):
+            self.rows = [np.asarray(r, float) for r in rows]
+        def __getitem__(self, key):
+            p, k, i = key
+            assert int(k) == 0, "preflight only checks k=0"
+            return float(self.rows[p-1][int(i)])
+
+    class _X2:
+        """Supports m.x1[k,i] / m.x2[k,i] style (k must be 0)."""
+        def __init__(self, row):
+            self.row = np.asarray(row, float)
+        def __getitem__(self, key):
+            k, i = key
+            assert int(k) == 0, "preflight only checks k=0"
+            return float(self.row[int(i)])
+
+    class _M:  # dummy model
+        pass
+
+    m = _M()
+    m.x = _X3(cfg["x0"])           # N-player accessor
+    if N >= 1: m.x1 = _X2(cfg["x0"][0])  # 2-player fallback accessors
+    if N >= 2: m.x2 = _X2(cfg["x0"][1])
+
+    # --- evaluate all h at k=0 ---
+    bad = []
+    for hi, hfun in enumerate(h_list):
+        try:
+            val = float(hfun(m, 0))
+        except Exception as e:
+            # If a builder has a different signature, just report and skip
+            if verbose:
+                print(f"[preflight] h[{hi}] raised {type(e).__name__}: {e} (skipping)")
+            continue
+        if (not isfinite(val)) or (val < 0):
+            bad.append((hi, val))
+
+    if verbose:
+        if bad:
+            print(f"[preflight] {len(bad)} violations at k=0: {bad}")
+        else:
+            print("[preflight] OK: all h>=0 at k=0 ✅")
+
+    return bad
+
+
+
+
+
 
 
 
