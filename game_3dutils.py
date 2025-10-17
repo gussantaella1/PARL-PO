@@ -867,6 +867,7 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
         exec_att[a].append({"R": R0, "phi": (float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)})
         phi_hist[a].append(float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)
 
+
     # initial FOV entry
     if fov_enabled:
         R_def0 = prev_R[fov_agent]
@@ -1018,23 +1019,30 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
     z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
     step_in_turn = 0
 
+    # keep a copy of the latest plans/atts to push every step
+    latest_plans = plans[:]     # list length N
+    latest_atts  = atts[:]
+
+
     # store initial plans for viz at step 0
     for a in range(N):
-        plan_hist[a].append(plans[a])
-        plan_att[a].append(atts[a])
-
+        plan_hist[a].append(latest_plans[a])
+        plan_att[a].append(latest_atts[a])
     # -------------------- rollout --------------------
     for k in range(steps):
-        # replan each turn
+        # replan at turn boundaries
         if k % turn_len == 0 and k > 0:
             z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
             step_in_turn = 0
+            latest_plans = plans[:]   # refresh cache
+            latest_atts  = atts[:]
 
-            for a in range(N):
-                plan_hist[a].append(plans[a])
-                plan_att[a].append(atts[a])
+        # ALWAYS log the currently valid plan/att this frame
+        for a in range(N):
+            plan_hist[a].append(latest_plans[a])
+            plan_att[a].append(latest_atts[a])
 
-        # controls for this step (N=2 for now)
+        # controls for this step ...
         u_step = []
         for a in range(N):
             U_a = U_list[a]
