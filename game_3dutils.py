@@ -28,6 +28,7 @@ __all__ = [
 try:
     from neos_path_game import (
         build_mcp_two_player_one_shot,
+        build_mcp_N_player_one_shot,
         solve_with_local_path,
         extract_trajectories,
         _snapshot_path_model
@@ -701,311 +702,409 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         ret.update(est_hist)
     return ret
 
-def run_rhc_multi(cfg: dict, steps: int | None = None, turn_len: int | None = None):
-    """
-    N-player (N>=2) RHC loop using the N-player PATH MCP.
-    Minimal version: translational double-integrator or HCW, no attitude/UKF.
-    Expected cfg keys:
-      N, D, T, dt, x0 (list length N of (2D,)), vmax, umax, arena, sep_min (optional), setting (=cost_kind)
 
-    Returns:
-      {
-        "exec_hist": [list of (x,y,z) per player],       # executed positions per step
-        "plan_hist": [list over steps of horizon plans], # horizon positions per step
-        "U_last":    [np.ndarray per player],            # last horizon controls
-        "X_last":    [np.ndarray per player],            # last horizon states
-        "frames":    [ { "t": k, "exec": [...], "plans": [...] } ]  # snapshots for animation
-      }
+# -------------------- RHC with execution & FOV (3D/2D-aware) - N player case--------------------
+def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
+                                  turn_len: int | None = None):
     """
-    assert HAS_PATH, "PATH/ASL solver not available."
+    RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.
+    PATH-only: uses a persistent MCP model with warm-starts each turn.
 
-    # --- basics ---
-    N = int(cfg.get("N", len(cfg["x0"])))
-    assert N >= 2, "Need N >= 2."
-    D = int(cfg.get("D", np.asarray(cfg["x0"][0]).shape[0] // 2))
-    nx_tr, nu_tr = 2*D, D
+    N-aware for logging/rollout/FOV. Solving step currently supports N=2 via
+    build_mcp_two_player_one_shot(). Plug in your N-player MCP when ready.
+    """
+    # -------------------- basic config --------------------
+    N  = int(cfg["N"])
+    D  = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
+    nx_tr, nu_tr = dims_from_D(D)
     T, dt = int(cfg["T"]), float(cfg["dt"])
 
-    # --- dynamics (MX) ---
+    # estimation (kept as in your original—pairwise UKFs can be extended later)
+    est_cfg = dict(cfg.get('est', {}))
+    do_est  = bool(est_cfg.get('enabled', False))
+
+    # dynamics
     dyn = (cfg.get("dynamics") or "double").lower()
     if dyn == "hcw":
-        n  = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad, Bd = hcw_discrete_mats(n, dt)   # MX
+        n = hcw_mean_motion(cfg.get("hcw", {}))
+        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # MX
     else:
-        # You likely already have this helper; if not, swap in your existing A,B builder.
-        Ad, Bd = step_double_integrator_mats(D=D, dt=dt)  # MX
+        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
 
-    # --- rollout length / turn length ---
-    sim_time = cfg.get("sim_time", cfg.get("duration"))
+    # attitude-in-state (optional)
+    att_cfg = cfg.get("att", {})
+    use_att = bool(att_cfg.get("enabled", False))
+    if use_att:
+        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
+        nx, nu = idx["nx"], idx["nu"]
+        i_phi  = idx["i_phi"]
+    else:
+        Ad_mx, Bd_mx = Ad_tr, Bd_tr
+        nx, nu = nx_tr, nu_tr
+        i_phi  = None
+
+    # rollout length / turn length
+    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
     if steps is None:
         steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
     if turn_len is None:
         turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
-    # --- bounds (vars kept wide; real limits via h~) ---
+    # constraints (fixed Ad,Bd)
+    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
     x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    # gtil_fun = build_g_tilde_linear(nx_tr, nu_tr, T, N, Ad, Bd)  # equalities enforced in pyomo model
-    # h~ includes arena/obstacles/separation/etc. for N players
-    h_list = build_h_builders_N(cfg, nx_tr, D, N)
+    if use_att:
+        x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
+    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
-    # --- initial states ---
-    x_list = [np.asarray(cfg["x0"][p], float).copy() for p in range(N)]
-    theta  = np.concatenate(x_list, axis=0)
+    # -------------------- initial states --------------------
+    # pad φ when attitude is on; store per-agent
+    X0_list = []
+    for a in range(N):
+        x0a = np.asarray(cfg["x0"][a], float)
+        x0a = pad_x0_with_att(x0a, att_cfg, D)[:nx] if use_att else x0a[:nx]
+        X0_list.append(x0a.copy())
 
-    # --- numeric stepper (MX→np) ---
-    Ad_np, Bd_np = as_numpy_const(Ad), as_numpy_const(Bd)
-    def step_plant(x, u): return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
+    # θ = [x1; x2; ... ; xN]
+    theta_curr = np.concatenate(X0_list, axis=0)
 
-    def _p3(v):
-        if D == 3:
-            return (float(v[0]), float(v[1]), float(v[2]))
-        return (float(v[0]), float(v[1]), 0.0)
+    # numeric plant stepper
+    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
+    def step_plant(x, u):
+        return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
 
-    # --- logs ---
-    exec_hist = [ [_p3(x_list[p][:D])] for p in range(N)]  # executed positions (start at t=0)
-    plan_hist = [ [] for _ in range(N) ]                   # per-step horizons
-    frames    = []                                         # animation snapshots
+    # -------------------- logs (N-aware) --------------------
+    plan_hist = [[] for _ in range(N)]    # per-step: planned horizon points (for viz)
+    plan_att  = [[] for _ in range(N)]    # per-step: planned attitudes list over horizon
+    exec_xyz  = [[] for _ in range(N)]    # executed positions
+    exec_att  = [[] for _ in range(N)]    # executed attitudes
+    phi_hist  = [[] for _ in range(N)]    # executed φ (if att on)
+    fov_axis_hist, fov_seen_mask = [], []
 
-    preflight_check_x0_feasibility_N(cfg)
+    # FOV config
+    fov_cfg     = cfg.get("fov", {"enabled": False})
+    fov_enabled = bool(fov_cfg.get("enabled", False))
+    # defender/observer index in [1..N], convert to 0-based
+    fov_agent   = max(1, min(N, int(fov_cfg.get("agent", 2)))) - 1
+    # target index (if not provided: pick the first different agent)
+    fov_target  = fov_cfg.get("target", None)
+    if fov_target is None or int(fov_target) < 1 or int(fov_target) > N or (int(fov_target)-1) == fov_agent:
+        # choose the smallest index != fov_agent
+        fov_target = next((j+1 for j in range(N) if j != fov_agent), 1)
+    fov_target -= 1  # 0-based
 
+    # helpers
+    def _p3_row(x_row):
+        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
+    def _p3_vec(x_vec):
+        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    # --- build PATH MCP model ---
+    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, i_phi=None):
+        if att_cfg is None: att_cfg = {}
+        align    = att_cfg.get("align", "x")
+        world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
+        vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
+
+        DD = 3 if len(x) >= 6 else 2
+        v  = np.asarray(x[DD:2*DD], float)
+        n  = np.linalg.norm(v)
+        if n > vmin:
+            axisD = v / n
+        elif prev_axisD is not None:
+            axisD = np.asarray(prev_axisD, float)
+        else:
+            axisD = np.array([1, 0, 0]) if align == "x" else np.array([0, 0, 1])
+
+        axis3 = axisD if DD == 3 else np.array([axisD[0], axisD[1], 0.0], float)
+        R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
+
+        phi = 0.0
+        if i_phi is not None and i_phi < len(x):
+            phi = float(x[i_phi])
+            R   = apply_roll_about_axis(R, phi, align=align)
+        return R, axisD, phi
+
+    def plan_attitudes_from_X(X, prev_axisD, prev_R):
+        if not use_att:
+            return ([{"R": prev_R, "phi": 0.0} for _ in range(T)], prev_axisD, prev_R)
+        att_list = []
+        ax_prev  = prev_axisD
+        R_prev   = prev_R
+        for t in range(T):
+            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev, att_cfg=att_cfg, i_phi=i_phi)
+            att_list.append({"R": R, "phi": phi_t})
+            R_prev = R
+        return att_list, ax_prev, R_prev
+
+    # t=0 attitudes per agent
+    align    = att_cfg.get("align", "x")
+    world_up = att_cfg.get("up", [0,0,1])
+    vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
+
+    def _axis_from_vel_t0(x):
+        v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
+        aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
+        # 3D row vector for world_to_body_R
+        a3 = aD if D==3 else np.array([aD[0], aD[1], 0.0], float)
+        return aD, a3
+
+    prev_axisD = []
+    prev_R     = []
+    X          = [x.copy() for x in X0_list]  # mutable state vector list
+
+    for a in range(N):
+        aD, a3 = _axis_from_vel_t0(X[a])
+        prev_axisD.append(aD)
+        R0 = world_to_body_R(a3, 3, align=align, up=world_up)
+        if use_att:
+            phi0 = float(X[a][i_phi]) if i_phi is not None else 0.0
+            R0   = apply_roll_about_axis(R0, phi0, align=align)
+        prev_R.append(R0)
+
+        # log t=0
+        exec_xyz[a].append(_p3_vec(X[a]))
+        exec_att[a].append({"R": R0, "phi": (float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)})
+        phi_hist[a].append(float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)
+
+    # initial FOV entry
+    if fov_enabled:
+        R_def0 = prev_R[fov_agent]
+        x_def  = X[fov_agent]
+        x_tgt  = X[fov_target]
+        a_def3 = R_def0[0] if align == 'x' else R_def0[2]
+        fov_axis_hist.append(a_def3)
+        cam_cfg = cfg.get("camera", None)
+        if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
+            _, _, _, ok0 = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def0)
+            fov_seen_mask.append(bool(ok0))
+        else:
+            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
+            fov_seen_mask.append(bool(seen0))
+    else:
+        fov_axis_hist.append(None); fov_seen_mask.append(False)
+
+    # -------------------- PATH persistent MCP (currently N == 2) --------------------
     x_var_box = (-1e6, 1e6)
     u_var_box = (-1e3, 1e3)
-    m = neos_path_game.build_mcp_n_player_one_shot(
-        Ad=as_numpy_const(Ad), Bd=as_numpy_const(Bd),
-        T=T, nx=nx_tr, nu=nu_tr, D=D,
-        x0_list=x_list,
+    h_list    = build_h_builders(cfg, nx, D)
+
+    if N != 2:
+        raise NotImplementedError("This run function handles N generically for rollout/logging, "
+                                  "but the solver hook still uses the 2-player MCP. Plug in your N-player MCP here.")
+
+    # m_path = build_mcp_two_player_one_shot(
+    #     Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
+    #     T=T, nx=nx, nu=nu, D=D,
+    #     x0_1=X[0], x0_2=X[1],
+    #     x_var_box=x_var_box, u_var_box=u_var_box,
+    #     h_builders=h_list,
+    #     cost_kind=cfg.get("setting","chase_escape_tail"),
+    #     cost_cfg=cfg,
+    # )
+
+    m_path = build_mcp_N_player_one_shot(
+        Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
+        T=T, nx=nx, nu=nu, D=D,
+        x0_list=X0_list,         # <-- replaces x0_1/x0_2
+        N=N,                     # <-- tell the model how many players
         x_var_box=x_var_box, u_var_box=u_var_box,
         h_builders=h_list,
-        cost_kind=cfg.get("setting", "generic_n"),
+        cost_kind=cfg.get("setting", "chase_escape_tail"),
         cost_cfg=cfg,
     )
 
+
     path_ctx = {
-        "m": m,
-        "A": as_numpy_const(Ad),
-        "B": as_numpy_const(Bd),
-        "X_guess": None,     # list length N
-        "U_guess": None,     # list length N
+        "m": m_path,
+        "A": as_numpy_const(Ad_mx),
+        "B": as_numpy_const(Bd_mx),
+        "U_guess": [None for _ in range(N)],  # list of length N
+        "X_guess": [None for _ in range(N)],
     }
 
-    def _shift_controls_one_step(U_prev, target_len, nu=nu_tr, fill=0.0):
-        if U_prev is None: return np.zeros((target_len, nu))
+    # -------------------- helpers for warm-start & sim --------------------
+    def _shift_controls_one_step(U_prev, target_len, fill=0.0):
         U_prev = np.asarray(U_prev, float)
-        U_new  = np.full((target_len, nu), float(fill))
-        if U_prev.ndim == 2 and U_prev.shape[0] >= 2:
-            take = min(target_len-1, U_prev.shape[0]-1)
+        old_len, nu_ = U_prev.shape if U_prev.ndim == 2 else (0, nu)
+        U_new = np.full((target_len, nu), float(fill))
+        if old_len >= 2:
+            take = min(target_len-1, old_len-1)
             if take > 0:
                 U_new[:take, :] = U_prev[1:1+take, :]
         return U_new
 
     def _forward_sim_x(A, B, x0, U):
-        x0 = np.asarray(x0, float); Tm1, _ = U.shape
+        A = np.asarray(A, float); B = np.asarray(B, float)
+        x0 = np.asarray(x0, float)
+        Tm1, _ = U.shape
         nx_ = A.shape[0]
-        X = np.zeros((Tm1+1, nx_), float)
-        X[0,:] = x0
-        for kk in range(Tm1):
-            X[kk+1,:] = A @ X[kk,:] + B @ U[kk,:]
-        return X
+        Xsim = np.zeros((Tm1+1, nx_), float)
+        Xsim[0,:] = x0
+        for k in range(Tm1):
+            Xsim[k+1,:] = A @ Xsim[k,:] + B @ U[k,:]
+        return Xsim
 
-    def _seed_from_guess(m, Xs, Us, N=N):
-        for p in range(1, N+1):
-            for k in m.Kx:
-                for i in m.S:
-                    m.x[p,k,i].value = float(Xs[p-1][int(k), int(i)])
-            for k in m.Ku:
-                for j in m.U:
-                    m.u[p,k,j].value = float(Us[p-1][int(k), int(j)])
+    def _seed_model_from_guess_2p(m, Xg_list, Ug_list):
+        # N=2 only; uses m.x1, m.x2, m.u1, m.u2
+        X1g, X2g = Xg_list
+        U1g, U2g = Ug_list
+        for k in list(m.Kx):
+            ki = int(k)
+            for i in list(m.S):
+                ii = int(i)
+                m.x1[ki, ii].value = float(X1g[ki, ii])
+                m.x2[ki, ii].value = float(X2g[ki, ii])
+        for k in list(m.Ku):
+            kk = int(k)
+            for j in list(m.U):
+                jj = int(j)
+                m.u1[kk, jj].value = float(U1g[kk, jj])
+                m.u2[kk, jj].value = float(U2g[kk, jj])
 
-    def _replan(theta_vec):
-        # Unpack theta → per-player x0
-        offs = 0; x0_now=[]
-        for p in range(N):
-            x0_now.append(theta_vec[offs:offs+nx_tr]); offs += nx_tr
+    # -------------------- replan (2-player) --------------------
+    def replan_path(theta_vec, prev_axesD, prev_Rs):
+        # unpack x0 for two agents
+        x0_1 = theta_vec[0:nx]
+        x0_2 = theta_vec[nx:2*nx]
+        m = path_ctx["m"]; A = path_ctx["A"]; B = path_ctx["B"]
 
-        # Refresh IC params + seed k=0
-        for p in range(1, N+1):
-            for i in m.S:
-                m.x0[p,i].set_value(float(x0_now[p-1][int(i)]))
-                m.x[p,0,i].value = float(x0_now[p-1][int(i)])
+        # refresh IC params + seed x(0)
+        for i in range(nx):
+            m.x01[i].set_value(float(x0_1[i]))
+            m.x02[i].set_value(float(x0_2[i]))
+            m.x1[0, i].value = float(x0_1[i])
+            m.x2[0, i].value = float(x0_2[i])
 
-        # Warm-start
+        # warm-start controls (|Ku| = T)
         Ku_len = len(list(m.Ku))
-        Ug = []
-        if path_ctx["U_guess"] is None:
-            for _ in range(N):
-                Ug.append(np.zeros((Ku_len, nu_tr)))
+        U_guess = path_ctx["U_guess"]
+        if U_guess[0] is None:
+            U1g = np.zeros((Ku_len, nu))
+            U2g = np.zeros((Ku_len, nu))
         else:
-            for p in range(N):
-                Ug.append(_shift_controls_one_step(path_ctx["U_guess"][p], Ku_len))
+            U1g = _shift_controls_one_step(U_guess[0], target_len=Ku_len)
+            U2g = _shift_controls_one_step(U_guess[1], target_len=Ku_len)
 
-        Xg = [ _forward_sim_x(Ad_np, Bd_np, x0_now[p], Ug[p]) for p in range(N) ]
-        _seed_from_guess(m, Xg, Ug)
+        # forward sim to get X guesses (|Kx| = T+1)
+        X1g = _forward_sim_x(A, B, x0_1, U1g)
+        X2g = _forward_sim_x(A, B, x0_2, U2g)
 
-        # Solve
+        _seed_model_from_guess_2p(m, [X1g, X2g], [U1g, U2g])
+
+        # solve
         solve_with_local_path(
             m,
-            path_exe=cfg.get("pathampl"),
-            tee=bool(cfg.get("path_tee", True)),
-            path_options=cfg.get("path_options"),
+            path_exe=cfg.get("pathampl", "/Users/gussantaella/Documents/UTAustin/Research/Code/Research_Repo/path_5/ampl/pathampl"),
+            tee=True,
         )
 
-        # Extract + cache
-        X, U = neos_path_game.extract_trajectories_N(m, N)
-        path_ctx["X_guess"], path_ctx["U_guess"] = X, U
+        # extract + cache warm start for next turn
+        X1, U1, X2, U2 = extract_trajectories(m)
+        path_ctx["X_guess"][0], path_ctx["U_guess"][0] = X1, U1
+        path_ctx["X_guess"][1], path_ctx["U_guess"][1] = X2, U2
 
-        # Build horizon position plans
-        plans = []
-        for p in range(N):
-            plans.append([ _p3(X[p][t, :D]) for t in range(T) ])
-        return plans, U
+        # pack outputs for viz/exec
+        plan1 = [_p3_row(X1[t, :]) for t in range(T)]
+        plan2 = [_p3_row(X2[t, :]) for t in range(T)]
+        att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev_axesD[0], prev_Rs[0])
+        att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev_axesD[1], prev_Rs[1])
 
-    # --- first plan at t = 0 ---
-    plans, U = _replan(theta)
+        z_dummy = np.zeros(1)  # API symmetry
+        return z_dummy, [plan1, plan2], [U1, U2], [att1, att2], [prev1_out, prev2_out], [prevR1_out, prevR2_out]
 
-    # seed plan_hist for t=0, and create initial frame
-    for p in range(N):
-        plan_hist[p].append(plans[p])
-    frames.append({
-        "t": 0,
-        "exec": [exec_hist[p][-1] for p in range(N)],
-        "plans": plans,   # horizons active at t=0
-    })
-
+    # --- first plan (N=2 solver) ---
+    z_last = np.zeros(1)
+    z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
     step_in_turn = 0
 
-    # --- rollout ---
-    for k in range(steps):
-        if k % turn_len == 0 and k > 0:
-            plans, U = _replan(theta)
-            step_in_turn = 0
-        # log plans used for this step
-        for p in range(N):
-            plan_hist[p].append(plans[p])
+    # store initial plans for viz at step 0
+    for a in range(N):
+        plan_hist[a].append(plans[a])
+        plan_att[a].append(atts[a])
 
-        # controls for this step
-        u_now = [ U[p][min(step_in_turn, len(U[p])-1)] for p in range(N) ]
+    # -------------------- rollout --------------------
+    for k in range(steps):
+        # replan each turn
+        if k % turn_len == 0 and k > 0:
+            z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
+            step_in_turn = 0
+
+            for a in range(N):
+                plan_hist[a].append(plans[a])
+                plan_att[a].append(atts[a])
+
+        # controls for this step (N=2 for now)
+        u_step = []
+        for a in range(N):
+            U_a = U_list[a]
+            u_step.append(U_a[min(step_in_turn, len(U_a)-1)])
         step_in_turn += 1
 
-        # plant step + log executed
-        for p in range(N):
-            x_list[p] = step_plant(x_list[p], u_now[p])
-        theta = np.concatenate(x_list, axis=0)
+        # 1) plant step
+        for a in range(N):
+            X[a] = step_plant(X[a], u_step[a])
+        theta_curr = np.concatenate(X, axis=0)
 
-        for p in range(N):
-            exec_pos = _p3(x_list[p][:D])
-            exec_hist[p].append(exec_pos)
+        # 2) attitude from updated states
+        for a in range(N):
+            if not use_att:
+                R_now, axis_now, phi_now = prev_R[a], prev_axisD[a], 0.0
+            else:
+                R_now, axis_now, phi_now = attitude_from_state(
+                    X[a], prev_R=prev_R[a], prev_axisD=prev_axisD[a], att_cfg=att_cfg, i_phi=i_phi
+                )
+            prev_R[a], prev_axisD[a] = R_now, axis_now
+            phi_hist[a].append(phi_now)
+            exec_att[a].append({"R": R_now, "phi": phi_now})
+            exec_xyz[a].append(_p3_vec(X[a]))
 
-        # frame snapshot after applying step k -> k+1
-        frames.append({
-            "t": k+1,
-            "exec": [exec_hist[p][-1] for p in range(N)],
-            "plans": plans,   # still the horizons in effect for this step
-        })
+        # 3) (optional) UKF — unchanged from your 2-agent pair example
+        if do_est and N == 2:
+            s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
+            P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
+            Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
+            Rm = np.diag([s_az**2, s_el**2])
+            who   = (est_cfg.get('who') or 'both').lower()
+            every = int(est_cfg.get('every', 1))
+            # You can lift your previous pairwise UKF block here if needed.
 
-    rollout = {
-        "exec_hist": exec_hist,
-        "plan_hist": plan_hist,
-        "U_last":    U,
-        "X_last":    path_ctx["X_guess"],
-        "frames":    frames,   # <-- new: per-step snapshots for animation
-    }
+        # 4) FOV
+        if fov_enabled:
+            R_def = prev_R[fov_agent]
+            x_def = X[fov_agent]
+            x_tgt = X[fov_target]
+            a_def3 = R_def[0] if align == 'x' else R_def[2]
+            fov_axis_hist.append(a_def3)
 
-        # Back-compat shim for the original 2-player animator
-    if N == 2:
-        rollout.update({
-            "plan_hist1": rollout["plan_hist"][0],
-            "plan_hist2": rollout["plan_hist"][1],
-            "exec1_xyz":  rollout["exec_hist"][0],
-            "exec2_xyz":  rollout["exec_hist"][1],
-
-            # If your old animator used these, stub them (we didn't compute attitude/FOV here)
-            "plan_att1": [None] * len(rollout["plan_hist"][0]),
-            "plan_att2": [None] * len(rollout["plan_hist"][1]),
-            "exec_att1": [None] * len(rollout["exec_hist"][0]),
-            "exec_att2": [None] * len(rollout["exec_hist"][1]),
-            "phi_hist1": [0.0]  * len(rollout["exec_hist"][0]),
-            "phi_hist2": [0.0]  * len(rollout["exec_hist"][1]),
-            "fov_axis_hist": [None]  * len(rollout["exec_hist"][0]),
-            "fov_seen_mask": [False] * len(rollout["exec_hist"][0]),
-        })
-
-    return rollout
-
-
-def preflight_check_x0_feasibility_N(cfg, verbose=True):
-    """
-    Evaluate the N-player h>=0 constraints at k=0 using cfg['x0'].
-    Works with both N-player builders that read m.x[p,k,i] and the
-    2-player fallback that reads m.x1[k,i]/m.x2[k,i].
-    Returns a list of (h_index, value) for any h<0 or non-finite.
-    """
-    import numpy as np
-    from math import isfinite
-
-    N = int(cfg.get("N", len(cfg["x0"])))
-    # infer D from x0 row length if not provided
-    D = int(cfg.get("D", np.asarray(cfg["x0"][0]).shape[0] // 2))
-    nx = 2 * D
-
-    # Use the same builders your MCP uses
-    try:
-        h_list = build_h_builders_N(cfg, nx, D, N)
-    except NameError:
-        # If you don't have an N-player builder yet, fall back to 2p
-        h_list = build_h_builders(cfg, nx, D)
-
-    # --- minimal mock model with the right indexing semantics ---
-    class _X3:
-        """Supports m.x[p,k,i] -> x0[p-1][i] (k must be 0 for preflight)."""
-        def __init__(self, rows):
-            self.rows = [np.asarray(r, float) for r in rows]
-        def __getitem__(self, key):
-            p, k, i = key
-            assert int(k) == 0, "preflight only checks k=0"
-            return float(self.rows[p-1][int(i)])
-
-    class _X2:
-        """Supports m.x1[k,i] / m.x2[k,i] style (k must be 0)."""
-        def __init__(self, row):
-            self.row = np.asarray(row, float)
-        def __getitem__(self, key):
-            k, i = key
-            assert int(k) == 0, "preflight only checks k=0"
-            return float(self.row[int(i)])
-
-    class _M:  # dummy model
-        pass
-
-    m = _M()
-    m.x = _X3(cfg["x0"])           # N-player accessor
-    if N >= 1: m.x1 = _X2(cfg["x0"][0])  # 2-player fallback accessors
-    if N >= 2: m.x2 = _X2(cfg["x0"][1])
-
-    # --- evaluate all h at k=0 ---
-    bad = []
-    for hi, hfun in enumerate(h_list):
-        try:
-            val = float(hfun(m, 0))
-        except Exception as e:
-            # If a builder has a different signature, just report and skip
-            if verbose:
-                print(f"[preflight] h[{hi}] raised {type(e).__name__}: {e} (skipping)")
-            continue
-        if (not isfinite(val)) or (val < 0):
-            bad.append((hi, val))
-
-    if verbose:
-        if bad:
-            print(f"[preflight] {len(bad)} violations at k=0: {bad}")
+            cam_cfg = cfg.get("camera", None)
+            if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
+                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def)
+                fov_seen_mask.append(bool(ok))
+            else:
+                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
+                fov_seen_mask.append(bool(seen))
         else:
-            print("[preflight] OK: all h>=0 at k=0 ✅")
+            fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    return bad
-
-
+    # -------------------- return --------------------
+    ret = {
+        # explode per-agent arrays into numbered keys for backward compat
+        **{f'plan_hist{a+1}': plan_hist[a] for a in range(min(N,5))},
+        **{f'plan_att{a+1}':  plan_att[a]  for a in range(min(N,5))},
+        **{f'exec{a+1}_xyz':  exec_xyz[a]  for a in range(min(N,5))},
+        **{f'exec_att{a+1}':  exec_att[a]  for a in range(min(N,5))},
+        **{f'phi_hist{a+1}':  phi_hist[a]  for a in range(min(N,5))},
+        'fov_axis_hist': fov_axis_hist,
+        'fov_seen_mask': fov_seen_mask,
+        # also return the compact lists-of-lists (new API)
+        'plan_hist_all': plan_hist,
+        'plan_att_all':  plan_att,
+        'exec_xyz_all':  exec_xyz,
+        'exec_att_all':  exec_att,
+        'phi_hist_all':  phi_hist,
+    }
+    return ret
 
 
 

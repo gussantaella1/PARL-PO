@@ -269,115 +269,138 @@ def build_mcp_two_player_one_shot(
     return m
 
 
-# --- NEW: extract for N players ---
-def extract_trajectories_N(m, N):
-    Kx = list(m.Kx); Ku = list(m.Ku); S = list(m.S); U = list(m.U)
-    X = [None]*N
-    Uv = [None]*N
-    for p in range(1, N+1):
-        Xp = np.array([[value(m.x[p,k,i]) for i in S] for k in Kx], dtype=float)
-        Up = np.array([[value(m.u[p,k,j]) for j in U] for k in Ku], dtype=float)
-        X[p-1] = Xp; Uv[p-1] = Up
-    return X, Uv
-
 
 # --- NEW: build one big MCP for N players ---
-def build_mcp_n_player_one_shot(
+def build_mcp_N_player_one_shot(
     Ad, Bd, T, nx, nu,
-    x0_list,                 # list/array of length N, each (nx,)
+    x0_list,                   # list of N arrays, each (nx,)
+    N,
     D=3,
     x_var_box=(-1e6, 1e6),
     u_var_box=(-1e3, 1e3),
-    h_builders=None,         # list of callables h(m,k) >= 0 that may look at all players
-    cost_kind="generic_n",
+    h_builders=None,           # list of callables h(m,k) >= 0; may use m.x1, m.x2, ...
+    cost_kind="chase_escape_tail",
     cost_cfg=None,
 ):
-    """
-    Generalization of your 2P MCP to N players.
+    cost_cfg   = dict(cost_cfg or {})
+    h_builders = list(h_builders or [])
 
-    Primals: for p=1..N   x[p,k,i], u[p,k,j]
-    Shared equalities g̃: IC + dynamics for every player (free multipliers)
-    Shared inequalities h̃ >= 0 (one vector for arena/separation/etc.), with μ ⟂ h̃
-    Stationarity: ∇_{(x[p],u[p])} (l_p) - Jg̃^T λ - Jh̃^T μ = 0  for each player p
-    """
-    cost_cfg = cost_cfg or {}
-    m = ConcreteModel()
-    Np = int(len(x0_list))
-    assert Np >= 2, "Need at least 2 players."
+    # ---------- model & sets ----------
+    m    = ConcreteModel()
+    N    = int(N); T = int(T); nx = int(nx); nu = int(nu)
+    m.P  = RangeSet(1, N)          # players
+    m.Kx = RangeSet(0, T)          # state time indices
+    m.Ku = RangeSet(0, T-1)        # control time indices
+    m.S  = RangeSet(0, nx-1)       # state components
+    m.U  = RangeSet(0, nu-1)       # control components
 
-    # ----- sets -----
-    m.P  = RangeSet(1, Np)
-    m.Kx = RangeSet(0, T)
-    m.Ku = RangeSet(0, T-1)
-    m.S  = RangeSet(0, nx-1)
-    m.U  = RangeSet(0, nu-1)
-
-    # ----- params -----
+    # ---------- parameters ----------
     Ad = np.asarray(Ad, float); Bd = np.asarray(Bd, float)
-    m.A  = Param(m.S, m.S, initialize=lambda _m,i,j: float(Ad[i,j]), within=Reals)
-    m.B  = Param(m.S, m.U, initialize=lambda _m,i,j: float(Bd[i,j]), within=Reals)
+    x0_list = [np.asarray(x0, float) for x0 in x0_list]
+    assert len(x0_list) == N, "x0_list must have length N"
 
-    # mutable ICs per player
-    def _ic_init(_m,p,i):
-        return float(np.asarray(x0_list[p-1], float)[i])
-    m.x0 = Param(m.P, m.S, initialize=_ic_init, within=Reals, mutable=True)
+    m.A = Param(m.S, m.S, initialize=lambda _m,i,j: float(Ad[i,j]), within=Reals, mutable=False)
+    m.B = Param(m.S, m.U, initialize=lambda _m,i,j: float(Bd[i,j]), within=Reals, mutable=False)
 
-    # ----- primals (wide boxes here; real limits in h_builders) -----
+    # mutable IC params per player
+    def _init_x0(_m, p, i):
+        return float(x0_list[p-1][i])
+    m.x0 = Param(m.P, m.S, initialize=_init_x0, within=Reals, mutable=True)
+
+    # ---------- primals (wide boxes; real limits via h_builders) ----------
     xlb, xub = float(x_var_box[0]), float(x_var_box[1])
     ulb, uub = float(u_var_box[0]), float(u_var_box[1])
+
+    # canonical variables
     m.x = Var(m.P, m.Kx, m.S, bounds=lambda _m,p,k,i: (xlb, xub))
     m.u = Var(m.P, m.Ku, m.U, bounds=lambda _m,p,k,j: (ulb, uub))
 
-    # ----- shared equalities g̃ = 0 -----
-    # ICs
+    # ---------- BACKWARD-COMPAT ALIASES (x1,u1,x2,u2, ... , x0{p}) ----------
+    # These are true alias views; they don’t add variables/constraints.
+    for p in range(1, N+1):
+        # These create views with indices (k,i) and (k,j)
+        setattr(m, f"x{p}",  Reference(m.x[p, :, :]))   # m.xp[k,i]
+        setattr(m, f"u{p}",  Reference(m.u[p, :, :]))   # m.up[k,j]
+        setattr(m, f"x0{p}", Reference(m.x0[p, :]))     # m.x0p[i]
+
+    # ---------- shared equality expressions g̃ (IC + dynamics for every player) ----------
     def g_ic_expr(_m, p, i):
-        return _m.x[p,0,i] - _m.x0[p,i]
-    # dynamics
+        return _m.x[p, 0, i] - _m.x0[p, i]
+
     def g_dyn_expr(_m, p, k, i):
-        return _m.x[p,k+1,i] - sum(_m.A[i,j]*_m.x[p,k,j] for j in _m.S) - sum(_m.B[i,j]*_m.u[p,k,j] for j in _m.U)
+        # x_p(k+1) - A x_p(k) - B u_p(k) = 0
+        return _m.x[p, k+1, i] - sum(_m.A[i,j]*_m.x[p, k, j] for j in _m.S) \
+                                - sum(_m.B[i,j]*_m.u[p, k, j] for j in _m.U)
 
-    m.ic  = Constraint(m.P, m.S,       rule=lambda _m,p,i: g_ic_expr(_m,p,i)  == 0)
-    m.dyn = Constraint(m.P, m.Ku, m.S, rule=lambda _m,p,k,i: g_dyn_expr(_m,p,k,i) == 0)
+    # impose g̃ = 0 as constraints
+    m.ic  = Constraint(m.P, m.S,         rule=lambda _m,p,i: g_ic_expr(_m,p,i) == 0)
+    m.dyn = Constraint(m.P, m.Ku, m.S,   rule=lambda _m,p,k,i: g_dyn_expr(_m,p,k,i) == 0)
 
-    # multipliers for g̃ (free)
+    # ---------- multipliers for g̃ ----------
     m.lam_ic  = Var(m.P, m.S,       domain=Reals)
     m.lam_dyn = Var(m.P, m.Ku, m.S, domain=Reals)
 
-    # ----- shared inequalities h̃ >= 0 with μ ⟂ h̃ -----
-    h_builders = h_builders or []
+    # ---------- shared inequalities and μ ≥ 0 with μ ⟂ h ----------
     if h_builders:
-        m.H = RangeSet(0, len(h_builders)-1)
+        m.H  = RangeSet(0, len(h_builders)-1)
         m.mu = Var(m.H, m.Kx, domain=NonNegativeReals)
-        def _h_expr(_m, h, k):
-            return h_builders[int(h)](_m, k)  # may reference m.x[many,...]
+
+        def _h_expr_wrap(_m, h, k):
+            # Existing h_builders can keep using m.x1, m.x2, ... thanks to References.
+            return h_builders[int(h)](_m, k)
+
         m.h_comp = Complementarity(
             m.H, m.Kx,
-            rule=lambda _m,h,k: complements(_m.mu[h,k] >= 0, _h_expr(_m,h,k) >= 0)
+            rule=lambda _m,h,k: complements(_m.mu[h,k] >= 0, _h_expr_wrap(_m,h,k) >= 0)
         )
 
-    # ----- per-player costs -----
-    # returns: (l_k_funcs, l_T_funcs) where each is a list of length Np
-    from game_costs import build_game_costs_N
-    l_k, l_T = build_game_costs_N(cost_kind, cost_cfg, D, T, Np)
+    # ---------- costs per player ----------
+    def _costs_for_N(cost_kind, cost_cfg, D, T, N):
+        # Prefer user N-player factory if present
+        if "build_game_costs_N" in globals():
+            return build_game_costs_N(cost_kind, cost_cfg or {}, D, T, N)
+        # Fallback: replicate your 2p cost
+        try:
+            l1_k, l2_k, l1_T, l2_T = build_game_costs(cost_kind, cost_cfg or {}, D, T)
+        except Exception:
+            def z_k(_m,_k): return 0.0
+            def z_T(_m):   return 0.0
+            return ({p:z_k for p in range(1,N+1)},
+                    {p:z_T for p in range(1,N+1)})
+        replicate_second = bool(cost_cfg.get("replicate_second_cost_for_others", True))
+        l_k, l_T = {}, {}
+        for p in range(1, N+1):
+            if p == 1:
+                l_k[p], l_T[p] = l1_k, l1_T
+            elif replicate_second:
+                l_k[p], l_T[p] = l2_k, l2_T
+            else:
+                l_k[p] = (lambda _m,_k: 0.0)
+                l_T[p] = (lambda _m: 0.0)
+        return l_k, l_T
 
-    # ----- helper: Jg^T λ and Jh^T μ acting on a specific var -----
-    from pyomo.core.expr.calculus.derivatives import differentiate, Modes
+    l_k, l_T = _costs_for_N(cost_kind, cost_cfg, D, T, N)
 
-    def _eq_grad_dot_lam_on(_m, var, p_hint=None, k_hint=None):
+    # ---------- helpers: Jg^T λ and Jh^T μ on a variable ----------
+    def _eq_grad_dot_lam_on(_m, var, k_hint=None, p_hint=None):
         s = 0.0
-        # IC row: only when k==0 of that player's state
-        if p_hint is not None and k_hint == 0:
+        if (p_hint is not None) and (k_hint == 0):
             for i in _m.S:
-                s += _m.lam_ic[p_hint,i] * differentiate(g_ic_expr(_m, p_hint, i), wrt=var, mode=Modes.reverse_symbolic)
-
-        # Dynamics rows: only two slots can touch a var at time k
-        if p_hint is not None and (k_hint is not None):
+                s += _m.lam_ic[p_hint, i] * differentiate(g_ic_expr(_m, p_hint, i),
+                                                          wrt=var, mode=Modes.reverse_symbolic)
+        if (p_hint is not None) and (k_hint is not None):
             if k_hint in _m.Ku:
                 for i in _m.S:
-                    s += _m.lam_dyn[p_hint,k_hint,i] * differentiate(g_dyn_expr(_m, p_hint, k_hint, i), wrt=var, mode=Modes.reverse_symbolic)
+                    s += _m.lam_dyn[p_hint, k_hint, i] * differentiate(
+                        g_dyn_expr(_m, p_hint, k_hint, i),
+                        wrt=var, mode=Modes.reverse_symbolic
+                    )
             if (k_hint-1) in _m.Ku:
                 for i in _m.S:
-                    s += _m.lam_dyn[p_hint,k_hint-1,i] * differentiate(g_dyn_expr(_m, p_hint, k_hint-1, i), wrt=var, mode=Modes.reverse_symbolic)
+                    s += _m.lam_dyn[p_hint, k_hint-1, i] * differentiate(
+                        g_dyn_expr(_m, p_hint, k_hint-1, i),
+                        wrt=var, mode=Modes.reverse_symbolic
+                    )
         return s
 
     def _ineq_grad_dot_mu_on(_m, var, k_hint=None):
@@ -386,26 +409,27 @@ def build_mcp_n_player_one_shot(
         if k_hint is None:
             for h in _m.H:
                 for k in _m.Kx:
-                    s += _m.mu[h,k] * differentiate(h_builders[int(h)](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+                    s += _m.mu[h,k] * differentiate(h_builders[int(h)](_m, k),
+                                                    wrt=var, mode=Modes.reverse_symbolic)
             return s
         for h in _m.H:
-            s += _m.mu[h,k_hint] * differentiate(h_builders[int(h)](_m, k_hint), wrt=var, mode=Modes.reverse_symbolic)
+            s += _m.mu[h,k_hint] * differentiate(h_builders[int(h)](_m, k_hint),
+                                                 wrt=var, mode=Modes.reverse_symbolic)
         return s
 
-    # ----- stationarity for every state & control of every player -----
+    # ---------- stationarity ----------
     def st_x_rule(_m, p, k, i):
-        var = _m.x[p,k,i]
-        grad_cost = differentiate(l_k[p-1](_m, k) if k < T else l_T[p-1](_m), wrt=var, mode=Modes.reverse_symbolic)
-        JgTlam    = _eq_grad_dot_lam_on(_m, var, p_hint=p, k_hint=k)
-        JhTmu     = _ineq_grad_dot_mu_on(_m, var, k_hint=k)
-        return grad_cost - JgTlam - JhTmu == 0
+        var = _m.x[p, k, i]
+        grad_cost = differentiate(l_k[p](_m, k), wrt=var, mode=Modes.reverse_symbolic) if k < T \
+                    else differentiate(l_T[p](_m),   wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+                         - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
 
     def st_u_rule(_m, p, k, j):
-        var = _m.u[p,k,j]
-        grad_cost = differentiate(l_k[p-1](_m, k), wrt=var, mode=Modes.reverse_symbolic)
-        JgTlam    = _eq_grad_dot_lam_on(_m, var, p_hint=p, k_hint=k)
-        JhTmu     = _ineq_grad_dot_mu_on(_m, var, k_hint=k)
-        return grad_cost - JgTlam - JhTmu == 0
+        var = _m.u[p, k, j]
+        grad_cost = differentiate(l_k[p](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+                         - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
 
     m.st_x = Constraint(m.P, m.Kx, m.S, rule=st_x_rule)
     m.st_u = Constraint(m.P, m.Ku, m.U, rule=st_u_rule)
@@ -415,108 +439,23 @@ def build_mcp_n_player_one_shot(
         for k in m.Ku:
             for j in m.U:
                 m.u[p, k, j].value = 0.0
-
-        # seed x(p,0,·) from x0
-        for i in m.S:
-            m.x[p, 0, i].value = pyo_value(m.x0[p, i])
-
-        # one free sim step (u=0) to seed x along the horizon
-        for k in m.Ku:
-            for i in m.S:
-                # Ad * x + Bd * u (with u=0)
-                m.x[p, k+1, i].value = sum(
-                    pyo_value(m.A[i, j]) * pyo_value(m.x[p, k, j]) for j in m.S
-                )
-                # (if you prefer, include Bd term explicitly; it’s zero here)
-                # + sum(pyo_value(m.B[i, j]) * 0.0 for j in m.U)
-
-
     for p in m.P:
         for i in m.S:
-            m.lam_ic[p,i].value = 0.0
+            m.x[p, 0, i].value = float(value(m.x0[p, i]))
+    for p in m.P:
         for k in m.Ku:
             for i in m.S:
-                m.lam_dyn[p,k,i].value = 0.0
-
+                m.x[p, k+1, i].value = sum(value(m.A[i,j]) * value(m.x[p, k, j]) for j in m.S)
+    for p in m.P:
+        for i in m.S:
+            m.lam_ic[p, i].value = 0.0
+    for p in m.P:
+        for k in m.Ku:
+            for i in m.S:
+                m.lam_dyn[p, k, i].value = 0.0
     if h_builders:
         for h in m.H:
             for k in m.Kx:
-                m.mu[h,k].value = 0.0
+                m.mu[h, k].value = 0.0
 
     return m
-
-
-def _snapshot_path_model(m, tag="(unspecified)", T=None, nx=None, nu=None, D=None):
-    import numpy as np
-    from pyomo.environ import value
-    print("\n========== PATH SNAPSHOT", tag, "==========")
-    # counts
-    n_x1 = sum(1 for _ in m.x1);  n_x2 = sum(1 for _ in m.x2)
-    n_u1 = sum(1 for _ in m.u1);  n_u2 = sum(1 for _ in m.u2)
-    n_lam = sum(1 for _ in m.lam_ic1) + sum(1 for _ in m.lam_ic2) \
-          + sum(1 for _ in m.lam_dyn1) + sum(1 for _ in m.lam_dyn2)
-    n_mu  = sum(1 for _ in m.mu) if hasattr(m, "mu") else 0
-    n_comp = (len(list(m.H))*len(list(m.Kx))) if hasattr(m, "H") else 0
-    print(f"vars: x1={n_x1}, x2={n_x2}, u1={n_u1}, u2={n_u2}, lam={n_lam}, mu={n_mu} (pairs={n_comp})")
-    if T is not None: print(f"shape: T={T}, nx={nx}, nu={nu}, D={D}")
-
-    # A/B/x0 finite?
-    def _bad(x):
-        try: return not np.isfinite(float(x))
-        except Exception: return True
-    badA = any(_bad(m.A[i,j]) for i in m.S for j in m.S)
-    badB = any(_bad(m.B[i,j]) for i in m.S for j in m.U)
-    badx01 = any(_bad(m.x01[i]) for i in m.S)
-    badx02 = any(_bad(m.x02[i]) for i in m.S)
-    print("A bad?:", badA, "  B bad?:", badB, "  x01 bad?:", badx01, "  x02 bad?:", badx02)
-
-    # h-builders count
-    print("h_builders count:", len(list(m.H)) if hasattr(m, "H") else 0)
-
-    # IC residuals at warm start
-    ic1 = [float(m.x1[0,i].value) - float(m.x01[i]) for i in m.S]
-    ic2 = [float(m.x2[0,i].value) - float(m.x02[i]) for i in m.S]
-    print(f"||IC1||={np.linalg.norm(ic1):.3e}  ||IC2||={np.linalg.norm(ic2):.3e}")
-
-    # dyn residuals at warm start
-    def _dyn_res(agent):
-        res=[]
-        for k in m.Ku:
-            for i in m.S:
-                if agent==1:
-                    lhs = float(m.x1[k+1,i].value)
-                    rhs = sum(float(m.A[i,j])*float(m.x1[k,j].value) for j in m.S) \
-                        + sum(float(m.B[i,j])*float(m.u1[k,j].value) for j in m.U)
-                else:
-                    lhs = float(m.x2[k+1,i].value)
-                    rhs = sum(float(m.A[i,j])*float(m.x2[k,j].value) for j in m.S) \
-                        + sum(float(m.B[i,j])*float(m.u2[k,j].value) for j in m.U)
-                res.append(lhs-rhs)
-        return np.array(res,float)
-    r1 = _dyn_res(1); r2 = _dyn_res(2)
-    print(f"||dyn1||={np.linalg.norm(r1):.3e}  ||dyn2||={np.linalg.norm(r2):.3e}")
-
-    # inequalities feasibility (min h at warm start)
-    if hasattr(m, "h_comp"):
-        min_h = +1e300
-        for h in m.H:
-            for k in m.Kx:
-                try:
-                    val = float(value(m.h_comp.complements.body[h,k]))  # h(m,k)
-                    min_h = min(min_h, val)
-                except Exception:
-                    min_h = None; break
-            if min_h is None: break
-        print("min h at warm start:", "N/A" if min_h is None else f"{min_h:.3e}")
-    else:
-        print("no shared inequalities.")
-
-    # sample stationarity body
-    try:
-        k0 = list(m.Kx)[0]; i0 = list(m.S)[0]
-        from pyomo.environ import value as pval
-        print("sample st_x1(k=0,i=0):", f"{pval(m.st_x1[k0,i0].body):.3e}")
-    except Exception as e:
-        print("sample st_x1 eval failed:", e)
-    print("==============================================\n")
-
