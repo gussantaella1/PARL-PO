@@ -30,6 +30,7 @@ try:
         build_mcp_two_player_one_shot,
         solve_with_local_path,
         extract_trajectories,
+        _snapshot_path_model
     )
 
 
@@ -188,7 +189,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
     # --- optional attitude augmentation (roll in state) ---
     att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg)
+    use_att = bool(att_cfg.get("enabled", False))
+    #use_att = False
+    # # print(use_att)
+    # raise("Stopping to debug")
     if use_att:
         Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
         nx, nu = idx["nx"], idx["nu"]
@@ -197,6 +201,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         Ad_mx, Bd_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
         i_phi  = None
+
+    # print(Ad_mx)
+    # print(Bd_mx)
+
+    # raise("Stop here")
 
     # --- rollout length / turn length ---
     sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
@@ -242,7 +251,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     def _p3_vec(x_vec):
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, use_att=True, i_phi=None):
+    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, i_phi=None):
         if att_cfg is None: att_cfg = {}
         align    = att_cfg.get("align", "x")
         world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
@@ -262,37 +271,57 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
 
         phi = 0.0
-        if use_att and i_phi is not None and i_phi < len(x):
+        if i_phi is not None and i_phi < len(x):  # i_phi is None when att is off
             phi = float(x[i_phi])
             R   = apply_roll_about_axis(R, phi, align=align)
 
         return R, axisD, phi
 
+
+
     def plan_attitudes_from_X(X, prev_axisD, prev_R):
+        # When attitude is disabled, return a constant frame/phi over horizon
+        if not use_att:
+            return ([{"R": prev_R, "phi": 0.0} for _ in range(T)],
+                    prev_axisD, prev_R)
+
+        # Otherwise, compute as before
         att_list = []
         ax_prev  = prev_axisD
         R_prev   = prev_R
         for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev)
+            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev, att_cfg=att_cfg, i_phi=i_phi)
             att_list.append({"R": R, "phi": phi_t})
             R_prev = R
         return att_list, ax_prev, R_prev
 
-    # --- t=0 attitude seed ---
+
+
+    # --- t=0 attitude seed (unchanged up to here) ---
     align    = att_cfg.get("align", "x")
     world_up = att_cfg.get("up", [0,0,1])
     vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
+
     def _axis_from_vel_t0(x):
         v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
         aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        return aD, (aD if D==3 else np.array([aD[0], aD[1], 0.0], float))
+        return aD, (aD if D==3 else np.array([aD[0], aD[1]], float).tolist() + [0.0])  # keep 3D row shape
+
     prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
     prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
+
     phi1_0 = float(x1[i_phi]) if (use_att and i_phi is not None) else 0.0
     phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
-    R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
-    R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
+
+    # base frames from boresight; add roll only when att is on
+    R1_0 = world_to_body_R(axis1_0, 3, align=align, up=world_up)
+    R2_0 = world_to_body_R(axis2_0, 3, align=align, up=world_up)
+    if use_att:
+        R1_0 = apply_roll_about_axis(R1_0, phi1_0, align=align)
+        R2_0 = apply_roll_about_axis(R2_0, phi2_0, align=align)
+
     prev_R1, prev_R2 = R1_0, R2_0
+
 
     # === optional UKFs ===
     if do_est:
@@ -349,6 +378,14 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         cost_cfg=cfg,
     )
 
+    # _snapshot_path_model(
+    #     m_path,
+    #     tag=f"att={'on' if use_att else 'off'}",
+    #     T=T, nx=nx, nu=nu, D=D
+    # )
+
+    # raise("Stopping to debud")
+
     path_ctx = {
         "m": m_path,
         "A": as_numpy_const(Ad_mx),
@@ -399,7 +436,9 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
         # refresh IC params + seed x(0)
         for i in range(nx):
-            m.x01[i] = float(x0_1[i]); m.x02[i] = float(x0_2[i])
+            m.x01[i].set_value(float(x0_1[i]))
+            m.x02[i].set_value(float(x0_2[i]))
+
             m.x1[0, i].value = float(x0_1[i]); m.x2[0, i].value = float(x0_2[i])
 
         # warm-start controls (|Ku| = T)
@@ -466,10 +505,14 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         theta_curr = np.r_[x1, x2]
 
         # 2) attitude from updated states
-        R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D,
-                                                   att_cfg=att_cfg, use_att=use_att, i_phi=i_phi)
-        R2, axis2D, phi2_now = attitude_from_state(x2, prev_R=prev_R2, prev_axisD=prev_axis2D,
-                                                   att_cfg=att_cfg, use_att=use_att, i_phi=i_phi)
+        if not use_att:
+            # keep the body frames and φ fixed
+            R1, axis1D, phi1_now = prev_R1, prev_axis1D, 0.0
+            R2, axis2D, phi2_now = prev_R2, prev_axis2D, 0.0
+        else:
+            R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D, att_cfg=att_cfg, i_phi=i_phi)
+            R2, axis2D, phi2_now = attitude_from_state(x1, prev_R=prev_R2, prev_axisD=prev_axis2D, att_cfg=att_cfg, i_phi=i_phi)
+
         prev_axis1D, prev_axis2D = axis1D, axis2D
         prev_R1, prev_R2 = R1, R2
 

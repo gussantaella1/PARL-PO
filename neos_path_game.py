@@ -265,3 +265,78 @@ def build_mcp_two_player_one_shot(
                 m.mu[h,k].value = 0.0
 
     return m
+
+def _snapshot_path_model(m, tag="(unspecified)", T=None, nx=None, nu=None, D=None):
+    import numpy as np
+    from pyomo.environ import value
+    print("\n========== PATH SNAPSHOT", tag, "==========")
+    # counts
+    n_x1 = sum(1 for _ in m.x1);  n_x2 = sum(1 for _ in m.x2)
+    n_u1 = sum(1 for _ in m.u1);  n_u2 = sum(1 for _ in m.u2)
+    n_lam = sum(1 for _ in m.lam_ic1) + sum(1 for _ in m.lam_ic2) \
+          + sum(1 for _ in m.lam_dyn1) + sum(1 for _ in m.lam_dyn2)
+    n_mu  = sum(1 for _ in m.mu) if hasattr(m, "mu") else 0
+    n_comp = (len(list(m.H))*len(list(m.Kx))) if hasattr(m, "H") else 0
+    print(f"vars: x1={n_x1}, x2={n_x2}, u1={n_u1}, u2={n_u2}, lam={n_lam}, mu={n_mu} (pairs={n_comp})")
+    if T is not None: print(f"shape: T={T}, nx={nx}, nu={nu}, D={D}")
+
+    # A/B/x0 finite?
+    def _bad(x):
+        try: return not np.isfinite(float(x))
+        except Exception: return True
+    badA = any(_bad(m.A[i,j]) for i in m.S for j in m.S)
+    badB = any(_bad(m.B[i,j]) for i in m.S for j in m.U)
+    badx01 = any(_bad(m.x01[i]) for i in m.S)
+    badx02 = any(_bad(m.x02[i]) for i in m.S)
+    print("A bad?:", badA, "  B bad?:", badB, "  x01 bad?:", badx01, "  x02 bad?:", badx02)
+
+    # h-builders count
+    print("h_builders count:", len(list(m.H)) if hasattr(m, "H") else 0)
+
+    # IC residuals at warm start
+    ic1 = [float(m.x1[0,i].value) - float(m.x01[i]) for i in m.S]
+    ic2 = [float(m.x2[0,i].value) - float(m.x02[i]) for i in m.S]
+    print(f"||IC1||={np.linalg.norm(ic1):.3e}  ||IC2||={np.linalg.norm(ic2):.3e}")
+
+    # dyn residuals at warm start
+    def _dyn_res(agent):
+        res=[]
+        for k in m.Ku:
+            for i in m.S:
+                if agent==1:
+                    lhs = float(m.x1[k+1,i].value)
+                    rhs = sum(float(m.A[i,j])*float(m.x1[k,j].value) for j in m.S) \
+                        + sum(float(m.B[i,j])*float(m.u1[k,j].value) for j in m.U)
+                else:
+                    lhs = float(m.x2[k+1,i].value)
+                    rhs = sum(float(m.A[i,j])*float(m.x2[k,j].value) for j in m.S) \
+                        + sum(float(m.B[i,j])*float(m.u2[k,j].value) for j in m.U)
+                res.append(lhs-rhs)
+        return np.array(res,float)
+    r1 = _dyn_res(1); r2 = _dyn_res(2)
+    print(f"||dyn1||={np.linalg.norm(r1):.3e}  ||dyn2||={np.linalg.norm(r2):.3e}")
+
+    # inequalities feasibility (min h at warm start)
+    if hasattr(m, "h_comp"):
+        min_h = +1e300
+        for h in m.H:
+            for k in m.Kx:
+                try:
+                    val = float(value(m.h_comp.complements.body[h,k]))  # h(m,k)
+                    min_h = min(min_h, val)
+                except Exception:
+                    min_h = None; break
+            if min_h is None: break
+        print("min h at warm start:", "N/A" if min_h is None else f"{min_h:.3e}")
+    else:
+        print("no shared inequalities.")
+
+    # sample stationarity body
+    try:
+        k0 = list(m.Kx)[0]; i0 = list(m.S)[0]
+        from pyomo.environ import value as pval
+        print("sample st_x1(k=0,i=0):", f"{pval(m.st_x1[k0,i0].body):.3e}")
+    except Exception as e:
+        print("sample st_x1 eval failed:", e)
+    print("==============================================\n")
+
