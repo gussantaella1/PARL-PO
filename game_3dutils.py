@@ -705,13 +705,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
 # -------------------- RHC with execution & FOV (3D/2D-aware) - N player case--------------------
 def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
-                                  turn_len: int | None = None):
+                                    turn_len: int | None = None):
     """
-    RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.
-    PATH-only: uses a persistent MCP model with warm-starts each turn.
-
-    N-aware for logging/rollout/FOV. Solving step currently supports N=2 via
-    build_mcp_two_player_one_shot(). Plug in your N-player MCP when ready.
+    N-player RHC rollout with optional attitude-in-state (roll φ) and FOV.
+    Uses your current 2-player replan/solve hook but logs & estimates for N agents.
     """
     # -------------------- basic config --------------------
     N  = int(cfg["N"])
@@ -719,7 +716,7 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
     nx_tr, nu_tr = dims_from_D(D)
     T, dt = int(cfg["T"]), float(cfg["dt"])
 
-    # estimation (kept as in your original—pairwise UKFs can be extended later)
+    # estimation config
     est_cfg = dict(cfg.get('est', {}))
     do_est  = bool(est_cfg.get('enabled', False))
 
@@ -759,14 +756,11 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
     htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
     # -------------------- initial states --------------------
-    # pad φ when attitude is on; store per-agent
     X0_list = []
     for a in range(N):
         x0a = np.asarray(cfg["x0"][a], float)
         x0a = pad_x0_with_att(x0a, att_cfg, D)[:nx] if use_att else x0a[:nx]
         X0_list.append(x0a.copy())
-
-    # θ = [x1; x2; ... ; xN]
     theta_curr = np.concatenate(X0_list, axis=0)
 
     # numeric plant stepper
@@ -775,22 +769,19 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
         return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
 
     # -------------------- logs (N-aware) --------------------
-    plan_hist = [[] for _ in range(N)]    # per-step: planned horizon points (for viz)
-    plan_att  = [[] for _ in range(N)]    # per-step: planned attitudes list over horizon
-    exec_xyz  = [[] for _ in range(N)]    # executed positions
-    exec_att  = [[] for _ in range(N)]    # executed attitudes
-    phi_hist  = [[] for _ in range(N)]    # executed φ (if att on)
+    plan_hist = [[] for _ in range(N)]
+    plan_att  = [[] for _ in range(N)]
+    exec_xyz  = [[] for _ in range(N)]
+    exec_att  = [[] for _ in range(N)]
+    phi_hist  = [[] for _ in range(N)]
     fov_axis_hist, fov_seen_mask = [], []
 
     # FOV config
     fov_cfg     = cfg.get("fov", {"enabled": False})
     fov_enabled = bool(fov_cfg.get("enabled", False))
-    # defender/observer index in [1..N], convert to 0-based
     fov_agent   = max(1, min(N, int(fov_cfg.get("agent", 2)))) - 1
-    # target index (if not provided: pick the first different agent)
     fov_target  = fov_cfg.get("target", None)
     if fov_target is None or int(fov_target) < 1 or int(fov_target) > N or (int(fov_target)-1) == fov_agent:
-        # choose the smallest index != fov_agent
         fov_target = next((j+1 for j in range(N) if j != fov_agent), 1)
     fov_target -= 1  # 0-based
 
@@ -829,8 +820,7 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
         if not use_att:
             return ([{"R": prev_R, "phi": 0.0} for _ in range(T)], prev_axisD, prev_R)
         att_list = []
-        ax_prev  = prev_axisD
-        R_prev   = prev_R
+        ax_prev, R_prev = prev_axisD, prev_R
         for t in range(T):
             R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev, att_cfg=att_cfg, i_phi=i_phi)
             att_list.append({"R": R, "phi": phi_t})
@@ -845,13 +835,12 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
     def _axis_from_vel_t0(x):
         v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
         aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        # 3D row vector for world_to_body_R
         a3 = aD if D==3 else np.array([aD[0], aD[1], 0.0], float)
         return aD, a3
 
     prev_axisD = []
     prev_R     = []
-    X          = [x.copy() for x in X0_list]  # mutable state vector list
+    X          = [x.copy() for x in X0_list]
 
     for a in range(N):
         aD, a3 = _axis_from_vel_t0(X[a])
@@ -861,12 +850,9 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
             phi0 = float(X[a][i_phi]) if i_phi is not None else 0.0
             R0   = apply_roll_about_axis(R0, phi0, align=align)
         prev_R.append(R0)
-
-        # log t=0
         exec_xyz[a].append(_p3_vec(X[a]))
         exec_att[a].append({"R": R0, "phi": (float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)})
         phi_hist[a].append(float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)
-
 
     # initial FOV entry
     if fov_enabled:
@@ -885,46 +871,31 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
     else:
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
-    # -------------------- PATH persistent MCP (currently N == 2) --------------------
+    # -------------------- PATH persistent MCP (using your N-player builder) --------------------
     x_var_box = (-1e6, 1e6)
     u_var_box = (-1e3, 1e3)
     h_list    = build_h_builders(cfg, nx, D)
 
-    if N != 2:
-        raise NotImplementedError("This run function handles N generically for rollout/logging, "
-                                  "but the solver hook still uses the 2-player MCP. Plug in your N-player MCP here.")
-
-    # m_path = build_mcp_two_player_one_shot(
-    #     Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
-    #     T=T, nx=nx, nu=nu, D=D,
-    #     x0_1=X[0], x0_2=X[1],
-    #     x_var_box=x_var_box, u_var_box=u_var_box,
-    #     h_builders=h_list,
-    #     cost_kind=cfg.get("setting","chase_escape_tail"),
-    #     cost_cfg=cfg,
-    # )
-
     m_path = build_mcp_N_player_one_shot(
         Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
         T=T, nx=nx, nu=nu, D=D,
-        x0_list=X0_list,         # <-- replaces x0_1/x0_2
-        N=N,                     # <-- tell the model how many players
+        x0_list=X0_list,
+        N=N,
         x_var_box=x_var_box, u_var_box=u_var_box,
         h_builders=h_list,
         cost_kind=cfg.get("setting", "chase_escape_tail"),
         cost_cfg=cfg,
     )
 
-
     path_ctx = {
         "m": m_path,
         "A": as_numpy_const(Ad_mx),
         "B": as_numpy_const(Bd_mx),
-        "U_guess": [None for _ in range(N)],  # list of length N
+        "U_guess": [None for _ in range(N)],
         "X_guess": [None for _ in range(N)],
     }
 
-    # -------------------- helpers for warm-start & sim --------------------
+    # --- helper: shift and forward sim ---
     def _shift_controls_one_step(U_prev, target_len, fill=0.0):
         U_prev = np.asarray(U_prev, float)
         old_len, nu_ = U_prev.shape if U_prev.ndim == 2 else (0, nu)
@@ -946,8 +917,8 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
             Xsim[k+1,:] = A @ Xsim[k,:] + B @ U[k,:]
         return Xsim
 
+    # --- seed (N=2 interface, matches your solver hook) ---
     def _seed_model_from_guess_2p(m, Xg_list, Ug_list):
-        # N=2 only; uses m.x1, m.x2, m.u1, m.u2
         X1g, X2g = Xg_list
         U1g, U2g = Ug_list
         for k in list(m.Kx):
@@ -963,21 +934,20 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
                 m.u1[kk, jj].value = float(U1g[kk, jj])
                 m.u2[kk, jj].value = float(U2g[kk, jj])
 
-    # -------------------- replan (2-player) --------------------
+    # --- replan (2-player wiring preserved) ---
     def replan_path(theta_vec, prev_axesD, prev_Rs):
-        # unpack x0 for two agents
         x0_1 = theta_vec[0:nx]
         x0_2 = theta_vec[nx:2*nx]
         m = path_ctx["m"]; A = path_ctx["A"]; B = path_ctx["B"]
 
-        # refresh IC params + seed x(0)
+        # refresh ICs & seed x(0)
         for i in range(nx):
             m.x01[i].set_value(float(x0_1[i]))
             m.x02[i].set_value(float(x0_2[i]))
             m.x1[0, i].value = float(x0_1[i])
             m.x2[0, i].value = float(x0_2[i])
 
-        # warm-start controls (|Ku| = T)
+        # warm-start controls
         Ku_len = len(list(m.Ku))
         U_guess = path_ctx["U_guess"]
         if U_guess[0] is None:
@@ -987,10 +957,9 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
             U1g = _shift_controls_one_step(U_guess[0], target_len=Ku_len)
             U2g = _shift_controls_one_step(U_guess[1], target_len=Ku_len)
 
-        # forward sim to get X guesses (|Kx| = T+1)
+        # state guesses
         X1g = _forward_sim_x(A, B, x0_1, U1g)
         X2g = _forward_sim_x(A, B, x0_2, U2g)
-
         _seed_model_from_guess_2p(m, [X1g, X2g], [U1g, U2g])
 
         # solve
@@ -1000,49 +969,116 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
             tee=True,
         )
 
-        # extract + cache warm start for next turn
+        # extract & cache
         X1, U1, X2, U2 = extract_trajectories(m)
         path_ctx["X_guess"][0], path_ctx["U_guess"][0] = X1, U1
         path_ctx["X_guess"][1], path_ctx["U_guess"][1] = X2, U2
 
-        # pack outputs for viz/exec
+        # viz/attitude plans
         plan1 = [_p3_row(X1[t, :]) for t in range(T)]
         plan2 = [_p3_row(X2[t, :]) for t in range(T)]
         att1, prev1_out, prevR1_out = plan_attitudes_from_X(X1, prev_axesD[0], prev_Rs[0])
         att2, prev2_out, prevR2_out = plan_attitudes_from_X(X2, prev_axesD[1], prev_Rs[1])
 
-        z_dummy = np.zeros(1)  # API symmetry
+        z_dummy = np.zeros(1)
         return z_dummy, [plan1, plan2], [U1, U2], [att1, att2], [prev1_out, prev2_out], [prevR1_out, prevR2_out]
 
-    # --- first plan (N=2 solver) ---
+    # --- first plan ---
     z_last = np.zeros(1)
     z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
     step_in_turn = 0
-
-    # keep a copy of the latest plans/atts to push every step
-    latest_plans = plans[:]     # list length N
+    latest_plans = plans[:]
     latest_atts  = atts[:]
-
-
-    # store initial plans for viz at step 0
     for a in range(N):
         plan_hist[a].append(latest_plans[a])
         plan_att[a].append(latest_atts[a])
+
+    # -------------------- UKF setup (N agents, robust 'who' parsing) --------------------
+    ukf_pairs = []      # list of (observer, target) 0-based
+    ukf_dict  = {}      # (i,j)->KF
+    est_hist  = {}      # dynamic keys: est{i}{j}_xyz, meas{i}{j}_azel
+    every = 1
+
+    if do_est:
+        s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
+        P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
+        Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
+        Rm = np.diag([s_az**2, s_el**2])
+        every = int(est_cfg.get('every', 1))
+
+        def _all_pairs(N_:int):
+            return [(i, j) for i in range(N_) for j in range(N_) if i != j]
+
+        def _parse_pair_token(tok: str):
+            s = str(tok).strip()
+            for sep in ("->", ",", " "):
+                if sep in s:
+                    a, b = s.split(sep, 1)
+                    return int(a), int(b)
+            return None
+
+        def _normalize_pairs(who_cfg, N_:int):
+            if isinstance(who_cfg, str):
+                w = who_cfg.strip().lower()
+                if w in ("all", "true"):   return _all_pairs(N_)
+                if w in ("none", "false"): return []
+                if w == "both" and N_ >= 2: return [(0,1), (1,0)]
+                pr = _parse_pair_token(who_cfg)
+                if pr is not None:
+                    i, j = pr
+                    return ([(i-1, j-1)] if (1 <= i <= N_ and 1 <= j <= N_ and i != j) else [])
+                return []
+            if who_cfg is True:
+                return _all_pairs(N_)
+            if who_cfg is False or who_cfg is None:
+                return []
+            pairs = []
+            try:
+                for item in who_cfg:
+                    if isinstance(item, (list, tuple)) and len(item) == 2:
+                        i, j = int(item[0]), int(item[1])
+                    elif isinstance(item, str):
+                        pr = _parse_pair_token(item)
+                        if pr is None: 
+                            continue
+                        i, j = pr
+                    else:
+                        continue
+                    i -= 1; j -= 1
+                    if 0 <= i < N_ and 0 <= j < N_ and i != j:
+                        pairs.append((i, j))
+            except TypeError:
+                pass
+            return pairs
+
+        who_cfg = est_cfg.get('who', 'all')
+        ukf_pairs = _normalize_pairs(who_cfg, N)
+
+        # build filters + history seeds
+        for (i, j) in ukf_pairs:
+            x_init = np.r_[X[j][:3], np.zeros(3)]
+            kf = KF_CV(x_init, P0.copy(), Q.copy(), Rm.copy(), dt)
+            ukf_dict[(i, j)] = kf
+            key_est  = f'est{i+1}{j+1}_xyz'
+            key_meas = f'meas{i+1}{j+1}_azel'
+            est_hist[key_est]  = [kf.x[:3].copy()]
+            est_hist[key_meas] = [None]
+
     # -------------------- rollout --------------------
     for k in range(steps):
-        # replan at turn boundaries
+        # replan each turn
         if k % turn_len == 0 and k > 0:
             z_last, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
             step_in_turn = 0
-            latest_plans = plans[:]   # refresh cache
+            latest_plans = plans[:]
             latest_atts  = atts[:]
 
-        # ALWAYS log the currently valid plan/att this frame
+        # always log current (latest) plan
         for a in range(N):
             plan_hist[a].append(latest_plans[a])
             plan_att[a].append(latest_atts[a])
 
-        # controls for this step ...
+        # controls for this step
         u_step = []
         for a in range(N):
             U_a = U_list[a]
@@ -1067,15 +1103,39 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
             exec_att[a].append({"R": R_now, "phi": phi_now})
             exec_xyz[a].append(_p3_vec(X[a]))
 
-        # 3) (optional) UKF — unchanged from your 2-agent pair example
-        if do_est and N == 2:
-            s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
-            P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
-            Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
-            Rm = np.diag([s_az**2, s_el**2])
-            who   = (est_cfg.get('who') or 'both').lower()
-            every = int(est_cfg.get('every', 1))
-            # You can lift your previous pairwise UKF block here if needed.
+        # 3) UKF (N-agent, per requested pairs)
+        if do_est and ukf_pairs:
+            def _u_tr(u):
+                u = np.asarray(u, float).ravel()
+                return u[:3] if u.size >= 3 else np.zeros(3)
+
+            take = ((k+1) % every) == 0  # +1 because we just advanced plant/execution
+
+            for (i, j) in ukf_pairs:
+                kf = ukf_dict[(i, j)]
+                # predict with target j's translational input (if any)
+                u_j_tr = _u_tr(u_step[j]) if j < len(u_step) else np.zeros(3)
+                kf.predict(dt, u=u_j_tr, u_cov=None)
+
+                key_est  = f'est{i+1}{j+1}_xyz'
+                key_meas = f'meas{i+1}{j+1}_azel'
+
+                if take:
+                    # observer i at X[i], target j at X[j]; bearing in body of i (R_i)
+                    p_obs = np.asarray(X[i][:3], float)
+                    p_tgt = np.asarray(X[j][:3], float)
+                    d = p_tgt - p_obs
+                    n = np.linalg.norm(d) + 1e-12
+                    d /= n
+                    b_b = prev_R[i] @ d
+                    az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
+                    el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
+                    kf.update(np.array([az, el]), p_obs=p_obs, R_wb=prev_R[i])
+                    est_hist[key_meas].append((p_obs.copy(), np.array([az, el])))
+                else:
+                    est_hist[key_meas].append(None)
+
+                est_hist[key_est].append(kf.x[:3].copy())
 
         # 4) FOV
         if fov_enabled:
@@ -1097,7 +1157,7 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
 
     # -------------------- return --------------------
     ret = {
-        # explode per-agent arrays into numbered keys for backward compat
+        # backward-compat numbered keys (up to 5)
         **{f'plan_hist{a+1}': plan_hist[a] for a in range(min(N,5))},
         **{f'plan_att{a+1}':  plan_att[a]  for a in range(min(N,5))},
         **{f'exec{a+1}_xyz':  exec_xyz[a]  for a in range(min(N,5))},
@@ -1105,14 +1165,17 @@ def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
         **{f'phi_hist{a+1}':  phi_hist[a]  for a in range(min(N,5))},
         'fov_axis_hist': fov_axis_hist,
         'fov_seen_mask': fov_seen_mask,
-        # also return the compact lists-of-lists (new API)
+        # compact lists
         'plan_hist_all': plan_hist,
         'plan_att_all':  plan_att,
         'exec_xyz_all':  exec_xyz,
         'exec_att_all':  exec_att,
         'phi_hist_all':  phi_hist,
     }
+    if do_est and ukf_pairs:
+        ret.update(est_hist)
     return ret
+
 
 
 
