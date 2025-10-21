@@ -6,7 +6,7 @@ from pyomo.mpec import Complementarity, complements
 from pyomo.core.expr.calculus.derivatives import differentiate, Modes
 from pyomo.environ import value as pyo_value
 
-from game_costs import build_game_costs
+from game_costs import build_game_costs , build_game_costs_N
 
 
 
@@ -278,21 +278,29 @@ def build_mcp_N_player_one_shot(
     D=3,
     x_var_box=(-1e6, 1e6),
     u_var_box=(-1e3, 1e3),
-    h_builders=None,           # list of callables h(m,k) >= 0; may use m.x1, m.x2, ...
+    h_builders=None,           # callables: h(m,k) >= 0; may use m.x1, m.x2, ...
     cost_kind="chase_escape_tail",
     cost_cfg=None,
 ):
+    """
+    N-player one-shot MCP with EXPLICIT per-player variables/params:
+      - States:  m.x1[k,i], m.x2[k,i], ..., m.xN[k,i]   for k∈[0..T], i∈[0..nx-1]
+      - Inputs:  m.u1[k,j], m.u2[k,j], ..., m.uN[k,j]   for k∈[0..T-1], j∈[0..nu-1]
+      - ICs:     m.x01[i],  m.x02[i],  ..., m.x0N[i]    mutable Params
+    Complementarity is enforced for shared inequalities h(m,k) ≥ 0 via μ ⟂ h.
+    Costs are per-player (via l_k[p], l_T[p]) and stationarity uses Pyomo differentiate.
+    """
+    # ---------- setup ----------
     cost_cfg   = dict(cost_cfg or {})
     h_builders = list(h_builders or [])
 
-    # ---------- model & sets ----------
     m    = ConcreteModel()
     N    = int(N); T = int(T); nx = int(nx); nu = int(nu)
-    m.P  = RangeSet(1, N)          # players
-    m.Kx = RangeSet(0, T)          # state time indices
-    m.Ku = RangeSet(0, T-1)        # control time indices
-    m.S  = RangeSet(0, nx-1)       # state components
-    m.U  = RangeSet(0, nu-1)       # control components
+
+    m.Kx = RangeSet(0, T)        # state time indices
+    m.Ku = RangeSet(0, T-1)      # control time indices
+    m.S  = RangeSet(0, nx-1)     # state components
+    m.U  = RangeSet(0, nu-1)     # control components
 
     # ---------- parameters ----------
     Ad = np.asarray(Ad, float); Bd = np.asarray(Bd, float)
@@ -302,51 +310,55 @@ def build_mcp_N_player_one_shot(
     m.A = Param(m.S, m.S, initialize=lambda _m,i,j: float(Ad[i,j]), within=Reals, mutable=False)
     m.B = Param(m.S, m.U, initialize=lambda _m,i,j: float(Bd[i,j]), within=Reals, mutable=False)
 
-    # mutable IC params per player
-    def _init_x0(_m, p, i):
-        return float(x0_list[p-1][i])
-    m.x0 = Param(m.P, m.S, initialize=_init_x0, within=Reals, mutable=True)
-
-    # ---------- primals (wide boxes; real limits via h_builders) ----------
+    # per-player mutable ICs and explicit state/control components
     xlb, xub = float(x_var_box[0]), float(x_var_box[1])
     ulb, uub = float(u_var_box[0]), float(u_var_box[1])
 
-    # canonical variables
-    m.x = Var(m.P, m.Kx, m.S, bounds=lambda _m,p,k,i: (xlb, xub))
-    m.u = Var(m.P, m.Ku, m.U, bounds=lambda _m,p,k,j: (ulb, uub))
-
-    # ---------- BACKWARD-COMPAT ALIASES (x1,u1,x2,u2, ... , x0{p}) ----------
-    # These are true alias views; they don’t add variables/constraints.
+    # Create explicit per-player components: x1..xN, u1..uN, x01..x0N
     for p in range(1, N+1):
-        # These create views with indices (k,i) and (k,j)
-        setattr(m, f"x{p}",  Reference(m.x[p, :, :]))   # m.xp[k,i]
-        setattr(m, f"u{p}",  Reference(m.u[p, :, :]))   # m.up[k,j]
-        setattr(m, f"x0{p}", Reference(m.x0[p, :]))     # m.x0p[i]
+        # IC param
+        setattr(
+            m, f"x0{p}",
+            Param(m.S, initialize=lambda _m, i, p=p: float(x0_list[p-1][i]),
+                  within=Reals, mutable=True)
+        )
+        # State & input vars
+        setattr(
+            m, f"x{p}",
+            Var(m.Kx, m.S, bounds=lambda _m, k, i: (xlb, xub))
+        )
+        setattr(
+            m, f"u{p}",
+            Var(m.Ku, m.U, bounds=lambda _m, k, j: (ulb, uub))
+        )
 
-    # ---------- shared equality expressions g̃ (IC + dynamics for every player) ----------
+    # ---------- equality constraints: IC & dynamics ----------
     def g_ic_expr(_m, p, i):
-        return _m.x[p, 0, i] - _m.x0[p, i]
+        xp = getattr(_m, f"x{p}")
+        x0p = getattr(_m, f"x0{p}")
+        return xp[0, i] - x0p[i]
 
     def g_dyn_expr(_m, p, k, i):
-        # x_p(k+1) - A x_p(k) - B u_p(k) = 0
-        return _m.x[p, k+1, i] - sum(_m.A[i,j]*_m.x[p, k, j] for j in _m.S) \
-                                - sum(_m.B[i,j]*_m.u[p, k, j] for j in _m.U)
+        xp = getattr(_m, f"x{p}")
+        up = getattr(_m, f"u{p}")
+        return xp[k+1, i] - sum(_m.A[i,j]*xp[k, j] for j in _m.S) \
+                           - sum(_m.B[i,j]*up[k, j] for j in _m.U)
 
-    # impose g̃ = 0 as constraints
-    m.ic  = Constraint(m.P, m.S,         rule=lambda _m,p,i: g_ic_expr(_m,p,i) == 0)
-    m.dyn = Constraint(m.P, m.Ku, m.S,   rule=lambda _m,p,k,i: g_dyn_expr(_m,p,k,i) == 0)
+    # Materialize constraints
+    m.ic  = Constraint(range(1, N+1), m.S,       rule=lambda _m,p,i: g_ic_expr(_m,p,i) == 0)
+    m.dyn = Constraint(range(1, N+1), m.Ku, m.S, rule=lambda _m,p,k,i: g_dyn_expr(_m,p,k,i) == 0)
 
-    # ---------- multipliers for g̃ ----------
-    m.lam_ic  = Var(m.P, m.S,       domain=Reals)
-    m.lam_dyn = Var(m.P, m.Ku, m.S, domain=Reals)
+    # ---------- multipliers for equalities ----------
+    m.lam_ic  = Var(range(1, N+1), m.S,       domain=Reals)
+    m.lam_dyn = Var(range(1, N+1), m.Ku, m.S, domain=Reals)
 
-    # ---------- shared inequalities and μ ≥ 0 with μ ⟂ h ----------
+    # ---------- shared inequalities & μ ≥ 0 with μ ⟂ h ----------
     if h_builders:
         m.H  = RangeSet(0, len(h_builders)-1)
         m.mu = Var(m.H, m.Kx, domain=NonNegativeReals)
 
         def _h_expr_wrap(_m, h, k):
-            # Existing h_builders can keep using m.x1, m.x2, ... thanks to References.
+            # h_builders may reference m.x1, m.x2, ... explicitly.
             return h_builders[int(h)](_m, k)
 
         m.h_comp = Complementarity(
@@ -354,52 +366,60 @@ def build_mcp_N_player_one_shot(
             rule=lambda _m,h,k: complements(_m.mu[h,k] >= 0, _h_expr_wrap(_m,h,k) >= 0)
         )
 
-    # ---------- costs per player ----------
+    # ---------- per-player costs (stage/terminal) ----------
     def _costs_for_N(cost_kind, cost_cfg, D, T, N):
-        # Prefer user N-player factory if present
-        if "build_game_costs_N" in globals():
+        # Preferred: dedicated N-player costs
+        try:
             return build_game_costs_N(cost_kind, cost_cfg or {}, D, T, N)
-        # Fallback: replicate your 2p cost
+        except NameError:
+            pass  # fall through if not defined
+
+        # Fallback: derive from 2p costs
         try:
             l1_k, l2_k, l1_T, l2_T = build_game_costs(cost_kind, cost_cfg or {}, D, T)
         except Exception:
-            def z_k(_m,_k): return 0.0
-            def z_T(_m):   return 0.0
-            return ({p:z_k for p in range(1,N+1)},
-                    {p:z_T for p in range(1,N+1)})
+            # pure zeros, as lists
+            z_k = lambda _m,_k: 0.0
+            z_T = lambda _m:   0.0
+            return [z_k for _ in range(N)], [z_T for _ in range(N)]
+
         replicate_second = bool(cost_cfg.get("replicate_second_cost_for_others", True))
-        l_k, l_T = {}, {}
+
+        l_k: list = []
+        l_T: list = []
         for p in range(1, N+1):
             if p == 1:
-                l_k[p], l_T[p] = l1_k, l1_T
+                l_k.append(lambda _m, k, _l=l1_k: _l(_m, k))
+                l_T.append(lambda _m, _l=l1_T: _l(_m))
             elif replicate_second:
-                l_k[p], l_T[p] = l2_k, l2_T
+                l_k.append(lambda _m, k, _l=l2_k: _l(_m, k))
+                l_T.append(lambda _m, _l=l2_T: _l(_m))
             else:
-                l_k[p] = (lambda _m,_k: 0.0)
-                l_T[p] = (lambda _m: 0.0)
+                l_k.append(lambda _m, k: 0.0)
+                l_T.append(lambda _m: 0.0)
         return l_k, l_T
+
 
     l_k, l_T = _costs_for_N(cost_kind, cost_cfg, D, T, N)
 
-    # ---------- helpers: Jg^T λ and Jh^T μ on a variable ----------
+    # ---------- gradient helper terms (for KKT stationarity) ----------
     def _eq_grad_dot_lam_on(_m, var, k_hint=None, p_hint=None):
         s = 0.0
         if (p_hint is not None) and (k_hint == 0):
             for i in _m.S:
-                s += _m.lam_ic[p_hint, i] * differentiate(g_ic_expr(_m, p_hint, i),
-                                                          wrt=var, mode=Modes.reverse_symbolic)
+                s += _m.lam_ic[p_hint, i] * differentiate(
+                    g_ic_expr(_m, p_hint, i), wrt=var, mode=Modes.reverse_symbolic
+                )
         if (p_hint is not None) and (k_hint is not None):
             if k_hint in _m.Ku:
                 for i in _m.S:
                     s += _m.lam_dyn[p_hint, k_hint, i] * differentiate(
-                        g_dyn_expr(_m, p_hint, k_hint, i),
-                        wrt=var, mode=Modes.reverse_symbolic
+                        g_dyn_expr(_m, p_hint, k_hint, i), wrt=var, mode=Modes.reverse_symbolic
                     )
             if (k_hint-1) in _m.Ku:
                 for i in _m.S:
                     s += _m.lam_dyn[p_hint, k_hint-1, i] * differentiate(
-                        g_dyn_expr(_m, p_hint, k_hint-1, i),
-                        wrt=var, mode=Modes.reverse_symbolic
+                        g_dyn_expr(_m, p_hint, k_hint-1, i), wrt=var, mode=Modes.reverse_symbolic
                     )
         return s
 
@@ -417,39 +437,53 @@ def build_mcp_N_player_one_shot(
                                                  wrt=var, mode=Modes.reverse_symbolic)
         return s
 
-    # ---------- stationarity ----------
+    # ---------- stationarity (KKT) ----------
     def st_x_rule(_m, p, k, i):
-        var = _m.x[p, k, i]
-        grad_cost = differentiate(l_k[p](_m, k), wrt=var, mode=Modes.reverse_symbolic) if k < T \
-                    else differentiate(l_T[p](_m),   wrt=var, mode=Modes.reverse_symbolic)
-        return grad_cost - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
-                         - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
+        var = getattr(_m, f"x{p}")[k, i]
+        if k < T:
+            grad_cost = differentiate(l_k[p-1](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+        else:
+            grad_cost = differentiate(l_T[p-1](_m),     wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost \
+            - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+            - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
 
     def st_u_rule(_m, p, k, j):
-        var = _m.u[p, k, j]
-        grad_cost = differentiate(l_k[p](_m, k), wrt=var, mode=Modes.reverse_symbolic)
-        return grad_cost - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
-                         - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
+        var = getattr(_m, f"u{p}")[k, j]
+        grad_cost = differentiate(l_k[p-1](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost \
+            - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+            - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
 
-    m.st_x = Constraint(m.P, m.Kx, m.S, rule=st_x_rule)
-    m.st_u = Constraint(m.P, m.Ku, m.U, rule=st_u_rule)
 
-    # ---------- warm-starts ----------
-    for p in m.P:
+    # Use model sets (cleaner than range(...))
+    m.st_x = Constraint(range(1, N+1), m.Kx, m.S, rule=st_x_rule)
+    m.st_u = Constraint(range(1, N+1), m.Ku, m.U, rule=st_u_rule)
+
+
+
+    # ---------- warm start ----------
+    # Controls: zero
+    for p in range(1, N+1):
+        up = getattr(m, f"u{p}")
         for k in m.Ku:
             for j in m.U:
-                m.u[p, k, j].value = 0.0
-    for p in m.P:
+                up[k, j].value = 0.0
+    # States: IC and open-loop A^k x0
+    for p in range(1, N+1):
+        xp  = getattr(m, f"x{p}")
+        x0p = getattr(m, f"x0{p}")
+        # x(0) = x0
         for i in m.S:
-            m.x[p, 0, i].value = float(value(m.x0[p, i]))
-    for p in m.P:
+            xp[0, i].value = float(value(x0p[i]))
+        # forward-propagate with u=0
         for k in m.Ku:
             for i in m.S:
-                m.x[p, k+1, i].value = sum(value(m.A[i,j]) * value(m.x[p, k, j]) for j in m.S)
-    for p in m.P:
+                xp[k+1, i].value = sum(value(m.A[i,j]) * value(xp[k, j]) for j in m.S)
+    # Multipliers
+    for p in range(1, N+1):
         for i in m.S:
             m.lam_ic[p, i].value = 0.0
-    for p in m.P:
         for k in m.Ku:
             for i in m.S:
                 m.lam_dyn[p, k, i].value = 0.0
