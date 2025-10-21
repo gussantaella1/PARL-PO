@@ -2,6 +2,8 @@
 from __future__ import annotations
 from typing import Tuple, Callable, Dict, Any
 from pyomo.environ import sqrt
+from pyomo.environ import log, exp, sqrt
+
 
 # ---- shared small helpers (Pyomo-friendly) ----
 def _vec(model_array, k, idxs):
@@ -478,19 +480,6 @@ def build_game_costs_N(
     def _norm(v):      return sqrt(_sq(v) + 1e-9)
     def _dot(a, b):    return sum(a[i]*b[i] for i in range(len(a)))
 
-    # ---------------------- generic_n (LQ-ish) ----------------------
-    if kname == "generic_n":
-        q  = float(cfg.get("Q", 1.0))
-        r  = float(cfg.get("R", 1e-2))
-        l_k, l_T = [], []
-        for p in range(1, N+1):
-            def _lk(m, k, p=p):
-                # use full nx in m.S (safe even if nx != 2D)
-                return q*sum(_Xp(m,p)[k, i]**2 for i in m.S) + r*sum(_Up(m,p)[k, j]**2 for j in m.U)
-            def _lT(m, p=p):
-                return q*sum(_Xp(m,p)[T, i]**2 for i in m.S)
-            l_k.append(_lk); l_T.append(_lT)
-        return l_k, l_T
 
     # ---------------------- chase_escape_tail (exact 2p behavior only) ----------------------
     if kname in ("chase_escape_tail", "chase_escape_tail_n") and N == 2:
@@ -546,125 +535,58 @@ def build_game_costs_N(
             return -c_wterm * _sq(r)
 
         return [_l1_k, _l2_k], [_l1_T, _l2_T]
+    
+            # ---------------------- reach_boundary (3p-friendly, works for any N) ----------------------
+    if kname in ("reach_boundary_3p", "reach_boundary", "to_boundary", "boundary") and N == 3:
+        # We expect an arena spec like:
+        #   cfg["arena"] = {"type": "sphere" or "circle", "cx":..., "cy":..., "cz":..., "r": ...}
+        # Fallbacks: cfg["center"] (list len D), cfg["R_boundary"] or cfg["R"]
+        arena = dict(cfg.get("arena", {}))
+        if arena:
+            cx = float(arena.get("cx", 0.0))
+            cy = float(arena.get("cy", 0.0))
+            cz = float(arena.get("cz", 0.0)) if D >= 3 else 0.0
+            Rb = float(arena.get("r", 1.0))
+            c  = [cx, cy] if D == 2 else [cx, cy, cz]
+        else:
+            c  = [float(x) for x in cfg.get("center", [0.0]*D)]
+            Rb = float(cfg.get("R_boundary", cfg.get("R", 1.0)))
 
-    # ---------------------- 3p_center_blocker ----------------------
-    if kname == "3p_center_blocker":
-        c = [float(ci) for ci in cfg.get("center", [0.0]*D)]
-        R_keep  = float(cfg.get("R_keep", 3.0))
-        w_block = float(cfg.get("w_block", 8.0))
-        w_T     = float(cfg.get("w_T", 12.0))
-        r1      = float(cfg.get("R1", 1e-3))
-        rA      = float(cfg.get("R_att", 3e-3))
-        eps=1e-9
-        def _relu(t): return 0.5*(t + sqrt(t*t + eps))
+        # Weights
+        q   = float(cfg.get("Q_radial", 1.0))    # stage weight on radius error
+        qT  = float(cfg.get("Q_radial_T", 10.0)) # terminal weight on radius error
+        rU  = float(cfg.get("R_u", 1e-3))        # effort weight
+        eps = 1e-9
 
-        def _d_center(m, p, k):
-            return _norm([_pos(m,p,k)[i]-c[i] for i in range(D)])
+        def _Xp(m, p): return getattr(m, f"x{p}")
+        def _Up(m, p): return getattr(m, f"u{p}")
+        def _pos(m, p, k): return [_Xp(m,p)[k, i] for i in range(D)]
+        def _u(m, p, k):   return [_Up(m,p)[k, j] for j in m.U]
+        def _sq(v):        return sum(vi*vi for vi in v)
+        def _norm(v):      return sqrt(_sq(v) + eps)
 
-        # attacker stage/terminal
-        def _att_lk(p):
-            return lambda m,k, p=p: _d_center(m,p,k)**2 + rA*_sq(_u(m,p,k))
+        def _rad_err_at(m, p, k):
+            pvec = _pos(m, p, k)
+            d    = _norm([pvec[i] - c[i] for i in range(D)])
+            return Rb - d  # zero when exactly on boundary
 
-        def _att_lT(p):
-            return lambda m, p=p: _norm([_Xp(m,p)[T,i] - c[i] for i in range(D)])**2 * w_T
-
-        # blocker penalizes attackers inside keep-out
-        def _blk_lk():
-            def f(m,k):
-                pen = 0.0
-                for pa in range(2, N+1):
-                    d = _d_center(m, pa, k)
-                    pen += w_block * _relu(R_keep - d)**2
-                return pen + r1*_sq(_u(m,1,k))
-            return f
-
-        def _blk_lT():
-            def f(m):
-                pen = 0.0
-                for pa in range(2, N+1):
-                    d = _norm([_Xp(m,pa)[T,i]-c[i] for i in range(D)])
-                    pen += w_T * _relu(R_keep - d)**2
-                return pen
-            return f
-
-        l_k=[None]*N; l_T=[None]*N
-        l_k[0] = _blk_lk(); l_T[0] = _blk_lT()
-        for p in range(2, N+1):
-            l_k[p-1] = _att_lk(p); l_T[p-1] = _att_lT(p)
-        return l_k, l_T
-
-    # ---------------------- 4p_tag (one runner vs 3 chasers) ----------------------
-    if kname == "4p_tag":
-        runner = int(cfg.get("runner", 1))  # 1..N
-        w_sep  = float(cfg.get("w_sep", 4.0))
-        rU     = float(cfg.get("R_u", 1e-2))
-
-        def _pair_sq(m,k,pa,pb):
-            a = _pos(m,pa,k); b = _pos(m,pb,k)
-            return sum((a[i]-b[i])**2 for i in range(D))
-
-        l_k=[None]*N; l_T=[None]*N
+        # Per-player stage/terminal costs
+        l_k = []
+        l_T = []
         for p in range(1, N+1):
-            if p == runner:
-                # runner maximizes separation (we minimize negative)
-                def _lk(m,k,p=p):
-                    sep = 0.0
-                    for q in range(1, N+1):
-                        if q == p: continue
-                        sep += _pair_sq(m,k,p,q)
-                    return -w_sep*sep + rU*_sq(_u(m,p,k))
-                def _lT(m,p=p):
-                    sepT=0.0
-                    a = [_Xp(m,p)[T,i] for i in range(D)]
-                    for q in range(1,N+1):
-                        if q == p: continue
-                        b = [_Xp(m,q)[T,i] for i in range(D)]
-                        sepT += sum((a[i]-b[i])**2 for i in range(D))
-                    return -w_sep*sepT
-            else:
-                # chaser minimizes distance to runner
-                def _lk(m,k,p=p):
-                    return _pair_sq(m,k,p,runner) + rU*_sq(_u(m,p,k))
-                def _lT(m,p=p):
-                    a=[_Xp(m,p)[T,i] for i in range(D)]
-                    b=[_Xp(m,runner)[T,i] for i in range(D)]
-                    return sum((a[i]-b[i])**2 for i in range(D))
-            l_k[p-1]=_lk; l_T[p-1]=_lT
+            def _lk(m, k, p=p):
+                e = _rad_err_at(m, p, k)
+                return q*(e*e) + rU*_sq(_u(m, p, k))
+            def _lT(m, p=p):
+                pT = [_Xp(m,p)[T, i] for i in range(D)]
+                dT = _norm([pT[i] - c[i] for i in range(D)])
+                eT = Rb - dT
+                return qT*(eT*eT)
+            l_k.append(_lk)
+            l_T.append(_lT)
+
         return l_k, l_T
 
-    # ---------------------- 5p_teams_3v2 (team sums) ----------------------
-    if kname == "5p_teams_3v2":
-        teamA = list(cfg.get("teamA", [1,2,3]))
-        teamB = [p for p in range(1,N+1) if p not in teamA]
-        w_c = float(cfg.get("w_cohesion", 0.2))
-        w_h = float(cfg.get("w_hunt", 1.0))
-        rU  = float(cfg.get("R_u", 1e-2))
-
-        def _centroid(m,k,team):
-            return [ sum(_Xp(m,p)[k,i] for p in team)/len(team) for i in range(D) ]
-        def _sq_to_point(v, w):
-            return sum((v[i]-w[i])**2 for i in range(D))
-
-        l_k=[None]*N; l_T=[None]*N
-        for p in range(1,N+1):
-            if p in teamA:
-                def _lk(m,k,p=p):
-                    cA = _centroid(m,k,teamA); cB = _centroid(m,k,teamB)
-                    return w_h*_sq_to_point(_pos(m,p,k), cB) + w_c*_sq_to_point(_pos(m,p,k), cA) + rU*_sq(_u(m,p,k))
-                def _lT(m,p=p):
-                    cB = [sum(_Xp(m,q)[T,i] for q in teamB)/len(teamB) for i in range(D)]
-                    a  = [_Xp(m,p)[T,i] for i in range(D)]
-                    return w_h*sum((a[i]-cB[i])**2 for i in range(D))
-            else:
-                def _lk(m,k,p=p):
-                    cB = _centroid(m,k,teamB); cA = _centroid(m,k,teamA)
-                    return w_h*_sq_to_point(_pos(m,p,k), cA) + w_c*_sq_to_point(_pos(m,p,k), cB) + rU*_sq(_u(m,p,k))
-                def _lT(m,p=p):
-                    cA = [sum(_Xp(m,q)[T,i] for q in teamA)/len(teamA) for i in range(D)]
-                    a  = [_Xp(m,p)[T,i] for i in range(D)]
-                    return w_h*sum((a[i]-cA[i])**2 for i in range(D))
-            l_k[p-1]=_lk; l_T[p-1]=_lT
-        return l_k, l_T
 
     # fallback
     return build_game_costs_N("generic_n", cfg, D, T, N)

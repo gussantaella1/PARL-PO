@@ -372,7 +372,7 @@ def build_mcp_N_player_one_shot(
         try:
             return build_game_costs_N(cost_kind, cost_cfg or {}, D, T, N)
         except NameError:
-            pass  # fall through if not defined
+            raise("Failed to build costs")  # fall through if not defined
 
         # Fallback: derive from 2p costs
         try:
@@ -491,5 +491,272 @@ def build_mcp_N_player_one_shot(
         for h in m.H:
             for k in m.Kx:
                 m.mu[h, k].value = 0.0
+
+    return m
+
+
+# ------------------------- costs for 3 players -------------------------
+def build_game_costs_3p(kind: str, cfg: dict, D: int, T: int):
+    kind = (kind or "3p_center_blocker").lower()
+    cfg  = dict(cfg or {})
+
+    def _Xp(m, p): return getattr(m, f"x{p}")
+    def _Up(m, p): return getattr(m, f"u{p}")
+
+    def _pos(m, p, k): return [_Xp(m,p)[k, i] for i in range(D)]
+    def _vel(m, p, k): return [_Xp(m,p)[k, i] for i in range(D, 2*D)]
+    def _u(m, p, k):   return [_Up(m,p)[k, j] for j in m.U]
+
+    def _sq(v):   return sum(vi*vi for vi in v)
+    def _norm(v): return (_sq(v) + 1e-9)**0.5
+
+    # ---------- NEW: 2 chasers vs 1 runner (tag) ----------
+    # p=1 runner; p=2,3 chasers
+    # --- NEW: per-player point-goal LQR ---
+    if kind in ("goals_lqr", "goals", "point_goals"):
+        # goals: list of 3 goal points (len D each)
+        goals = cfg.get("goals", [[0.0]*D, [0.0]*D, [0.0]*D])
+        q   = float(cfg.get("Q",   1.0))
+        qT  = float(cfg.get("Q_T", 8.0))
+        r   = float(cfg.get("R_u", 1e-2))
+
+        def _Xp(m,p): return getattr(m, f"x{p}")
+        def _Up(m,p): return getattr(m, f"u{p}")
+        def _pos(m,p,k): return [_Xp(m,p)[k,i] for i in range(D)]
+        def _u(m,p,k):   return [_Up(m,p)[k,j] for j in m.U]
+        def _sq(v):      return sum(vi*vi for vi in v)
+
+        def _lk_p(p):
+            g = [float(x) for x in goals[p-1]]
+            def f(m,k):
+                e = [ _pos(m,p,k)[i] - g[i] for i in range(D) ]
+                return q*_sq(e) + r*_sq(_u(m,p,k))
+            return f
+
+        def _lT_p(p):
+            g = [float(x) for x in goals[p-1]]
+            def f(m):
+                eT = [ _Xp(m,p)[T,i] - g[i] for i in range(D) ]
+                return qT*_sq(eT)
+            return f
+
+        l_k = [_lk_p(1), _lk_p(2), _lk_p(3)]
+        l_T = [_lT_p(1), _lT_p(2), _lT_p(3)]
+        return l_k, l_T
+
+
+    # ---------- your existing center-blocker ----------
+    if kind in ("3p_center_blocker", "center_blocker"):
+        c       = [float(ci) for ci in cfg.get("center", [0.0]*D)]
+        R_keep  = float(cfg.get("R_keep", 3.0))
+        w_block = float(cfg.get("w_block", 8.0))
+        w_T     = float(cfg.get("w_T", 12.0))
+        r1      = float(cfg.get("R1", 1e-3))
+        rA      = float(cfg.get("R_att", 3e-3))
+        eps     = 1e-9
+        def _relu(t): return 0.5*(t + (t*t + eps)**0.5)
+        def _d_center(m, p, k):
+            pvec = _pos(m, p, k)
+            return _norm([pvec[i] - c[i] for i in range(D)])
+        def _att_lk(p):
+            return lambda m,k, p=p: _d_center(m, p, k)**2 + rA*_sq(_u(m, p, k))
+        def _att_lT(p):
+            return lambda m, p=p: _norm([_Xp(m,p)[T,i] - c[i] for i in range(D)])**2 * w_T
+        def _blk_lk():
+            def f(m,k):
+                pen = 0.0
+                for pa in (2,3):
+                    d = _d_center(m, pa, k)
+                    pen += w_block * _relu(R_keep - d)**2
+                return pen + r1*_sq(_u(m, 1, k))
+            return f
+        def _blk_lT():
+            def f(m):
+                pen = 0.0
+                for pa in (2,3):
+                    dT = _norm([_Xp(m,pa)[T,i] - c[i] for i in range(D)])
+                    pen += w_T * _relu(R_keep - dT)**2
+                return pen
+            return f
+        l_k=[None]*3; l_T=[None]*3
+        l_k[0]=_blk_lk(); l_T[0]=_blk_lT()
+        l_k[1]=_att_lk(2); l_T[1]=_att_lT(2)
+        l_k[2]=_att_lk(3); l_T[2]=_att_lT(3)
+        return l_k, l_T
+
+    # ---------- simple LQ fallback ----------
+    if kind in ("lq", "generic"):
+        q = float(cfg.get("Q", 1.0)); r = float(cfg.get("R", 1e-2))
+        l_k=[]; l_T=[]
+        for p in (1,2,3):
+            def _lk(m,k,p=p):
+                return q*sum(_Xp(m,p)[k,i]**2 for i in m.S) + r*sum(_Up(m,p)[k,j]**2 for j in m.U)
+            def _lT(m,p=p):
+                return q*sum(_Xp(m,p)[T,i]**2 for i in m.S)
+            l_k.append(_lk); l_T.append(_lT)
+        return l_k, l_T
+
+    # default
+    return build_game_costs_3p("3p_center_blocker", cfg, D, T)
+
+
+
+# ----------------------- one big MCP: 3 players -----------------------
+def build_mcp_three_player_one_shot(
+    Ad, Bd, T, nx, nu,
+    x0_1, x0_2, x0_3,
+    D=3,
+    x_var_box=(-1e6, 1e6),
+    u_var_box=(-1e3, 1e3),
+    h_builders=None,                # list of callables h(m,k) >= 0
+    cost_kind="3p_center_blocker",  # or "lq"
+    cost_cfg=None,
+):
+    """
+    Build a single MCP for 3 players with explicit components:
+      Primals: x1,u1, x2,u2, x3,u3 over horizon
+      Shared eqs: IC & dynamics for each player (with free multipliers)
+      Shared ineqs: h(m,k) >= 0 with μ >= 0 and μ ⟂ h
+      KKT stationarity: ∇f_p - Jg^T λ - Jh^T μ = 0 for each player's vars
+    """
+    cost_cfg   = cost_cfg or {}
+    h_builders = h_builders or []
+    m = ConcreteModel()
+
+    # ---------- sets ----------
+    m.Kx = RangeSet(0, T)
+    m.Ku = RangeSet(0, T-1)
+    m.S  = RangeSet(0, nx-1)
+    m.U  = RangeSet(0, nu-1)
+
+    # ---------- params ----------
+    Ad = np.asarray(Ad, float); Bd = np.asarray(Bd, float)
+    x0_1 = np.asarray(x0_1, float); x0_2 = np.asarray(x0_2, float); x0_3 = np.asarray(x0_3, float)
+
+    m.A  = Param(m.S, m.S, initialize=lambda _m,i,j: float(Ad[i,j]), within=Reals, mutable=False)
+    m.B  = Param(m.S, m.U, initialize=lambda _m,i,j: float(Bd[i,j]), within=Reals, mutable=False)
+
+    # mutable ICs for RHC
+    m.x01 = Param(m.S, initialize=lambda _m,i: float(x0_1[i]), within=Reals, mutable=True)
+    m.x02 = Param(m.S, initialize=lambda _m,i: float(x0_2[i]), within=Reals, mutable=True)
+    m.x03 = Param(m.S, initialize=lambda _m,i: float(x0_3[i]), within=Reals, mutable=True)
+
+    # ---------- primals ----------
+    xlb, xub = float(x_var_box[0]), float(x_var_box[1])
+    ulb, uub = float(u_var_box[0]), float(u_var_box[1])
+
+    m.x1 = Var(m.Kx, m.S, bounds=lambda _m,k,i: (xlb, xub))
+    m.x2 = Var(m.Kx, m.S, bounds=lambda _m,k,i: (xlb, xub))
+    m.x3 = Var(m.Kx, m.S, bounds=lambda _m,k,i: (xlb, xub))
+    m.u1 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
+    m.u2 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
+    m.u3 = Var(m.Ku, m.U, bounds=lambda _m,k,j: (ulb, uub))
+
+    # ---------- shared equalities (IC + dynamics) ----------
+    def g_ic_expr(_m, p, i):
+        return getattr(_m, f"x{p}")[0, i] - getattr(_m, f"x0{p}")[i]
+
+    def g_dyn_expr(_m, p, k, i):
+        xp = getattr(_m, f"x{p}")
+        up = getattr(_m, f"u{p}")
+        return xp[k+1, i] - sum(_m.A[i,j]*xp[k, j] for j in _m.S) \
+                           - sum(_m.B[i,j]*up[k, j] for j in _m.U)
+
+    m.ic  = Constraint([1,2,3], m.S,       rule=lambda _m,p,i: g_ic_expr(_m,p,i) == 0)
+    m.dyn = Constraint([1,2,3], m.Ku, m.S, rule=lambda _m,p,k,i: g_dyn_expr(_m,p,k,i) == 0)
+
+    # ---------- multipliers for equalities (free) ----------
+    m.lam_ic  = Var([1,2,3], m.S,       domain=Reals)
+    m.lam_dyn = Var([1,2,3], m.Ku, m.S, domain=Reals)
+
+    # ---------- shared inequalities with complementarity ----------
+    if h_builders:
+        m.H  = RangeSet(0, len(h_builders)-1)
+        m.mu = Var(m.H, m.Kx, domain=NonNegativeReals)
+        def _h_expr(_m, h, k):
+            return h_builders[int(h)](_m, k)  # may reference m.x1/x2/x3 explicitly
+        m.h_comp = Complementarity(
+            m.H, m.Kx,
+            rule=lambda _m,h,k: complements(_m.mu[h,k] >= 0, _h_expr(_m,h,k) >= 0)
+        )
+
+    # ---------- per-player costs ----------
+    l_k, l_T = build_game_costs_3p(cost_kind, cost_cfg, D, T)
+
+    # ---------- gradient helpers ----------
+    def _eq_grad_dot_lam_on(_m, var, k_hint=None, p_hint=None):
+        s = 0.0
+        # IC row
+        if (p_hint is not None) and (k_hint == 0):
+            for i in _m.S:
+                s += _m.lam_ic[p_hint, i] * differentiate(g_ic_expr(_m, p_hint, i), wrt=var, mode=Modes.reverse_symbolic)
+        # Dynamics rows touching this var (k and k-1)
+        if (p_hint is not None) and (k_hint is not None):
+            if k_hint in _m.Ku:
+                for i in _m.S:
+                    s += _m.lam_dyn[p_hint, k_hint, i] * differentiate(g_dyn_expr(_m, p_hint, k_hint, i), wrt=var, mode=Modes.reverse_symbolic)
+            if (k_hint-1) in _m.Ku:
+                for i in _m.S:
+                    s += _m.lam_dyn[p_hint, k_hint-1, i] * differentiate(g_dyn_expr(_m, p_hint, k_hint-1, i), wrt=var, mode=Modes.reverse_symbolic)
+        return s
+
+    def _ineq_grad_dot_mu_on(_m, var, k_hint=None):
+        if not h_builders: return 0.0
+        s = 0.0
+        if k_hint is None:
+            for h in _m.H:
+                for k in _m.Kx:
+                    s += _m.mu[h,k] * differentiate(h_builders[int(h)](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+            return s
+        for h in _m.H:
+            s += _m.mu[h,k_hint] * differentiate(h_builders[int(h)](_m, k_hint), wrt=var, mode=Modes.reverse_symbolic)
+        return s
+
+    # ---------- stationarity (KKT) ----------
+    def _st_x_rule(_m, p, k, i):
+        var = getattr(_m, f"x{p}")[k, i]
+        grad_cost = differentiate(l_k[p-1](_m, k), wrt=var, mode=Modes.reverse_symbolic) if k < T \
+                    else differentiate(l_T[p-1](_m),     wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost \
+            - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+            - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
+
+    def _st_u_rule(_m, p, k, j):
+        var = getattr(_m, f"u{p}")[k, j]
+        grad_cost = differentiate(l_k[p-1](_m, k), wrt=var, mode=Modes.reverse_symbolic)
+        return grad_cost \
+            - _eq_grad_dot_lam_on(_m, var, k_hint=k, p_hint=p) \
+            - _ineq_grad_dot_mu_on(_m, var, k_hint=k) == 0
+
+    m.st_x = Constraint([1,2,3], m.Kx, m.S, rule=_st_x_rule)
+    m.st_u = Constraint([1,2,3], m.Ku, m.U, rule=_st_u_rule)
+
+    # ---------- warm-start ----------
+    # controls = 0
+    for p in (1,2,3):
+        up = getattr(m, f"u{p}")
+        for k in m.Ku:
+            for j in m.U:
+                up[k, j].value = 0.0
+    # states: x(0)=x0, then open-loop propagate with u=0
+    for p, x0 in zip((1,2,3), (x0_1, x0_2, x0_3)):
+        xp  = getattr(m, f"x{p}")
+        x0p = getattr(m, f"x0{p}")
+        for i in m.S:
+            xp[0, i].value = float(value(x0p[i]))
+        for k in m.Ku:
+            for i in m.S:
+                xp[k+1, i].value = sum(value(m.A[i,j]) * value(xp[k, j]) for j in m.S)
+    # multipliers = 0
+    for p in (1,2,3):
+        for i in m.S:
+            m.lam_ic[p, i].value = 0.0
+        for k in m.Ku:
+            for i in m.S:
+                m.lam_dyn[p, k, i].value = 0.0
+    if h_builders:
+        for h in m.H:
+            for k in m.Kx:
+                m.mu[h,k].value = 0.0
 
     return m

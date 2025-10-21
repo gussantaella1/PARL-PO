@@ -857,12 +857,15 @@ def interactive_rollout_3d(
 def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                          show_fov=True, show_axes=True, show_est=True, triads="fov"):
     """
-    N-aware version:
+    N-aware animation:
       - reads plan_hist_all / exec_xyz_all / exec_att_all (falls back to numbered keys)
       - draws FOV for a chosen agent/target
-      - overlays any est{i}{j}_xyz and meas{i}{j}_azel found in frames_dict
+      - overlays any est{i}{j}_xyz and meas{i}{j}_azel (supports nested frames_dict['est'])
     triads: "fov" (only defender), "all" (all agents), or "none".
     """
+    import re
+    import numpy as np
+    import matplotlib.pyplot as plt
     import shutil
     from matplotlib import animation
     from matplotlib.animation import FFMpegWriter, PillowWriter
@@ -887,23 +890,21 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     if att_all is None:
         att_all = [frames_dict.get(f"exec_att{a+1}", []) for a in range(N)]
 
-    # coerce 2D→3D
+    # 2D→3D coercion
     def _as3_hist(seq):
         if not seq: return []
         if seq and seq[0] and len(seq[0][0]) == 2:
             return [[(x, y, 0.0) for (x, y) in fr] for fr in seq]
         return seq
-
     def _as3_exec(seq):
         if not seq: return []
         if seq and len(seq[0]) == 2:
             return [(x, y, 0.0) for (x, y) in seq]
         return seq
-
     plan_all = [ _as3_hist(pl) for pl in plan_all ]
     exec_all = [ _as3_exec(ex) for ex in exec_all ]
 
-    # frames count = min over available agents
+    # Frame count
     n_frames = min([len(ex) for ex in exec_all if ex]) if any(exec_all) else 0
     if n_frames < 2:
         if n_frames == 1:
@@ -924,23 +925,28 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         fov_target = next((j+1 for j in range(N) if j != fov_agent), 1)
     fov_target -= 1
 
-    seen_mask  = frames_dict.get("fov_seen_mask", [])
+    seen_mask  = list(frames_dict.get("fov_seen_mask", []) or [])
+    if seen_mask:
+        seen_mask = seen_mask[:n_frames]
     axis_hist  = frames_dict.get("fov_axis_hist", [])
 
-    # --------------- discover estimate series (any i->j present) ---------------
-    est_pairs = []   # list of tuples (i,j) 0-based
-    est_series = {}
-    meas_series = {}
+    # ---------------- discover estimate/measurement series (nested-aware) -------
+    est_pairs = []      # list[(i,j)]
+    est_series = {}     # {(i,j): [(x,y,z), ...]}
+    meas_series = {}    # {(i,j): [(p_obs, [az,el]) or None, ...]}
     if show_est:
         pat_est  = re.compile(r"^est(\d+)(\d+)_xyz$")
         pat_meas = re.compile(r"^meas(\d+)(\d+)_azel$")
-        for k, v in frames_dict.items():
+        merged = dict(frames_dict)
+        if isinstance(frames_dict.get("est"), dict):
+            merged.update(frames_dict["est"])
+        for k, v in merged.items():
             m = pat_est.match(k)
             if m:
                 i, j = int(m.group(1))-1, int(m.group(2))-1
                 est_pairs.append((i, j))
                 est_series[(i, j)] = v
-        for k, v in frames_dict.items():
+        for k, v in merged.items():
             m = pat_meas.match(k)
             if m:
                 i, j = int(m.group(1))-1, int(m.group(2))-1
@@ -967,7 +973,6 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         cx, cy, cz, R = ar["cx"], ar["cy"], ar["cz"], ar["r"]
         ax.set_xlim(cx-R, cx+R); ax.set_ylim(cy-R, cy+R); ax.set_zlim(cz-R, cz+R)
     else:
-        # autoscale from all exec points
         pts = np.array([p for ea in exec_all for p in ea], float)
         if pts.size:
             mn = pts.min(0); mx = pts.max(0)
@@ -976,39 +981,38 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
 
     # -------------------- artists per agent --------------------
-    # color cycle
     color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', None) or [
-        "tab:blue","tab:orange","tab:green","tab:red","tab:purple","tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"
+        "tab:blue","tab:orange","tab:green","tab:red","tab:purple","tab:brown",
+        "tab:pink","tab:gray","tab:olive","tab:cyan"
     ]
 
-    plan_lns = []
-    exec_lns = []
-    dots     = []
+    plan_lns, exec_lns, dots = [], [], []
     for a in range(N):
         ca = color_cycle[a % len(color_cycle)]
         (pl_ln,) = ax.plot([], [], [], '--', lw=1, alpha=0.65, label=f'Plan P{a+1}', color=ca)
         (ex_ln,) = ax.plot([], [], [], '-',  lw=2,              label=f'Exec P{a+1}', color=ca)
         (dot,)  = ax.plot([], [], [], 'o',  ms=6, color=ca, mec='k', mew=0.6, label='_nolegend_')
-        plan_lns.append(pl_ln)
-        exec_lns.append(ex_ln)
-        dots.append(dot)
+        plan_lns.append(pl_ln); exec_lns.append(ex_ln); dots.append(dot)
 
     # triads
-    triads_mode = triads.lower()
-    triad_agent_idxs = []
-    if show_axes and triads_mode != "none":
-        triad_agent_idxs = list(range(N)) if triads_mode == "all" else [fov_agent]
+    triads_mode = (triads or "fov").lower()
+    triad_idxs = [] if not show_axes or triads_mode == "none" else (
+        list(range(N)) if triads_mode == "all" else [fov_agent]
+    )
     triad_colors = tuple(viz_cfg.get('triad_colors', ('tab:red','tab:green','tab:blue')))
+    triad_labels = tuple(viz_cfg.get('triad_labels', ('x_b (boresight)', 'y_b', 'z_b')))
+    triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
+    triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
+    triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
     L_tri = tuple(viz_cfg.get("triad_len", (0.35, 0.35, 0.55)))
     triad_art = [None for _ in range(N)]
-    for a in triad_agent_idxs:
+    for a in triad_idxs:
         triad_art[a] = make_body_axes_artists_3d(ax, colors=triad_colors)
         for key in ('bx','by','bz'):
             triad_art[a][key].set_label('_nolegend_')
 
-    # estimates (one line per pair)
-    est_lns = {}
-    meas_lns = {}
+    # estimates / meas
+    est_lns, meas_lns = {}, {}
     if est_pairs:
         for (i, j) in est_pairs:
             col = color_cycle[j % len(color_cycle)]
@@ -1019,28 +1023,16 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 (mln,) = ax.plot([], [], [], '-', lw=0.9, alpha=0.35, color=col, label='_nolegend_')
                 meas_lns[(i, j)] = mln
 
-    # legends
+    # legend
     def _legend_clean(H):
         out = []
         for h in H:
             if h is None: continue
             lab = getattr(h, "get_label", lambda: "")()
-            if lab and not str(lab).startswith("_"):
-                out.append(h)
+            if lab and not str(lab).startswith("_"): out.append(h)
         return out, [h.get_label() for h in out]
-
-    handles_for_leg = plan_lns + exec_lns + list(est_lns.values())
-    handles, labels = _legend_clean(handles_for_leg)
-    leg_main = ax.legend(handles, labels, loc='upper left') if handles else None
-    leg_axes = None
-    if show_axes and triad_agent_idxs:
-        triad_labels = tuple(viz_cfg.get('triad_labels', ('x_b (boresight)', 'y_b', 'z_b')))
-        triad_leg_loc = viz_cfg.get('triad_leg_loc', 'lower left')
-        triad_leg_ncol = int(viz_cfg.get('triad_leg_ncol', 3))
-        triad_leg_title = viz_cfg.get('triad_leg_title', 'Body axes')
-        leg_axes = add_triad_legend(ax, colors=triad_colors, labels=triad_labels,
-                                    loc=triad_leg_loc, ncol=triad_leg_ncol,
-                                    title=triad_leg_title, keep_legend=leg_main)
+    H, L = _legend_clean(plan_lns + exec_lns + list(est_lns.values()))
+    if H: ax.legend(H, L, loc='upper left')
 
     # FOV artists
     fov_art = {'coll': None, 'rim': None, 'edges': []}
@@ -1089,7 +1081,6 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             if rim is not None: rim.set_label('_nolegend_')
             fov_art['coll'], fov_art['rim'] = coll, rim
 
-    # helpers
     def _set3d(ln, xs, ys, zs):
         if ln is not None:
             ln.set_data(xs, ys); ln.set_3d_properties(zs)
@@ -1100,51 +1091,44 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                 ln.set_data([], []); ln.set_3d_properties([])
         for dot in dots:
             dot.set_data([], []); dot.set_3d_properties([])
-        if triad_agent_idxs:
-            for a in triad_agent_idxs:
-                L = triad_art[a]
-                if L:
-                    for key in ('bx','by','bz'):
-                        L[key].set_data([], []); L[key].set_3d_properties([])
+        for a in triad_idxs:
+            L = triad_art[a]
+            if L:
+                for key in ('bx','by','bz'):
+                    L[key].set_data([], []); L[key].set_3d_properties([])
         _clear_fov()
         return []
 
     def update(f):
-        # plans + execs + dots
+        # plans + exec + dots
         for a in range(N):
-            # plan this frame
             if plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
             else:
                 _set3d(plan_lns[a], [], [], [])
-            # exec trail
             xs = [p[0] for p in exec_all[a][:f+1]]
             ys = [p[1] for p in exec_all[a][:f+1]]
             zs = [p[2] for p in exec_all[a][:f+1]]
             _set3d(exec_lns[a], xs, ys, zs)
-            # head dot
             if exec_all[a]:
                 x,y,z = exec_all[a][min(f, len(exec_all[a])-1)]
                 dots[a].set_data([x],[y]); dots[a].set_3d_properties([z])
 
         # triads
-        if triad_agent_idxs:
-            for a in triad_agent_idxs:
-                if triad_art[a] and att_all[a]:
-                    x,y,z = exec_all[a][min(f, len(exec_all[a])-1)]
-                    R = _R_exec(a, f)
-                    update_body_axes_artists_3d(triad_art[a], np.array([x,y,z], float), R, L=tuple(L_tri))
+        for a in triad_idxs:
+            if triad_art[a] and att_all[a]:
+                x,y,z = exec_all[a][min(f, len(exec_all[a])-1)]
+                R = _R_exec(a, f)
+                update_body_axes_artists_3d(triad_art[a], np.array([x,y,z], float), R, L=tuple(L_tri))
 
-        # estimates
+        # estimates + meas
         if est_pairs:
-            # measurement ray helper
-            def _meas_ray(p_obs, R_wb, az, el, L):
+            def _meas_ray(p_obs, R_wb, az, el, Lm):
                 c = np.cos(el)
                 v_b = np.array([c*np.cos(az), c*np.sin(az), np.sin(el)])
                 v_w = R_wb.T @ v_b
-                pF = p_obs + L * v_w
+                pF = p_obs + Lm * v_w
                 return p_obs, pF
-
             L_meas = float(viz_cfg.get("meas_len", cfg.get("camera", {}).get("far", 15.0)))
             for (i, j) in est_pairs:
                 est = est_series.get((i, j), [])
@@ -1153,8 +1137,6 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                     _set3d(est_lns[(i, j)], xs, ys, zs)
                 else:
                     _set3d(est_lns[(i, j)], [], [], [])
-
-                # meas
                 if (i, j) in meas_series and (i, j) in meas_lns:
                     me = meas_series[(i, j)]
                     if f < len(me) and me[f] is not None and att_all[i]:
@@ -1166,7 +1148,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                     else:
                         meas_lns[(i, j)].set_data([], []); meas_lns[(i, j)].set_3d_properties([])
 
-        # FOV of selected agent
+        # FOV
         if fov_enabled and att_all[fov_agent]:
             x,y,z = exec_all[fov_agent][min(f, len(exec_all[fov_agent])-1)]
             R_def = _R_exec(fov_agent, f)
@@ -1193,6 +1175,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     finally:
         plt.close(fig)
     print(f"Saved 3D animation to {out_path}")
+
 
 
 # -------------------- N-aware interactive viewer --------------------
@@ -1252,24 +1235,30 @@ def interactive_rollout_3d_N(
         else:
             raise ValueError("No frames to display.")
 
-    seen_mask  = frames_dict.get("fov_seen_mask", [])
-    # ---------- discover any estimates/meas ----------
+    seen_mask  = list(frames_dict.get("fov_seen_mask", []) or [])
+    if seen_mask:
+        seen_mask = seen_mask[:n_frames]
+
+    # ---------- discover any estimates/meas (nested-aware) ----------
     est_pairs, est_series, meas_series = [], {}, {}
     pat_est  = re.compile(r"^est(\d+)(\d+)_xyz$")
     pat_meas = re.compile(r"^meas(\d+)(\d+)_azel$")
-    for k, v in frames_dict.items():
+    merged = dict(frames_dict)
+    if isinstance(frames_dict.get("est"), dict):
+        merged.update(frames_dict["est"])
+    for k, v in merged.items():
         m = pat_est.match(k)
         if m:
             i, j = int(m.group(1))-1, int(m.group(2))-1
             est_pairs.append((i, j))
             est_series[(i, j)] = v
-    for k, v in frames_dict.items():
+    for k, v in merged.items():
         m = pat_meas.match(k)
         if m:
             i, j = int(m.group(1))-1, int(m.group(2))-1
             meas_series[(i, j)] = v
 
-    # ---------- figure/axes (match animator) ----------
+    # ---------- figure/axes ----------
     fig = plt.figure(figsize=(8,6))
     ax  = fig.add_subplot(111, projection="3d")
     ax.set_title(title)
@@ -1299,7 +1288,8 @@ def interactive_rollout_3d_N(
 
     # ---------- artists per agent ----------
     color_cycle = plt.rcParams['axes.prop_cycle'].by_key().get('color', None) or [
-        "tab:blue","tab:orange","tab:green","tab:red","tab:purple","tab:brown","tab:pink","tab:gray","tab:olive","tab:cyan"
+        "tab:blue","tab:orange","tab:green","tab:red","tab:purple","tab:brown",
+        "tab:pink","tab:gray","tab:olive","tab:cyan"
     ]
     def _set3d(ln, xs, ys, zs):
         if ln is not None:
@@ -1315,7 +1305,9 @@ def interactive_rollout_3d_N(
 
     # triads
     triads_mode = (triads or "fov").lower()
-    triad_idxs = [] if not show_axes or triads_mode == "none" else (list(range(N)) if triads_mode == "all" else [max(0, int(fov_cfg.get("agent",2))-1)])
+    triad_idxs = [] if not show_axes or triads_mode == "none" else (
+        list(range(N)) if triads_mode == "all" else [max(0, int(fov_cfg.get("agent",2))-1)]
+    )
     triad_colors = tuple(viz_cfg.get("triad_colors", ("tab:red","tab:green","tab:blue")))
     triad_labels = tuple(viz_cfg.get("triad_labels", ("x_b (boresight)","y_b","z_b")))
     triad_leg_loc  = viz_cfg.get("triad_leg_loc", "lower left")
@@ -1369,7 +1361,7 @@ def interactive_rollout_3d_N(
             if art is not None:
                 try: art.remove()
                 except Exception: pass
-                fov_art[k] = None
+            fov_art[k] = None
         for ln in fov_art.get("edges", []):
             try: ln.remove()
             except Exception: pass
@@ -1386,7 +1378,7 @@ def interactive_rollout_3d_N(
 
     def _set_fov(p, R_wb, idx):
         _clear_fov()
-        if not fov_on: return
+        if not (fov_on and show_fov): return
         col = fov_cfg.get("color","C1")
         if seen_mask and idx < len(seen_mask) and bool(seen_mask[idx]):
             col = "tab:green"
@@ -1415,36 +1407,33 @@ def interactive_rollout_3d_N(
     play = W.Play(min=0, max=n_frames-1, step=1, interval=50, value=0)
     W.jslink((play, "value"), (s_frame, "value"))
 
-    # ---------- redraw ----------
     def redraw(f):
         # plans + execs + dots
         for a in range(N):
-            # plan at this frame (rollout already caches latest each step)
             if t_plan.value and plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
             else:
                 _set3d(plan_lns[a], [], [], [])
-            # exec trail
             xs = [p[0] for p in exec_all[a][:f+1]]
             ys = [p[1] for p in exec_all[a][:f+1]]
             zs = [p[2] for p in exec_all[a][:f+1]]
             _set3d(exec_lns[a], xs, ys, zs)
-            # head
             x,y,z = exec_all[a][min(f, len(exec_all[a])-1)]
             dots[a].set_data([x],[y]); dots[a].set_3d_properties([z])
 
         # triads
-        if t_axes.value and triad_idxs:
-            for a in triad_idxs:
-                if triad_art[a] and att_all[a]:
+        if t_axes.value and triads.lower() != "none":
+            triad_idxs_local = list(range(N)) if triads.lower()=="all" else [max(0, int(fov_cfg.get("agent",2))-1)]
+            for a in triad_idxs_local:
+                if a < len(att_all) and att_all[a] and triad_art[a]:
                     x,y,z = exec_all[a][min(f, len(exec_all[a])-1)]
                     R = _R_exec(a, f)
-                    update_body_axes_artists_3d(triad_art[a], np.array([x,y,z], float), R, L=tuple(L_tri))
-        elif triad_idxs:
-            for a in triad_idxs:
+                    update_body_axes_artists_3d(triad_art[a], np.array([x,y,z], float), R, L=tuple(viz_cfg.get("triad_len", (0.35,0.35,0.55))))
+        else:
+            for a in range(N):
                 if triad_art[a]:
                     for key in ("bx","by","bz"):
-                        _set3d(triad_art[a][key], [], [], [])
+                        triad_art[a][key].set_data([], []); triad_art[a][key].set_3d_properties([])
 
         # estimates + meas
         for (i, j) in est_pairs:
@@ -1456,23 +1445,23 @@ def interactive_rollout_3d_N(
             else:
                 _set3d(ln, [], [], [])
             if (i, j) in meas_lns:
-                mln = meas_lns[(i, j)]
-                if t_est.value and t_meas.value and (i, j) in meas_series and f < len(meas_series[(i, j)]) and meas_series[(i, j)][f] is not None:
-                    p_obs, z = meas_series[(i, j)][f]
+                me = meas_series.get((i, j), [])
+                if t_est.value and t_meas.value and f < len(me) and me[f] is not None and att_all[i]:
+                    p_obs, z = me[f]
                     R_i = _R_exec(i, f)
                     c = np.cos(float(z[1]))
                     v_b = np.array([c*np.cos(float(z[0])), c*np.sin(float(z[0])), np.sin(float(z[1]))])
                     v_w = R_i.T @ v_b
                     Lm  = float(viz_cfg.get("meas_len", cfg.get("camera", {}).get("far", 15.0)))
                     p0 = np.asarray(p_obs, float); pF = p0 + Lm*v_w
-                    mln.set_data([p0[0], pF[0]], [p0[1], pF[1]])
-                    mln.set_3d_properties([p0[2], pF[2]])
+                    meas_lns[(i, j)].set_data([p0[0], pF[0]], [p0[1], pF[1]])
+                    meas_lns[(i, j)].set_3d_properties([p0[2], pF[2]])
                 else:
-                    mln.set_data([], []); mln.set_3d_properties([])
+                    meas_lns[(i, j)].set_data([], []); meas_lns[(i, j)].set_3d_properties([])
 
         # FOV
         kskip = max(1, int(perf_skip_fov_every))
-        if t_fov.value and fov_on and (f % kskip == 0):
+        if t_fov.value and show_fov and (f % kskip == 0):
             x,y,z = exec_all[fov_agent][min(f, len(exec_all[fov_agent])-1)]
             _set_fov(np.array([x,y,z], float), _R_exec(fov_agent, f), f)
         else:
@@ -1481,7 +1470,19 @@ def interactive_rollout_3d_N(
         ax.view_init(elev=s_elev.value, azim=s_azim.value)
         fig.canvas.draw_idle()
 
-    # wire up
+    # ---------- widgets / wiring ----------
+    s_frame = W.IntSlider(min=0, max=n_frames-1, step=1, value=0, description="frame")
+    s_azim  = W.IntSlider(min=-180, max=180, step=1, value=45, description="azim")
+    s_elev  = W.IntSlider(min=-10,  max=90,  step=1, value=25, description="elev")
+    t_plan  = W.Checkbox(value=True, description="show plan")
+    t_axes  = W.Checkbox(value=show_axes, description="show axes")
+    t_fov   = W.Checkbox(value=show_fov and bool(fov_cfg.get("enabled", False)), description="show FOV")
+    t_est   = W.Checkbox(value=bool(est_pairs), description="show estimates", disabled=(len(est_pairs)==0))
+    t_meas  = W.Checkbox(value=bool(viz_cfg.get("show_meas", False)) and bool(est_pairs),
+                         description="show meas rays", disabled=(len(est_pairs)==0))
+    play = W.Play(min=0, max=n_frames-1, step=1, interval=50, value=0)
+    W.jslink((play, "value"), (s_frame, "value"))
+
     s_frame.observe(lambda ch: redraw(ch["new"]), names="value")
     for w in (s_azim, s_elev, t_plan, t_axes, t_fov, t_est, t_meas):
         w.observe(lambda ch: redraw(s_frame.value), names="value")
@@ -1493,6 +1494,7 @@ def interactive_rollout_3d_N(
         W.HBox([s_azim, s_elev, t_plan, t_axes, t_fov, t_est, t_meas]),
     ])
     display(ui)
+
 
 
 # -------------------- Triad legend (unchanged API; silences proxies) --------------------
