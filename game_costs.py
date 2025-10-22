@@ -421,6 +421,62 @@ def build_game_costs(
             return to_centerT
 
         return l1_k, l2_k, l1_T, l2_T
+    
+    elif k == "guard_center":
+        # Player 2: reach the center c
+        # Player 1: stay close to Player 2 (optional screening alignment)
+        ar = (cfg.get("arena") or {})
+        c = [float(ar.get(key, 0.0)) for key in (["cx","cy"] if D == 2 else ["cx","cy","cz"])]
+
+        # weights
+        w2_c      = float(cfg.get("w2_center",    1.0))    # P2 stage: dist to center
+        w2_c_T    = float(cfg.get("w2_center_T",  20.0))   # P2 terminal
+        w1_close  = float(cfg.get("w1_close",     2.0))    # P1 stage: closeness to P2
+        w1_close_T= float(cfg.get("w1_close_T",   20.0))   # P1 terminal
+        w1_align  = float(cfg.get("w1_align",     0.0))    # optional screening (stage)
+        w1_align_T= float(cfg.get("w1_align_T",   0.0))    # optional screening (terminal)
+
+        # effort regularization
+        c_eff1 = float(cfg.get("effort_w1", 1e-2))
+        c_eff2 = float(cfg.get("effort_w2", 1e-2))
+        eps    = float(cfg.get("eps_cost", 1e-9))
+
+        def _align_penalty(p1, p2):
+            # Encourage (p1 - p2) to align with (c - p2); 0 when perfectly aligned.
+            v1 = [p1[i] - p2[i] for i in range(D)]
+            v2 = [(c[i] if i < len(c) else 0.0) - p2[i] for i in range(D)]
+            n1 = _norm(v1); n2 = _norm(v2)
+            cos = _dot(v1, v2) / (n1*n2 + eps)
+            return (1.0 - cos) * (1.0 - cos)
+
+        # ---- stage costs ----
+        def l1_k(m, k_):
+            p1 = _pos(m.x1, k_, D); p2 = _pos(m.x2, k_, D)
+            u1 = [m.u1[k_, j] for j in m.U]
+            stay_close = _sumsq([p1[i] - p2[i] for i in range(D)])
+            align = _align_penalty(p1, p2) if w1_align > 0.0 else 0.0
+            return w1_close*stay_close + w1_align*align + c_eff1*_sumsq(u1)
+
+        def l2_k(m, k_):
+            p2 = _pos(m.x2, k_, D)
+            u2 = [m.u2[k_, j] for j in m.U]
+            to_center = _sumsq([p2[i] - (c[i] if i < len(c) else 0.0) for i in range(D)])
+            return w2_c*to_center + c_eff2*_sumsq(u2)
+
+        # ---- terminal costs ----
+        def l1_T(m):
+            p1T = _pos(m.x1, T, D); p2T = _pos(m.x2, T, D)
+            stay_close_T = _sumsq([p1T[i] - p2T[i] for i in range(D)])
+            align_T = _align_penalty(p1T, p2T) if w1_align_T > 0.0 else 0.0
+            return w1_close_T*stay_close_T + w1_align_T*align_T
+
+        def l2_T(m):
+            p2T = _pos(m.x2, T, D)
+            to_center_T = _sumsq([p2T[i] - (c[i] if i < len(c) else 0.0) for i in range(D)])
+            return w2_c_T*to_center_T
+
+        return l1_k, l2_k, l1_T, l2_T
+
 
 
 
