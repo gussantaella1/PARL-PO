@@ -6,14 +6,31 @@ import casadi as ca
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
+from dyn_models import (
+    dims_from_D,
+    hcw_mean_motion, hcw_discrete_mats, as_numpy_const,
+    augment_AB_for_att, augment_bounds_with_att, pad_x0_with_att,
+    world_to_body_R, frame_from_axis_continuous, apply_roll_about_axis,
+    make_bounds,
+)
 
-import importlib, game_3dutils, game_costs, neos_path_game, ukf_estimator, ekf_estimator
+
+
+import importlib, game_3dutils, game_costs, neos_path_game
 importlib.reload(game_3dutils)
 importlib.reload(game_costs)
 importlib.reload(neos_path_game)
 
-from ukf_estimator import AgentUKF 
-from ekf_estimator import AgentEKF 
+# Keep only module-level imports and always reference via the module
+import ukf_estimator, ekf_estimator
+import importlib
+importlib.reload(ukf_estimator)
+importlib.reload(ekf_estimator)
+
+# (Optional) local aliases to current classes after reload
+AgentUKF = ukf_estimator.AgentUKF
+AgentEKF = ekf_estimator.AgentEKF
+
 
 
 
@@ -147,34 +164,34 @@ class KF_CV:
     """
     Common interface over AgentUKF / AgentEKF.
 
-    - ctor: KF_CV(x0, P0, Q, R, dt, kind='auto'|'ukf'|'ekf', **ukf_sigma_params)
-    - predict(dt=None, u=None, **kwargs)   # extra kwargs ignored if EKF
-    - update(z, p_obs, R_wb, **kwargs)     # same signature on both; forwards
+    - ctor: KF_CV(x0, P0, Q, R, dt, kind='auto'|'ukf'|'ekf', **kwargs)
+      UKF-recognized kwargs: alpha, beta, kappa, dyn, hcw
+    - predict(dt=None, u=None, **kwargs)
+    - update(z, p_obs, R_wb, **kwargs)
     """
     def __init__(self, x0, P0, Q, R, dt, kind='auto', **kwargs):
         kind = (kind or 'auto').lower()
-        impl = None
 
-        if kind == 'ekf' and AgentEKF is not None:
-            impl = AgentEKF(x0, P0, Q, R, dt)
-        elif kind in ('ukf', 'auto') and AgentUKF is not None:
-            # pass through optional sigma-point params if provided
-            sp = {k: kwargs[k] for k in ('alpha', 'beta', 'kappa') if k in kwargs}
-            impl = AgentUKF(x0, P0, Q, R, dt, **sp)
-        elif AgentUKF is not None:  # fallback preference: UKF if available
-            impl = AgentUKF(x0, P0, Q, R, dt)
-        elif AgentEKF is not None:
-            impl = AgentEKF(x0, P0, Q, R, dt)
+        has_ukf = (AgentUKF is not None)
+        has_ekf = (AgentEKF is not None)
+
+        if kind == 'ekf' and has_ekf:
+            self._impl = AgentEKF(x0, P0, Q, R, dt)
+        elif kind in ('ukf', 'auto') and has_ukf:
+            # forward UKF-specific ctor kwargs, incl. dynamics selection
+            ukf_ctor_keys = ('alpha', 'beta', 'kappa', 'dyn', 'hcw')
+            ukf_ctor = {k: kwargs[k] for k in ukf_ctor_keys if k in kwargs}
+            self._impl = AgentUKF(x0, P0, Q, R, dt, **ukf_ctor)
+        elif has_ukf:
+            self._impl = AgentUKF(x0, P0, Q, R, dt)
+        elif has_ekf:
+            self._impl = AgentEKF(x0, P0, Q, R, dt)
         else:
             raise RuntimeError("Neither AgentUKF nor AgentEKF is importable.")
 
-        self._impl = impl  # keep the concrete filter
-
-    # expose state/cov/etc. transparently
     def __getattr__(self, name):
         return getattr(self._impl, name)
 
-    # accept superset of kwargs; drop those the impl doesn't support
     def predict(self, dt=None, u=None, **kwargs):
         f = getattr(self._impl, 'predict')
         return f(dt=dt, u=u, **_filter_kwargs(f, kwargs))
@@ -202,12 +219,12 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     do_est  = bool(est_cfg.get('enabled', False))
 
     # --- translational Ad,Bd (MX) ---
-    dyn = (cfg.get("dynamics") or "double").lower()
+    dyn = (cfg.get("dynamics") or "hcw").lower()
     if dyn == "hcw":
         n = hcw_mean_motion(cfg.get("hcw", {}))
         Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)        # MX
-    else:
-        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
+    # else:
+    #     Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)  # MX
 
     # --- optional attitude augmentation (roll in state) ---
     att_cfg = cfg.get("att", {})
@@ -315,7 +332,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
     prev_R1, prev_R2 = R1_0, R2_0
 
-    # === optional UKFs ===
+    # === optional UKFs (HCW-only) ===
     if do_est:
         s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
         P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
@@ -324,14 +341,20 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         who   = (est_cfg.get('who') or 'both').lower()
         every = int(est_cfg.get('every', 1))
 
+        # Force HCW in the estimator
         est_hist = {'est12_xyz': [], 'est21_xyz': [], 'meas12_azel': [], 'meas21_azel': []}
-        ukf12 = KF_CV(np.r_[x2[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','1->2') else None
-        ukf21 = KF_CV(np.r_[x1[:3], np.zeros(3)], P0, Q, Rm, dt) if who in ('both','2->1') else None
+        hcw_cfg = cfg.get('hcw', {})           # pass same params used by the plant
+
+        ukf12 = KF_CV(np.r_[x2[:3], np.zeros(3)], P0, Q, Rm, dt,
+                    kind='ukf', dyn='hcw', hcw=hcw_cfg) if who in ('both','1->2') else None
+        ukf21 = KF_CV(np.r_[x1[:3], np.zeros(3)], P0, Q, Rm, dt,
+                    kind='ukf', dyn='hcw', hcw=hcw_cfg) if who in ('both','2->1') else None
 
         if ukf12 is not None:
             est_hist['est12_xyz'].append(ukf12.x[:3].copy()); est_hist['meas12_azel'].append(None)
         if ukf21 is not None:
             est_hist['est21_xyz'].append(ukf21.x[:3].copy()); est_hist['meas21_azel'].append(None)
+
 
     # log true t=0
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
@@ -625,24 +648,6 @@ def points_in_fov_mask(Xw_list, x_def, axis, cam_cfg):
 
 
 
-
-# -------------------- dims & dynamics (generic)--------------------
-def dims_from_D(D: int):
-    assert D in (2,3), "Only D=2 or D=3 supported."
-    return 2*D, D
-
-def step_double_integrator_D(x, u, dt, D=3):
-    """
-    One forward-Euler step for a D-dim double integrator.
-    x = [p(1..D), v(1..D)], u = [a(1..D)]
-    """
-    x = np.asarray(x, float).copy()
-    u = np.asarray(u, float)
-    p = x[:D]; v = x[D:]
-    p_next = p + dt * v
-    v_next = v + dt * u
-    return np.r_[p_next, v_next]
-
 # -------------------- dims & dynamics (orbital HCW)--------------------
 
 # --- in game_sharedutils.py ---
@@ -683,409 +688,7 @@ def as_numpy_const(M):
         return np.array(out, dtype=float)
 
 
-
-def hcw_mean_motion(hcw_cfg: dict):
-    """
-    Compute mean motion n [rad/s].
-    Provide either {'n': ...} or {'mu': ..., 'r0': ...}, where
-    mu ≈ 3.986004418e14 m^3/s^2 (Earth), r0 is circular ref. radius [m].
-    """
-    if "n" in hcw_cfg:
-        return float(hcw_cfg["n"])
-    mu = float(hcw_cfg.get("mu", 3.986004418e14))
-    r0 = float(hcw_cfg["r0"])   # must exist if n not given
-    return float(np.sqrt(mu / (r0**3)))
-
-def _discretize_linear(Ac, Bc, dt, series_terms=18):
-    """
-    Discretize xdot = Ac x + Bc u with ZOH over dt.
-    Returns (Ad, Bd) as casadi.MX. No CasADi expm plugin required.
-    """
-    import numpy as np
-    import casadi as ca
-
-    nx = int(Ac.shape[0])
-    nu = int(Bc.shape[1])
-
-    # Robustly get numpy copies even if Ac/Bc are MX
-    Ac_np = as_numpy_const(Ac)
-    Bc_np = as_numpy_const(Bc)
-
-    # Build augmented matrix and exponentiate
-    M = np.block([[Ac_np,              Bc_np],
-                  [np.zeros((nu, nx)), np.zeros((nu, nu))]])
-
-    try:
-        from scipy.linalg import expm
-        E = expm(M * dt)
-    except Exception:
-        # Small-dt fallback: truncated series
-        E = np.eye(nx + nu)
-        term = np.eye(nx + nu)
-        Mdt = M * dt
-        for k in range(1, series_terms + 1):
-            term = term @ (Mdt / k)
-            E += term
-
-    Ad_np = E[:nx, :nx]
-    Bd_np = E[:nx, nx:nx+nu]
-    return ca.MX(Ad_np), ca.MX(Bd_np)
-
-
-def hcw_discrete_mats(n: float, dt: float):
-    """
-    HCW dynamics in LVLH with state x=[dx,dy,dz,vx,vy,vz], input u=[ax,ay,az].
-    Continuous-time:
-      ẍ - 3 n^2 x - 2 n ẏ = ax
-      ÿ + 2 n ẋ           = ay
-      z̈ + n^2 z           = az
-    Returns (Ad, Bd) as CasADi MX for one step Δt.
-    """
-    n = float(n)
-    Ac = ca.MX.zeros(6,6)
-    # kinematics
-    Ac[0,3] = 1.0
-    Ac[1,4] = 1.0
-    Ac[2,5] = 1.0
-    # dynamics
-    Ac[3,0] = 3*n*n
-    Ac[3,4] = 2*n
-    Ac[4,3] = -2*n
-    Ac[5,2] = -n*n
-
-    Bc = ca.MX.zeros(6,3)
-    Bc[3,0] = 1.0
-    Bc[4,1] = 1.0
-    Bc[5,2] = 1.0
-
-    return _discretize_linear(Ac, Bc, dt)
-
-def build_g_tilde_linear(nx, nu, T, N, Ad: ca.MX, Bd: ca.MX):
-    """
-    Linear shared equality constraints with fixed (Ad,Bd):
-      x_t - (Ad x_{t-1} + Bd u_{t-1}) = 0, and x_0 - θᶦ = 0 for each player.
-    Drop-in replacement for build_g_tilde(...).
-    """
-    nprim = T*nx + (T-1)*nu
-
-    def g_tilde(tau, theta):
-        g_list = []
-        ofs = 0
-        for p in range(N):
-            tau_p = tau[ofs:ofs+nprim]; ofs += nprim
-            xs, us = unpack_trajectory(tau_p, nx, nu, T)
-            th_p = theta[p*nx:(p+1)*nx]
-            g_list.append(xs[0] - th_p)  # IC
-            for t in range(1, T):
-                g_list.append(xs[t] - (Ad @ xs[t-1] + Bd @ us[t-1]))
-        return ca.vcat(g_list)
-
-    return g_tilde
-
-
-# ---------- Attitude helpers (shared) ----------
-
-def apply_roll_about_axis(R_wb, phi: float, align: str = "x"):
-    """
-    Rotate the body frame by roll φ around the boresight axis.
-    Returns rows [x_b'; y_b'; z_b'].
-    """
-    x_b, y_b, z_b = R_wb[0], R_wb[1], R_wb[2]
-    c, s = np.cos(phi), np.sin(phi)
-
-    if align == "x":           # roll about x_b
-        y_p =  c*y_b + s*z_b
-        z_p = -s*y_b + c*z_b
-        return np.vstack([x_b, y_p, z_p])
-
-    # legacy: roll about z_b
-    x_p =  c*x_b + s*y_b
-    y_p = -s*x_b + c*y_b
-    return np.vstack([x_p, y_p, z_b])
-
-
-# --- Attitude (roll) augmentation -------------------------------------------
-
-
-def augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg):
-    """
-    Augment translational Ad,Bd with attitude states [φ, θ, ψ].
-    Each evolves with a simple integrator: angle_{k+1} = angle_k + dt * rate.
-    """
-    Ad_tr = ca.MX(Ad_tr)
-    Bd_tr = ca.MX(Bd_tr)
-    nx_tr = Ad_tr.size1()
-    nu_tr = Bd_tr.size2()
-
-    n_att = 3   # roll, pitch, yaw
-    n_ctrl = 3  # their rates
-
-    # --- Augmented A ---
-    Ad_aug = ca.MX.zeros(nx_tr + n_att, nx_tr + n_att)
-    Ad_aug[:nx_tr, :nx_tr] = Ad_tr
-    Ad_aug[nx_tr:, nx_tr:] = ca.MX_eye(n_att)  # φ,θ,ψ → themselves
-
-    # --- Augmented B ---
-    Bd_aug = ca.MX.zeros(nx_tr + n_att, nu_tr + n_ctrl)
-    Bd_aug[:nx_tr, :nu_tr] = Bd_tr              # translational part unchanged
-    Bd_aug[nx_tr:, nu_tr:] = dt * ca.MX_eye(n_att)  # angle += dt * rate
-
-    idx = {
-        "nx": nx_tr + n_att,
-        "nu": nu_tr + n_ctrl,
-        "i_phi":   nx_tr + 0,
-        "i_theta": nx_tr + 1,
-        "i_psi":   nx_tr + 2,
-        "i_u_phi": nu_tr + 0,
-        "i_u_theta": nu_tr + 1,
-        "i_u_psi": nu_tr + 2,
-    }
-    return Ad_aug, Bd_aug, idx
-
-def augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg):
-    """
-    Expand bounds to include φ, θ, ψ states and their rates.
-    """
-    x_lb = np.asarray(x_lb, float).ravel()
-    x_ub = np.asarray(x_ub, float).ravel()
-    u_lb = np.asarray(u_lb, float).ravel()
-    u_ub = np.asarray(u_ub, float).ravel()
-
-    # Angle limits (can tweak via att_cfg)
-    phi_lim   = att_cfg.get("phi_lim",   (-np.pi, np.pi))
-    theta_lim = att_cfg.get("theta_lim", (-np.pi/2, np.pi/2))
-    psi_lim   = att_cfg.get("psi_lim",   (-np.pi, np.pi))
-
-    # Rate limits
-    phi_dot_lim   = att_cfg.get("phi_dot_lim",   (-1.0, 1.0))
-    theta_dot_lim = att_cfg.get("theta_dot_lim", (-1.0, 1.0))
-    psi_dot_lim   = att_cfg.get("psi_dot_lim",   (-1.0, 1.0))
-
-    # Expand state bounds
-    x_lb = np.concatenate([x_lb, [phi_lim[0],   theta_lim[0],   psi_lim[0]]])
-    x_ub = np.concatenate([x_ub, [phi_lim[1],   theta_lim[1],   psi_lim[1]]])
-
-    # Expand control bounds
-    u_lb = np.concatenate([u_lb, [phi_dot_lim[0],   theta_dot_lim[0],   psi_dot_lim[0]]])
-    u_ub = np.concatenate([u_ub, [phi_dot_lim[1],   theta_dot_lim[1],   psi_dot_lim[1]]])
-
-    return x_lb, x_ub, u_lb, u_ub
-
-
-def pad_x0_with_att(x0_row, att_cfg, D):
-    """
-    Extend initial state with φ, θ, ψ.
-    Defaults = 0.0 unless att_cfg specifies otherwise.
-    """
-    x0_row = np.asarray(x0_row, float).ravel()
-    phi0   = att_cfg.get("phi0", 0.0)
-    theta0 = att_cfg.get("theta0", 0.0)
-    psi0   = att_cfg.get("psi0", 0.0)
-
-    # Append angles to whatever translational state we have
-    return np.concatenate([x0_row, [phi0, theta0, psi0]])
-
-
-# -------------------- bounds & geometry --------------------
-def make_bounds(cfg: dict):
-    """
-    Build box bounds for states and controls in D dims.
-    x = [p(1..D), v(1..D)], u = [a(1..D)]
-    If arena is a box/cuboid, use tight pos bounds; otherwise keep pos wide and let h~ handle geometry.
-    """
-    D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
-    nx, nu = dims_from_D(D)
-    vmax, umax = float(cfg["vmax"]), float(cfg["umax"])
-    ar = cfg["arena"]
-    ar_type = ar.get("type", "box")
-
-    # Control bounds
-    u_lb = -umax * np.ones(nu, float)
-    u_ub =  umax * np.ones(nu, float)
-
-    BIG = 1e6
-    if ar_type == "box":
-        if D == 2:
-            keys = ("xmin","xmax","ymin","ymax")
-            assert all(k in ar for k in keys), "Missing 2D box bounds"
-            p_lb = np.array([ar["xmin"], ar["ymin"]], float)
-            p_ub = np.array([ar["xmax"], ar["ymax"]], float)
-        else:
-            keys = ("xmin","xmax","ymin","ymax","zmin","zmax")
-            assert all(k in ar for k in keys), "Missing 3D box bounds"
-            p_lb = np.array([ar["xmin"], ar["ymin"], ar["zmin"]], float)
-            p_ub = np.array([ar["xmax"], ar["ymax"], ar["zmax"]], float)
-    else:
-        p_lb = -BIG * np.ones(D, float)
-        p_ub =  BIG * np.ones(D, float)
-
-    v_lb = -float(cfg["vmax"]) * np.ones(D, float)
-    v_ub =  float(cfg["vmax"]) * np.ones(D, float)
-    x_lb = np.r_[p_lb, v_lb]
-    x_ub = np.r_[p_ub, v_ub]
-    return x_lb, x_ub, u_lb, u_ub
-
-
-# -------------------- shared constraints builders --------------------
-
-def build_h_tilde(nx: int, nu: int, T: int, N: int, x_lb, x_ub, u_lb, u_ub, cfg: dict):
-    """
-    h̃(τ,θ) ≥ 0: bounds + arena + keep-out + pairwise separation.
-    D-aware; supports 2D (box/circle/polygon + circles) and 3D (box/sphere/polyhedron + spheres).
-    """
-    D = int(cfg.get("D", 3))
-    nprim = T*nx + (T-1)*nu
-    dmin2 = float(cfg["sep_min"])**2
-    arena  = cfg["arena"]
-    artype = arena.get("type", "box")
-
-    # obstacle key by D
-    sphere_key = "circles" if D == 2 else "spheres"
-
-    def h_fun(tau, theta):
-        h_list, ofs = [], 0
-        taus = []
-
-        for _ in range(N):
-            tau_p = tau[ofs:ofs+nprim]; ofs += nprim
-            taus.append(tau_p)
-            xs, us = unpack_trajectory(tau_p, nx, nu, T)
-
-            # box bounds
-            for t in range(T):
-                if x_lb is not None: h_list.append(xs[t] - x_lb)
-                if x_ub is not None: h_list.append(x_ub - xs[t])
-            for t in range(T-1):
-                if u_lb is not None: h_list.append(us[t] - u_lb)
-                if u_ub is not None: h_list.append(u_ub - us[t])
-
-            # arena keep-in
-            if artype in ("circle","sphere"):
-                c = ca.MX(np.array([arena.get(k) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])], float))
-                r2 = float(arena["r"])**2
-                for t in range(T):
-                    p = xs[t][0:D]
-                    h_list.append(r2 - ca.sumsqr(p - c))
-            elif artype == "polygon":  # 2D
-                for t in range(T):
-                    p = xs[t][0:2]
-                    h_list.append(polyb - polyA @ p)  # vector
-            elif artype == "polyhedron":  # 3D
-                for t in range(T):
-                    p = xs[t][0:3]
-                    h_list.append(polyb - polyA @ p)  # vector
-
-            # keep-out spheres/circles
-            for sph in cfg.get(sphere_key, []):
-                o = ca.MX(np.array([sph.get(k) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])], float))
-                r2 = float(sph["r"])**2
-                for t in range(T):
-                    p = xs[t][0:D]
-                    h_list.append(ca.sumsqr(p - o) - r2)
-
-        # pairwise separation for N=2
-        if N == 2:
-            xs1, _ = unpack_trajectory(taus[0], nx, nu, T)
-            xs2, _ = unpack_trajectory(taus[1], nx, nu, T)
-            for t in range(T):
-                p1 = xs1[t][0:D]; p2 = xs2[t][0:D]
-                h_list.append(ca.sumsqr(p1 - p2) - dmin2)
-
-        return ca.vcat(h_list)
-
-    return h_fun
-
 # -------------------- frames & FOV --------------------
-def _unit(v, eps: float = 1e-12):
-    v = np.asarray(v, float)
-    n = np.linalg.norm(v)
-    return v / (n + eps)
-
-def _skew(w):
-    wx, wy, wz = w
-    return np.array([[0, -wz,  wy],
-                     [wz,  0, -wx],
-                     [-wy, wx,  0]], float)
-
-def minimal_rotation(a, b, eps: float = 1e-9):
-    """3D: rotation matrix R s.t. R@a ≈ b with minimal angle (no spin)."""
-    a = _unit(a); b = _unit(b)
-    v = np.cross(a, b)
-    s = np.linalg.norm(v); c = float(np.dot(a, b))
-    if s < eps:
-        if c > 0: return np.eye(3)  # a ~ b
-        # a ~ -b: 180° around any axis ⟂ a
-        axis = _unit(np.cross(a, np.array([1,0,0]) if abs(a[0]) < 0.9 else np.array([0,1,0])))
-        K = _skew(axis)
-        return np.eye(3) + 2*(K @ K)
-    axis = v / s
-    K = _skew(axis)
-    angle = np.arctan2(s, c)
-    return np.eye(3) + np.sin(angle)*K + (1 - np.cos(angle))*(K @ K)
-
-
-def frame_from_axis_continuous(axis,
-                               R_prev=None,
-                               align: str = "x",
-                               world_up=np.array([0.0, 0.0, 1.0])):
-    """
-    Build/propagate a continuous body frame with minimal spin about the boresight.
-    Returns rows [x_b; y_b; z_b] expressed in WORLD.
-    - align='x': x_b is boresight (x-forward).
-    - align='z': z_b is boresight (legacy).
-    Uses minimal_rotation(prev_boresight, new_boresight) to avoid flips.
-    """
-    a = _unit(np.asarray(axis, float))
-    up = _unit(np.asarray(world_up, float))
-
-    if R_prev is not None:
-        if align == "x":
-            # rotate previous frame so x_prev -> a with minimum angle
-            x_prev = _unit(R_prev[0])
-            Rdel = minimal_rotation(x_prev, a)   # Rdel @ x_prev ≈ a
-            R = Rdel @ R_prev
-
-            # re-orthonormalize while preserving x_b ~ a
-            x_b = a
-            y_tmp = R[1] - x_b*np.dot(R[1], x_b)
-            if np.linalg.norm(y_tmp) < 1e-8:
-                # singular: pick a safe reference not parallel to x_b
-                ref = up if abs(np.dot(up, x_b)) < 0.98 else np.array([0,1,0], float)
-                y_tmp = np.cross(ref, x_b)
-            y_b = _unit(y_tmp)
-            z_b = _unit(np.cross(x_b, y_b))
-            y_b = _unit(np.cross(z_b, x_b))  # final Gram-Schmidt pass
-            return np.vstack([x_b, y_b, z_b])
-
-        else:  # align == "z"
-            z_prev = _unit(R_prev[2])
-            Rdel = minimal_rotation(z_prev, a)  # Rdel @ z_prev ≈ a
-            R = Rdel @ R_prev
-
-            z_b = a
-            x_tmp = R[0] - z_b*np.dot(R[0], z_b)
-            if np.linalg.norm(x_tmp) < 1e-8:
-                ref = up if abs(np.dot(up, z_b)) < 0.98 else np.array([1,0,0], float)
-                x_tmp = np.cross(ref, z_b)
-            x_b = _unit(x_tmp)
-            y_b = _unit(np.cross(z_b, x_b))
-            x_b = _unit(np.cross(y_b, z_b))
-            return np.vstack([x_b, y_b, z_b])
-
-    # First frame (no R_prev): construct from world_up safely
-    if align == "x":
-        if abs(np.dot(a, up)) > 0.98:
-            up = np.array([0,1,0], float) if abs(a[1]) < 0.9 else np.array([1,0,0], float)
-        y_b = _unit(np.cross(up, a))
-        z_b = _unit(np.cross(a, y_b))
-        return np.vstack([a, y_b, z_b])
-    else:
-        if abs(np.dot(a, up)) > 0.98:
-            up = np.array([1,0,0], float)
-        x_b = _unit(np.cross(up, a))
-        y_b = _unit(np.cross(a, x_b))
-        return np.vstack([x_b, y_b, a])
-
 
 def att_lin3d_AB(dt: float, att_cfg: dict):
     """
@@ -1109,38 +712,6 @@ def att_lin3d_AB(dt: float, att_cfg: dict):
     Bin = np.diag([dt/Jx, dt/Jy, dt/Jz])
     B = np.vstack([np.zeros((3,3)), Bin])   # τ only affects ω-row
     return A.astype(float), B.astype(float)
-
-def world_to_body_R(axis, D: int = 3, align: str = "x", up=(0.0, 0.0, 1.0)):
-    """
-    Build body frame rows [x_b; y_b; z_b].
-    align='x' -> x_b aligned to axis (your boresight).
-    align='z' -> z_b aligned to axis (legacy).
-    """
-    axis = _unit(axis)
-    up   = _unit(np.asarray(up, float))
-
-    if D == 2:
-        # 2D: keep old behavior (no roll in plane)
-        x_b = axis
-        y_b = np.array([-axis[1], axis[0]])
-        return np.vstack([x_b, y_b])
-
-    # 3D:
-    if align == "x":
-        x_b = axis
-        # pick a usable up vector (not parallel to axis)
-        if abs(np.dot(x_b, up)) > 0.98:
-            up = np.array([0.0, 1.0, 0.0]) if abs(x_b[1]) < 0.9 else np.array([1.0, 0.0, 0.0])
-        y_b = _unit(np.cross(up, x_b))       # pitch axis
-        z_b = _unit(np.cross(x_b, y_b))      # yaw axis
-        return np.vstack([x_b, y_b, z_b])
-
-    # align == "z" (legacy)
-    z_b = axis
-    ref = np.array([1.0, 0.0, 0.0]) if abs(z_b[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    x_b = _unit(np.cross(ref, z_b))
-    y_b = _unit(np.cross(z_b, x_b))
-    return np.vstack([x_b, y_b, z_b])
 
 
 def in_fov(p_t, x_def, axis, fov_cfg, D: int):
