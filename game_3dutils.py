@@ -28,11 +28,8 @@ __all__ = [
 try:
     from neos_path_game import (
         build_mcp_two_player_one_shot,
-        build_mcp_three_player_one_shot,
-        build_mcp_N_player_one_shot,
         solve_with_local_path,
         extract_trajectories,
-        _snapshot_path_model
     )
 
 
@@ -115,101 +112,6 @@ def build_h_builders(cfg, nx, D):
 
     return funcs
 
-def build_h_builders_N(cfg, nx, D, N):
-    """
-    N-player shared-inequality builders h(m,k) >= 0.
-    Uses ONLY per-agent vars: m.x1[k,j], m.x2[k,j], ..., m.xN[k,j].
-    """
-    ar = (cfg.get("arena") or {})
-    funcs = []
-
-    # accessor: strictly m.x{agent}[k,j]
-    def _x(m, agent, k, j):
-        try:
-            xv = getattr(m, f"x{agent}")
-        except AttributeError as e:
-            raise KeyError(f"Missing variable for agent {agent}: expected m.x{agent}[k,j]") from e
-        return xv[k, j]
-
-    # -------- arena keep-in --------
-    # box
-    if {"xmin","xmax","ymin","ymax"} <= set(ar.keys()):
-        xmin, xmax = float(ar["xmin"]), float(ar["xmax"])
-        ymin, ymax = float(ar["ymin"]), float(ar["ymax"])
-        have_z     = (D == 3) and ("zmin" in ar and "zmax" in ar)
-        zmin, zmax = (float(ar["zmin"]), float(ar["zmax"])) if have_z else (None, None)
-
-        for a in range(1, N+1):
-            funcs.append(lambda m,k,_a=a,_b=xmin: _x(m,_a,k,0) - _b)  # x >= xmin
-            funcs.append(lambda m,k,_a=a,_b=xmax: _b - _x(m,_a,k,0))  # xmax - x
-            if D >= 2:
-                funcs.append(lambda m,k,_a=a,_b=ymin: _x(m,_a,k,1) - _b)
-                funcs.append(lambda m,k,_a=a,_b=ymax: _b - _x(m,_a,k,1))
-            if have_z:
-                funcs.append(lambda m,k,_a=a,_b=zmin: _x(m,_a,k,2) - _b)
-                funcs.append(lambda m,k,_a=a,_b=zmax: _b - _x(m,_a,k,2))
-
-    # sphere
-    elif {"cx","cy","cz","r"} <= set(ar.keys()) or ar.get("type") == "sphere":
-        cx = float(ar.get("cx", 0.0))
-        cy = float(ar.get("cy", 0.0))
-        cz = float(ar.get("cz", 0.0))
-        R2 = float(ar.get("r", 1.0))**2
-
-        def _sphere_h(agent):
-            def h(m,k,_a=agent,_cx=cx,_cy=cy,_cz=cz,_R2=R2):
-                px = _x(m,_a,k,0) - _cx
-                py = _x(m,_a,k,1) - _cy if D >= 2 else 0.0
-                pz = _x(m,_a,k,2) - _cz if D == 3 else 0.0
-                return _R2 - (px*px + py*py + pz*pz)  # inside sphere
-            return h
-        for a in range(1, N+1):
-            funcs.append(_sphere_h(a))
-
-    # -------- min separation (all unordered pairs) --------
-    sep = cfg.get("sep_min", cfg.get("min_sep", None))
-    if sep is not None:
-        d2 = float(sep)**2
-        for a in range(1, N+1):
-            for b in range(a+1, N+1):
-                def h_sep(m,k,_a=a,_b=b,_d2=d2):
-                    s = 0
-                    for j in range(D):
-                        s += (_x(m,_a,k,j) - _x(m,_b,k,j))**2
-                    return s - _d2  # >= 0
-                funcs.append(h_sep)
-
-    # -------- speed cap (per player) --------
-    vmax = cfg.get("vmax", cfg.get("speed_max", None))
-    if vmax is not None:
-        vmax2 = float(vmax)**2
-        vel_idx = tuple(range(D, 2*D))  # assumes [pos(0:D-1), vel(D:2D-1), ...]
-        for a in range(1, N+1):
-            def _speed_h(agent):
-                def h(m,k,_a=agent,_v=vel_idx,_v2=vmax2):
-                    vsq = 0
-                    for j in _v:
-                        vsq += _x(m,_a,k,j)**2
-                    return _v2 - vsq  # >= 0
-                return h
-            funcs.append(_speed_h(a))
-
-    # -------- keep-out obstacles (circles/spheres) --------
-    sphere_key = "circles" if D == 2 else "spheres"
-    for obs in cfg.get(sphere_key, []):
-        oc = [float(obs.get(k, 0.0)) for k in (["cx","cy"] if D==2 else ["cx","cy","cz"])]
-        r2 = float(obs["r"])**2
-        for a in range(1, N+1):
-            def h_keepout(m,k,_a=a,_oc=tuple(oc),_r2=r2):
-                s = 0
-                for j in range(D):
-                    s += (_x(m,_a,k,j) - _oc[j])**2
-                return s - _r2  # >= 0 (outside obstacle)
-            funcs.append(h_keepout)
-
-    return funcs
-
-
 
 def _filter_kwargs(fn, kwargs):
     """Keep only kwargs that `fn` accepts."""
@@ -267,7 +169,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     RHC rollout with optional attitude-in-state (roll φ). Boresight at t=0 is v/‖v‖.
     PATH-only: uses a persistent MCP model with warm-starts each turn.
     """
-    N = int(cfg["N"])
+    N = 2
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx_tr, nu_tr = dims_from_D(D)
     T, dt  = int(cfg["T"]), float(cfg["dt"])
@@ -286,10 +188,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
     # --- optional attitude augmentation (roll in state) ---
     att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg.get("enabled", False))
-    #use_att = False
-    # # print(use_att)
-    # raise("Stopping to debug")
+    use_att = bool(att_cfg)
     if use_att:
         Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
         nx, nu = idx["nx"], idx["nu"]
@@ -298,11 +197,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         Ad_mx, Bd_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
         i_phi  = None
-
-    # print(Ad_mx)
-    # print(Bd_mx)
-
-    # raise("Stop here")
 
     # --- rollout length / turn length ---
     sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
@@ -348,7 +242,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     def _p3_vec(x_vec):
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, i_phi=None):
+    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, use_att=True, i_phi=None):
         if att_cfg is None: att_cfg = {}
         align    = att_cfg.get("align", "x")
         world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
@@ -368,57 +262,37 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
 
         phi = 0.0
-        if i_phi is not None and i_phi < len(x):  # i_phi is None when att is off
+        if use_att and i_phi is not None and i_phi < len(x):
             phi = float(x[i_phi])
             R   = apply_roll_about_axis(R, phi, align=align)
 
         return R, axisD, phi
 
-
-
     def plan_attitudes_from_X(X, prev_axisD, prev_R):
-        # When attitude is disabled, return a constant frame/phi over horizon
-        if not use_att:
-            return ([{"R": prev_R, "phi": 0.0} for _ in range(T)],
-                    prev_axisD, prev_R)
-
-        # Otherwise, compute as before
         att_list = []
         ax_prev  = prev_axisD
         R_prev   = prev_R
         for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev, att_cfg=att_cfg, i_phi=i_phi)
+            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev)
             att_list.append({"R": R, "phi": phi_t})
             R_prev = R
         return att_list, ax_prev, R_prev
 
-
-
-    # --- t=0 attitude seed (unchanged up to here) ---
+    # --- t=0 attitude seed ---
     align    = att_cfg.get("align", "x")
     world_up = att_cfg.get("up", [0,0,1])
     vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
-
     def _axis_from_vel_t0(x):
         v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
         aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        return aD, (aD if D==3 else np.array([aD[0], aD[1]], float).tolist() + [0.0])  # keep 3D row shape
-
+        return aD, (aD if D==3 else np.array([aD[0], aD[1], 0.0], float))
     prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
     prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
-
     phi1_0 = float(x1[i_phi]) if (use_att and i_phi is not None) else 0.0
     phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
-
-    # base frames from boresight; add roll only when att is on
-    R1_0 = world_to_body_R(axis1_0, 3, align=align, up=world_up)
-    R2_0 = world_to_body_R(axis2_0, 3, align=align, up=world_up)
-    if use_att:
-        R1_0 = apply_roll_about_axis(R1_0, phi1_0, align=align)
-        R2_0 = apply_roll_about_axis(R2_0, phi2_0, align=align)
-
+    R1_0   = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=align, up=world_up), phi1_0, align=align)
+    R2_0   = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=align, up=world_up), phi2_0, align=align)
     prev_R1, prev_R2 = R1_0, R2_0
-
 
     # === optional UKFs ===
     if do_est:
@@ -463,10 +337,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     # Wide var boxes; actual limits go in h(x) >= 0
     x_var_box = (-1e6, 1e6)
     u_var_box = (-1e3, 1e3)
-
-    h_list = build_h_builders(cfg, nx, D)
-
-
+    h_list    = build_h_builders(cfg, nx, D)
 
     m_path = build_mcp_two_player_one_shot(
         Ad=as_numpy_const(Ad_mx), Bd=as_numpy_const(Bd_mx),
@@ -477,14 +348,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         cost_kind=cfg.get("setting","chase_escape_tail"),
         cost_cfg=cfg,
     )
-
-    # _snapshot_path_model(
-    #     m_path,
-    #     tag=f"att={'on' if use_att else 'off'}",
-    #     T=T, nx=nx, nu=nu, D=D
-    # )
-
-    # raise("Stopping to debud")
 
     path_ctx = {
         "m": m_path,
@@ -536,9 +399,7 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
         # refresh IC params + seed x(0)
         for i in range(nx):
-            m.x01[i].set_value(float(x0_1[i]))
-            m.x02[i].set_value(float(x0_2[i]))
-
+            m.x01[i] = float(x0_1[i]); m.x02[i] = float(x0_2[i])
             m.x1[0, i].value = float(x0_1[i]); m.x2[0, i].value = float(x0_2[i])
 
         # warm-start controls (|Ku| = T)
@@ -605,14 +466,10 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         theta_curr = np.r_[x1, x2]
 
         # 2) attitude from updated states
-        if not use_att:
-            # keep the body frames and φ fixed
-            R1, axis1D, phi1_now = prev_R1, prev_axis1D, 0.0
-            R2, axis2D, phi2_now = prev_R2, prev_axis2D, 0.0
-        else:
-            R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D, att_cfg=att_cfg, i_phi=i_phi)
-            R2, axis2D, phi2_now = attitude_from_state(x1, prev_R=prev_R2, prev_axisD=prev_axis2D, att_cfg=att_cfg, i_phi=i_phi)
-
+        R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D,
+                                                   att_cfg=att_cfg, use_att=use_att, i_phi=i_phi)
+        R2, axis2D, phi2_now = attitude_from_state(x2, prev_R=prev_R2, prev_axisD=prev_axis2D,
+                                                   att_cfg=att_cfg, use_att=use_att, i_phi=i_phi)
         prev_axis1D, prev_axis2D = axis1D, axis2D
         prev_R1, prev_R2 = R1, R2
 
@@ -694,539 +551,6 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         ret.update(est_hist)
     return ret
 
-
-# -------------------- RHC with execution & FOV (3D/2D-aware) - N player case--------------------
-
-def run_rhc_and_collect_frames_3d_N(cfg: dict, steps: int | None = None,
-                                    turn_len: int | None = None):
-    """
-    N-player RHC rollout with optional attitude-in-state (roll φ), FOV, and pairwise UKFs.
-
-    Returns (N-aware only):
-      {
-        "plan_hist_all":  list[N][steps] -> list of horizon 3D points,
-        "plan_att_all":   list[N][steps] -> list of dicts {"R":(3x3), "phi":float} over horizon,
-        "exec_xyz_all":   list[N] of executed 3D points,
-        "exec_att_all":   list[N] of executed {"R","phi"},
-        "phi_hist_all":   list[N] of executed roll values,
-        "fov_axis_hist":  list[steps+1] boresight axis for FOV agent,
-        "fov_seen_mask":  list[steps+1] bool,
-        # if est enabled:
-        "est": {
-          "pairs_0based": [(i,j), ...],
-          "est{i}{j}_xyz": [...],
-          "meas{i}{j}_azel": [...]
-        }
-      }
-    """
-    # -------- basics --------
-    N  = int(cfg["N"])
-    D  = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
-    nx_tr, nu_tr = dims_from_D(D)
-    T, dt = int(cfg["T"]), float(cfg["dt"])
-
-    est_cfg = dict(cfg.get('est', {}))
-    do_est  = bool(est_cfg.get('enabled', False))
-
-    dyn = (cfg.get("dynamics") or "double").lower()
-    if dyn == "hcw":
-        n = hcw_mean_motion(cfg.get("hcw", {}))
-        Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)
-    else:
-        Ad_tr, Bd_tr = step_double_integrator_D(D=D, dt=dt)
-
-    att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg.get("enabled", False))
-    if use_att:
-        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
-        nx, nu = idx["nx"], idx["nu"]
-        i_phi  = idx["i_phi"]
-    else:
-        Ad_mx, Bd_mx = Ad_tr, Bd_tr
-        nx, nu = nx_tr, nu_tr
-        i_phi  = None
-
-    sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
-    if steps is None:
-        steps = max(1, int(np.ceil(float(sim_time)/dt))) if sim_time is not None else int(cfg.get("steps", 60))
-    if turn_len is None:
-        turn_len = int(cfg.get("turn_len", 3)) if "turn_seconds" not in cfg else \
-                   max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
-
-    # bounds (for h-builders); note: var boxes in MCP remain wide
-    x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
-    if use_att:
-        x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-
-    # -------- initial states --------
-    X0_list = []
-    for a in range(N):
-        x0a = np.asarray(cfg["x0"][a], float)
-        x0a = pad_x0_with_att(x0a, att_cfg, D)[:nx] if use_att else x0a[:nx]
-        X0_list.append(x0a.copy())
-    theta_curr = np.concatenate(X0_list, axis=0)
-
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-    def step_plant(x, u): return Ad_np @ np.asarray(x, float) + Bd_np @ np.asarray(u, float)
-
-    # -------- logs (N-aware only) --------
-    plan_hist_all: list[list[list[tuple]]] = [[] for _ in range(N)]
-    plan_att_all:  list[list[list[dict]]]  = [[] for _ in range(N)]
-    exec_xyz_all:  list[list[tuple]]       = [[] for _ in range(N)]
-    exec_att_all:  list[list[dict]]        = [[] for _ in range(N)]
-    phi_hist_all:  list[list[float]]       = [[] for _ in range(N)]
-    fov_axis_hist, fov_seen_mask = [], []
-
-    # -------- FOV config --------
-    fov_cfg     = cfg.get("fov", {"enabled": False})
-    fov_enabled = bool(fov_cfg.get("enabled", False))
-    fov_agent   = max(1, min(N, int(fov_cfg.get("agent", 2)))) - 1
-    fov_target0 = fov_cfg.get("target", None)
-    if fov_target0 is None or int(fov_target0) < 1 or int(fov_target0) > N or (int(fov_target0)-1) == fov_agent:
-        fov_target0 = next((j+1 for j in range(N) if j != fov_agent), 1)
-    fov_target = int(fov_target0) - 1
-
-    # -------- helpers --------
-    def _p3_row(x_row):
-        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D==3 else (float(x_row[0]), float(x_row[1]), 0.0)
-    def _p3_vec(x_vec):
-        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D==3 else (float(x_vec[0]), float(x_vec[1]), 0.0)
-
-    def attitude_from_state(x, prev_R=None, prev_axisD=None, att_cfg=None, i_phi=None):
-        if att_cfg is None: att_cfg = {}
-        align    = att_cfg.get("align", "x")
-        world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
-        vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
-
-        DD = 3 if len(x) >= 6 else 2
-        v  = np.asarray(x[DD:2*DD], float)
-        n  = np.linalg.norm(v)
-        if n > vmin: axisD = v / n
-        elif prev_axisD is not None: axisD = np.asarray(prev_axisD, float)
-        else: axisD = np.array([1, 0, 0]) if att_cfg.get("align","x") == "x" else np.array([0, 0, 1])
-
-        axis3 = axisD if DD == 3 else np.array([axisD[0], axisD[1], 0.0], float)
-        R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=att_cfg.get("align","x"), world_up=world_up)
-
-        phi = 0.0
-        if i_phi is not None and i_phi < len(x):
-            phi = float(x[i_phi])
-            R   = apply_roll_about_axis(R, phi, align=att_cfg.get("align","x"))
-        return R, axisD, phi
-
-    def plan_attitudes_from_X(X, prev_axisD, prev_R):
-        if not use_att:
-            return ([{"R": prev_R, "phi": 0.0} for _ in range(T)], prev_axisD, prev_R)
-        att_list, ax_prev, R_prev = [], prev_axisD, prev_R
-        for t in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X[t], prev_R=R_prev, prev_axisD=ax_prev, att_cfg=att_cfg, i_phi=i_phi)
-            att_list.append({"R": R, "phi": phi_t}); R_prev = R
-        return att_list, ax_prev, R_prev
-
-    align    = att_cfg.get("align", "x")
-    world_up = att_cfg.get("up", [0,0,1])
-    vmin0    = float(att_cfg.get("min_speed_for_axis", 1e-3))
-
-    def _axis_from_vel_t0(x):
-        v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
-        aD = (v/n) if n > vmin0 else (np.array([1,0,0], float) if align=="x" else np.array([0,0,1], float))[:D]
-        a3 = aD if D==3 else np.array([aD[0], aD[1], 0.0], float)
-        return aD, a3
-
-    prev_axisD, prev_R = [], []
-    X = [x.copy() for x in X0_list]
-    for a in range(N):
-        aD, a3 = _axis_from_vel_t0(X[a])
-        prev_axisD.append(aD)
-        R0 = world_to_body_R(a3, 3, align=align, up=world_up)
-        if use_att:
-            phi0 = float(X[a][i_phi]) if i_phi is not None else 0.0
-            R0   = apply_roll_about_axis(R0, phi0, align=align)
-        prev_R.append(R0)
-        exec_xyz_all[a].append(_p3_vec(X[a]))
-        exec_att_all[a].append({"R": R0, "phi": (float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)})
-        phi_hist_all[a].append(float(X[a][i_phi]) if (use_att and i_phi is not None) else 0.0)
-
-    # Initial FOV stamp
-    if fov_enabled:
-        R_def0 = prev_R[fov_agent]; x_def = X[fov_agent]; x_tgt = X[fov_target]
-        a_def3 = R_def0[0] if align == "x" else R_def0[2]
-        fov_axis_hist.append(a_def3)
-        cam_cfg = cfg.get("camera", None)
-        if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-            _, _, _, ok0 = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def0)
-            fov_seen_mask.append(bool(ok0))
-        else:
-            seen0, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
-            fov_seen_mask.append(bool(seen0))
-    else:
-        fov_axis_hist.append(None); fov_seen_mask.append(False)
-
-    # -------- PATH model (N-player) --------
-    x_var_box = (-1e6, 1e6)
-    u_var_box = (-1e3, 1e3)
-    h_list    = build_h_builders_N(cfg, nx, D, N)
-
-    cfg.update({
-        "setting": "reach_boundary_3p",   # or "reach_boundary"
-        "Q_radial":   1.0,
-        "Q_radial_T": 20.0,
-        "R_u":        1e-3,
-        "arena": {"type":"sphere", "cx":0.0, "cy":0.0, "cz":0.0, "r": 20.0},
-    })
-
-    m = build_mcp_N_player_one_shot(
-        Ad=Ad_np, Bd=Bd_np,
-        T=T, nx=nx, nu=nu, D=D,
-        x0_list=X0_list, N=N,
-        x_var_box=x_var_box, u_var_box=u_var_box,
-        h_builders=h_list,
-        cost_kind=cfg.get("setting","chase_escape_tail"),
-        cost_cfg=cfg,
-    )
-
-    # m = build_mcp_three_player_one_shot(
-    # Ad=Ad_np, Bd=Bd_np, T=T, nx=nx, nu=nu,
-    # x0_1=X0_list[0], x0_2=X0_list[1], x0_3=X0_list[2],
-    # D=D,
-    # h_builders=h_list,               # or []
-    # cost_kind="goals",
-    # cost_cfg=cfg,
-    # )
-
-    path_ctx = {"m": m, "A": Ad_np, "B": Bd_np, "U_guess": [None]*N, "X_guess": [None]*N}
-
-    # ---- helpers: warm-start & explicit alias I/O ----
-    def _shift_controls_one_step(U_prev, target_len, fill=0.0):
-        U_prev = np.asarray(U_prev, float)
-        old_len, _ = U_prev.shape if U_prev.ndim == 2 else (0, nu)
-        U_new = np.full((target_len, nu), float(fill))
-        if old_len >= 2:
-            take = min(target_len-1, old_len-1)
-            if take > 0: U_new[:take, :] = U_prev[1:1+take, :]
-        return U_new
-
-    def _forward_sim_x(A, B, x0, U):
-        A = np.asarray(A, float); B = np.asarray(B, float)
-        Tm1, _ = U.shape
-        Xsim = np.zeros((Tm1+1, A.shape[0]), float)
-        Xsim[0,:] = np.asarray(x0, float)
-        for k in range(Tm1): Xsim[k+1,:] = A @ Xsim[k,:] + B @ U[k,:]
-        return Xsim
-
-    def _refresh_initial_conditions_N(mdl, x0_blocks):
-        for p in range(1, N+1):
-            x0p = np.asarray(x0_blocks[p-1], float)
-            x0_param = getattr(mdl, f"x0{p}")
-            x_var    = getattr(mdl, f"x{p}")
-            for i in range(nx):
-                x0_param[i].set_value(float(x0p[i]))
-                x_var[0, i].value = float(x0p[i])
-
-    def _seed_model_from_guess_N(mdl, Xg_list, Ug_list):
-        for p in range(1, N+1):
-            x_var = getattr(mdl, f"x{p}")
-            u_var = getattr(mdl, f"u{p}")
-            Xg, Ug = np.asarray(Xg_list[p-1], float), np.asarray(Ug_list[p-1], float)
-            for k in range(T+1):
-                for i in range(nx): x_var[k, i].value = float(Xg[k, i])
-            for k in range(T):
-                for j in range(nu): u_var[k, j].value = float(Ug[k, j])
-
-    def _extract_trajectories_N(mdl):
-        from pyomo.environ import value as pyo_value
-        X_list, U_list = [], []
-        for p in range(1, N+1):
-            x_var = getattr(mdl, f"x{p}")
-            u_var = getattr(mdl, f"u{p}")
-            Xp = np.zeros((T+1, nx), float)
-            Up = np.zeros((T,   nu), float)
-            for k in range(T+1):
-                for i in range(nx):
-                    Xp[k, i] = float(pyo_value(x_var[k, i]))
-            for k in range(T):
-                for j in range(nu):
-                    Up[k, j] = float(pyo_value(u_var[k, j]))
-            X_list.append(Xp); U_list.append(Up)
-        return X_list, U_list
-
-    # ---- single-shot replan (N-player) ----
-    def replan_path(theta_vec, prev_axesD, prev_Rs):
-        x0_blocks = [theta_vec[p*nx:(p+1)*nx] for p in range(N)]
-        _refresh_initial_conditions_N(m, x0_blocks)
-
-        Ku_len = len(list(m.Ku))  # == T
-        Ug_list = []
-        for p in range(N):
-            Ug_prev = path_ctx["U_guess"][p]
-            Ug_list.append(np.zeros((Ku_len, nu)) if Ug_prev is None
-                           else _shift_controls_one_step(Ug_prev, target_len=Ku_len))
-
-        Xg_list = [_forward_sim_x(Ad_np, Bd_np, x0_blocks[p], Ug_list[p]) for p in range(N)]
-        _seed_model_from_guess_N(m, Xg_list, Ug_list)
-
-        solve_with_local_path(
-            m, path_exe=cfg.get("pathampl",
-               "/Users/gussantaella/Documents/UTAustin/Research/Code/Research_Repo/path_5/ampl/pathampl"),
-            tee=True,
-        )
-
-        X_list, U_list = _extract_trajectories_N(m)
-        for p in range(N):
-            path_ctx["X_guess"][p] = X_list[p]
-            path_ctx["U_guess"][p] = U_list[p]
-
-        plans, atts, next_axes, next_Rs = [], [], [], []
-        for p in range(N):
-            plans.append([_p3_row(X_list[p][t, :]) for t in range(T)])
-            att_p, ax_out, R_out = plan_attitudes_from_X(X_list[p], prev_axesD[p], prev_Rs[p])
-            atts.append(att_p); next_axes.append(ax_out); next_Rs.append(R_out)
-
-        return np.zeros(1), plans, U_list, atts, next_axes, next_Rs
-
-    # ---- first plan ----
-    _, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
-    step_in_turn = 0
-    latest_plans, latest_atts = plans[:], atts[:]
-    for a in range(N):
-        plan_hist_all[a].append(latest_plans[a])
-        plan_att_all[a].append(latest_atts[a])
-
-    # -------- UKFs (N) using shared helpers --------
-    ukf_pairs, ukf_dict, est_hist = [], {}, {}
-    every = 1
-    if do_est:
-        ukf_pairs, ukf_dict, est_hist, noise = build_kf_registry_N(
-            X_init_list=X, dt=dt, est_cfg=est_cfg, D=D
-        )
-        _, _, every, _ = noise  # cadence
-
-    # -------- rollout --------
-    for k in range(steps):
-        # replan each turn
-        if k % turn_len == 0 and k > 0:
-            _, plans, U_list, atts, prev_axisD, prev_R = replan_path(theta_curr, prev_axisD, prev_R)
-            step_in_turn = 0
-            latest_plans, latest_atts = plans[:], atts[:]
-
-        # log current plan
-        for a in range(N):
-            plan_hist_all[a].append(latest_plans[a])
-            plan_att_all[a].append(latest_atts[a])
-
-        # controls for this step (choose current row from U)
-        u_step = []
-        for a in range(N):
-            U_a = U_list[a]
-            u_step.append(U_a[min(step_in_turn, len(U_a)-1)])
-        step_in_turn += 1
-
-        # 1) plant step
-        for a in range(N):
-            X[a] = step_plant(X[a], u_step[a])
-        theta_curr = np.concatenate(X, axis=0)
-
-        # 2) attitude from updated states
-        for a in range(N):
-            if not use_att:
-                R_now, axis_now, phi_now = prev_R[a], prev_axisD[a], 0.0
-            else:
-                R_now, axis_now, phi_now = attitude_from_state(
-                    X[a], prev_R=prev_R[a], prev_axisD=prev_axisD[a], att_cfg=att_cfg, i_phi=i_phi
-                )
-            prev_R[a], prev_axisD[a] = R_now, axis_now
-            phi_hist_all[a].append(phi_now)
-            exec_att_all[a].append({"R": R_now, "phi": phi_now})
-            exec_xyz_all[a].append(_p3_vec(X[a]))
-
-        # 3) UKF step (predict + optional bearing update)
-
-        if do_est and ukf_pairs:
-            take = ((k+1) % every) == 0
-            kf_predict_update_step_N(
-                ukf_pairs=ukf_pairs,
-                ukf_dict=ukf_dict,
-                est_hist=est_hist,
-                X_state_list=X,         # truth after plant step
-                u_step_list=u_step,     # for target accel prior
-                R_list=prev_R,          # observers' frames
-                noise=noise,
-                D=D,
-                take_measurement=take
-            )
-
-        # 4) FOV (selected agent)
-        if fov_enabled:
-            R_def = prev_R[fov_agent]; x_def = X[fov_agent]; x_tgt = X[fov_target]
-            a_def3 = R_def[0] if align == 'x' else R_def[2]
-            fov_axis_hist.append(a_def3)
-            cam_cfg = cfg.get("camera", None)
-            if fov_cfg.get("type","cone") == "pinhole" and (cam_cfg is not None):
-                _, _, _, ok = project_point_pinhole(X_w=x_tgt[:3], x_def=x_def, cam_cfg=cam_cfg, R_wb=R_def)
-                fov_seen_mask.append(bool(ok))
-            else:
-                seen, _ = in_fov(x_tgt[:D], x_def[:D], a_def3, fov_cfg, D)
-                fov_seen_mask.append(bool(seen))
-        else:
-            fov_axis_hist.append(None); fov_seen_mask.append(False)
-
-    # -------- return (N-only) --------
-    ret = {
-        "plan_hist_all": plan_hist_all,
-        "plan_att_all":  plan_att_all,
-        "exec_xyz_all":  exec_xyz_all,
-        "exec_att_all":  exec_att_all,
-        "phi_hist_all":  phi_hist_all,
-        "fov_axis_hist": fov_axis_hist,
-        "fov_seen_mask": fov_seen_mask,
-    }
-    if do_est and ukf_pairs:
-        ret["est"] = {"pairs_0based": ukf_pairs, **est_hist}
-    return ret
-
-
-
-def build_kf_registry_N(
-    X_init_list,
-    dt: float,
-    est_cfg: dict,
-    D: int = 3,
-):
-    """
-    Build N-pair bearing-only constant-velocity KFs.
-
-    Returns:
-      ukf_pairs : list[(i,j)] 0-based observer->target pairs
-      ukf_dict  : {(i,j): KF_CV(...)}
-      est_hist  : dict with keys 'est{i}{j}_xyz', 'meas{i}{j}_azel'
-                  Each starts with KF prior @ t=0 and meas=None
-      noise     : tuple (s_az, s_el, every, Rm)
-    """
-    # --- parse noise/cadence ---
-    s_az, s_el = np.deg2rad(est_cfg.get('meas_std_deg', (0.3, 0.3)))
-    P0 = np.diag(est_cfg.get('P0_diag', [25,25,25, 1,1,1]))
-    Q  = np.diag(est_cfg.get('Q_diag',  [1e-4,1e-4,1e-4, 1e-3,1e-3,1e-3]))
-    Rm = np.diag([s_az**2, s_el**2])
-    every = int(est_cfg.get('every', 1))
-    who   = est_cfg.get('who', 'all')
-
-    N = len(X_init_list)
-
-    # --- who parsing helpers ---
-    def _all_pairs(N_): return [(i, j) for i in range(N_) for j in range(N_) if i != j]
-
-    def _parse_pair_token(tok: str):
-        s = str(tok).strip()
-        for sep in ("->", ",", " "):
-            if sep in s:
-                a, b = s.split(sep, 1)
-                return int(a), int(b)
-        return None
-
-    def _normalize_pairs(who_cfg, N_):
-        if isinstance(who_cfg, str):
-            w = who_cfg.strip().lower()
-            if w in ("all", "true"):   return _all_pairs(N_)
-            if w in ("none", "false"): return []
-            if w == "both" and N_ >= 2: return [(0,1), (1,0)]
-            pr = _parse_pair_token(who_cfg)
-            if pr:
-                i, j = pr
-                return ([(i-1, j-1)] if (1 <= i <= N_ and 1 <= j <= N_ and i != j) else [])
-            return []
-        if who_cfg is True:
-            return _all_pairs(N_)
-        if not who_cfg:
-            return []
-        pairs = []
-        for item in who_cfg:
-            if isinstance(item, (list, tuple)) and len(item) == 2:
-                i, j = int(item[0]), int(item[1])
-            elif isinstance(item, str):
-                pr = _parse_pair_token(item)
-                if not pr:
-                    continue
-                i, j = pr
-            else:
-                continue
-            i -= 1; j -= 1
-            if 0 <= i < N_ and 0 <= j < N_ and i != j:
-                pairs.append((i, j))
-        return pairs
-
-    ukf_pairs = _normalize_pairs(who, N)
-
-    # --- build filters & seed histories ---
-    ukf_dict = {}
-    est_hist = {}
-    for (i, j) in ukf_pairs:
-        x0j = np.asarray(X_init_list[j], float)
-        p0  = (x0j[:3] if D == 3 else np.array([x0j[0], x0j[1], 0.0], float))
-        kf  = KF_CV(np.r_[p0, np.zeros(3)], P0.copy(), Q.copy(), Rm.copy(), dt)
-        ukf_dict[(i, j)] = kf
-
-        key_est  = f'est{i+1}{j+1}_xyz'
-        key_meas = f'meas{i+1}{j+1}_azel'
-        est_hist[key_est]  = [kf.x[:3].copy()]
-        est_hist[key_meas] = [None]
-
-    return ukf_pairs, ukf_dict, est_hist, (s_az, s_el, every, Rm)
-
-
-def kf_predict_update_step_N(
-    ukf_pairs,
-    ukf_dict,
-    est_hist: dict,
-    X_state_list,         # list of true states x (contains at least pos[:3])
-    u_step_list,          # list of inputs u (we'll take first 3 as translational accel prior)
-    R_list,               # list of observers' rotation matrices R_wb (world->body)
-    noise,                # (s_az, s_el, every, Rm) - cadence handled by caller
-    D: int = 3,
-    take_measurement: bool = True,
-):
-    """
-    Single time-step for all KFs:
-      - Predict with target translational input (first 3 entries if present)
-      - If take_measurement: generate bearing (az, el) in observer body and update.
-      - Append to est_hist: new meas (or None) and current state mean position.
-    """
-    s_az, s_el, _, _ = noise
-
-    def _pos3(x):
-        x = np.asarray(x, float).ravel()
-        return x[:3] if x.size >= 3 else np.array([x[0], x[1], 0.0], float)
-
-    def _u_tr3(u):
-        u = np.asarray(u, float).ravel()
-        return (u[:3] if u.size >= 3 else np.zeros(3))
-
-    for (i, j) in ukf_pairs:
-        kf = ukf_dict[(i, j)]
-        # --- predict with target j's translational input (as process accel prior) ---
-        u_j_tr = _u_tr3(u_step_list[j]) if j < len(u_step_list) else np.zeros(3)
-        kf.predict(kf.dt, u=u_j_tr, u_cov=None)
-
-        key_est  = f'est{i+1}{j+1}_xyz'
-        key_meas = f'meas{i+1}{j+1}_azel'
-
-        if take_measurement:
-            p_obs = _pos3(X_state_list[i])
-            p_tgt = _pos3(X_state_list[j])
-            d = p_tgt - p_obs
-            n = np.linalg.norm(d) + 1e-12
-            d /= n
-            # world -> body: b_b = R_wb @ d
-            R_wb = np.asarray(R_list[i], float)
-            b_b = R_wb @ d
-            az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*s_az
-            el = np.arctan2(b_b[2], np.sqrt(max(b_b[0]**2 + b_b[1]**2, 1e-18))) + np.random.randn()*s_el
-
-            kf.update(np.array([az, el]), p_obs=p_obs, R_wb=R_wb)
-            est_hist[key_meas].append((p_obs.copy(), np.array([az, el])))
-        else:
-            est_hist[key_meas].append(None)
-
-        est_hist[key_est].append(kf.x[:3].copy())
 
 
 # -------------------- FOV artists & cones --------------------

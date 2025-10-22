@@ -2,8 +2,6 @@
 from __future__ import annotations
 from typing import Tuple, Callable, Dict, Any
 from pyomo.environ import sqrt
-from pyomo.environ import log, exp, sqrt
-
 
 # ---- shared small helpers (Pyomo-friendly) ----
 def _vec(model_array, k, idxs):
@@ -339,7 +337,7 @@ def build_game_costs(
         # numerics
         eps   = 1e-9
         alpha = float(cfg.get("soft_norm_alpha", 0.05))  # softnorm floor
-        d_min = float(cfg.get("d_min", 0.8))             # must match separation constraint
+        d_min = float(cfg.get("d_min", 0.8))             # must match your separation constraint
 
         def _pospart(t):
             return 0.5*(t + sqrt(t*t + eps))  # smooth hinge
@@ -446,147 +444,3 @@ def build_game_costs(
             return q*sum(m.x2[T, i]**2 for i in m.S)
 
         return l1_k, l2_k, l1_T, l2_T
-    
-
-def build_game_costs_N(
-    kind: str,
-    cfg: Dict[str, Any],
-    D: int,
-    T: int,
-    N: int,
-) -> Tuple[List[Callable], List[Callable]]:
-    """
-    Returns:
-      l_k: list (len N) of callables l_k[p-1](m,k)   for k=0..T-1
-      l_T: list (len N) of callables l_T[p-1](m)     terminal at k=T
-
-    IMPORTANT: This version assumes explicit per-player components on the model:
-      m.x1[k,i], m.x2[k,i], ..., m.xN[k,i]
-      m.u1[k,j], m.u2[k,j], ..., m.uN[k,j]
-    """
-
-    kname = (kind or "generic_n").lower()
-    cfg = cfg or {}
-
-    # ----- helpers that respect explicit per-player components -----
-    def _Xp(m, p): return getattr(m, f"x{p}")
-    def _Up(m, p): return getattr(m, f"u{p}")
-
-    def _pos(m, p, k): return [_Xp(m,p)[k, i] for i in range(D)]
-    def _vel(m, p, k): return [_Xp(m,p)[k, i] for i in range(D, 2*D)]
-    def _u(m, p, k):   return [_Up(m,p)[k, j] for j in m.U]
-
-    def _sq(v):        return sum(vi*vi for vi in v)
-    def _norm(v):      return sqrt(_sq(v) + 1e-9)
-    def _dot(a, b):    return sum(a[i]*b[i] for i in range(len(a)))
-
-
-    # ---------------------- chase_escape_tail (exact 2p behavior only) ----------------------
-    if kname in ("chase_escape_tail", "chase_escape_tail_n") and N == 2:
-        # Same knobs as legacy 2p
-        c_eff1  = float(cfg.get("effort_w1",   0.01))
-        c_eff2  = float(cfg.get("effort_w2",   0.01))
-        c_wfar  = float(cfg.get("w_far",       1.0))
-        c_wterm = float(cfg.get("w_term",      1.0))
-        c_ddes  = float(cfg.get("follow_gap",  0.6))
-        c_wlong = float(cfg.get("w_tail_long", 1.0))
-        c_wlat  = float(cfg.get("w_tail_lat",  8.0))
-        c_vref  = float(cfg.get("tail_v_ref",  0.2))
-        eps_R   = float(cfg.get("path_eps_R",  1e-3))
-
-        def _sumsq(a):  return sum(ai*ai for ai in a)
-
-        # follower wants to sit at (s=-d_des, r_perp=0) behind leader
-        def _tail_cost(pL, pF, vL):
-            speed = _norm(vL)
-            vhat = [vi / (speed + 1e-9) for vi in vL]
-            r    = [pF[i] - pL[i] for i in range(D)]
-            s    = _dot(r, vhat)
-            rperp = [r[i] - s*vhat[i] for i in range(D)]
-            tail  = c_wlong*(s + c_ddes)**2 + c_wlat*_sumsq(rperp)
-            blend = (speed*speed) / (speed*speed + c_vref*c_vref)
-            return blend*tail + (1.0 - blend)*_sumsq(r)
-
-        # Player 1 = follower, Player 2 = leader
-        def _l1_k(m, k):
-            p2 = _pos(m, 2, k)
-            v2 = _vel(m, 2, k)
-            p1 = _pos(m, 1, k)
-            u1 = _u(m, 1, k)
-            return _tail_cost(p2, p1, v2) + (c_eff1 + eps_R)*_sq(u1)
-
-        def _l2_k(m, k):
-            p1 = _pos(m, 1, k)
-            p2 = _pos(m, 2, k)
-            u2 = _u(m, 2, k)
-            r  = [p2[i] - p1[i] for i in range(D)]
-            return -c_wfar*_sq(r) + (c_eff2 + eps_R)*_sq(u2)
-
-        def _l1_T(m):
-            p2 = [_Xp(m,2)[T, i] for i in range(D)]
-            v2 = [_Xp(m,2)[T, i] for i in range(D, 2*D)]
-            p1 = [_Xp(m,1)[T, i] for i in range(D)]
-            return c_wterm * _tail_cost(p2, p1, v2)
-
-        def _l2_T(m):
-            p1 = [_Xp(m,1)[T, i] for i in range(D)]
-            p2 = [_Xp(m,2)[T, i] for i in range(D)]
-            r  = [p2[i] - p1[i] for i in range(D)]
-            return -c_wterm * _sq(r)
-
-        return [_l1_k, _l2_k], [_l1_T, _l2_T]
-    
-            # ---------------------- reach_boundary (3p-friendly, works for any N) ----------------------
-    if kname in ("reach_boundary_3p", "reach_boundary", "to_boundary", "boundary") and N == 3:
-        # We expect an arena spec like:
-        #   cfg["arena"] = {"type": "sphere" or "circle", "cx":..., "cy":..., "cz":..., "r": ...}
-        # Fallbacks: cfg["center"] (list len D), cfg["R_boundary"] or cfg["R"]
-        arena = dict(cfg.get("arena", {}))
-        if arena:
-            cx = float(arena.get("cx", 0.0))
-            cy = float(arena.get("cy", 0.0))
-            cz = float(arena.get("cz", 0.0)) if D >= 3 else 0.0
-            Rb = float(arena.get("r", 1.0))
-            c  = [cx, cy] if D == 2 else [cx, cy, cz]
-        else:
-            c  = [float(x) for x in cfg.get("center", [0.0]*D)]
-            Rb = float(cfg.get("R_boundary", cfg.get("R", 1.0)))
-
-        # Weights
-        q   = float(cfg.get("Q_radial", 1.0))    # stage weight on radius error
-        qT  = float(cfg.get("Q_radial_T", 10.0)) # terminal weight on radius error
-        rU  = float(cfg.get("R_u", 1e-3))        # effort weight
-        eps = 1e-9
-
-        def _Xp(m, p): return getattr(m, f"x{p}")
-        def _Up(m, p): return getattr(m, f"u{p}")
-        def _pos(m, p, k): return [_Xp(m,p)[k, i] for i in range(D)]
-        def _u(m, p, k):   return [_Up(m,p)[k, j] for j in m.U]
-        def _sq(v):        return sum(vi*vi for vi in v)
-        def _norm(v):      return sqrt(_sq(v) + eps)
-
-        def _rad_err_at(m, p, k):
-            pvec = _pos(m, p, k)
-            d    = _norm([pvec[i] - c[i] for i in range(D)])
-            return Rb - d  # zero when exactly on boundary
-
-        # Per-player stage/terminal costs
-        l_k = []
-        l_T = []
-        for p in range(1, N+1):
-            def _lk(m, k, p=p):
-                e = _rad_err_at(m, p, k)
-                return q*(e*e) + rU*_sq(_u(m, p, k))
-            def _lT(m, p=p):
-                pT = [_Xp(m,p)[T, i] for i in range(D)]
-                dT = _norm([pT[i] - c[i] for i in range(D)])
-                eT = Rb - dT
-                return qT*(eT*eT)
-            l_k.append(_lk)
-            l_T.append(_lT)
-
-        return l_k, l_T
-
-
-    # fallback
-    return build_game_costs_N("generic_n", cfg, D, T, N)
