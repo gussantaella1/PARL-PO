@@ -25,6 +25,70 @@ __all__ = [
     "animate_rollout_3d", "interactive_rollout_3d",
 ]
 
+
+def _normalize_oi_list(oi_cfg):
+    """Return a list of enabled OI dicts (accepts dict or list of dicts)."""
+    if not oi_cfg:
+        return []
+    if isinstance(oi_cfg, (list, tuple)):
+        return [d for d in oi_cfg if d and bool(d.get("enabled", True))]
+    return [oi_cfg] if bool(oi_cfg.get("enabled", True)) else []
+
+def draw_object_of_interest(ax, oi, D=3, res=24):
+    """
+    Draw a sphere (3D) or a circle (2D embedded in z=0) to visualize the object-of-interest.
+    oi keys: {cx,cy[,cz], r, color?, alpha?, edgecolor?}
+    Returns a list of Matplotlib artists (so caller can hold references if needed).
+    """
+    import numpy as np
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    cx = float(oi.get("cx", 0.0))
+    cy = float(oi.get("cy", 0.0))
+    cz = float(oi.get("cz", 0.0)) if D == 3 else float(oi.get("cz", 0.0) if "cz" in oi else 0.0)
+    r  = float(oi.get("r", 1.0))
+
+    color     = oi.get("color", "k")
+    alpha     = float(oi.get("alpha", 0.15))
+    edgecolor = oi.get("edgecolor", "k")
+
+    arts = []
+
+    if D == 3:
+        # sphere surface as a low-res mesh (lightweight)
+        u = np.linspace(0, 2*np.pi, res)
+        v = np.linspace(0, np.pi,    res//2 + 1)
+        uu, vv = np.meshgrid(u, v)
+        X = cx + r * np.cos(uu) * np.sin(vv)
+        Y = cy + r * np.sin(uu) * np.sin(vv)
+        Z = cz + r * np.cos(vv)
+
+        surf = ax.plot_surface(X, Y, Z, linewidth=0, antialiased=False,
+                               color=color, alpha=alpha, shade=True)
+        # equator ring for clarity
+        th = np.linspace(0, 2*np.pi, max(32, res))
+        xe = cx + r*np.cos(th); ye = cy + r*np.sin(th); ze = cz + 0*th
+        (rim,) = ax.plot(xe, ye, ze, color=edgecolor, lw=1.0, alpha=min(1.0, 0.8))
+        arts += [surf, rim]
+    else:
+        # 2D case: draw a circle in the z=cz plane
+        th = np.linspace(0, 2*np.pi, max(64, 2*res))
+        x = cx + r*np.cos(th); y = cy + r*np.sin(th); z = cz + 0*th
+        (ln,) = ax.plot(x, y, z, color=edgecolor, lw=1.5)
+        # very light filled disk as many triangles (optional and cheap)
+        verts = [[(cx, cy, cz), (x[i], y[i], z[i]), (x[(i+1)%len(x)], y[(i+1)%len(y)], z[(i+1)%len(z)])]
+                 for i in range(len(x))]
+        coll = Poly3DCollection(verts, facecolors=color, edgecolors='none', alpha=alpha)
+        ax.add_collection3d(coll)
+        arts += [coll, ln]
+
+    # keep it out of the legend
+    for a in arts:
+        try: a.set_label("_nolegend_")
+        except Exception: pass
+    return arts
+
+
 # --- artists & legends ---
 def make_body_axes_artists_3d(ax, colors=('tab:red','tab:green','tab:blue'), lw=2, alpha=0.9):
     plt, _, _ = _mpl3d()
@@ -313,6 +377,13 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     elif ar.get("type") == "sphere":
         cx, cy, cz, R = ar["cx"], ar["cy"], ar["cz"], ar["r"]
         ax.set_xlim(cx-R, cx+R); ax.set_ylim(cy-R, cy+R); ax.set_zlim(cz-R, cz+R)
+
+    # --- draw object(s) of interest, if any ---
+    D = int(cfg.get("D", 3))
+    oi_list = _normalize_oi_list(cfg.get("oi"))
+    oi_artists = []
+    for oi in oi_list:
+        oi_artists += draw_object_of_interest(ax, oi, D=D)
 
     # ---- artists ----
     plan1_ln = plan2_ln = exe1_ln = exe2_ln = dot1 = dot2 = None
@@ -605,6 +676,14 @@ def interactive_rollout_3d(
             span = np.maximum(mx - mn, 1e-3); pad = 0.1 * span
             lo = mn - pad; hi = mx + pad
             ax.set_xlim(lo[0], hi[0]); ax.set_ylim(lo[1], hi[1]); ax.set_zlim(lo[2], hi[2])
+
+    # --- draw object(s) of interest, if any ---
+    D = int(cfg.get("D", 3))
+    oi_list = _normalize_oi_list(cfg.get("oi"))
+    oi_artists = []
+    for oi in oi_list:
+        oi_artists += draw_object_of_interest(ax, oi, D=D)
+
 
     # artists
     plan1_ln, = ax.plot([], [], [], "--", lw=1, alpha=0.6, label="Plan P1", color="blue")

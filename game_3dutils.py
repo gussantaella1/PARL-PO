@@ -110,6 +110,29 @@ def build_h_builders(cfg, nx, D):
             return h
         funcs += [_speed_h(1), _speed_h(2)]
 
+    # -------- object-of-interest (keep-out for selected agents) --------
+    # cfg example:
+    # cfg["oi"] = {
+    #   "enabled": True,
+    #   "cx": 0.0, "cy": 0.0, "cz": 0.0,   # cz optional if D==2
+    #   "r":  2.0,                         # keep-out radius
+    #   "avoid_by": [1]                    # which agents must avoid (defaults to [1])
+    # }
+    oi = cfg.get("oi", {})
+    if bool(oi.get("enabled", False)):
+        oc = [float(oi.get(k, 0.0)) for k in (["cx","cy"] if D == 2 else ["cx","cy","cz"])]
+        r2 = float(oi.get("r", 1.0))**2
+        avoid_by = list(oi.get("avoid_by", [1]))
+        for agent in (1, 2):
+            if agent not in avoid_by:
+                continue
+            def _h_oi(m,k,_a=agent,_oc=tuple(oc),_r2=r2):
+                s = 0.0
+                for j in range(D):
+                    s += (_x(m,_a,k,j) - _oc[j])**2
+                return s - _r2   # ≥ 0 => outside the object
+            funcs.append(_h_oi)
+
     return funcs
 
 
@@ -207,11 +230,9 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
                    max(1, int(round(float(cfg["turn_seconds"]) / float(dt))))
 
     # --- constraints (fixed Ad,Bd) ---
-    gtil_fun = build_g_tilde_linear(nx, nu, T, N, Ad_mx, Bd_mx)
     x_lb, x_ub, u_lb, u_ub = make_bounds(cfg)
     if use_att:
         x_lb, x_ub, u_lb, u_ub = augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg)
-    htil_fun = build_h_tilde(nx, nu, T, N, x_lb, x_ub, u_lb, u_ub, cfg)
 
     # --- initial states (pad with φ if needed) ---
     x1 = pad_x0_with_att(cfg["x0"][0], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][0], float)[:nx].copy()
@@ -917,16 +938,6 @@ def build_h_tilde(nx: int, nu: int, T: int, N: int, x_lb, x_ub, u_lb, u_ub, cfg:
     dmin2 = float(cfg["sep_min"])**2
     arena  = cfg["arena"]
     artype = arena.get("type", "box")
-
-    # Precompute polygon/polyhedron keep-in if needed
-    polyA = polyb = None
-    if artype == "polygon":
-        assert D == 2, "polygon keep-in is 2D; use polyhedron for 3D."
-        polyA_np, polyb_np = polygon_halfspaces(arena["vertices"])
-        polyA, polyb = ca.MX(polyA_np), ca.MX(polyb_np)
-    elif artype == "polyhedron":
-        polyA = ca.MX(np.asarray(arena["A"], float))
-        polyb = ca.MX(np.asarray(arena["b"], float))
 
     # obstacle key by D
     sphere_key = "circles" if D == 2 else "spheres"
