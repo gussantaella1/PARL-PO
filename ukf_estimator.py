@@ -2,6 +2,12 @@
 from __future__ import annotations
 import numpy as np
 
+from game_3dutils import hcw_discrete_mats as _hcw_disc_mx
+from game_3dutils import hcw_mean_motion as _hcw_mean_motion
+from game_3dutils import as_numpy_const as _as_numpy_const
+
+from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+
 # -------------------------------
 # Helpers
 # -------------------------------
@@ -86,20 +92,14 @@ def _body_vec_from_azel(az: float, el: float):
 
 class AgentUKF:
     """
-    Unscented Kalman Filter for a target with constant-velocity dynamics observed by an agent.
-    State:   x = [px, py, pz, vx, vy, vz]^T   (world frame)
-    Process: x_{k+1} = F(dt) x_k + B(dt)*u_k + w_k
-             where u is interpreted as acceleration in WORLD by default.
-    Meas:    z = [az, el]^T (bearing in OBSERVER BODY frame)
-
-    Usage (backward compatible):
-        ukf.predict(dt)                               # no input (same as before)
-        ukf.predict(dt, u=u_world)                    # accel in world frame
-        ukf.predict(dt, u=u_body, u_frame='body',
-                    R_wb_tgt=R_wb_target)             # accel given in body frame
-        ukf.predict(dt, u=u_world, u_cov=Sigma_u)     # add input uncertainty contribution
+    UKF with selectable linear dynamics:
+      - dyn='cv'  : constant-velocity (legacy)
+      - dyn='hcw' : HCW relative motion (needs dt and hcw params)
+    State: x=[px,py,pz,vx,vy,vz], u=[ax,ay,az]
     """
-    def __init__(self, x0, P0, Q, R, dt, alpha=1e-3, beta=2.0, kappa=0.0):
+    def __init__(self, x0, P0, Q, R, dt,
+                 alpha=1e-3, beta=2.0, kappa=0.0,
+                 dyn='cv', hcw=None):
         self.x  = np.asarray(x0, float).reshape(6)
         self.P  = _psd_enforce(np.asarray(P0, float))
         self.Q  = _psd_enforce(np.asarray(Q,  float))
@@ -108,60 +108,81 @@ class AgentUKF:
         self.n  = 6
 
         lam, Wm0, Wmi, Wc0, Wci, c = _ukf_weights(self.n, alpha, beta, kappa)
-        self._Wm0, self._Wmi = Wm0, Wmi
-        self._Wc0, self._Wci = Wc0, Wci
-        self._c = c  # note: this is n + lambda (used as the scale on P)
+        self._Wm0, self._Wmi, self._Wc0, self._Wci, self._c = Wm0, Wmi, Wc0, Wci, c
 
-    # ----- linear CV dynamics -----
+        self._dyn = (dyn or 'cv').lower()
+        self._hcw_params = (hcw or {})
+        self._Ad = None
+        self._Bd = None
+        if self._dyn == 'hcw':
+            n = hcw_mean_motion(self._hcw_params)
+            Ad_mx, Bd_mx = hcw_discrete_mats(n, self.dt)
+            self._Ad = as_numpy_const(Ad_mx)
+            self._Bd = as_numpy_const(Bd_mx)
+
+    # ---- CV matrices (legacy) ----
     def F(self, dt=None):
         if dt is None: dt = self.dt
-        F = np.eye(6)
-        F[0,3] = dt; F[1,4] = dt; F[2,5] = dt
+        F = np.eye(6); F[0,3]=dt; F[1,4]=dt; F[2,5]=dt
         return F
 
     def B_accel(self, dt=None):
-        """Input matrix for acceleration input u (3-vector)."""
         if dt is None: dt = self.dt
         B = np.zeros((6,3))
         B[0:3, 0:3] = 0.5 * (dt**2) * np.eye(3)
         B[3:6, 0:3] = dt * np.eye(3)
         return B
 
-    def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
-        """
-        Deterministic dynamics: x+ = F x + B u  (if u provided).
-        If u_frame='body', convert u_body -> u_world using R_wb_tgt (world->body).
-        """
-        F = self.F(dt)
-        x_next = F @ x
-        if u is not None:
-            u = np.asarray(u, float).reshape(3)
-            if u_frame == 'body':
-                if R_wb_tgt is None:
-                    raise ValueError("u given in 'body' frame but R_wb_tgt is None")
-                # body -> world: v_w = R_wb^T v_b
-                u = R_wb_tgt.T @ u
-            x_next = x_next + self.B_accel(dt) @ u
-        return x_next
-
-    # ----- measurement: bearing (az,el) in observer body frame -----
+    # ---- measurement model (bearing in observer BODY frame) ----
     def h(self, x, p_obs, R_wb):
         p_tgt = x[:3]
         v_b = _body_bearing_from_world(p_obs, R_wb, p_tgt)
         az, el = _azel_from_body_vec(v_b)
         return np.array([az, el], float)
 
-    # ----- UKF steps -----
+    # ---- dynamics step used by sigma-point propagation ----
+    def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
+        if dt is None: dt = self.dt
+        u_world = None
+        if u is not None:
+            u_world = np.asarray(u, float).reshape(3)
+            if u_frame == 'body':
+                if R_wb_tgt is None:
+                    raise ValueError("u in body frame but R_wb_tgt is None")
+                u_world = R_wb_tgt.T @ u_world
+
+        if self._dyn == 'hcw':
+            # ensure Ad/Bd match requested dt
+            if dt != self.dt or self._Ad is None:
+                n = hcw_mean_motion(self._hcw_params)
+                Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+                Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
+            else:
+                Ad_np, Bd_np = self._Ad, self._Bd
+            x_next = Ad_np @ x
+            if u_world is not None:
+                x_next = x_next + Bd_np @ u_world
+            return x_next
+        else:  # 'cv'
+            F = self.F(dt)
+            x_next = F @ x
+            if u_world is not None:
+                x_next = x_next + self.B_accel(dt) @ u_world
+            return x_next
+
+    # ---- UKF time update ----
     def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
-        """
-        Unscented prediction. If u is provided, apply affine term B u to each sigma point.
-        If u_cov (3x3) is provided, add B * u_cov * B^T to P to model input uncertainty.
-        """
         if dt is None: dt = self.dt
         self.P = _psd_enforce(self.P)
 
+        # refresh cached Ad/Bd if HCW and dt changed
+        if self._dyn == 'hcw' and (self._Ad is None or dt != self.dt):
+            n = hcw_mean_motion(self._hcw_params)
+            Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+            self._Ad = as_numpy_const(Ad_mx)
+            self._Bd = as_numpy_const(Bd_mx)
+
         Xi = _sigma_points(self.x, self.P, self._c)
-        # propagate sigma points with shared input u
         Xi_pred = np.array([ self.f(xi, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt) for xi in Xi ])
 
         # mean
@@ -177,13 +198,18 @@ class AgentUKF:
 
         # add input uncertainty if provided
         if u_cov is not None:
-            Bu = self.B_accel(dt)
             U = _psd_enforce(np.asarray(u_cov, float))
-            P_pred += Bu @ U @ Bu.T
+            if self._dyn == 'hcw':
+                Bd = self._Bd           # already matches dt above
+            else:
+                Bd = self.B_accel(dt)
+            P_pred += Bd @ U @ Bd.T
 
         self.x = x_pred
         self.P = _psd_enforce(_symmetrize(P_pred), floor=1e-12)
+        self.dt = dt  # track last-step dt
 
+    # ---- UKF measurement update (bearing) ----
     def update(self, z, p_obs, R_wb):
         self.P = _psd_enforce(self.P)
         Xi = _sigma_points(self.x, self.P, self._c)
