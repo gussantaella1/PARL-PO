@@ -69,25 +69,8 @@ def build_h_builders(cfg, nx, D):
         return m.x1[k, j] if agent == 1 else m.x2[k, j]
 
     # -------- arena --------
-    # Box if explicit bounds present
-    if {"xmin","xmax","ymin","ymax"} <= set(ar.keys()):
-        xmin, xmax = float(ar["xmin"]), float(ar["xmax"])
-        ymin, ymax = float(ar["ymin"]), float(ar["ymax"])
-        have_z     = (D == 3) and ("zmin" in ar and "zmax" in ar)
-        zmin, zmax = (float(ar["zmin"]), float(ar["zmax"])) if have_z else (None, None)
-
-        for agent in (1, 2):
-            funcs.append(lambda m,k,_a=agent,_b=xmin: _x(m,_a,k,0) - _b)  # x >= xmin
-            funcs.append(lambda m,k,_a=agent,_b=xmax: _b - _x(m,_a,k,0))  # xmax - x
-            if D >= 2:
-                funcs.append(lambda m,k,_a=agent,_b=ymin: _x(m,_a,k,1) - _b)
-                funcs.append(lambda m,k,_a=agent,_b=ymax: _b - _x(m,_a,k,1))
-            if have_z:
-                funcs.append(lambda m,k,_a=agent,_b=zmin: _x(m,_a,k,2) - _b)
-                funcs.append(lambda m,k,_a=agent,_b=zmax: _b - _x(m,_a,k,2))
-
     # Sphere if given (your CONFIG uses this)
-    elif {"cx","cy","cz","r"} <= set(ar.keys()) or ar.get("type") == "sphere":
+    if {"cx","cy","cz","r"} <= set(ar.keys()) or ar.get("type") == "sphere":
         cx = float(ar.get("cx", 0.0))
         cy = float(ar.get("cy", 0.0))
         cz = float(ar.get("cz", 0.0))
@@ -228,7 +211,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
 
     # --- optional attitude augmentation (roll in state) ---
     att_cfg = cfg.get("att", {})
-    use_att = bool(att_cfg)
+    use_att = bool(att_cfg.get('enabled', True))
+
+    print(use_att)
+
+    # raise("Debug")
     if use_att:
         Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
         nx, nu = idx["nx"], idx["nu"]
@@ -237,6 +224,11 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
         Ad_mx, Bd_mx = Ad_tr, Bd_tr
         nx, nu = nx_tr, nu_tr
         i_phi  = None
+
+    # print("Ad_mx shape:", Ad_mx.size1(), "+",Ad_mx.size2())
+    # print("Bd_mx shape:", Bd_mx.size1(), "+",Bd_mx.size2())
+
+    # raise("Debug")
 
     # --- rollout length / turn length ---
     sim_time = cfg.get("sim_time", cfg.get("max_time", cfg.get("duration", None)))
