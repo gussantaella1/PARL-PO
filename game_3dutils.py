@@ -593,13 +593,14 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
                                           steps: int | None = None,
                                           turn_len: int | None = None):
     """
-    RL-only rollout that feeds the PPO policies with the SAME observation used in training:
+    RL-only rollout (no attitude/FOV). Matches training obs:
         obs = [p1-center, p2-center, (p2-p1), v1, v2]
-    and (optionally) the SAME observation normalization.
+    Returns the same keys your animator expects; attitude fields are stubs.
     """
     # -------------------- basics & dims --------------------
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
-    nx_tr, nu_tr = dims_from_D(D)
+    nx = 2 * D               # [p, v] per agent
+    nu = D                   # LVLH accel per agent
     T, dt = int(cfg["T"]), float(cfg["dt"])
 
     # -------------------- dynamics (Ad,Bd) --------------------
@@ -607,46 +608,31 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
     if dyn_name != "hcw":
         raise ValueError("This runner currently expects 'hcw' dynamics.")
     n = hcw_mean_motion(cfg.get("hcw", {}))
-    Ad_tr, Bd_tr = hcw_discrete_mats(n, dt)
+    Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
 
-    # -------------------- optional attitude aug --------------------
-    att_cfg = dict(cfg.get("att", {}))
-    use_att = bool(att_cfg.get("enabled", False))
-    if use_att:
-        Ad_mx, Bd_mx, idx = augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg)
-        nx, nu = idx["nx"], idx["nu"]
-        i_phi  = idx["i_phi"]
-    else:
-        Ad_mx, Bd_mx = Ad_tr, Bd_tr
-        nx, nu = nx_tr, nu_tr
-        i_phi  = None
+    def step_plant_single(x, u):
+        x = np.asarray(x, float); u = np.asarray(u, float)
+        return Ad_np @ x + Bd_np @ u
 
     # -------------------- sim length --------------------
     if steps is None:
         steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
     if turn_len is None:
-        turn_len = 1  # N/A for RL; kept for API symmetry
-
-    # -------------------- initial states --------------------
-    x1 = pad_x0_with_att(cfg["x0"][0], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][0], float)[:nx].copy()
-    x2 = pad_x0_with_att(cfg["x0"][1], att_cfg, D)[:nx] if use_att else np.asarray(cfg["x0"][1], float)[:nx].copy()
-
-    # -------------------- numeric stepper --------------------
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-    def step_plant_single(x, u):
-        x = np.asarray(x, float); u = np.asarray(u, float)
-        return Ad_np @ x + Bd_np @ u
+        turn_len = 1  # unused here; kept for API symmetry
 
     # -------------------- arena & center --------------------
     ar = cfg.setdefault("arena", {})
     ar.setdefault("type", "sphere")
-    ar.setdefault("cx", 0.0)
-    ar.setdefault("cy", 0.0)
-    ar.setdefault("cz", 0.0)
+    ar.setdefault("cx", 0.0); ar.setdefault("cy", 0.0); ar.setdefault("cz", 0.0)
     ar.setdefault("r", 30.0)
     center = np.array([ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)], float)[:D]
 
-    # -------------------- obs normalization (if used in training) --------------------
+    # -------------------- initial states --------------------
+    x1 = np.asarray(cfg["x0"][0], float)[:2*D].copy()
+    x2 = np.asarray(cfg["x0"][1], float)[:2*D].copy()
+
+    # -------------------- obs normalization (optional) --------------------
     use_obsnorm = bool(cfg.get("obsnorm", False))
     obs_mean = None; obs_std = None
     if use_obsnorm and "obs_stats" in cfg:
@@ -657,51 +643,38 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
         if sp and os.path.exists(sp): obs_std  = np.load(sp)
 
     def build_train_obs(x1_vec: np.ndarray, x2_vec: np.ndarray) -> np.ndarray:
-        """Match Env._obs() from training exactly."""
         p1 = x1_vec[:D]; v1 = x1_vec[D:2*D]
         p2 = x2_vec[:D]; v2 = x2_vec[D:2*D]
-        obs = np.concatenate([
-            p1 - center,
-            p2 - center,
-            (p2 - p1),
-            v1, v2
-        ]).astype(np.float32)
+        obs = np.concatenate([p1 - center, p2 - center, (p2 - p1), v1, v2]).astype(np.float32)
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
             obs = (obs - obs_mean.astype(np.float32)) / (obs_std.astype(np.float32) + 1e-8)
         return obs
 
     # -------------------- policy wrapper --------------------
     deterministic = bool(cfg.get("rl_eval_deterministic", True))
-    pol = rl_infer.RLPolicy(cfg, device=cfg.get("device", "cpu"))
     umax = float(cfg.get("umax", 5e-4))
     debug_actions = bool(cfg.get("debug_actions", False))
 
-    # choose best-available API on RLPolicy
+    pol = rl_infer.RLPolicy(cfg, device=cfg.get("device", "cpu"))
     has_obs_api = hasattr(pol, "act_def_obs") and hasattr(pol, "act_att_obs")
 
-    def _act_with_train_obs(which: str, x1_vec: np.ndarray, x2_vec: np.ndarray, deterministic: bool):
+    def _act(which: str, x1_vec: np.ndarray, x2_vec: np.ndarray, deterministic: bool):
         obs = build_train_obs(x1_vec, x2_vec)
         if has_obs_api:
-            if which == "def":
-                return pol.act_def_obs(obs, deterministic=deterministic)
-            else:
-                return pol.act_att_obs(obs, deterministic=deterministic)
-        else:
-            # Fallback: if your RLPolicy ONLY accepts raw [p1,v1,p2,v2], we emulate Env._obs inside RLPolicy.
-            # Pack raw, but warn once so you can update RLPolicy.
-            if not getattr(_act_with_train_obs, "_warned", False):
-                print("[info] RLPolicy has no *_obs API; falling back to raw pack_state. "
-                      "Ensure RLPolicy reproduces training obs internally.")
-                _act_with_train_obs._warned = True
-            p1 = x1_vec[:D]; v1 = x1_vec[D:2*D]
-            p2 = x2_vec[:D]; v2 = x2_vec[D:2*D]
-            raw_state = rl_infer.RLPolicy.pack_state(p1, v1, p2, v2)
-            if which == "def":
-                return pol.act_def(raw_state, deterministic=deterministic)
-            else:
-                return pol.act_att(raw_state, deterministic=deterministic)
+            return pol.act_def_obs(obs, deterministic=deterministic) if which == "def" \
+                   else pol.act_att_obs(obs, deterministic=deterministic)
+        # Fallback: raw pack; RLPolicy must internally reproduce training obs
+        if not getattr(_act, "_warned", False):
+            print("[info] RLPolicy has no *_obs API; falling back to raw pack_state. "
+                  "Ensure RLPolicy reproduces training obs internally.")
+            _act._warned = True
+        p1 = x1_vec[:D]; v1 = x1_vec[D:2*D]
+        p2 = x2_vec[:D]; v2 = x2_vec[D:2*D]
+        raw_state = rl_infer.RLPolicy.pack_state(p1, v1, p2, v2)
+        return pol.act_def(raw_state, deterministic=deterministic) if which == "def" \
+               else pol.act_att(raw_state, deterministic=deterministic)
 
-    # -------------------- viz helpers --------------------
+    # -------------------- tiny helpers for animator compatibility --------------------
     def _p3_row(x_row):
         return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D == 3 else \
                (float(x_row[0]), float(x_row[1]), 0.0)
@@ -710,114 +683,65 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
         return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D == 3 else \
                (float(x_vec[0]), float(x_vec[1]), 0.0)
 
-    # ---- attitude helpers (unchanged) ----
-    def attitude_from_state(x, prev_R=None, prev_axisD=None):
-        align    = att_cfg.get("align", "x")
-        world_up = np.asarray(att_cfg.get("up", [0, 0, 1]), float)
-        vmin     = float(att_cfg.get("min_speed_for_axis", 1e-3))
-        DD = 3 if len(x) >= 6 else 2
-        v  = np.asarray(x[DD:2*DD], float)
-        n  = np.linalg.norm(v)
-        if n > vmin:
-            axisD = v / max(n, 1e-9)
-        elif prev_axisD is not None:
-            axisD = np.asarray(prev_axisD, float)
-        else:
-            axisD = np.array([1, 0, 0]) if align == "x" else np.array([0, 0, 1])
-        axis3 = axisD if DD == 3 else np.array([axisD[0], axisD[1], 0.0], float)
-        R = frame_from_axis_continuous(axis3, R_prev=prev_R, align=align, world_up=world_up)
-        phi = 0.0
-        if use_att and (i_phi is not None) and (i_phi < len(x)):
-            phi = float(x[i_phi]); R = apply_roll_about_axis(R, phi, align=align)
-        return R, axisD, phi
+    def _identity_R():
+        return np.eye(3, dtype=float)
 
-    def plan_attitudes_from_X(X, prev_axisD, prev_R):
-        att_list, ax_prev, R_prev = [], prev_axisD, prev_R
-        for _ in range(T):
-            R, ax_prev, phi_t = attitude_from_state(X, prev_R=R_prev, prev_axisD=ax_prev)
-            att_list.append({"R": R, "phi": phi_t}); R_prev = R
-        return att_list, ax_prev, R_prev
-
-    # -------------------- initial attitude seeds --------------------
-    def _axis_from_vel_t0(x):
-        v = np.asarray(x[D:2*D], float); n = float(np.linalg.norm(v))
-        if n > float(att_cfg.get("min_speed_for_axis", 1e-3)):
-            aD = v / n
-        else:
-            aD = np.array([1, 0, 0], float) if att_cfg.get("align","x") == "x" else np.array([0, 0, 1], float)
-        if D == 2: return aD[:2], np.array([aD[0], aD[1], 0.0], float)
-        return aD, aD
-
-    prev_axis1D, axis1_0 = _axis_from_vel_t0(x1)
-    prev_axis2D, axis2_0 = _axis_from_vel_t0(x2)
-    phi1_0 = float(x1[i_phi]) if (use_att and i_phi is not None) else 0.0
-    phi2_0 = float(x2[i_phi]) if (use_att and i_phi is not None) else 0.0
-    R1_0 = apply_roll_about_axis(world_to_body_R(axis1_0, 3, align=att_cfg.get("align","x"), up=att_cfg.get("up",[0,0,1])), phi1_0, align=att_cfg.get("align","x"))
-    R2_0 = apply_roll_about_axis(world_to_body_R(axis2_0, 3, align=att_cfg.get("align","x"), up=att_cfg.get("up",[0,0,1])), phi2_0, align=att_cfg.get("align","x"))
-    prev_R1, prev_R2 = R1_0, R2_0
-
-    # -------------------- logs for animator --------------------
+    # -------------------- logs for animator (attitude = stubs) --------------------
     plan_hist1, plan_hist2 = [], []
-    plan_att1,  plan_att2  = [], []
+    plan_att1,  plan_att2  = [], []           # lists of length=steps; each item is a flat horizon of identity Rs
     exec_xyz1,  exec_xyz2  = [], []
-    exec_att1,  exec_att2  = [], []
+    exec_att1,  exec_att2  = [], []           # dicts with {"R": I, "phi": 0.0}
     phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
     # t=0 logs
     exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-    exec_att1.append({"R": R1_0, "phi": phi1_0}); phi_hist1.append(phi1_0)
-    exec_att2.append({"R": R2_0, "phi": phi2_0}); phi_hist2.append(phi2_0)
-    fov_axis_hist.append(None); fov_seen_mask.append(False)  # keep shape even if FOV disabled
+    exec_att1.append({"R": _identity_R(), "phi": 0.0}); phi_hist1.append(0.0)
+    exec_att2.append({"R": _identity_R(), "phi": 0.0}); phi_hist2.append(0.0)
+    fov_axis_hist.append(None); fov_seen_mask.append(False)
 
     # ==================== ROLLOUT ====================
     for k in range(steps):
-        # 1) get actions from policies using TRAINER-STYLE OBS
-        u1_tr = _act_with_train_obs("def", x1, x2, deterministic)
-        u2_tr = _act_with_train_obs("att", x1, x2, deterministic)
-
-        # 2) clip and embed into full control vectors
-        u1_tr = np.clip(np.asarray(u1_tr, float), -umax, +umax)
-        u2_tr = np.clip(np.asarray(u2_tr, float), -umax, +umax)
+        # 1) actions from policies
+        u1 = np.clip(np.asarray(_act("def", x1, x2, deterministic), float), -umax, +umax)
+        u2 = np.clip(np.asarray(_act("att", x1, x2, deterministic), float), -umax, +umax)
         if debug_actions and k < 3:
             obs_dbg = build_train_obs(x1, x2)
-            print(f"[k={k:02d}] ||a_def||={np.linalg.norm(u1_tr):.3g}, ||a_att||={np.linalg.norm(u2_tr):.3g}, "
+            print(f"[k={k:02d}] ||a_def||={np.linalg.norm(u1):.3g}, ||a_att||={np.linalg.norm(u2):.3g}, "
                   f"first obs entries={obs_dbg[:6]}")
+
+        # 2) embed into full control vectors [D accel, then zeros if any extra states]
         u1_full = np.zeros(nu); u2_full = np.zeros(nu)
-        u1_full[:D] = u1_tr; u2_full[:D] = u2_tr
+        u1_full[:D] = u1;       u2_full[:D] = u2
 
         # 3) plant step
         x1 = step_plant_single(x1, u1_full)
         x2 = step_plant_single(x2, u2_full)
 
-        # 4) synth fixed-length "plan" horizons for animator
+        # 4) "plan" horizons (flat, just repeat current pos)
         plan1 = [_p3_row(x1)] * T
         plan2 = [_p3_row(x2)] * T
         plan_hist1.append(plan1); plan_hist2.append(plan2)
 
-        # 5) attitude updates & logs
-        R1, axis1D, phi1_now = attitude_from_state(x1, prev_R=prev_R1, prev_axisD=prev_axis1D)
-        R2, axis2D, phi2_now = attitude_from_state(x2, prev_R=prev_R2, prev_axisD=prev_axis2D)
-        prev_axis1D, prev_axis2D = axis1D, axis2D
-        prev_R1, prev_R2 = R1, R2
-        phi_hist1.append(phi1_now); phi_hist2.append(phi2_now)
-        att1_stub, _, _ = plan_attitudes_from_X(x1, prev_axis1D, prev_R1)
-        att2_stub, _, _ = plan_attitudes_from_X(x2, prev_axis2D, prev_R2)
-        plan_att1.append(att1_stub); plan_att2.append(att2_stub)
+        # 5) attitude stubs (keep shapes)
+        I = _identity_R()
+        att_stub = [{"R": I, "phi": 0.0} for _ in range(T)]
+        plan_att1.append(att_stub); plan_att2.append(att_stub)
 
-        exec_att1.append({"R": R1, "phi": phi1_now})
-        exec_att2.append({"R": R2, "phi": phi2_now})
+        exec_att1.append({"R": I, "phi": 0.0})
+        exec_att2.append({"R": I, "phi": 0.0})
+        phi_hist1.append(0.0); phi_hist2.append(0.0)
+
         exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-
-        # (FOV block omitted for brevity; keep yours if needed)
+        fov_axis_hist.append(None); fov_seen_mask.append(False)
 
     # -------------------- pack results --------------------
     return {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
-        "plan_att1":  plan_att1,  "plan_att2":  plan_att2,
+        "plan_att1":  plan_att1,  "plan_att2":  plan_att2,      # identity-R horizons
         "exec1_xyz":  exec_xyz1,  "exec2_xyz":  exec_xyz2,
-        "exec_att1":  exec_att1,  "exec_att2":  exec_att2,
-        "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,
+        "exec_att1":  exec_att1,  "exec_att2":  exec_att2,      # identity-R per step
+        "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,      # zeros
         "fov_axis_hist": fov_axis_hist, "fov_seen_mask": fov_seen_mask,
     }
 
