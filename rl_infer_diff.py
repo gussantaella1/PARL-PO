@@ -43,8 +43,8 @@ class RLPolicyDiff:
         self.pi_att = ActorCriticDiff(self.obs_dim, self.act_dim, cfg).to(self.device)
 
         # Resolve checkpoints
-        def_ckpt = def_ckpt or cfg.get("ckpt_def", "ppo_def_diff.pt")
-        att_ckpt = att_ckpt or cfg.get("ckpt_att", "ppo_att_diff.pt")
+        def_ckpt = def_ckpt or cfg.get("ckpt_def", "ppo_def.pt")
+        att_ckpt = att_ckpt or cfg.get("ckpt_att", "ppo_att.pt")
 
         # Load strictly (shape must match)
         sd_def = torch.load(def_ckpt, map_location=self.device)
