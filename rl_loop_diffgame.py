@@ -16,12 +16,15 @@ Key points
 from __future__ import annotations
 from typing import Dict, Any, Tuple, Callable, List
 
+import importlib
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 
 # --- Single source of truth for config & dynamics ---
+import config_rl
+importlib.reload(config_rl)
 from config_rl import config_for_train, config_for_eval, build_dyn
 
 

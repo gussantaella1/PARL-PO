@@ -30,7 +30,7 @@ COMMON: Dict[str, Any] = {
     # Dynamics / horizon
     "D": 3,
     "dt": 0.1,
-    "T": 120,
+    "T": 240,
     "dynamics": "hcw",
     "hcw": {"mu": 3.986004418e14, "r0": 6_371_000.0 + 400_000.0},
 
@@ -41,7 +41,7 @@ COMMON: Dict[str, Any] = {
     "wall_penalty": 3.0,
 
     # Action bounds
-    "umax": 0.1,
+    "umax": 10,
 
     # Initial conditions
     "x0": np.array([
