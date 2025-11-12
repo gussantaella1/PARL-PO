@@ -41,7 +41,7 @@ COMMON: Dict[str, Any] = {
     "wall_penalty": 3.0,
 
     # Action bounds
-    "umax": 10,
+    "umax": 2,
 
     # Initial conditions
     "x0": np.array([
