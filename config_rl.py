@@ -30,7 +30,8 @@ COMMON: Dict[str, Any] = {
     # Dynamics / horizon
     "D": 3,
     "dt": 0.1,
-    "T": 240,
+    # "T": 240,
+    "T": 600,
     "dynamics": "hcw",
     "hcw": {"mu": 3.986004418e14, "r0": 6_371_000.0 + 400_000.0},
 
@@ -82,18 +83,28 @@ COMMON: Dict[str, Any] = {
 
     # Filled by build_dyn()
     "dyn": {"Ad": None, "Bd": None},
+
+    "oi": {
+        "enabled": True,
+        "cx": 0.0, "cy": 0.0, "cz": 0.0,  # omit cz in 2D
+        "r":  1,                        # keep-out radius (m)
+        "avoid_by": [1],                   # only player 1 must avoid
+        "color": "tab:purple",
+        "alpha": 0.18,
+        "edgecolor": "k"        
+    },
 }
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    # "num_envs": 64,          # was 8
-    # "steps_per_env": 512,    # was 256
-    # "total_updates": 2000,   # was 300
+    "num_envs": 64,          # was 8
+    "steps_per_env": 512,    # was 256
+    "total_updates": 2000,   # was 300
 
-    "num_envs": 8,          # was 8
-    "steps_per_env": 256,    # was 256
-    "total_updates": 300,   # was 300
+    # "num_envs": 8,          # was 8
+    # "steps_per_env": 256,    # was 256
+    # "total_updates": 300,   # was 300
 
     "log_every": 10,
 

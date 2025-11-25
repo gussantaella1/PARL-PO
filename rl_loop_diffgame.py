@@ -112,6 +112,10 @@ class Env:
         self.soft_wall = float(cfg.get("soft_wall_start", 0.7))
         self.margin = float(cfg["arena_terminate_margin"])  # 1.0 = at radius
 
+        # NEW: defender center keep-out (normalized radius wrt arena R)
+        self.def_center_safe_radius = float(cfg.get("def_center_safe_radius", 0.05))
+        self.def_center_avoid_coef  = float(cfg.get("def_center_avoid_coef", 10.0))
+
         # Training-only initial-condition randomization
         # Defaults to "fixed" if keys are absent (e.g., eval config)
         self.train_ic_mode = cfg.get("train_ic_mode", "fixed")
@@ -220,6 +224,15 @@ class Env:
         wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
+        # NEW: defender keep-out around center (donut safety zone)
+        # penalty only if defender is *inside* safe radius
+        if rho1 < self.def_center_safe_radius:
+            # normalized penetration: 0 at boundary, 1 at exact center
+            pen = (self.def_center_safe_radius - rho1) / max(self.def_center_safe_radius, 1e-6)
+            center_avoid_pen = (pen ** 2) * self.def_center_avoid_coef
+        else:
+            center_avoid_pen = 0.0
+
         # defender radial velocity
         rhat1 = (p1 - self.center)
         rnorm = np.linalg.norm(rhat1) + 1e-9
@@ -234,7 +247,10 @@ class Env:
              - self.k_vel * float(np.dot(v1, v1))
              - k_vrad * (vrad1**2)
              - self.lD * float(np.dot(a1, a1))
-             - wall1 )
+             - wall1
+             - center_avoid_pen   # <--- NEW
+             )
+
 
         r2 = (- self.alpha * delta_d2
              - self.k_pos * d2
