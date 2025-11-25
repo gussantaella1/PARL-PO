@@ -25,7 +25,7 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
     "seed": 42,
-    "device": "cpu",  # "cuda" if available
+    "device": "cuda",  # "cuda" if available
 
     # Dynamics / horizon
     "D": 3,
@@ -74,10 +74,10 @@ COMMON: Dict[str, Any] = {
     "att_rule": {
         "ridge": 1e-2,        # one-step ridge in u_center
         "w_center": 1.0,      # weight for center pull
-        "w_avoid":  1.0,      # weight for repulsion
+        "w_avoid":  0.5,      # weight for repulsion
         "w_damp":   0.2,      # velocity damping
         "min_sep":  1.0,      # (m) soft floor for repulsion distance
-        "repulse_gain": 5.0,  # overall strength of repulsion ~ 1/r^3
+        "repulse_gain": 2.0,  # overall strength of repulsion ~ 1/r^3
     },
 
     # Filled by build_dyn()
@@ -87,9 +87,14 @@ COMMON: Dict[str, Any] = {
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    "num_envs": 8,
-    "steps_per_env": 256,   # batch = 2048 / update
-    "total_updates": 300,
+    # "num_envs": 64,          # was 8
+    # "steps_per_env": 512,    # was 256
+    # "total_updates": 2000,   # was 300
+
+    "num_envs": 8,          # was 8
+    "steps_per_env": 256,    # was 256
+    "total_updates": 300,   # was 300
+
     "log_every": 10,
 
     # PPO hyperparams
@@ -106,7 +111,14 @@ TRAIN: Dict[str, Any] = {
 
     # Anneal (training-time only)
     "def_center_min_anneal": 0.5,
+
+    # Training-only initial condition randomization
+    # (env uses this; eval config will default back to "fixed")
+    "train_ic_mode": "random_shell",  # or "fixed"
+    "train_ic_vmax": 0.05,            # max |v| component at t=0
+    "train_min_sep": 1.0,             # min defender–attacker separation (m)
 }
+
 
 # ---------- Public getters ----------
 def config_for_train(**overrides) -> Dict[str, Any]:

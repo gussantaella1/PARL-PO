@@ -21,6 +21,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import matplotlib.pyplot as plt
+import os  # <---- add this
+
 
 # --- Single source of truth for config & dynamics ---
 import config_rl
@@ -109,25 +112,87 @@ class Env:
         self.soft_wall = float(cfg.get("soft_wall_start", 0.7))
         self.margin = float(cfg["arena_terminate_margin"])  # 1.0 = at radius
 
+        # Training-only initial-condition randomization
+        # Defaults to "fixed" if keys are absent (e.g., eval config)
+        self.train_ic_mode = cfg.get("train_ic_mode", "fixed")
+        self.train_ic_vmax = float(cfg.get("train_ic_vmax", 0.05))
+        self.train_min_sep = float(cfg.get("train_min_sep", 1.0))
+
+
         self.state = None
         self.t = 0
         self._d2_prev = None
 
     def reset(self) -> np.ndarray:
         self.t = 0
-        x0 = self._x0.copy()
-        jit = self.cfg.get("x0_jitter", None)
-        if jit:
-            jp = float(jit.get("pos", 0.0)) ; jv = float(jit.get("vel", 0.0))
-            x0[0, 0:self.D]        += np.random.uniform(-jp, jp, size=(self.D,))
-            x0[0, self.D:2*self.D] += np.random.uniform(-jv, jv, size=(self.D,))
-            x0[1, 0:self.D]        += np.random.uniform(-jp, jp, size=(self.D,))
-            x0[1, self.D:2*self.D] += np.random.uniform(-jv, jv, size=(self.D,))
+        mode = self.train_ic_mode
+
+        if mode == "fixed":
+            # Original behavior: base x0 plus small jitter
+            x0 = self._x0.copy()
+            jit = self.cfg.get("x0_jitter", None)
+            if jit:
+                jp = float(jit.get("pos", 0.0))
+                jv = float(jit.get("vel", 0.0))
+                # defender
+                x0[0, 0:self.D]        += np.random.uniform(-jp, jp, size=(self.D,))
+                x0[0, self.D:2*self.D] += np.random.uniform(-jv, jv, size=(self.D,))
+                # attacker
+                x0[1, 0:self.D]        += np.random.uniform(-jp, jp, size=(self.D,))
+                x0[1, self.D:2*self.D] += np.random.uniform(-jv, jv, size=(self.D,))
+
+        elif mode == "random_shell":
+            # Robust training: sample both agents anywhere within the sphere,
+            # with a bias: defender near center, attacker nearer outer shell,
+            # and enforce a minimum separation.
+
+            R = self.radius
+            v_max = self.train_ic_vmax
+            min_sep = self.train_min_sep
+
+            def sample_in_ball(r_min, r_max):
+                # uniform direction
+                d = np.random.normal(size=(self.D,))
+                d /= (np.linalg.norm(d) + 1e-9)
+                # radius (uniform in volume)
+                u = np.random.rand()
+                r = (r_min**3 + (r_max**3 - r_min**3) * u) ** (1.0 / 3.0)
+                return self.center + r * d
+
+            # You can tune these fractions; this uses inner half vs outer band
+            r_def_min = 0.0
+            r_def_max = 0.5 * R
+            r_att_min = 0.4 * R
+            r_att_max = 0.95 * R
+
+            # sample until separation constraint satisfied
+            for _ in range(1000):  # safety cap
+                p1 = sample_in_ball(r_def_min, r_def_max)
+                p2 = sample_in_ball(r_att_min, r_att_max)
+                if np.linalg.norm(p2 - p1) >= min_sep:
+                    break
+
+            v1 = np.random.uniform(-v_max, v_max, size=(self.D,))
+            v2 = np.random.uniform(-v_max, v_max, size=(self.D,))
+
+            x0 = np.zeros_like(self._x0)
+            x0[0, 0:self.D]        = p1
+            x0[0, self.D:2*self.D] = v1
+            x0[1, 0:self.D]        = p2
+            x0[1, self.D:2*self.D] = v2
+
+        else:
+            raise ValueError(f"Unknown train_ic_mode='{mode}'")
+
         self.state = np.concatenate([x0[0], x0[1]])
+
+        # initialize d2_prev as before
         p1, v1, p2, v2 = self._unpack(self.state)
         d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
         self._d2_prev = d2_raw / (self.radius**2)
+
         return self._obs()
+
 
     def step(self, a1_env: np.ndarray, a2_env: np.ndarray) -> Tuple[np.ndarray, float, float, bool, dict]:
         a1 = np.clip(np.asarray(a1_env, float), self.u_lo, self.u_hi)
@@ -600,6 +665,19 @@ def train(cfg: Dict[str, Any]):
     act_dim = int(cfg["D"])
     ppo = PPO(obs_dim, act_dim, cfg, device=device)
 
+    # ---- NEW: metrics container ----
+    metrics = {
+        "update": [],
+        "R_def_mean": [],
+        "R_att_mean": [],
+        "muD_abs_mean": [],
+        "stdD_mean": [],
+        "d1_mean": [],
+        "lr_pi": [],
+        "lr_vf": [],
+    }
+
+
     # Optional anneal of defender center tether
     def_center_base = cfg.get("def_center_coef", 0.0)
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
@@ -651,17 +729,39 @@ def train(cfg: Dict[str, Any]):
         else:
             ppo.update_defender_only(bufD)
 
+
         if upd % log_every == 0:
-            print(f"[update {upd:05d}] R_def_mean={ep_ret_def.mean():+.3f}  R_att_mean={ep_ret_att.mean():+.3f}  (batch={num_envs*steps_per_env})")
+            R_def_mean = ep_ret_def.mean()
+            R_att_mean = ep_ret_att.mean()
+
             with torch.no_grad():
                 distD = ppo.def_net.dist(bufD.obs.reshape(-1, obs_dim), who="def")
-                muD = distD.mean.abs().mean().item() ; stdD = distD.stddev.mean().item()
-                print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+                muD = distD.mean.abs().mean().item()
+                stdD = distD.stddev.mean().item()
                 d1_mean = bufD.obs.reshape(-1, obs_dim)[:, :cfg["D"]].pow(2).sum(-1).mean().sqrt().item()
-                print(f"   approx <||p1-center||> ≈ {d1_mean:.3f}")
+
+            # grab learning rates (assuming two param groups: policy+logstd and value)
+            lr_pi = ppo.def_opt.param_groups[0]["lr"]
+            lr_vf = ppo.def_opt.param_groups[-1]["lr"]
+
+            # ---- store in metrics ----
+            metrics["update"].append(upd)
+            metrics["R_def_mean"].append(R_def_mean)
+            metrics["R_att_mean"].append(R_att_mean)
+            metrics["muD_abs_mean"].append(muD)
+            metrics["stdD_mean"].append(stdD)
+            metrics["d1_mean"].append(d1_mean)
+            metrics["lr_pi"].append(lr_pi)
+            metrics["lr_vf"].append(lr_vf)
+
+            # keep your printout if you like
+            print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
+            print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(f"   approx <||p1-center||> ≈ {d1_mean:.3f}")
+
 
     print("Training finished.")
-    return ppo
+    return ppo, metrics
 
 
 def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
@@ -724,8 +824,12 @@ if __name__ == "__main__":
         raise RuntimeError("cfg['device']='cuda' but CUDA is not available.")
     print(f"Using device: {cfg['device']}")
 
+    # ---- Output directory for policies + plots ----
+    OUT_DIR = "Training_Policy"
+    os.makedirs(OUT_DIR, exist_ok=True)
+
     # Train
-    ppo = train(cfg)
+    ppo, metrics = train(cfg)
 
     # Eval config from same source; safer defaults applied inside config_for_eval
     cfg_eval = config_for_eval(
@@ -746,8 +850,56 @@ if __name__ == "__main__":
     m = rollout_metrics(trajs[0]["states"], center, R)
     print(f"[metrics] d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}")
 
+    # ---- Plot training curves ----
+    updates = np.array(metrics["update"], dtype=float)
+
+    plt.figure()
+    plt.plot(updates, metrics["R_def_mean"], label="Defender return")
+    plt.plot(updates, metrics["R_att_mean"], label="Attacker return")
+    plt.xlabel("Update")
+    plt.ylabel("Episode return (mean over envs)")
+    plt.title("Training returns")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "train_returns.png"), dpi=200)
+
+    plt.figure()
+    plt.plot(updates, metrics["muD_abs_mean"], label="|μ_def| mean")
+    plt.plot(updates, metrics["stdD_mean"], label="σ_def mean")
+    plt.xlabel("Update")
+    plt.ylabel("Policy stats")
+    plt.title("Defender policy mean/std")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "policy_stats.png"), dpi=200)
+
+    plt.figure()
+    plt.plot(updates, metrics["d1_mean"])
+    plt.xlabel("Update")
+    plt.ylabel("<||p1 - center||>")
+    plt.title("Avg defender distance to center")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "def_center_dist.png"), dpi=200)
+
+    plt.figure()
+    plt.plot(updates, metrics["lr_pi"], label="policy LR")
+    plt.plot(updates, metrics["lr_vf"], label="value LR")
+    plt.xlabel("Update")
+    plt.ylabel("Learning rate")
+    plt.title("Learning rates")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "learning_rates.png"), dpi=200)
+
+    # (Optional) save raw metrics for later analysis
+    np.savez(os.path.join(OUT_DIR, "train_metrics.npz"), **metrics)
+
     # Save policies
-    torch.save(ppo.def_net.state_dict(), "ppo_def.pt")
+    torch.save(ppo.def_net.state_dict(), os.path.join(OUT_DIR, "ppo_def.pt"))
     if ppo.attacker_mode == "rl":
-        torch.save(ppo.att_net.state_dict(), "ppo_att.pt")
-    print("Saved: ppo_def.pt" + (", ppo_att.pt" if ppo.attacker_mode == "rl" else ""))
+        torch.save(ppo.att_net.state_dict(), os.path.join(OUT_DIR, "ppo_att.pt"))
+    print(
+        "Saved: "
+        + os.path.join(OUT_DIR, "ppo_def.pt")
+        + (", " + os.path.join(OUT_DIR, "ppo_att.pt") if ppo.attacker_mode == "rl" else "")
+    )
