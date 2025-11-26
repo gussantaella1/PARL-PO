@@ -1,95 +1,161 @@
 # rl_infer_diff.py
-# Inference helpers for Diff-Nash policy (5D observation = 15 for D=3)
 
-from __future__ import annotations
-from typing import Dict, Any, Tuple
 import os
+from typing import Dict, Any, Tuple
+
 import numpy as np
 import torch
 
-# IMPORTANT: import the SAME class you used during training
-# If your file/class name differs, update this import accordingly.
-from rl_loop_diffgame import ActorCriticDiff  # must exist in your project
-
-
-def _to_t32(x, device):
-    if isinstance(x, torch.Tensor):
-        return x.to(device=device, dtype=torch.float32)
-    return torch.as_tensor(x, dtype=torch.float32, device=device)
+# Import the Diff-Nash network + rule-based attacker from training script
+from rl_loop_diffgame import ActorCriticDiff, AttackerRuleController
 
 
 class RLPolicyDiff:
     """
-    Loads Diff-Nash defender/attacker nets and exposes:
-      - act_def_obs(obs15), act_att_obs(obs15)
-    where obs15 = [p1-c, p2-c, (p2-p1), v1, v2] in float32.
+    Inference wrapper for Diff-Nash policies.
+
+    - Defender is always RL (ActorCriticDiff loaded from ppo_def.pt).
+    - Attacker can be:
+        * "rl"   -> RL attacker (ppo_att.pt required)
+        * "rule" -> rule-based attacker (AttackerRuleController; no ppo_att.pt)
+
+    Exposes:
+      - verify_ckpt_compat() -> (obs_dim_def, obs_dim_att)
+      - act_def_obs(obs, deterministic=True)
+      - act_att_obs(obs, deterministic=True)
+
+    Where obs is expected to be:
+        obs = [p1 - center, p2 - center, (p2 - p1), v1, v2]  in R^{5D}.
     """
+
     def __init__(self,
                  cfg: Dict[str, Any],
                  device: str = "cpu",
                  def_ckpt: str | None = None,
                  att_ckpt: str | None = None):
+
         self.cfg = cfg
         self.device = device
+        self.D = int(cfg["D"])
+        self.act_dim = self.D
+        self.umax = float(cfg.get("umax", 5e-4))
+        self.attacker_mode = cfg.get("attacker_mode", "rl")  # "rl" or "rule"
+        self.use_mean_at_eval = bool(cfg.get("rl_eval_deterministic", True))
 
-        D = int(cfg.get("D", 3))
-        self.D = D
-        self.obs_dim = 5 * D
-        self.act_dim = D
-        self.umax = float(cfg.get("umax", 0.02))
+        # ---- Arena center (for reconstructing p1, p2 from obs) ----
+        ar = cfg.get("arena", {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0})
+        if ar.get("type", "sphere") == "sphere":
+            self.center = np.array(
+                [
+                    ar.get("cx", 0.0),
+                    ar.get("cy", 0.0),
+                    (ar.get("cz", 0.0) if self.D == 3 else 0.0),
+                ],
+                dtype=np.float32,
+            )[: self.D]
+        else:
+            cx = float(ar.get("cx", 0.0))
+            cy = float(ar.get("cy", 0.0))
+            cz = float(ar.get("cz", 0.0)) if self.D == 3 else 0.0
+            self.center = np.array([cx, cy, cz], dtype=np.float32)[: self.D]
 
-        # Build the SAME nets used for training
-        self.pi_def = ActorCriticDiff(self.obs_dim, self.act_dim, cfg).to(self.device)
-        self.pi_att = ActorCriticDiff(self.obs_dim, self.act_dim, cfg).to(self.device)
+        # ==================== DEFENDER (RL) ====================
+        self.def_ckpt = def_ckpt or cfg.get("ckpt_def", "ppo_def.pt")
+        if not os.path.exists(self.def_ckpt):
+            raise FileNotFoundError(self.def_ckpt)
 
-        # Resolve checkpoints
-        def_ckpt = def_ckpt or cfg.get("ckpt_def", "ppo_def.pt")
-        att_ckpt = att_ckpt or cfg.get("ckpt_att", "ppo_att.pt")
+        # Diff-Nash training uses obs_dim = 5 * D
+        self.obs_dim_def = 5 * self.D
+        self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, cfg).to(self.device)
 
-        # Load strictly (shape must match)
-        sd_def = torch.load(def_ckpt, map_location=self.device)
-        sd_att = torch.load(att_ckpt, map_location=self.device)
-        self.pi_def.load_state_dict(sd_def, strict=True)
-        self.pi_att.load_state_dict(sd_att, strict=True)
-        self.pi_def.eval()
-        self.pi_att.eval()
+        sd_def = torch.load(self.def_ckpt, map_location=self.device)
+        # allow pure state_dict or wrapped {"state_dict": ...}
+        if isinstance(sd_def, dict) and "state_dict" in sd_def:
+            sd_def = sd_def["state_dict"]
+        miss_def = self.def_net.load_state_dict(sd_def, strict=False)
+        if miss_def.missing_keys or miss_def.unexpected_keys:
+            print(
+                "[rl_infer_diff] DEF load: missing:",
+                miss_def.missing_keys,
+                " unexpected:",
+                miss_def.unexpected_keys,
+            )
+        self.def_net.eval()
 
-    # ------------- Public API (obs-aware) -------------
-    @torch.no_grad()
-    def act_def_obs(self, obs_15: np.ndarray | torch.Tensor, deterministic: bool = True) -> np.ndarray:
-        o = _to_t32(obs_15, self.device).unsqueeze(0)  # (1, obs_dim)
-        dist = self.pi_def.dist(o, who="def")
-        u_raw = dist.mean if deterministic else dist.rsample()
-        a = torch.tanh(u_raw) * self.umax
-        return a.squeeze(0).cpu().numpy()
+        # ==================== ATTACKER: RL or RULE ====================
+        self.att_net = None
+        self.rule_ctrl = None
 
-    @torch.no_grad()
-    def act_att_obs(self, obs_15: np.ndarray | torch.Tensor, deterministic: bool = True) -> np.ndarray:
-        o = _to_t32(obs_15, self.device).unsqueeze(0)
-        dist = self.pi_att.dist(o, who="att")
-        u_raw = dist.mean if deterministic else dist.rsample()
-        a = torch.tanh(u_raw) * self.umax
-        return a.squeeze(0).cpu().numpy()
+        if self.attacker_mode == "rl":
+            # RL attacker – ppo_att.pt required
+            self.att_ckpt = att_ckpt or cfg.get("ckpt_att", "ppo_att.pt")
+            if not os.path.exists(self.att_ckpt):
+                raise FileNotFoundError(self.att_ckpt)
 
-    # ------------- Optional helpers -------------
-    @staticmethod
-    def build_train_obs(p1, v1, p2, v2, center) -> np.ndarray:
-        """
-        Returns float32 array with shape (5D,)
-        [p1-c, p2-c, (p2-p1), v1, v2]
-        """
-        p1 = np.asarray(p1, dtype=np.float32)
-        v1 = np.asarray(v1, dtype=np.float32)
-        p2 = np.asarray(p2, dtype=np.float32)
-        v2 = np.asarray(v2, dtype=np.float32)
-        c  = np.asarray(center, dtype=np.float32)
-        return np.concatenate([p1 - c, p2 - c, (p2 - p1), v1, v2], axis=-1).astype(np.float32)
+            self.obs_dim_att = 5 * self.D
+            self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, cfg).to(self.device)
 
+            sd_att = torch.load(self.att_ckpt, map_location=self.device)
+            if isinstance(sd_att, dict) and "state_dict" in sd_att:
+                sd_att = sd_att["state_dict"]
+            miss_att = self.att_net.load_state_dict(sd_att, strict=False)
+            if miss_att.missing_keys or miss_att.unexpected_keys:
+                print(
+                    "[rl_infer_diff] ATT load: missing:",
+                    miss_att.missing_keys,
+                    " unexpected:",
+                    miss_att.unexpected_keys,
+                )
+            self.att_net.eval()
+        else:
+            # Rule-based attacker – no ppo_att required
+            self.obs_dim_att = 5 * self.D
+            self.rule_ctrl = AttackerRuleController(cfg)
+
+    # ------------------------------------------------------------------
+    #  Public helpers
+    # ------------------------------------------------------------------
     def verify_ckpt_compat(self) -> Tuple[int, int]:
         """
-        Quick check to ensure model's first linear layer matches obs_dim.
-        Returns (def_in_features, att_in_features).
+        For runner sanity-check; the runner expects (5*D, 5*D).
         """
-        def_in = self.pi_def.vf[0].in_features  # expects obs_dim
-        att_in = self.pi_att.vf[0].in_features
-        return def_in, att_in
+        return self.obs_dim_def, self.obs_dim_att
+
+    # ---- Core one-step for obs-level policies ----
+    def _act_one_obs(self, net: ActorCriticDiff, obs: np.ndarray, who: str, deterministic: bool):
+        obs_np = np.asarray(obs, dtype=np.float32)
+        o = torch.as_tensor(obs_np[None, :], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            # ActorCriticDiff.act already does Normal + tanh + scaling
+            a_env, _, _ = net.act(o, who=who, act_scale=self.umax)
+        a = a_env.squeeze(0).detach().cpu().numpy()
+        return np.clip(a, -self.umax, +self.umax)
+
+    # ---- Defender: always RL ----
+    def act_def_obs(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray:
+        return self._act_one_obs(self.def_net, obs, who="def", deterministic=deterministic)
+
+    # ---- Attacker: RL or rule-based ----
+    def act_att_obs(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray:
+        obs_np = np.asarray(obs, dtype=np.float32)
+
+        if self.attacker_mode == "rl":
+            if self.att_net is None:
+                raise RuntimeError("attacker_mode='rl' but attacker net is not initialized.")
+            return self._act_one_obs(self.att_net, obs_np, who="att", deterministic=deterministic)
+
+        # Rule-based attacker: reconstruct (p1, v1, p2, v2) from obs = [p1-c, p2-c, rel, v1, v2]
+        D = self.D
+        c = self.center
+
+        p1c = obs_np[0:D]
+        p2c = obs_np[D : 2 * D]
+        # rel = obs_np[2*D : 3*D]  # (p2 - p1), not needed explicitly
+        v1 = obs_np[3 * D : 4 * D]
+        v2 = obs_np[4 * D : 5 * D]
+
+        p1 = p1c + c
+        p2 = p2c + c
+
+        u = self.rule_ctrl.act(p1, v1, p2, v2)
+        return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)

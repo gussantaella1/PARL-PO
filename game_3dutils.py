@@ -38,6 +38,9 @@ AgentEKF = ekf_estimator.AgentEKF
 importlib.reload(ukf_estimator)
 importlib.reload(ekf_estimator)
 
+from rl_loop_diffgame import AttackerRuleController
+# importlib.reload(AttackerRuleController)
+
 __all__ = [
      "run_rhc_and_collect_frames_3d",
     "animate_rollout_3d", "interactive_rollout_3d"
@@ -589,12 +592,20 @@ def run_rhc_and_collect_frames_3d(cfg: dict, steps: int | None = None,
     return ret
 
 
-def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
-                                          steps: int | None = None,
-                                          turn_len: int | None = None):
+def run_rhc_with_rl_and_collect_frames_3d(
+    cfg: Dict[str, Any],
+    steps: int | None = None,
+    turn_len: int | None = None,
+):
     """
-    RL-only rollout (no attitude/FOV). Matches training obs:
+    RHC-style rollout in 3D with:
+      - Defender controlled by an RL policy.
+      - Attacker controlled by either RL or a rule-based controller
+        (AttackerRuleController), depending on config.
+
+    Observation matches training:
         obs = [p1-center, p2-center, (p2-p1), v1, v2]
+
     Returns the same keys your animator expects; attitude fields are stubs.
     """
     # -------------------- basics & dims --------------------
@@ -612,8 +623,14 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
     Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
 
     def step_plant_single(x, u):
-        x = np.asarray(x, float); u = np.asarray(u, float)
+        x = np.asarray(x, float)
+        u = np.asarray(u, float)
         return Ad_np @ x + Bd_np @ u
+
+    # Make sure cfg["dyn"] exists for AttackerRuleController
+    dyn_cfg = cfg.setdefault("dyn", {})
+    dyn_cfg["Ad"] = Ad_np
+    dyn_cfg["Bd"] = Bd_np
 
     # -------------------- sim length --------------------
     if steps is None:
@@ -624,33 +641,59 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
     # -------------------- arena & center --------------------
     ar = cfg.setdefault("arena", {})
     ar.setdefault("type", "sphere")
-    ar.setdefault("cx", 0.0); ar.setdefault("cy", 0.0); ar.setdefault("cz", 0.0)
+    ar.setdefault("cx", 0.0)
+    ar.setdefault("cy", 0.0)
+    ar.setdefault("cz", 0.0)
     ar.setdefault("r", 30.0)
-    center = np.array([ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)], float)[:D]
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)],
+        float,
+    )[:D]
 
     # -------------------- initial states --------------------
-    x1 = np.asarray(cfg["x0"][0], float)[:2*D].copy()
-    x2 = np.asarray(cfg["x0"][1], float)[:2*D].copy()
+    x1 = np.asarray(cfg["x0"][0], float)[:2 * D].copy()
+    x2 = np.asarray(cfg["x0"][1], float)[:2 * D].copy()
 
     # -------------------- obs normalization (optional) --------------------
     use_obsnorm = bool(cfg.get("obsnorm", False))
-    obs_mean = None; obs_std = None
+    obs_mean = None
+    obs_std = None
     if use_obsnorm and "obs_stats" in cfg:
         import os
         mp = cfg["obs_stats"].get("mean_path", None)
         sp = cfg["obs_stats"].get("std_path", None)
-        if mp and os.path.exists(mp): obs_mean = np.load(mp)
-        if sp and os.path.exists(sp): obs_std  = np.load(sp)
+        if mp and os.path.exists(mp):
+            obs_mean = np.load(mp)
+        if sp and os.path.exists(sp):
+            obs_std = np.load(sp)
 
     def build_train_obs(x1_vec: np.ndarray, x2_vec: np.ndarray) -> np.ndarray:
-        p1 = x1_vec[:D]; v1 = x1_vec[D:2*D]
-        p2 = x2_vec[:D]; v2 = x2_vec[D:2*D]
-        obs = np.concatenate([p1 - center, p2 - center, (p2 - p1), v1, v2]).astype(np.float32)
+        p1 = x1_vec[:D]
+        v1 = x1_vec[D:2 * D]
+        p2 = x2_vec[:D]
+        v2 = x2_vec[D:2 * D]
+        obs = np.concatenate(
+            [p1 - center, p2 - center, (p2 - p1), v1, v2]
+        ).astype(np.float32)
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
-            obs = (obs - obs_mean.astype(np.float32)) / (obs_std.astype(np.float32) + 1e-8)
+            obs = (obs - obs_mean.astype(np.float32)) / (
+                obs_std.astype(np.float32) + 1e-8
+            )
         return obs
 
-    # -------------------- policy wrapper --------------------
+    # -------------------- attacker mode & rule-based attacker --------------------
+    # Prefer a dedicated override for RHC; fall back to global attacker_mode.
+    attacker_mode = cfg.get("rhc_attacker_mode", cfg.get("attacker_mode", "rl"))
+    attacker_mode = str(attacker_mode).lower()
+    if attacker_mode not in ("rl", "rule"):
+        raise ValueError(f"Unknown attacker_mode='{attacker_mode}' (expected 'rl' or 'rule').")
+
+    rule_attacker: AttackerRuleController | None = None
+    if attacker_mode == "rule":
+        # This uses cfg["dyn"]["Ad"/"Bd"], arena, att_rule, etc.
+        rule_attacker = AttackerRuleController(cfg)
+
+    # -------------------- policy wrapper (RL) --------------------
     deterministic = bool(cfg.get("rl_eval_deterministic", True))
     umax = float(cfg.get("umax", 5e-4))
     debug_actions = bool(cfg.get("debug_actions", False))
@@ -659,60 +702,100 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
     has_obs_api = hasattr(pol, "act_def_obs") and hasattr(pol, "act_att_obs")
 
     def _act(which: str, x1_vec: np.ndarray, x2_vec: np.ndarray, deterministic: bool):
+        """
+        Unified action interface:
+          - Defender: always RL policy.
+          - Attacker: RL or rule-based, depending on attacker_mode.
+        """
+        # --- rule-based attacker branch ---
+        if which == "att" and attacker_mode == "rule":
+            assert rule_attacker is not None, "rule_attacker should be initialized when attacker_mode='rule'."
+            p1 = x1_vec[:D]
+            v1 = x1_vec[D:2 * D]
+            p2 = x2_vec[:D]
+            v2 = x2_vec[D:2 * D]
+            u = rule_attacker.act(p1, v1, p2, v2)
+            return u.astype(np.float32)
+
+        # --- RL (defender or attacker) ---
         obs = build_train_obs(x1_vec, x2_vec)
         if has_obs_api:
-            return pol.act_def_obs(obs, deterministic=deterministic) if which == "def" \
-                   else pol.act_att_obs(obs, deterministic=deterministic)
+            if which == "def":
+                return pol.act_def_obs(obs, deterministic=deterministic)
+            else:
+                return pol.act_att_obs(obs, deterministic=deterministic)
+
         # Fallback: raw pack; RLPolicy must internally reproduce training obs
         if not getattr(_act, "_warned", False):
-            print("[info] RLPolicy has no *_obs API; falling back to raw pack_state. "
-                  "Ensure RLPolicy reproduces training obs internally.")
+            print(
+                "[info] RLPolicy has no *_obs API; falling back to raw pack_state. "
+                "Ensure RLPolicy reproduces training obs internally."
+            )
             _act._warned = True
-        p1 = x1_vec[:D]; v1 = x1_vec[D:2*D]
-        p2 = x2_vec[:D]; v2 = x2_vec[D:2*D]
+        p1 = x1_vec[:D]
+        v1 = x1_vec[D:2 * D]
+        p2 = x2_vec[:D]
+        v2 = x2_vec[D:2 * D]
         raw_state = rl_infer.RLPolicy.pack_state(p1, v1, p2, v2)
-        return pol.act_def(raw_state, deterministic=deterministic) if which == "def" \
-               else pol.act_att(raw_state, deterministic=deterministic)
+        if which == "def":
+            return pol.act_def(raw_state, deterministic=deterministic)
+        else:
+            return pol.act_att(raw_state, deterministic=deterministic)
 
     # -------------------- tiny helpers for animator compatibility --------------------
     def _p3_row(x_row):
-        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D == 3 else \
-               (float(x_row[0]), float(x_row[1]), 0.0)
+        return (
+            (float(x_row[0]), float(x_row[1]), float(x_row[2]))
+            if D == 3
+            else (float(x_row[0]), float(x_row[1]), 0.0)
+        )
 
     def _p3_vec(x_vec):
-        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D == 3 else \
-               (float(x_vec[0]), float(x_vec[1]), 0.0)
+        return (
+            (float(x_vec[0]), float(x_vec[1]), float(x_vec[2]))
+            if D == 3
+            else (float(x_vec[0]), float(x_vec[1]), 0.0)
+        )
 
     def _identity_R():
         return np.eye(3, dtype=float)
 
     # -------------------- logs for animator (attitude = stubs) --------------------
     plan_hist1, plan_hist2 = [], []
-    plan_att1,  plan_att2  = [], []           # lists of length=steps; each item is a flat horizon of identity Rs
-    exec_xyz1,  exec_xyz2  = [], []
-    exec_att1,  exec_att2  = [], []           # dicts with {"R": I, "phi": 0.0}
-    phi_hist1,  phi_hist2  = [], []
+    plan_att1, plan_att2 = [], []          # lists of length=steps; each item is a flat horizon of identity Rs
+    exec_xyz1, exec_xyz2 = [], []
+    exec_att1, exec_att2 = [], []          # dicts with {"R": I, "phi": 0.0}
+    phi_hist1, phi_hist2 = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
     # t=0 logs
-    exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-    exec_att1.append({"R": _identity_R(), "phi": 0.0}); phi_hist1.append(0.0)
-    exec_att2.append({"R": _identity_R(), "phi": 0.0}); phi_hist2.append(0.0)
-    fov_axis_hist.append(None); fov_seen_mask.append(False)
+    exec_xyz1.append(_p3_vec(x1))
+    exec_xyz2.append(_p3_vec(x2))
+    exec_att1.append({"R": _identity_R(), "phi": 0.0})
+    exec_att2.append({"R": _identity_R(), "phi": 0.0})
+    phi_hist1.append(0.0)
+    phi_hist2.append(0.0)
+    fov_axis_hist.append(None)
+    fov_seen_mask.append(False)
 
     # ==================== ROLLOUT ====================
     for k in range(steps):
-        # 1) actions from policies
+        # 1) actions from policies / rule controller
         u1 = np.clip(np.asarray(_act("def", x1, x2, deterministic), float), -umax, +umax)
         u2 = np.clip(np.asarray(_act("att", x1, x2, deterministic), float), -umax, +umax)
         if debug_actions and k < 3:
             obs_dbg = build_train_obs(x1, x2)
-            print(f"[k={k:02d}] ||a_def||={np.linalg.norm(u1):.3g}, ||a_att||={np.linalg.norm(u2):.3g}, "
-                  f"first obs entries={obs_dbg[:6]}")
+            print(
+                f"[k={k:02d}] ||a_def||={np.linalg.norm(u1):.3g}, "
+                f"||a_att||={np.linalg.norm(u2):.3g}, "
+                f"first obs entries={obs_dbg[:6]}"
+            )
 
         # 2) embed into full control vectors [D accel, then zeros if any extra states]
-        u1_full = np.zeros(nu); u2_full = np.zeros(nu)
-        u1_full[:D] = u1;       u2_full[:D] = u2
+        u1_full = np.zeros(nu)
+        u2_full = np.zeros(nu)
+        u1_full[:D] = u1
+        u2_full[:D] = u2
 
         # 3) plant step
         x1 = step_plant_single(x1, u1_full)
@@ -721,29 +804,42 @@ def run_rhc_with_rl_and_collect_frames_3d(cfg: Dict[str, Any],
         # 4) "plan" horizons (flat, just repeat current pos)
         plan1 = [_p3_row(x1)] * T
         plan2 = [_p3_row(x2)] * T
-        plan_hist1.append(plan1); plan_hist2.append(plan2)
+        plan_hist1.append(plan1)
+        plan_hist2.append(plan2)
 
         # 5) attitude stubs (keep shapes)
         I = _identity_R()
         att_stub = [{"R": I, "phi": 0.0} for _ in range(T)]
-        plan_att1.append(att_stub); plan_att2.append(att_stub)
+        plan_att1.append(att_stub)
+        plan_att2.append(att_stub)
 
         exec_att1.append({"R": I, "phi": 0.0})
         exec_att2.append({"R": I, "phi": 0.0})
-        phi_hist1.append(0.0); phi_hist2.append(0.0)
+        phi_hist1.append(0.0)
+        phi_hist2.append(0.0)
 
-        exec_xyz1.append(_p3_vec(x1)); exec_xyz2.append(_p3_vec(x2))
-        fov_axis_hist.append(None); fov_seen_mask.append(False)
+        exec_xyz1.append(_p3_vec(x1))
+        exec_xyz2.append(_p3_vec(x2))
+        fov_axis_hist.append(None)
+        fov_seen_mask.append(False)
 
     # -------------------- pack results --------------------
     return {
-        "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
-        "plan_att1":  plan_att1,  "plan_att2":  plan_att2,      # identity-R horizons
-        "exec1_xyz":  exec_xyz1,  "exec2_xyz":  exec_xyz2,
-        "exec_att1":  exec_att1,  "exec_att2":  exec_att2,      # identity-R per step
-        "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,      # zeros
-        "fov_axis_hist": fov_axis_hist, "fov_seen_mask": fov_seen_mask,
+        "plan_hist1": plan_hist1,
+        "plan_hist2": plan_hist2,
+        "plan_att1": plan_att1,
+        "plan_att2": plan_att2,      # identity-R horizons
+        "exec1_xyz": exec_xyz1,
+        "exec2_xyz": exec_xyz2,
+        "exec_att1": exec_att1,
+        "exec_att2": exec_att2,      # identity-R per step
+        "phi_hist1": phi_hist1,
+        "phi_hist2": phi_hist2,      # zeros
+        "fov_axis_hist": fov_axis_hist,
+        "fov_seen_mask": fov_seen_mask,
     }
+
+
 
 
 

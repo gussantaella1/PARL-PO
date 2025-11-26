@@ -75,10 +75,10 @@ COMMON: Dict[str, Any] = {
     "att_rule": {
         "ridge": 1e-2,        # one-step ridge in u_center
         "w_center": 1.0,      # weight for center pull
-        "w_avoid":  0.5,      # weight for repulsion
-        "w_damp":   0.2,      # velocity damping
-        "min_sep":  1.0,      # (m) soft floor for repulsion distance
-        "repulse_gain": 2.0,  # overall strength of repulsion ~ 1/r^3
+        "w_avoid":  2.0,      # weight for repulsion
+        "w_damp":   0.3,      # velocity damping
+        "min_sep":  4.0,      # (m) soft floor for repulsion distance
+        "repulse_gain": 10.0,  # overall strength of repulsion ~ 1/r^3
     },
 
     # Filled by build_dyn()
@@ -98,18 +98,18 @@ COMMON: Dict[str, Any] = {
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    "num_envs": 64,          # was 8
-    "steps_per_env": 512,    # was 256
-    "total_updates": 2000,   # was 300
+    # "num_envs": 64,          # was 8
+    # "steps_per_env": 512,    # was 256
+    # "total_updates": 2000,   # was 300
 
-    # "num_envs": 8,          # was 8
-    # "steps_per_env": 256,    # was 256
-    # "total_updates": 300,   # was 300
+    "num_envs": 8,          # was 8
+    "steps_per_env": 256,    # was 256
+    "total_updates": 300,   # was 300
 
     "log_every": 10,
 
     # PPO hyperparams
-    "gamma": 0.97,
+    "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
     "policy_lr": 3e-4,
@@ -119,6 +119,9 @@ TRAIN: Dict[str, Any] = {
     "entropy_coef": 0.02,
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
+
+    "lr_schedule": "linear",   # options: "none", "linear"
+    "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
 
     # Anneal (training-time only)
     "def_center_min_anneal": 0.5,

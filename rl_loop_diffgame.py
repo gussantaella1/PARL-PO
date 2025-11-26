@@ -224,15 +224,6 @@ class Env:
         wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
-        # NEW: defender keep-out around center (donut safety zone)
-        # penalty only if defender is *inside* safe radius
-        if rho1 < self.def_center_safe_radius:
-            # normalized penetration: 0 at boundary, 1 at exact center
-            pen = (self.def_center_safe_radius - rho1) / max(self.def_center_safe_radius, 1e-6)
-            center_avoid_pen = (pen ** 2) * self.def_center_avoid_coef
-        else:
-            center_avoid_pen = 0.0
-
         # defender radial velocity
         rhat1 = (p1 - self.center)
         rnorm = np.linalg.norm(rhat1) + 1e-9
@@ -247,10 +238,7 @@ class Env:
              - self.k_vel * float(np.dot(v1, v1))
              - k_vrad * (vrad1**2)
              - self.lD * float(np.dot(a1, a1))
-             - wall1
-             - center_avoid_pen   # <--- NEW
-             )
-
+             - wall1 )
 
         r2 = (- self.alpha * delta_d2
              - self.k_pos * d2
@@ -392,42 +380,57 @@ def compute_gae_from_buffer(buf: RolloutBuffer, gamma: float, lam: float):
 class AttackerRuleController:
     """
     u = sat_umax( w_center * u_center + w_avoid * u_repulse - w_damp * v2 )
-    where
-      - u_center: one-step ridge minimizer to drive p2 -> center under (Ad, Bd)
-      - u_repulse: smooth inverse-cube repulsion away from the defender
+
+    - u_center: one-step ridge minimizer to drive p2 -> center under (Ad, Bd)
+    - u_repulse: repulsion away from defender with a *hard* keep-out:
+        * if dist(p2, p1) < min_sep  -> full thrust directly away
+        * else                       -> smooth inverse-square repulsion
     """
     def __init__(self, cfg: Dict[str, Any]):
         D = int(cfg["D"])
         self.D = D
         ar = cfg["arena"]
-        self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D==3 else 0.0)], dtype=np.float32)[:D]
+        self.center = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
+            dtype=np.float32
+        )[:D]
+
         self.Ad = np.asarray(cfg["dyn"]["Ad"], dtype=np.float32)
         self.Bd = np.asarray(cfg["dyn"]["Bd"], dtype=np.float32)
-        P = np.hstack([np.eye(D, dtype=np.float32), np.zeros((D, D), dtype=np.float32)])
+
+        # Position selection matrix: P * [p, v] = p
+        P = np.hstack([
+            np.eye(D, dtype=np.float32),
+            np.zeros((D, D), dtype=np.float32),
+        ])
         self.P = P
-        self.F = (self.Bd.T @ P.T).T  # (D,D)
+        self.F = (self.Bd.T @ P.T).T  # (D, D)
         FtF = self.F.T @ self.F
 
         # Safe defaults; allow overrides via cfg["att_rule"]
         rule = dict(
-            ridge=1e-2,        # ridge for one-step center pull
-            w_center=1.0,      # weight for center attraction
-            w_avoid=0.6,       # weight for repulsion from defender
-            w_damp=0.3,        # linear velocity damping
-            min_sep=1.0,       # meters; soft floor for repulsion
-            repulse_gain=5.0,  # strength of repulsion ~ 1/r^3
+            ridge=1e-2,         # ridge for one-step center pull
+            w_center=0.5,       # weight for center attraction
+            w_avoid=2.0,        # weight for repulsion from defender
+            w_damp=0.3,         # linear velocity damping
+            min_sep=3.0,        # meters; hard keep-out radius
+            repulse_gain=10.0,  # strength of repulsion outside min_sep
         )
         rule.update(cfg.get("att_rule", {}))
 
-        self.lam = float(rule["ridge"])
-        self.K = np.linalg.solve(FtF + self.lam * np.eye(D, dtype=np.float32), self.F.T)
-
-        self.w_center = float(rule["w_center"])
-        self.w_avoid  = float(rule["w_avoid"])
-        self.w_damp   = float(rule["w_damp"])
-        self.min_sep  = float(rule["min_sep"])
+        self.lam          = float(rule["ridge"])
+        self.w_center     = float(rule["w_center"])
+        self.w_avoid      = float(rule["w_avoid"])
+        self.w_damp       = float(rule["w_damp"])
+        self.min_sep      = float(rule["min_sep"])
         self.repulse_gain = float(rule["repulse_gain"])
-        self.umax = float(cfg["umax"])
+        self.umax         = float(cfg["umax"])
+
+        # One-step ridge solution gain for u_center
+        self.K = np.linalg.solve(
+            FtF + self.lam * np.eye(D, dtype=np.float32),
+            self.F.T
+        )
 
     def u_center(self, p2: np.ndarray, v2: np.ndarray) -> np.ndarray:
         x2 = np.concatenate([p2, v2])
@@ -436,18 +439,42 @@ class AttackerRuleController:
         return -(self.K @ E2)
 
     def u_repulse(self, p1: np.ndarray, p2: np.ndarray) -> np.ndarray:
+        """
+        Hard keep-out:
+          - If dist < min_sep: full thrust directly away from defender.
+          - Else: smooth inverse-square repulsion.
+        """
         r = p2 - p1
-        r2 = float(r @ r)
-        eps = 1e-6
-        soft = max(self.min_sep**2, r2)
-        scale = self.repulse_gain / ((soft + eps) ** 1.5)  # ~1/r^3 with floor
-        return scale * r
+        dist = float(np.linalg.norm(r)) + 1e-9
+        r_hat = r / dist
 
-    def act(self, p1: np.ndarray, v1: np.ndarray, p2: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        # Inside keep-out zone: *max thrust* directly away
+        if dist < self.min_sep:
+            return self.umax * r_hat
+
+        # Outside keep-out: smoother inverse-square repulsion
+        # magnitude ≈ repulse_gain / dist^2 (then clipped in act())
+        mag = self.repulse_gain / (dist**2)
+        return mag * r_hat
+
+    def act(self,
+            p1: np.ndarray, v1: np.ndarray,
+            p2: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        # Center pull and repulsion
         uc = self.u_center(p2, v2)
         ur = self.u_repulse(p1, p2)
-        u  = self.w_center * uc + self.w_avoid * ur - self.w_damp * v2
+
+        # Compute separation to optionally *down-weight center* close in
+        dist = float(np.linalg.norm(p2 - p1))
+        if dist < self.min_sep:
+            # Near defender: ignore center attraction
+            w_center_eff = 0.0
+        else:
+            w_center_eff = self.w_center
+
+        u = w_center_eff * uc + self.w_avoid * ur - self.w_damp * v2
         return np.clip(u, -self.umax, +self.umax)
+
 
 
 # =============================================================
@@ -573,19 +600,33 @@ class PPO:
             {"params": [self.def_net.logstd], "lr": cfg["policy_lr"] * 0.5},
             {"params": self.def_net.vf.parameters(), "lr": cfg["value_lr"]},
         ])
+        # NEW: remember initial defender LRs
+        self.def_base_lrs = [g["lr"] for g in self.def_opt.param_groups]
 
         # Attacker: rule or RL
         if self.attacker_mode == "rl":
             self.att_net = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
             self.att_opt = optim.Adam([
-                {"params": list(self.att_net.pi.parameters()) + list(self.att_net.mu_res.parameters()), "lr": cfg["policy_lr"]},
-                {"params": [self.att_net.logstd], "lr": cfg["policy_lr"] * 0.5},
-                {"params": self.att_net.vf.parameters(), "lr": cfg["value_lr"]},
+                {
+                    "params": list(self.att_net.pi.parameters()) + list(self.att_net.mu_res.parameters()),
+                    "lr": cfg["policy_lr"],
+                },
+                {
+                    "params": [self.att_net.logstd],
+                    "lr": cfg["policy_lr"] * 0.5,
+                },
+                {
+                    "params": self.att_net.vf.parameters(),
+                    "lr": cfg["value_lr"],
+                },
             ])
+            # NEW: remember initial attacker LRs
+            self.att_base_lrs = [g["lr"] for g in self.att_opt.param_groups]
             self.rule_ctrl = None
         else:
             self.att_net = None
             self.att_opt = None
+            self.att_base_lrs = None
             self.rule_ctrl = AttackerRuleController(cfg)
 
     @torch.no_grad()
@@ -681,6 +722,10 @@ def train(cfg: Dict[str, Any]):
     act_dim = int(cfg["D"])
     ppo = PPO(obs_dim, act_dim, cfg, device=device)
 
+    # NEW: LR schedule config
+    lr_schedule = cfg.get("lr_schedule", "none")
+    lr_final_factor = float(cfg.get("lr_final_factor", 0.1))
+
     # ---- NEW: metrics container ----
     metrics = {
         "update": [],
@@ -689,9 +734,11 @@ def train(cfg: Dict[str, Any]):
         "muD_abs_mean": [],
         "stdD_mean": [],
         "d1_mean": [],
+        "d2_mean": [],   # <--- NEW
         "lr_pi": [],
         "lr_vf": [],
     }
+
 
 
     # Optional anneal of defender center tether
@@ -699,9 +746,26 @@ def train(cfg: Dict[str, Any]):
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
 
     for upd in range(1, total_updates + 1):
-        # Linear anneal multiplier from 1.0 → min_anneal
-        frac = upd / max(1, total_updates)
-        k_cent_mul = 1.0 - (1.0 - min_anneal) * frac
+
+        # ---------- optional LR decay (linear) ----------
+        if lr_schedule == "linear":
+            # frac_lr goes 0 → 1 over training
+            frac_lr = (upd - 1) / max(1, total_updates - 1)
+            scale = 1.0 - frac_lr * (1.0 - lr_final_factor)
+
+            # defender
+            for g, base in zip(ppo.def_opt.param_groups, ppo.def_base_lrs):
+                g["lr"] = base * scale
+
+            # attacker RL (if you ever turn it on)
+            if ppo.att_opt is not None and getattr(ppo, "att_base_lrs", None) is not None:
+                for g, base in zip(ppo.att_opt.param_groups, ppo.att_base_lrs):
+                    g["lr"] = base * scale
+        # ------------------------------------------------
+
+        # Linear anneal multiplier from 1.0 → min_anneal for k_cent
+        center_frac = upd / max(1, total_updates)
+        k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
         for e in vec.envs:
             e.k_cent = def_center_base * k_cent_mul
 
@@ -745,16 +809,23 @@ def train(cfg: Dict[str, Any]):
         else:
             ppo.update_defender_only(bufD)
 
-
         if upd % log_every == 0:
             R_def_mean = ep_ret_def.mean()
             R_att_mean = ep_ret_att.mean()
 
             with torch.no_grad():
-                distD = ppo.def_net.dist(bufD.obs.reshape(-1, obs_dim), who="def")
+                flat_obs = bufD.obs.reshape(-1, obs_dim)
+                distD = ppo.def_net.dist(flat_obs, who="def")
                 muD = distD.mean.abs().mean().item()
                 stdD = distD.stddev.mean().item()
-                d1_mean = bufD.obs.reshape(-1, obs_dim)[:, :cfg["D"]].pow(2).sum(-1).mean().sqrt().item()
+
+                # obs = [p1c, p2c, rel, v1, v2]
+                Dcfg = cfg["D"]
+                p1c = flat_obs[:, :Dcfg]
+                p2c = flat_obs[:, Dcfg:2*Dcfg]
+
+                d1_mean = p1c.pow(2).sum(-1).mean().sqrt().item()
+                d2_mean = p2c.pow(2).sum(-1).mean().sqrt().item()
 
             # grab learning rates (assuming two param groups: policy+logstd and value)
             lr_pi = ppo.def_opt.param_groups[0]["lr"]
@@ -767,6 +838,7 @@ def train(cfg: Dict[str, Any]):
             metrics["muD_abs_mean"].append(muD)
             metrics["stdD_mean"].append(stdD)
             metrics["d1_mean"].append(d1_mean)
+            metrics["d2_mean"].append(d2_mean)
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
 
@@ -774,6 +846,8 @@ def train(cfg: Dict[str, Any]):
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
             print(f"   approx <||p1-center||> ≈ {d1_mean:.3f}")
+            print(f"   approx <||p2-center||> ≈ {d2_mean:.3f}")
+
 
 
     print("Training finished.")
@@ -896,6 +970,15 @@ if __name__ == "__main__":
     plt.title("Avg defender distance to center")
     plt.tight_layout()
     plt.savefig(os.path.join(OUT_DIR, "def_center_dist.png"), dpi=200)
+
+    plt.figure()
+    plt.plot(updates, metrics["d2_mean"])
+    plt.xlabel("Update")
+    plt.ylabel("<||p2 - center||>")
+    plt.title("Avg attacker distance to center")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "att_center_dist.png"), dpi=200)
+
 
     plt.figure()
     plt.plot(updates, metrics["lr_pi"], label="policy LR")
