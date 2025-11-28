@@ -31,6 +31,10 @@ importlib.reload(config_rl)
 from config_rl import config_for_train, config_for_eval, build_dyn
 
 
+from ukf_estimator import AgentUKF, _body_bearing_from_world, _azel_from_body_vec
+
+
+
 # =============================================================
 # Utils
 # =============================================================
@@ -121,6 +125,48 @@ class Env:
         self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
         self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
 
+        # ---- UKF / measurement model knobs ----
+        self.use_ukf          = bool(cfg.get("use_ukf", False))
+        self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
+        self.meas_innov_coef  = float(cfg.get("meas_innov_coef", 0.0))  # weight on innovation^2
+        self.meas_cov_coef    = float(cfg.get("meas_cov_coef", 0.0))    # weight on trace(P_pos)
+
+        if self.use_ukf and self.D != 3:
+            raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
+
+        self.ukf = None
+        self._latest_meas_innov = 0.0
+        self._latest_meas_trP   = 0.0
+
+        if self.use_ukf:
+            ukf_cfg = cfg.get("ukf", {})
+
+            # Initial covariance P0
+            pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * self.radius))
+            vel_std0 = float(ukf_cfg.get("vel_std0", 0.01))
+            P0 = np.diag(
+                [pos_std0**2, pos_std0**2, pos_std0**2,
+                 vel_std0**2, vel_std0**2, vel_std0**2]
+            )
+
+            # Process noise Q (simple isotropic default)
+            q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
+            Q = q_scale * np.eye(6, dtype=float)
+
+            # Measurement noise R (az, el)
+            sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
+            sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
+            Rm = np.diag([sigma_az**2, sigma_el**2])
+
+            self._ukf_P0 = P0
+            self._ukf_Q  = Q
+            self._ukf_R  = Rm
+
+            # Keep some init stds around for reset-time randomization
+            self._ukf_init_pos_std = float(ukf_cfg.get("init_pos_std", pos_std0))
+            self._ukf_init_vel_std = float(ukf_cfg.get("init_vel_std", vel_std0))
+
+
         # Training-only initial-condition randomization
         # Defaults to "fixed" if keys are absent (e.g., eval config)
         self.train_ic_mode = cfg.get("train_ic_mode", "fixed")
@@ -200,7 +246,36 @@ class Env:
         d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
         self._d2_prev = d2_raw / (self.radius**2)
 
+        # ---- (optional) UKF init: attacker state estimate from noisy prior ----
+        if self.use_ukf:
+            # Rough initial guess = truth + Gaussian perturbation
+            pos_noise = np.random.normal(
+                scale=self._ukf_init_pos_std,
+                size=p2.shape
+            )
+            vel_noise = np.random.normal(
+                scale=self._ukf_init_vel_std,
+                size=v2.shape
+            )
+            p2_est = p2 + pos_noise
+            v2_est = v2 + vel_noise
+            x0_ukf = np.concatenate([p2_est, v2_est])
+
+            self.ukf = AgentUKF(
+                x0=x0_ukf,
+                P0=self._ukf_P0.copy(),
+                Q=self._ukf_Q.copy(),
+                R=self._ukf_R.copy(),
+                dt=self.dt,
+                dyn='hcw',
+                hcw=self.cfg.get("hcw", {})  # or whatever your HCW params live under
+            )
+
+            self._latest_meas_innov = 0.0
+            self._latest_meas_trP   = float(np.trace(self.ukf.P[0:3, 0:3]))
+
         return self._obs()
+
 
 
     def step(self, a1_env: np.ndarray, a2_env: np.ndarray) -> Tuple[np.ndarray, float, float, bool, dict]:
@@ -223,14 +298,58 @@ class Env:
         # relative distance (tiny zero-sum shaping)
         rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
 
-        # soft walls
         rho1 = np.linalg.norm(p1 - self.center) / self.radius
         rho2 = np.linalg.norm(p2 - self.center) / self.radius
         wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
+        # ---- UKF + measurement-based metrics (optional) ----
+        meas_innov_sq = 0.0
+        meas_trPpos   = 0.0
+
+        if self.use_ukf:
+            # Time update (no explicit control input; attacker accel folded into Q)
+            self.ukf.predict(dt=self.dt, u=None, u_cov=None)
+
+            # True bearing measurement from defender (observer) to attacker (target)
+            p_obs = p1
+            if self.D != 3:
+                raise RuntimeError("UKF bearing logic assumes D=3.")
+            R_wb = np.eye(3)  # assume body aligned with world for now
+
+            # world-frame unit vector and az/el
+            v_b = _body_bearing_from_world(p_obs, R_wb, p2)
+            az_true, el_true = _azel_from_body_vec(v_b)
+            z_true = np.array([az_true, el_true], float)
+
+            # Add measurement noise ~ N(0, R)
+            z_noise = np.random.multivariate_normal(
+                mean=np.zeros(2),
+                cov=self._ukf_R
+            )
+            z_meas = z_true + z_noise
+
+            # Innovation: measured - predicted (from prior mean)
+            z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+            innov = z_meas - z_hat_prior
+            # wrap to [-pi, pi]
+            innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
+            innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
+
+            meas_innov_sq = float(innov @ innov)
+
+            # Measurement update
+            self.ukf.update(z_meas, p_obs, R_wb)
+
+            # Position covariance trace
+            meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
+
+            self._latest_meas_innov = meas_innov_sq
+            self._latest_meas_trP   = meas_trPpos
+
         # --- NEW: attacker "hits" the object/center if close enough ---
         hit_target = False
+
         if self.att_target_hit_radius > 0.0 and rho2 <= self.att_target_hit_radius:
             hit_target = True
 
@@ -260,8 +379,16 @@ class Env:
             - k_vrad * (vrad1**2)
             - self.lD * float(np.dot(a1, a1))
             - wall1                        # arena boundary
-            - center_keepout               # <--- NEW strong penalty for being near center
+            - center_keepout               # keep-out near object
         )
+
+        # Optional measurement-based penalties for defender:
+        #  - large innovation (filter surprised by measurement)
+        #  - large position uncertainty in the estimate
+        if self.use_ukf and self.use_meas_reward:
+            r1 -= self.meas_innov_coef * meas_innov_sq
+            r1 -= self.meas_cov_coef   * meas_trPpos
+
 
 
         r2 = (- self.alpha * delta_d2
@@ -303,8 +430,15 @@ class Env:
             "d1_norm": d1,
             "oob_def": bool(oob1),
             "oob_att": bool(oob2),
-            "hit_target": bool(hit_target),   # <--- NEW
+            "hit_target": bool(hit_target),
         }
+        if self.use_ukf:
+            info["meas_innov_sq"] = meas_innov_sq
+            info["ukf_trPpos"]    = meas_trPpos
+            # (optional) estimated attacker range normalized by R
+            est_range = np.linalg.norm(self.ukf.x[:self.D]) / self.radius
+            info["ukf_est_range_norm"] = float(est_range)
+
 
         return self._obs(), float(r1), float(r2), bool(done), info
 

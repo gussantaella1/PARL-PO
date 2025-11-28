@@ -48,6 +48,32 @@ def _psd_enforce(M: np.ndarray, floor: float = 1e-10) -> np.ndarray:
     eig = np.maximum(eig, floor)
     return (V * eig) @ V.T
 
+def _safe_inv_2x2(S: np.ndarray,
+                  jitter: float = 1e-8,
+                  max_tries: int = 5) -> np.ndarray:
+    """
+    Robust inverse for small 2x2 PSD-ish matrices.
+    Tries to add diagonal jitter and invert via Cholesky; falls back to pinv.
+    """
+    S = np.asarray(S, float)
+    I = np.eye(S.shape[0])
+
+    for k in range(max_tries):
+        try:
+            # Enforce symmetry and positiveness first
+            S_reg = _psd_enforce(_symmetrize(S + (jitter * (10.0**k)) * I),
+                                 floor=jitter * (10.0**k))
+            # Cholesky-based inverse: S_reg = L L^T  →  S_reg^{-1} = L^{-T} L^{-1}
+            L = np.linalg.cholesky(S_reg)
+            Linv = np.linalg.inv(L)
+            return Linv.T @ Linv
+        except np.linalg.LinAlgError:
+            continue
+
+    # Last resort: Moore–Penrose pseudo-inverse
+    return np.linalg.pinv(S)
+
+
 def _normalize_angle(a: float) -> float:
     return (a + np.pi) % (2*np.pi) - np.pi
 
@@ -238,7 +264,12 @@ class AgentUKF:
             Pxz += self._Wci * np.outer(dxi, dzi)
 
         S = _psd_enforce(_symmetrize(S), floor=1e-12)
-        K = Pxz @ np.linalg.inv(S + 1e-12*np.eye(2))
+        # K = Pxz @ np.linalg.inv(S + 1e-12*np.eye(2))
+
+        # S is already symmetrized/PSD-enforced above
+        Sinv = _safe_inv_2x2(S)
+        K = Pxz @ Sinv
+
 
         y = np.asarray(z, float) - z_pred
         y[0] = _normalize_angle(y[0]); y[1] = _normalize_angle(y[1])
@@ -246,3 +277,30 @@ class AgentUKF:
         self.x = self.x + K @ y
         self.P = _psd_enforce(_symmetrize(self.P - K @ S @ K.T), floor=1e-12)
         return self.x, self.P
+
+
+# -------------------------------
+# Backwards-compatible factory
+# -------------------------------
+
+def KF_CV(x0, P0, Q, R, dt,
+          kind: str = "ukf",
+          dyn: str = "cv",
+          hcw: dict | None = None,
+          **kwargs) -> AgentUKF:
+    """
+    Backwards-compatible helper so older code can do:
+        KF_CV(x0, P0, Q, R, dt, kind="ukf", dyn="hcw", hcw=hcw_params)
+
+    We ignore `kind` (we only implement a UKF) and just construct AgentUKF.
+    """
+    dyn = (dyn or "cv").lower()
+    return AgentUKF(
+        x0=x0,
+        P0=P0,
+        Q=Q,
+        R=R,
+        dt=dt,
+        dyn=dyn,      # 'cv' or 'hcw'
+        hcw=hcw,
+    )

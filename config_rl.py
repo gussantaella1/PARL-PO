@@ -101,6 +101,7 @@ COMMON: Dict[str, Any] = {
 
 
 
+
     # Filled by build_dyn()
     "dyn": {"Ad": None, "Bd": None},
 
@@ -114,6 +115,49 @@ COMMON: Dict[str, Any] = {
         "edgecolor": "k"        
     },
 }
+
+# ---------- Kalman / measurement subconfig ----------
+ARENA_R = float(COMMON["arena"]["r"])
+
+KF_COMMON: Dict[str, Any] = {
+    "use_ukf": True,
+    "use_meas_reward": True,
+    "meas_innov_coef": 0.0,   # start at 0, then slowly crank up
+    "meas_cov_coef": 0.0,
+    "ukf": {
+        "sigma_az": np.deg2rad(0.5),
+        "sigma_el": np.deg2rad(0.5),
+        "pos_std0": 0.2 * ARENA_R,
+        "vel_std0": 0.01,
+        "init_pos_std": 0.2 * ARENA_R,
+        "init_vel_std": 0.01,
+        "Q_scale": 1e-5,
+    },
+}
+
+# ---------- Visualizer config ----------
+
+VIZ: Dict[str, Any] = {
+    "viz": {
+        "axis_scale": 1e2,       # labels like x (10^2 m)
+        "axis_unit": "m",
+        "axis_label_only": True,
+        "triad_len": (0.5, 0.5, 0.7),
+        "triad_colors": ("tab:red", "tab:green", "tab:blue"),
+        "triad_labels": ("x_b (boresight)", "y_b", "z_b"),
+        "triad_leg_loc": "lower left",
+        "triad_leg_ncol": 3,
+        "triad_leg_title": "Body axes",
+        "only_est": False,
+        "show_meas": True,
+        "meas_len": 20.0,
+    },
+}
+
+
+# merge KF settings into COMMON so config_for_train/eval see them
+COMMON = _merge(COMMON, KF_COMMON)
+COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
