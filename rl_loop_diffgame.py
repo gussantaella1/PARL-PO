@@ -116,6 +116,11 @@ class Env:
         self.def_center_safe_radius = float(cfg.get("def_center_safe_radius", 0.05))
         self.def_center_avoid_coef  = float(cfg.get("def_center_avoid_coef", 10.0))
 
+        # NEW: attacker "hit object" termination around center (normalized wrt arena R)
+        self.att_target_hit_radius = float(cfg.get("att_target_hit_radius", 0.0))
+        self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
+        self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
+
         # Training-only initial-condition randomization
         # Defaults to "fixed" if keys are absent (e.g., eval config)
         self.train_ic_mode = cfg.get("train_ic_mode", "fixed")
@@ -224,6 +229,21 @@ class Env:
         wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
+        # --- NEW: attacker "hits" the object/center if close enough ---
+        hit_target = False
+        if self.att_target_hit_radius > 0.0 and rho2 <= self.att_target_hit_radius:
+            hit_target = True
+
+        # --- Defender keep-out around object of interest (center) ---
+        # rho1: defender distance / R
+        # If inside safe radius, apply quadratic penalty that grows as we go deeper.
+        center_keepout = 0.0
+        if self.def_center_safe_radius > 0.0:
+            if rho1 < self.def_center_safe_radius:
+                gap = (self.def_center_safe_radius - rho1)
+                center_keepout = (gap * gap) * self.def_center_avoid_coef
+
+
         # defender radial velocity
         rhat1 = (p1 - self.center)
         rnorm = np.linalg.norm(rhat1) + 1e-9
@@ -231,14 +251,18 @@ class Env:
         k_vrad = self.k_vel * 3.0
 
         # rewards
-        r1 = ( self.alpha * delta_d2
-             + self.k_pos * d2
-             - self.k_rel * rel2
-             - self.k_cent * d1
-             - self.k_vel * float(np.dot(v1, v1))
-             - k_vrad * (vrad1**2)
-             - self.lD * float(np.dot(a1, a1))
-             - wall1 )
+        r1 = (
+              self.alpha * delta_d2        # likes attacker moving outward
+            + self.k_pos * d2              # likes attacker far from center
+            - self.k_rel * rel2            # still a small incentive to stay near attacker (tune down if needed)
+            # - self.k_cent * d1           # <--- DROP this term
+            - self.k_vel * float(np.dot(v1, v1))
+            - k_vrad * (vrad1**2)
+            - self.lD * float(np.dot(a1, a1))
+            - wall1                        # arena boundary
+            - center_keepout               # <--- NEW strong penalty for being near center
+        )
+
 
         r2 = (- self.alpha * delta_d2
              - self.k_pos * d2
@@ -250,20 +274,38 @@ class Env:
         # termination
         oob1 = (rho1 >= self.margin)
         oob2 = (rho2 >= self.margin)
-        done = (oob1 or oob2) or (self.t >= self.T)
-        if oob1: r1 -= self.wallK
-        if oob2: r2 -= self.wallK
+
+        # include hit_target in done condition
+        done = (oob1 or oob2 or hit_target) or (self.t >= self.T)
+
+        if oob1:
+            r1 -= self.wallK
+        if oob2:
+            r2 -= self.wallK
+
         if done:
+            # existing terminal shaping
             r1 += self.beta * d2
             r2 -= self.beta * d2
             r1 -= 0.10 * d1
 
+            # extra: attacker success if it hit the target
+            if hit_target:
+                r1 -= self.att_target_hit_penalty_def
+                r2 += self.att_target_hit_reward_att
+
+
         self._d2_prev = d2
 
         info = {
-            "t": self.t, "d2_norm": d2, "d1_norm": d1,
-            "oob_def": bool(oob1), "oob_att": bool(oob2),
+            "t": self.t,
+            "d2_norm": d2,
+            "d1_norm": d1,
+            "oob_def": bool(oob1),
+            "oob_att": bool(oob2),
+            "hit_target": bool(hit_target),   # <--- NEW
         }
+
         return self._obs(), float(r1), float(r2), bool(done), info
 
     def _obs(self) -> np.ndarray:

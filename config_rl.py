@@ -72,14 +72,34 @@ COMMON: Dict[str, Any] = {
     "attacker_mode": "rule",
 
     # Rule-based attacker parameters
+    # "att_rule": {
+    #     "ridge": 1e-2,        # one-step ridge in u_center
+    #     "w_center": 1.0,      # weight for center pull
+    #     "w_avoid":  2.0,      # weight for repulsion
+    #     "w_damp":   0.3,      # velocity damping
+    #     "min_sep":  4.0,      # (m) soft floor for repulsion distance
+    #     "repulse_gain": 30.0,  # overall strength of repulsion ~ 1/r^3
+    # },
+
     "att_rule": {
-        "ridge": 1e-2,        # one-step ridge in u_center
-        "w_center": 1.0,      # weight for center pull
-        "w_avoid":  2.0,      # weight for repulsion
-        "w_damp":   0.3,      # velocity damping
-        "min_sep":  4.0,      # (m) soft floor for repulsion distance
-        "repulse_gain": 10.0,  # overall strength of repulsion ~ 1/r^3
+        "ridge": 2e-2,       # slightly smoother center controller
+        "w_center": 1.0,     # still wants the center
+        "w_avoid":  2.5,     # stronger fear
+        "w_damp":   0.3,     # more damping to avoid jitter
+        "min_sep":  4.0,     # reacts earlier to defender
+        "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
     },
+
+    # "att_rule": {
+    #     "ridge": 5e-2,       # slightly smoother center controller
+    #     "w_center": 0.8,     # still wants the center
+    #     "w_avoid":  3.0,     # stronger fear
+    #     "w_damp":   0.5,     # more damping to avoid jitter
+    #     "min_sep":  6.0,     # reacts earlier to defender
+    #     "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
+    # },
+
+
 
     # Filled by build_dyn()
     "dyn": {"Ad": None, "Bd": None},
@@ -98,13 +118,13 @@ COMMON: Dict[str, Any] = {
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    # "num_envs": 64,          # was 8
-    # "steps_per_env": 512,    # was 256
-    # "total_updates": 2000,   # was 300
+    "num_envs": 64,          # was 8
+    "steps_per_env": 512,    # was 256
+    "total_updates": 2000,   # was 300
 
-    "num_envs": 8,          # was 8
-    "steps_per_env": 256,    # was 256
-    "total_updates": 300,   # was 300
+    # "num_envs": 8,          # was 8
+    # "steps_per_env": 256,    # was 256
+    # "total_updates": 300,   # was 300
 
     "log_every": 10,
 
@@ -131,6 +151,17 @@ TRAIN: Dict[str, Any] = {
     "train_ic_mode": "random_shell",  # or "fixed"
     "train_ic_vmax": 0.05,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
+
+    "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
+    "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
+    "def_center_coef":        0.0,    # no attractive center tether
+    "prior_blend_def":        0.0,    # (optional) disable center prior for def
+
+
+    "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
+    "att_target_hit_penalty_def": 5.0,      # big negative for defender
+    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
+
 }
 
 
