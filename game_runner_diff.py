@@ -94,7 +94,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     debug_actions = bool(cfg.get("debug_actions", False))
 
     pol = RLPolicyDiff(cfg, device=cfg.get("device", "cpu"))
-    # Optional safety check:
     din_def, din_att = pol.verify_ckpt_compat()
     if din_def != 5*D or din_att != 5*D:
         print(
@@ -102,10 +101,24 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
             f"but runner will feed {5*D}. Make sure checkpoints are Diff-Nash."
         )
 
-    def _act(which: str, x1_vec: np.ndarray, x2_vec: np.ndarray, deterministic: bool):
-        obs = build_train_obs(x1_vec, x2_vec)
+    def _act(which: str,
+             x1_vec: np.ndarray,
+             x2_true: np.ndarray,
+             x2_est_vec: np.ndarray,
+             deterministic: bool):
+        if which == "def":
+            # defender uses belief if UKF 1→2 exists
+            x2_for_obs = x2_est_vec if (use_ukf and ukf12 is not None) else x2_true
+        else:
+            # attacker always gets truth (full info)
+            x2_for_obs = x2_true
+
+        obs = build_train_obs(x1_vec, x2_for_obs)
         return (pol.act_def_obs(obs, deterministic=deterministic)
                 if which == "def" else pol.act_att_obs(obs, deterministic=deterministic))
+
+
+
 
     # -------------------- tiny helpers for animator compatibility --------------------
     def _p3_row(x_row):
@@ -130,6 +143,10 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     # === optional UKFs (HCW-only, bearing-only) ===
     use_ukf = bool(cfg.get("use_ukf", False))
     est_hist = None
+
+    # belief state for attacker (what the policy will see)
+    x2_est = x2.copy()   # default: truth
+
     if use_ukf:
         ukf_cfg = cfg.get("ukf", {})
 
@@ -162,6 +179,11 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         if ukf12 is not None:
             est_hist["est12_xyz"] = [ukf12.x[:3].copy()]
             est_hist["meas12_azel"] = [None]
+            # initialize x2_est from belief, like in Env.reset
+            x2_est[:3] = ukf12.x[:3]
+            if x2_est.shape[0] >= 2*D:
+                x2_est[3:6] = ukf12.x[3:6]
+
         if ukf21 is not None:
             est_hist["est21_xyz"] = [ukf21.x[:3].copy()]
             est_hist["meas21_azel"] = [None]
@@ -181,15 +203,18 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     # ==================== ROLLOUT ====================
     for k in range(steps):
         # 1) actions from policies
-        u1 = np.clip(np.asarray(_act("def", x1, x2, deterministic), dtype=np.float32),
-                     -umax, +umax)
-        u2 = np.clip(np.asarray(_act("att", x1, x2, deterministic), dtype=np.float32),
-                     -umax, +umax)
+        u1 = np.clip(np.asarray(_act("def", x1, x2, x2_est, deterministic), dtype=np.float32),
+                    -umax, +umax)
+        u2 = np.clip(np.asarray(_act("att", x1, x2, x2_est, deterministic), dtype=np.float32),
+                    -umax, +umax)
+
         if debug_actions and k < 3:
-            obs_dbg = build_train_obs(x1, x2)
+            x2_for_dbg = x2_est if (use_ukf and ukf12 is not None) else x2
+            obs_dbg = build_train_obs(x1, x2_for_dbg)
             print(f"[k={k:02d}] ||a_def||={np.linalg.norm(u1):.3g}, "
                   f"||a_att||={np.linalg.norm(u2):.3g}, "
                   f"first obs entries={obs_dbg[:6]}")
+
 
         # 2) embed into full control vectors
         u1_full = np.zeros(nu, dtype=np.float32)
@@ -255,6 +280,13 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                 else:
                     est_hist["meas21_azel"].append(None)
                 est_hist["est21_xyz"].append(ukf21.x[:3].copy())
+            
+                # after UKF predict/update block:
+            if use_ukf and ukf12 is not None:
+                # Keep x2_est aligned with current belief state
+                x2_est[:3] = ukf12.x[:3]
+                if x2_est.shape[0] >= 2*D:
+                    x2_est[3:6] = ukf12.x[3:6]
 
         # 4) "plan" horizons (flat, just repeat current pos)
         plan1 = [_p3_row(x1)] * T

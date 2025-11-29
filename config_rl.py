@@ -99,9 +99,6 @@ COMMON: Dict[str, Any] = {
     #     "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
     # },
 
-
-
-
     # Filled by build_dyn()
     "dyn": {"Ad": None, "Bd": None},
 
@@ -133,13 +130,16 @@ KF_COMMON: Dict[str, Any] = {
         "init_vel_std": 0.01,
         "Q_scale": 1e-5,
     },
+    "reward_from_belief": True,   # NEW: toggle
+
+    "belief_clip_factor": 2.0,
 }
 
 # ---------- Visualizer config ----------
 
 VIZ: Dict[str, Any] = {
     "viz": {
-        "axis_scale": 1e2,       # labels like x (10^2 m)
+        "axis_scale": 1e0,       # labels like x (10^2 m)
         "axis_unit": "m",
         "axis_label_only": True,
         "triad_len": (0.5, 0.5, 0.7),
@@ -162,13 +162,13 @@ COMMON = _merge(COMMON,VIZ)
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    "num_envs": 64,          # was 8
-    "steps_per_env": 512,    # was 256
-    "total_updates": 2000,   # was 300
+    # "num_envs": 64,          # was 8
+    # "steps_per_env": 512,    # was 256
+    # "total_updates": 2000,   # was 300
 
-    # "num_envs": 8,          # was 8
-    # "steps_per_env": 256,    # was 256
-    # "total_updates": 300,   # was 300
+    "num_envs": 8,          # was 8
+    "steps_per_env": 256,    # was 256
+    "total_updates": 300,   # was 300
 
     "log_every": 10,
 

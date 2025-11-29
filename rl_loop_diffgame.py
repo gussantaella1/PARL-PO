@@ -240,11 +240,7 @@ class Env:
             raise ValueError(f"Unknown train_ic_mode='{mode}'")
 
         self.state = np.concatenate([x0[0], x0[1]])
-
-        # initialize d2_prev as before
         p1, v1, p2, v2 = self._unpack(self.state)
-        d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
-        self._d2_prev = d2_raw / (self.radius**2)
 
         # ---- (optional) UKF init: attacker state estimate from noisy prior ----
         if self.use_ukf:
@@ -268,40 +264,57 @@ class Env:
                 R=self._ukf_R.copy(),
                 dt=self.dt,
                 dyn='hcw',
-                hcw=self.cfg.get("hcw", {})  # or whatever your HCW params live under
+                hcw=self.cfg.get("hcw", {}),
             )
 
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = float(np.trace(self.ukf.P[0:3, 0:3]))
+        else:
+            self.ukf = None
+            self._latest_meas_innov = 0.0
+            self._latest_meas_trP   = 0.0
+
+        # ---- initialize d2_prev using belief if UKF is on ----
+        if self.use_ukf and (self.ukf is not None):
+            p2_geom = self.ukf.x[:self.D].copy()   # belief
+
+            # ---- sanity clip on belief ----
+            r_est = np.linalg.norm(p2_geom - self.center)
+            R = self.radius
+            clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))  # e.g. 3× arena radius
+            r_max = clip_factor * R
+
+            if (not np.isfinite(r_est)) or (r_est > r_max):
+                # Option A: project back to sphere of radius r_max
+                if np.isfinite(r_est) and r_est > 1e-9:
+                    direction = (p2_geom - self.center) / r_est
+                    p2_geom = self.center + direction * r_max
+                else:
+                    # Completely broken: just snap to truth for this step
+                    p2_geom = p2.copy()
+
+                # Optional: also reset the UKF to something sane
+                if self.cfg.get("reset_ukf_on_diverge", True):
+                    self.ukf.x[:self.D] = p2          # truth position
+                    self.ukf.x[self.D:2*self.D] = v2  # truth velocity
+                    self.ukf.P = self._ukf_P0.copy()
+        else:
+            p2_geom = p2
+
+        d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
+        self._d2_prev = d2_raw / (self.radius**2)
 
         return self._obs()
-
-
 
     def step(self, a1_env: np.ndarray, a2_env: np.ndarray) -> Tuple[np.ndarray, float, float, bool, dict]:
         a1 = np.clip(np.asarray(a1_env, float), self.u_lo, self.u_hi)
         a2 = np.clip(np.asarray(a2_env, float), self.u_lo, self.u_hi)
 
-        # propagate
+        # propagate true state
         self.state = self._plant_step(self.state, a1, a2)
         self.t += 1
 
         p1, v1, p2, v2 = self._unpack(self.state)
-
-        # normalized squared distances to center
-        d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
-        d1_raw = float(np.dot(p1 - self.center, p1 - self.center))
-        d2 = d2_raw / (self.radius**2)
-        d1 = d1_raw / (self.radius**2)
-        delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
-
-        # relative distance (tiny zero-sum shaping)
-        rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
-
-        rho1 = np.linalg.norm(p1 - self.center) / self.radius
-        rho2 = np.linalg.norm(p2 - self.center) / self.radius
-        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
-        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- UKF + measurement-based metrics (optional) ----
         meas_innov_sq = 0.0
@@ -311,98 +324,132 @@ class Env:
             # Time update (no explicit control input; attacker accel folded into Q)
             self.ukf.predict(dt=self.dt, u=None, u_cov=None)
 
-            # True bearing measurement from defender (observer) to attacker (target)
             p_obs = p1
             if self.D != 3:
                 raise RuntimeError("UKF bearing logic assumes D=3.")
-            R_wb = np.eye(3)  # assume body aligned with world for now
+            R_wb = np.eye(3)
 
-            # world-frame unit vector and az/el
+            # True bearing → noisy measurement
             v_b = _body_bearing_from_world(p_obs, R_wb, p2)
             az_true, el_true = _azel_from_body_vec(v_b)
             z_true = np.array([az_true, el_true], float)
 
-            # Add measurement noise ~ N(0, R)
             z_noise = np.random.multivariate_normal(
                 mean=np.zeros(2),
                 cov=self._ukf_R
             )
             z_meas = z_true + z_noise
 
-            # Innovation: measured - predicted (from prior mean)
+            # Innovation (for optional reward term)
             z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
             innov = z_meas - z_hat_prior
-            # wrap to [-pi, pi]
             innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
             innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
-
             meas_innov_sq = float(innov @ innov)
 
             # Measurement update
             self.ukf.update(z_meas, p_obs, R_wb)
 
-            # Position covariance trace
             meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
-
             self._latest_meas_innov = meas_innov_sq
             self._latest_meas_trP   = meas_trPpos
+        else:
+            self._latest_meas_innov = 0.0
+            self._latest_meas_trP   = 0.0
 
-        # --- NEW: attacker "hits" the object/center if close enough ---
-        hit_target = False
+        # ---- choose geometry position: BELIEF if UKF is on, else TRUTH ----
+        if self.use_ukf and (self.ukf is not None):
+            p2_geom = self.ukf.x[:self.D].copy()   # belief
 
-        if self.att_target_hit_radius > 0.0 and rho2 <= self.att_target_hit_radius:
-            hit_target = True
+            # ---- sanity clip on belief ----
+            r_est = np.linalg.norm(p2_geom - self.center)
+            R = self.radius
+            clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))  # e.g., 2× arena radius
+            r_max = clip_factor * R
+
+            if (not np.isfinite(r_est)) or (r_est > r_max):
+                # Project back to sphere of radius r_max, or snap to truth if totally broken
+                if np.isfinite(r_est) and r_est > 1e-9:
+                    direction = (p2_geom - self.center) / r_est
+                    p2_geom = self.center + direction * r_max
+                else:
+                    p2_geom = p2.copy()
+
+                # Optional: also reset the UKF itself so future obs use a sane state
+                if self.cfg.get("reset_ukf_on_diverge", True):
+                    self.ukf.x[:self.D]        = p2          # truth position
+                    self.ukf.x[self.D:2*self.D] = v2         # truth velocity
+                    self.ukf.P = self._ukf_P0.copy()
+        else:
+            p2_geom = p2                            # truth
+
+
+        # ---- distances for reward (using p2_geom) ----
+        d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
+        d1_raw = float(np.dot(p1       - self.center, p1       - self.center))
+        d2 = d2_raw / (self.radius**2)
+        d1 = d1_raw / (self.radius**2)
+        delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
+
+        rel2 = float(np.dot((p2_geom - p1), (p2_geom - p1))) / (self.radius**2)
+
+
+        # ---- TRUE geometry (always from true state) ----
+        d2_true_raw = float(np.dot(p2 - self.center, p2 - self.center))
+        d2_true = d2_true_raw / (self.radius**2)
+        rel2_true = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
+
+        rho1 = np.linalg.norm(p1       - self.center) / self.radius
+        rho2 = np.linalg.norm(p2_geom  - self.center) / self.radius
+        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # --- Defender keep-out around object of interest (center) ---
-        # rho1: defender distance / R
-        # If inside safe radius, apply quadratic penalty that grows as we go deeper.
         center_keepout = 0.0
         if self.def_center_safe_radius > 0.0:
             if rho1 < self.def_center_safe_radius:
                 gap = (self.def_center_safe_radius - rho1)
                 center_keepout = (gap * gap) * self.def_center_avoid_coef
 
-
-        # defender radial velocity
+        # defender radial velocity (true)
         rhat1 = (p1 - self.center)
         rnorm = np.linalg.norm(rhat1) + 1e-9
-        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius  # 1/s
+        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius
         k_vrad = self.k_vel * 3.0
 
-        # rewards
+        # ---- rewards (using p2_geom everywhere) ----
         r1 = (
-              self.alpha * delta_d2        # likes attacker moving outward
-            + self.k_pos * d2              # likes attacker far from center
-            - self.k_rel * rel2            # still a small incentive to stay near attacker (tune down if needed)
-            # - self.k_cent * d1           # <--- DROP this term
+            self.alpha * delta_d2
+            + self.k_pos * d2
+            - self.k_rel * rel2
             - self.k_vel * float(np.dot(v1, v1))
             - k_vrad * (vrad1**2)
             - self.lD * float(np.dot(a1, a1))
-            - wall1                        # arena boundary
-            - center_keepout               # keep-out near object
+            - wall1
+            - center_keepout
         )
 
-        # Optional measurement-based penalties for defender:
-        #  - large innovation (filter surprised by measurement)
-        #  - large position uncertainty in the estimate
         if self.use_ukf and self.use_meas_reward:
             r1 -= self.meas_innov_coef * meas_innov_sq
             r1 -= self.meas_cov_coef   * meas_trPpos
 
-
-
         r2 = (- self.alpha * delta_d2
-             - self.k_pos * d2
-             + self.k_rel * rel2
-             - self.k_vel * float(np.dot(v2, v2))
-             - self.lA * float(np.dot(a2, a2))
-             - wall2 )
+            - self.k_pos * d2
+            + self.k_rel * rel2
+            - self.k_vel * float(np.dot(v2, v2))
+            - self.lA * float(np.dot(a2, a2))
+            - wall2 )
 
-        # termination
-        oob1 = (rho1 >= self.margin)
-        oob2 = (rho2 >= self.margin)
+        # ---- termination still uses TRUE state ----
+        rho1_true = np.linalg.norm(p1 - self.center) / self.radius
+        rho2_true = np.linalg.norm(p2 - self.center) / self.radius
 
-        # include hit_target in done condition
+        hit_target = False
+        if self.att_target_hit_radius > 0.0 and rho2_true <= self.att_target_hit_radius:
+            hit_target = True
+
+        oob1 = (rho1_true >= self.margin)
+        oob2 = (rho2_true >= self.margin)
         done = (oob1 or oob2 or hit_target) or (self.t >= self.T)
 
         if oob1:
@@ -411,41 +458,65 @@ class Env:
             r2 -= self.wallK
 
         if done:
-            # existing terminal shaping
             r1 += self.beta * d2
             r2 -= self.beta * d2
             r1 -= 0.10 * d1
-
-            # extra: attacker success if it hit the target
             if hit_target:
                 r1 -= self.att_target_hit_penalty_def
                 r2 += self.att_target_hit_reward_att
 
-
+        # d2_prev now always tracks whatever was used in reward (belief or truth)
         self._d2_prev = d2
 
         info = {
             "t": self.t,
+
+            # geometry used by reward (belief if UKF on, truth otherwise)
             "d2_norm": d2,
             "d1_norm": d1,
+            "rel2_norm": rel2,
+
+            # always TRUE geometry
+            "d1_true_norm": d1,           # p1 is always truth anyway
+            "d2_true_norm": d2_true,
+            "rel2_true_norm": rel2_true,
+
             "oob_def": bool(oob1),
             "oob_att": bool(oob2),
             "hit_target": bool(hit_target),
         }
         if self.use_ukf:
-            info["meas_innov_sq"] = meas_innov_sq
-            info["ukf_trPpos"]    = meas_trPpos
-            # (optional) estimated attacker range normalized by R
-            est_range = np.linalg.norm(self.ukf.x[:self.D]) / self.radius
-            info["ukf_est_range_norm"] = float(est_range)
+            info["d2_belief_norm"] = d2        # alias for clarity
+            info["meas_innov_sq"]  = meas_innov_sq
+            info["ukf_trPpos"]     = meas_trPpos
+            info["ukf_est_range_norm"] = float(
+                np.linalg.norm(p2_geom - self.center) / self.radius
+            )
 
 
         return self._obs(), float(r1), float(r2), bool(done), info
 
+
     def _obs(self) -> np.ndarray:
         p1, v1, p2, v2 = self._unpack(self.state)
-        obs = np.concatenate([p1 - self.center, p2 - self.center, p2 - p1, v1, v2])
+
+        if self.use_ukf and (self.ukf is not None):
+            # UKF state: [p2, v2] for attacker
+            p2_obs = self.ukf.x[:self.D]
+            v2_obs = self.ukf.x[self.D:2*self.D]
+        else:
+            p2_obs = p2
+            v2_obs = v2
+
+        obs = np.concatenate([
+            p1 - self.center,        # defender pos (truth)
+            p2_obs - self.center,    # attacker pos (belief if UKF on)
+            p2_obs - p1,             # relative pos (belief-based)
+            v1,                      # defender vel (truth)
+            v2_obs,                  # attacker vel (belief-based)
+        ])
         return obs.astype(np.float32)
+
 
     def _plant_step(self, s: np.ndarray, a1: np.ndarray, a2: np.ndarray) -> np.ndarray:
         p1, v1, p2, v2 = self._unpack(s)
@@ -909,8 +980,11 @@ def train(cfg: Dict[str, Any]):
         "R_att_mean": [],
         "muD_abs_mean": [],
         "stdD_mean": [],
-        "d1_mean": [],
-        "d2_mean": [],   # <--- NEW
+        "d1_mean": [],          # defender true distance
+        "d2_mean": [],          # attacker belief distance (what obs sees)
+        "d2_true_mean": [],     # attacker true distance
+        "meas_innov_mean": [],  # optional
+        "ukf_trPpos_mean": [],  # optional
         "lr_pi": [],
         "lr_vf": [],
     }
@@ -955,11 +1029,22 @@ def train(cfg: Dict[str, Any]):
         ep_ret_def = np.zeros(num_envs, dtype=np.float64)
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
+        # accumulators for metrics over this update
+        d1_true_acc = 0.0
+        d2_true_acc = 0.0
+        d2_belief_acc = 0.0
+        meas_innov_acc = 0.0
+        trP_acc = 0.0
+        info_count = 0
+
         for _ in range(steps_per_env):
             with torch.no_grad():
                 a1, lp1, v1 = ppo.act(o, who="def")
                 a2, lp2, v2 = ppo.act(o, who="att")
-            o2_np, r1_np, r2_np, d_np, _ = vec.step(a1.cpu().numpy(), a2.cpu().numpy())
+
+            o2_np, r1_np, r2_np, d_np, infos = vec.step(
+                a1.cpu().numpy(), a2.cpu().numpy()
+            )
             o2 = torch.as_tensor(o2_np, dtype=torch.float32, device=device)
             r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
             r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
@@ -972,6 +1057,20 @@ def train(cfg: Dict[str, Any]):
             ep_ret_def += r1_np
             ep_ret_att += r2_np
             o = o2
+
+            # ---- accumulate truth / belief metrics from Env.info ----
+            for inf in infos:
+                if "d2_true_norm" in inf:
+                    d1_true_acc += inf["d1_true_norm"]
+                    d2_true_acc += inf["d2_true_norm"]
+                    if "d2_belief_norm" in inf:
+                        d2_belief_acc += inf["d2_belief_norm"]
+                    if "meas_innov_sq" in inf:
+                        meas_innov_acc += inf["meas_innov_sq"]
+                    if "ukf_trPpos" in inf:
+                        trP_acc += inf["ukf_trPpos"]
+                    info_count += 1
+
 
         with torch.no_grad():
             next_v_def = ppo.def_net.value(o)
@@ -989,6 +1088,21 @@ def train(cfg: Dict[str, Any]):
             R_def_mean = ep_ret_def.mean()
             R_att_mean = ep_ret_att.mean()
 
+            # means over all steps collected this update
+            if info_count > 0:
+                R = cfg["arena"]["r"]
+
+                d1_true_mean = np.sqrt(d1_true_acc / info_count) * R
+                d2_true_mean = np.sqrt(d2_true_acc / info_count) * R
+                d2_belief_mean = np.sqrt(d2_belief_acc / info_count) * R
+                meas_innov_mean = meas_innov_acc / info_count
+                trP_mean = trP_acc / info_count
+            else:
+                d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
+                meas_innov_mean = trP_mean = 0.0
+
+
+
             with torch.no_grad():
                 flat_obs = bufD.obs.reshape(-1, obs_dim)
                 distD = ppo.def_net.dist(flat_obs, who="def")
@@ -1000,8 +1114,9 @@ def train(cfg: Dict[str, Any]):
                 p1c = flat_obs[:, :Dcfg]
                 p2c = flat_obs[:, Dcfg:2*Dcfg]
 
-                d1_mean = p1c.pow(2).sum(-1).mean().sqrt().item()
-                d2_mean = p2c.pow(2).sum(-1).mean().sqrt().item()
+                d1_obs_mean = p1c.pow(2).sum(-1).mean().sqrt().item()
+                d2_obs_mean = p2c.pow(2).sum(-1).mean().sqrt().item()
+
 
             # grab learning rates (assuming two param groups: policy+logstd and value)
             lr_pi = ppo.def_opt.param_groups[0]["lr"]
@@ -1013,16 +1128,24 @@ def train(cfg: Dict[str, Any]):
             metrics["R_att_mean"].append(R_att_mean)
             metrics["muD_abs_mean"].append(muD)
             metrics["stdD_mean"].append(stdD)
-            metrics["d1_mean"].append(d1_mean)
-            metrics["d2_mean"].append(d2_mean)
+
+            metrics["d1_mean"].append(d1_true_mean)
+            metrics["d2_mean"].append(d2_belief_mean)
+            metrics["d2_true_mean"].append(d2_true_mean)
+            metrics["meas_innov_mean"].append(meas_innov_mean)
+            metrics["ukf_trPpos_mean"].append(trP_mean)
+
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
 
-            # keep your printout if you like
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
-            print(f"   approx <||p1-center||> ≈ {d1_mean:.3f}")
-            print(f"   approx <||p2-center||> ≈ {d2_mean:.3f}")
+            print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
+            print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
+            if cfg.get("use_ukf", False):
+                print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
+                print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
+
 
 
 
