@@ -160,15 +160,64 @@ COMMON = _merge(COMMON, KF_COMMON)
 COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
+# TRAIN: Dict[str, Any] = {
+#     # Vectorized rollout & logging
+#     # "num_envs": 64,          # was 8
+#     # "steps_per_env": 512,    # was 256
+#     # "total_updates": 2000,   # was 300
+
+#     "num_envs": 8,          # was 8
+#     "steps_per_env": 256,    # was 256
+#     "total_updates": 300,   # was 300
+
+#     "log_every": 10,
+
+#     # PPO hyperparams
+#     "gamma": 0.99,
+#     "gae_lambda": 0.95,
+#     "clip_eps": 0.2,
+#     "policy_lr": 3e-4,
+#     "value_lr": 1e-3,
+#     "train_epochs": 10,
+#     "minibatch_size": 1024,
+#     "entropy_coef": 0.02,
+#     "value_coef": 0.5,
+#     "max_grad_norm": 1.0,
+
+#     "lr_schedule": "linear",   # options: "none", "linear"
+#     "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
+
+#     # Anneal (training-time only)
+#     "def_center_min_anneal": 0.5,
+
+#     # Training-only initial condition randomization
+#     # (env uses this; eval config will default back to "fixed")
+#     "train_ic_mode": "random_shell",  # or "fixed"
+#     "train_ic_vmax": 0.05,            # max |v| component at t=0
+#     "train_min_sep": 1.0,             # min defender–attacker separation (m)
+
+#     "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
+#     "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
+#     "def_center_coef":        0.0,    # no attractive center tether
+#     "prior_blend_def":        0.0,    # (optional) disable center prior for def
+
+
+#     "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
+#     "att_target_hit_penalty_def": 5.0,      # big negative for defender
+#     "att_target_hit_reward_att": 5.0,       # matching positive for attacker
+
+# }
+
+#Long training config below:
+
+# ---------- TRAIN (long-run, more stable) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    # "num_envs": 64,          # was 8
-    # "steps_per_env": 512,    # was 256
-    # "total_updates": 2000,   # was 300
-
-    "num_envs": 8,          # was 8
-    "steps_per_env": 256,    # was 256
-    "total_updates": 300,   # was 300
+    # Total samples per update = num_envs * steps_per_env
+    # Here: 32 * 512 = 16,384 steps/update (8x your original short run)
+    "num_envs": 32,
+    "steps_per_env": 512,
+    "total_updates": 1200,     # long but not crazy; ~19.7M steps
 
     "log_every": 10,
 
@@ -176,37 +225,40 @@ TRAIN: Dict[str, Any] = {
     "gamma": 0.99,
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
-    "policy_lr": 3e-4,
-    "value_lr": 1e-3,
+
+    # ↓ Smaller LRs than your short-run config (since batch is much larger)
+    "policy_lr": 1e-4,         # was 3e-4
+    "value_lr": 3e-4,          # was 1e-3
+
     "train_epochs": 10,
-    "minibatch_size": 1024,
+    "minibatch_size": 1024,    # 16 minibatches per update w/ 16,384 steps
     "entropy_coef": 0.02,
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
 
     "lr_schedule": "linear",   # options: "none", "linear"
-    "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
+    "lr_final_factor": 0.1,    # final_lr = lr_final_factor * initial_lr
 
     # Anneal (training-time only)
     "def_center_min_anneal": 0.5,
 
     # Training-only initial condition randomization
-    # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell",  # or "fixed"
     "train_ic_vmax": 0.05,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
 
-    "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
-    "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
-    "def_center_coef":        0.0,    # no attractive center tether
-    "prior_blend_def":        0.0,    # (optional) disable center prior for def
+    # Defender vs center behaviour
+    "def_center_safe_radius": 0.10,   # keep-out inside 10% of R
+    "def_center_avoid_coef":  50.0,   # penalty for entering this zone
+    "def_center_coef":        0.0,    # no attractive tether to center
+    "prior_blend_def":        0.0,    # disable center prior for def (RL only)
 
-
-    "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
-    "att_target_hit_penalty_def": 5.0,      # big negative for defender
-    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
-
+    # Terminal hit logic
+    "att_target_hit_radius":       0.05,   # attacker within 5% of R hits target
+    "att_target_hit_penalty_def": 10.0,    # was 5.0 → stronger slap to defender
+    "att_target_hit_reward_att":   5.0,    # attacker reward unchanged
 }
+
 
 
 # ---------- Public getters ----------
