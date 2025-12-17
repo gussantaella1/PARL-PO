@@ -950,6 +950,173 @@ class PPO:
 
 
 # =============================================================
+# Distillation helpers (teacher uses full-state; student sees belief)
+# =============================================================
+
+def build_full_obs_from_envs(vec: VecEnv, device: str) -> torch.Tensor:
+    """
+    Build 'full-state' observations for the teacher from each Env in vec.envs:
+      o_full = [p1 - c, p2 - c, (p2 - p1), v1, v2]
+    using TRUE p2, v2 (not UKF belief).
+    Shape: [num_envs, 5*D]
+    """
+    obs_list = []
+    for e in vec.envs:
+        p1, v1, p2, v2 = e._unpack(e.state)
+        center = e.center
+        p1c = p1 - center
+        p2c = p2 - center
+        rel = p2 - p1
+        obs_full = np.concatenate([p1c, p2c, rel, v1, v2]).astype(np.float32)
+        obs_list.append(obs_full)
+    obs_full_np = np.stack(obs_list, axis=0)
+    return torch.as_tensor(obs_full_np, dtype=torch.float32, device=device)
+
+def distill_from_teacher(
+    cfg: Dict[str, Any],
+    teacher_ckpt_path: str,
+    out_path: str = "ppo_def_ukf_distilled.pt",
+):
+    """
+    Distillation phase:
+      - Env runs with UKF / partial observation (cfg['use_ukf']=True).
+      - Defender actions come from a frozen full-state teacher policy.
+      - Student defender sees *belief-based* obs and imitates teacher actions
+        via supervised MSE on the mean action (behavior cloning).
+
+    Returns
+    -------
+    student : ActorCriticDiff
+        The distilled student network.
+    metrics : Dict[str, List[float]]
+        Simple metrics over distillation, currently:
+            - "update": list of update indices where we logged
+            - "bc_mse_dbg": behavior cloning MSE on a debug batch
+    """
+    set_seed(cfg["seed"])
+    device = cfg["device"]
+
+    def make_env():
+        return Env(cfg)
+
+    num_envs      = int(cfg.get("num_envs", 8))
+    steps_per_env = int(cfg.get("steps_per_env", 256))
+    total_updates = int(cfg.get("total_updates", 300))
+    log_every     = int(cfg.get("log_every", 10))
+
+    # Vectorized UKF env (student view)
+    vec = VecEnv(make_env, num_envs)
+    obs_dim = vec.obs.shape[1]
+    act_dim = int(cfg["D"])
+
+    # ---------- Teacher (full-state policy) ----------
+    teacher = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    teacher_state = torch.load(teacher_ckpt_path, map_location=device)
+    teacher.load_state_dict(teacher_state)
+    teacher.eval()   # freeze
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+
+    # ---------- Student (belief-based policy) ----------
+    student = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    bc_lr = float(cfg.get("distill_lr", cfg["policy_lr"]))
+    student_opt = optim.Adam(
+        list(student.pi.parameters()) + list(student.mu_res.parameters()) + [student.logstd],
+        lr=bc_lr,
+    )
+
+    # Attacker remains the same rule-based controller
+    rule_ctrl = AttackerRuleController(cfg)
+
+    mb_size    = int(cfg.get("distill_mb_size", 1024))
+    bc_epochs  = int(cfg.get("distill_epochs", 4))
+
+    # --- metrics container for distillation ---
+    metrics = {
+        "update": [],
+        "bc_mse_dbg": [],
+    }
+
+    print("=== Distillation: teacher -> UKF student ===")
+    print(f"Teacher checkpoint: {teacher_ckpt_path}")
+    print(f"Saving distilled student to: {out_path}")
+
+    for upd in range(1, total_updates + 1):
+        # Storage for this "update"
+        obs_buf = torch.zeros(steps_per_env, num_envs, obs_dim, device=device)
+        act_buf = torch.zeros(steps_per_env, num_envs, act_dim, device=device)
+
+        # --------- Data collection (teacher drives, student observes) ---------
+        for t in range(steps_per_env):
+            # Student obs (belief-based) from UKF env
+            o_student = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
+
+            # Build full-state obs for teacher from TRUE state
+            o_teacher = build_full_obs_from_envs(vec, device)
+
+            with torch.no_grad():
+                # Teacher action (env-scaled)
+                a_teacher, _, _ = teacher.act(o_teacher, who="def", act_scale=float(cfg["umax"]))
+
+            # Attacker actions from rule controller
+            acts_att = []
+            for e in vec.envs:
+                p1, v1, p2, v2 = e._unpack(e.state)
+                a2 = rule_ctrl.act(p1, v1, p2, v2).astype(np.float32)
+                acts_att.append(a2)
+            a2_env = np.stack(acts_att, axis=0)
+
+            # Step env using teacher actions for defender
+            o2_np, _, _, _, _ = vec.step(
+                a_teacher.cpu().numpy(), a2_env
+            )
+
+            # Store belief-obs + teacher action for BC
+            obs_buf[t] = o_student
+            act_buf[t] = a_teacher
+
+            vec.obs = o2_np
+
+        # --------- Behavior cloning update on collected batch ---------
+        B = steps_per_env * num_envs
+        obs_flat = obs_buf.reshape(B, obs_dim)
+        act_flat = act_buf.reshape(B, act_dim)
+
+        for _ in range(bc_epochs):
+            perm = torch.randperm(B, device=device)
+            for start in range(0, B, mb_size):
+                idx = perm[start:start + mb_size]
+                o = obs_flat[idx]
+                target = act_flat[idx]
+
+                dist = student.dist(o, who="def")
+                mu = dist.mean
+                bc_loss = ((mu - target) ** 2).mean()
+
+                student_opt.zero_grad(set_to_none=True)
+                bc_loss.backward()
+                nn.utils.clip_grad_norm_(student.parameters(), cfg["max_grad_norm"])
+                student_opt.step()
+
+        # --- logging on a debug batch ---
+        if upd % log_every == 0:
+            with torch.no_grad():
+                dist_dbg = student.dist(obs_flat[:min(B, 2048)], who="def")
+                mse_dbg  = ((dist_dbg.mean - act_flat[:min(B, 2048)])**2).mean().item()
+            print(f"[distill {upd:05d}] BC MSE (dbg batch) = {mse_dbg:.3e}")
+
+            metrics["update"].append(upd)
+            metrics["bc_mse_dbg"].append(mse_dbg)
+
+    # Save student weights
+    torch.save(student.state_dict(), out_path)
+    print(f"Distillation finished. Saved student defender to '{out_path}'.")
+
+    return student, metrics
+
+
+
+# =============================================================
 # Training & Evaluation
 # =============================================================
 def train(cfg: Dict[str, Any]):
@@ -1194,110 +1361,155 @@ def rollout_metrics(states: np.ndarray, center: np.ndarray, R: float):
 
     return {"d1_norm": d1, "d2_norm": d2, "rel2_norm": rel2, "d2_delta": d2_delta}
 
-
 # =============================================================
 # Main
 # =============================================================
 if __name__ == "__main__":
-    # Build training config from the single shared source
-    cfg = config_for_train(
-        # Example optional overrides:
-        # attacker_mode="rule",   # train with fixed attacker per prof guidance (default)
-        # umax=0.02,
-        # T=120,
-    )
-    build_dyn(cfg)
-
-    # Device check
-    if cfg["device"] == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("cfg['device']='cuda' but CUDA is not available.")
-    print(f"Using device: {cfg['device']}")
-
-    # ---- Output directory for policies + plots ----
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # Train
-    ppo, metrics = train(cfg)
-
-    # Eval config from same source; safer defaults applied inside config_for_eval
-    cfg_eval = config_for_eval(
-        attacker_mode=cfg.get("attacker_mode", "rule"),
-        umax=cfg["umax"],
-        T=cfg["T"],
+    # =========================================================
+    # (A) Train full-state TEACHER (no UKF)
+    # =========================================================
+    cfg_teacher = config_for_train(
+        # Example optional overrides:
+        # attacker_mode="rule",
+        # umax=0.02,
+        # T=120,
     )
-    build_dyn(cfg_eval)
+    # Teacher should really be full-state:
+    cfg_teacher["use_ukf"] = False
+    build_dyn(cfg_teacher)
 
-    # Rollout
-    trajs = evaluate(ppo, cfg_eval, episodes=2)
+    # Device check
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("cfg_teacher['device']='cuda' but CUDA is not available.")
+    print(f"[TEACHER] Using device: {cfg_teacher['device']}")
 
-    # Metrics
-    ar = cfg_eval["arena"]
-    D = cfg_eval["D"]
-    center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
+    # Train teacher
+    ppo_teacher, metrics_teacher = train(cfg_teacher)
+
+    # --------- Evaluate teacher (full-state) ---------
+    cfg_eval_teacher = config_for_eval(
+        attacker_mode=cfg_teacher.get("attacker_mode", "rule"),
+        umax=cfg_teacher["umax"],
+        T=cfg_teacher["T"],
+    )
+    cfg_eval_teacher["use_ukf"] = False  # full-state eval
+    build_dyn(cfg_eval_teacher)
+
+    trajs_teacher = evaluate(ppo_teacher, cfg_eval_teacher, episodes=2)
+    ar = cfg_eval_teacher["arena"]
+    D = cfg_eval_teacher["D"]
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
+        dtype=float
+    )[:D]
     R = float(ar["r"])
-    m = rollout_metrics(trajs[0]["states"], center, R)
-    print(f"[metrics] d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}")
+    m_teacher = rollout_metrics(trajs_teacher[0]["states"], center, R)
+    print(
+        f"[TEACHER metrics] d2_T={m_teacher['d2_norm'][-1]:.3f}  "
+        f"d1_med={np.median(m_teacher['d1_norm']):.3f}  "
+        f"rel2_med={np.median(m_teacher['rel2_norm']):.3f}"
+    )
 
-    # ---- Plot training curves ----
-    updates = np.array(metrics["update"], dtype=float)
+    # --------- Plot teacher training curves ---------
+    updates_t = np.array(metrics_teacher["update"], dtype=float)
 
     plt.figure()
-    plt.plot(updates, metrics["R_def_mean"], label="Defender return")
-    plt.plot(updates, metrics["R_att_mean"], label="Attacker return")
+    plt.plot(updates_t, metrics_teacher["R_def_mean"], label="Defender return")
+    plt.plot(updates_t, metrics_teacher["R_att_mean"], label="Attacker return")
     plt.xlabel("Update")
     plt.ylabel("Episode return (mean over envs)")
-    plt.title("Training returns")
+    plt.title("Training returns (teacher)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "train_returns.png"), dpi=200)
+    plt.savefig(os.path.join(OUT_DIR, "train_returns_teacher.png"), dpi=200)
 
     plt.figure()
-    plt.plot(updates, metrics["muD_abs_mean"], label="|μ_def| mean")
-    plt.plot(updates, metrics["stdD_mean"], label="σ_def mean")
+    plt.plot(updates_t, metrics_teacher["muD_abs_mean"], label="|μ_def| mean")
+    plt.plot(updates_t, metrics_teacher["stdD_mean"], label="σ_def mean")
     plt.xlabel("Update")
     plt.ylabel("Policy stats")
-    plt.title("Defender policy mean/std")
+    plt.title("Defender policy mean/std (teacher)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "policy_stats.png"), dpi=200)
+    plt.savefig(os.path.join(OUT_DIR, "policy_stats_teacher.png"), dpi=200)
 
     plt.figure()
-    plt.plot(updates, metrics["d1_mean"])
+    plt.plot(updates_t, metrics_teacher["d1_mean"])
     plt.xlabel("Update")
     plt.ylabel("<||p1 - center||>")
-    plt.title("Avg defender distance to center")
+    plt.title("Avg defender distance to center (teacher)")
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "def_center_dist.png"), dpi=200)
+    plt.savefig(os.path.join(OUT_DIR, "def_center_dist_teacher.png"), dpi=200)
 
     plt.figure()
-    plt.plot(updates, metrics["d2_mean"])
+    plt.plot(updates_t, metrics_teacher["d2_mean"])
     plt.xlabel("Update")
     plt.ylabel("<||p2 - center||>")
-    plt.title("Avg attacker distance to center")
+    plt.title("Avg attacker distance to center (teacher)")
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "att_center_dist.png"), dpi=200)
-
+    plt.savefig(os.path.join(OUT_DIR, "att_center_dist_teacher.png"), dpi=200)
 
     plt.figure()
-    plt.plot(updates, metrics["lr_pi"], label="policy LR")
-    plt.plot(updates, metrics["lr_vf"], label="value LR")
+    plt.plot(updates_t, metrics_teacher["lr_pi"], label="policy LR")
+    plt.plot(updates_t, metrics_teacher["lr_vf"], label="value LR")
     plt.xlabel("Update")
     plt.ylabel("Learning rate")
-    plt.title("Learning rates")
+    plt.title("Learning rates (teacher)")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(OUT_DIR, "learning_rates.png"), dpi=200)
+    plt.savefig(os.path.join(OUT_DIR, "learning_rates_teacher.png"), dpi=200)
 
-    # (Optional) save raw metrics for later analysis
-    np.savez(os.path.join(OUT_DIR, "train_metrics.npz"), **metrics)
+    # Save teacher policy
+    teacher_ckpt = os.path.join(OUT_DIR, "ppo_def.pt")
+    torch.save(ppo_teacher.def_net.state_dict(), teacher_ckpt)
+    if ppo_teacher.attacker_mode == "rl":
+        torch.save(
+            ppo_teacher.att_net.state_dict(),
+            os.path.join(OUT_DIR, "ppo_att_teacher.pt")
+        )
+    print(f"[TEACHER] Saved teacher defender to {teacher_ckpt}")
 
-    # Save policies
-    torch.save(ppo.def_net.state_dict(), os.path.join(OUT_DIR, "ppo_def.pt"))
-    if ppo.attacker_mode == "rl":
-        torch.save(ppo.att_net.state_dict(), os.path.join(OUT_DIR, "ppo_att.pt"))
-    print(
-        "Saved: "
-        + os.path.join(OUT_DIR, "ppo_def.pt")
-        + (", " + os.path.join(OUT_DIR, "ppo_att.pt") if ppo.attacker_mode == "rl" else "")
+    # Save raw teacher metrics
+    np.savez(os.path.join(OUT_DIR, "train_metrics_teacher.npz"), **metrics_teacher)
+
+    # =========================================================
+    # (B) Distillation: full-state teacher -> UKF STUDENT
+    # =========================================================
+    cfg_student = config_for_train(
+        # You can reuse most things, but we flip UKF on:
+        # attacker_mode="rule",
+        # umax=0.02,
+        # T=120,
     )
+    cfg_student["use_ukf"] = True
+    # Different seed so distill doesn’t reuse teacher’s randomization
+    cfg_student["seed"] = cfg_teacher["seed"] + 1
+    build_dyn(cfg_student)
+
+    if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("cfg_student['device']='cuda' but CUDA is not available.")
+    print(f"[STUDENT] Using device: {cfg_student['device']}")
+
+    student_out = os.path.join(OUT_DIR, "ppo_def_ukf_distilled.pt")
+    student, metrics_student = distill_from_teacher(
+        cfg_student, teacher_ckpt, out_path=student_out
+    )
+    print(f"[STUDENT] Distilled UKF student saved to {student_out}")
+
+    # --------- Plot student (distillation) metrics ---------
+    updates_s = np.array(metrics_student["update"], dtype=float)
+
+    plt.figure()
+    plt.plot(updates_s, metrics_student["bc_mse_dbg"])
+    plt.xlabel("Distillation update")
+    plt.ylabel("BC MSE (debug batch)")
+    plt.title("Student distillation loss vs update")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, "distill_bc_mse_student.png"), dpi=200)
+
+    # Save raw distillation metrics
+    np.savez(os.path.join(OUT_DIR, "distill_metrics_student.npz"), **metrics_student)
+

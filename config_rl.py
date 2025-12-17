@@ -117,7 +117,7 @@ COMMON: Dict[str, Any] = {
 ARENA_R = float(COMMON["arena"]["r"])
 
 KF_COMMON: Dict[str, Any] = {
-    "use_ukf": True,
+    "use_ukf": False,
     "use_meas_reward": True,
     "meas_innov_coef": 0.0,   # start at 0, then slowly crank up
     "meas_cov_coef": 0.0,
@@ -162,13 +162,13 @@ COMMON = _merge(COMMON,VIZ)
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
-    # "num_envs": 64,          # was 8
-    # "steps_per_env": 512,    # was 256
-    # "total_updates": 2000,   # was 300
+    "num_envs": 64,          # was 8
+    "steps_per_env": 512,    # was 256
+    "total_updates": 2000,   # was 300
 
-    "num_envs": 8,          # was 8
-    "steps_per_env": 256,    # was 256
-    "total_updates": 300,   # was 300
+    # "num_envs": 8,          # was 8
+    # "steps_per_env": 256,    # was 256
+    # "total_updates": 300,   # was 300
 
     "log_every": 10,
 
