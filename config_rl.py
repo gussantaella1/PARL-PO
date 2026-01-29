@@ -24,6 +24,7 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
+    "num_attackers": 1,   # default
     "seed": 42,
     "device": "cuda",  # "cuda" if available
 
@@ -69,7 +70,7 @@ COMMON: Dict[str, Any] = {
     # Attacker control selection
     #   "rule" => deterministic controller
     #   "rl"   => learned attacker (if your training loop supports it)
-    "attacker_mode": "rule",
+    "attacker_mode": "rl",
 
     # Rule-based attacker parameters
     # "att_rule": {
@@ -161,14 +162,20 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    # Vectorized rollout & logging
-    "num_envs": 64,          # was 8
-    "steps_per_env": 512,    # was 256
-    "total_updates": 2000,   # was 300
 
-    # "num_envs": 8,          # was 8
-    # "steps_per_env": 256,    # was 256
-    # "total_updates": 300,   # was 300
+    # Optional checkpoints
+
+    "def_ckpt_path": None,
+    "att_ckpt_path": None,
+
+    # Vectorized rollout & logging
+    # "num_envs": 64,          # was 8
+    # "steps_per_env": 512,    # was 256
+    # "total_updates": 2000,   # was 300
+
+    "num_envs": 8,          # was 8
+    "steps_per_env": 256,    # was 256
+    "total_updates": 300,   # was 300
 
     "log_every": 10,
 
