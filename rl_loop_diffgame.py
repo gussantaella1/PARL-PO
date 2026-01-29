@@ -9,7 +9,7 @@ Key points
 ----------
 - Single source of truth for config via: from config_rl import config_for_train, config_for_eval, build_dyn
 - Clean attacker swap: set cfg["attacker_mode"] to "rule" (default) or "rl"
-- Differentiable one-step ridge prior (DiffNash-style) blended into actor mean
+- Differentiable one-step ridge prior (DiffLS-style) blended into actor mean
 - Minimal, single-process VecEnv for reproducible, fixed-length rollouts
 """
 
@@ -429,9 +429,9 @@ class Env:
             - center_keepout
         )
 
-        if self.use_ukf and self.use_meas_reward:
-            r1 -= self.meas_innov_coef * meas_innov_sq
-            r1 -= self.meas_cov_coef   * meas_trPpos
+        # if self.use_ukf and self.use_meas_reward:
+        #     r1 -= self.meas_innov_coef * meas_innov_sq
+        #     r1 -= self.meas_cov_coef   * meas_trPpos
 
         r2 = (- self.alpha * delta_d2
             - self.k_pos * d2
@@ -725,9 +725,9 @@ class AttackerRuleController:
 
 
 # =============================================================
-# DiffNash Layer & Actor-Critic
+# DiffLS Layer & Actor-Critic
 # =============================================================
-class DiffNashLayer(nn.Module):
+class DiffLSLayer(nn.Module):
     """One-step ridge prior (center pull) for each agent; blended in actor mean."""
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
@@ -778,24 +778,184 @@ class DiffNashLayer(nn.Module):
 
         feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # (B, 4D)
         return feats, u_prior
+    
+
+class DiffNashLayer(nn.Module):
+    """
+    One-step Nash prior via an external IPOPT-based game solver.
+
+    - Reconstructs (x1, x2) = [p1, v1], [p2, v2] from the observation.
+    - Calls an external 'Nash game solver' (IPOPT-based) that returns (u1*, u2*).
+    - Returns u1* as prior if who='def', u2* if who='att'.
+
+    Notes:
+    - This layer *does not* backprop through the IPOPT solver; u_prior is treated
+      as a fixed, non-differentiable prior. Gradients only flow through the
+      learned residual policy on top of u_prior.
+    - The actual game definition (costs, constraints) is inside the external
+      solver you provide (e.g. nash_ipopt_solver.solve_nash_ipopt).
+    """
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self.D = int(cfg["D"])
+        self.dt = float(cfg["dt"])
+
+        # Dynamics, center, etc., same geometry as DiffLS
+        self.register_buffer(
+            "Ad",
+            torch.as_tensor(np.asarray(cfg["dyn"]["Ad"], np.float32), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "Bd",
+            torch.as_tensor(np.asarray(cfg["dyn"]["Bd"], np.float32), dtype=torch.float32)
+        )
+
+        ar = cfg["arena"]
+        c = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
+            dtype=np.float32
+        )[: self.D]
+        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
+
+        # Where to find the IPOPT game solver
+        # Example expected structure in cfg:
+        # cfg["nash_solver"] = {
+        #     "module": "nash_ipopt_solver",
+        #     "fn":     "solve_nash_ipopt",
+        #     "params": {...}   # optional dict passed to solver
+        # }
+        solver_cfg = cfg.get("nash_solver", {})
+        module_name = solver_cfg.get("module", "nash_ipopt_solver")
+        fn_name     = solver_cfg.get("fn", "solve_nash_ipopt")
+        self.solver_params = solver_cfg.get("params", {})
+
+        mod = importlib.import_module(module_name)
+        self.nash_solve = getattr(mod, fn_name)
+
+    def forward(self, obs: torch.Tensor, who: str):
+        """
+        obs:  [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
+        who:  'def' or 'att'
+        """
+        B, D = obs.shape[0], self.D
+        device = obs.device
+        dtype  = obs.dtype
+
+        center = self.center.to(dtype=dtype, device=device)
+
+        # Decompose obs into pieces
+        p1c = obs[:, 0:D]          # defender pos (centered)
+        p2c = obs[:, D:2*D]        # attacker pos (centered)
+        v1  = obs[:, 3*D:4*D]
+        v2  = obs[:, 4*D:5*D]
+
+        # Recover absolute positions
+        p1 = p1c + center          # [B, D]
+        p2 = p2c + center          # [B, D]
+
+        # Construct state vectors x1, x2 = [p, v]
+        x1 = torch.cat([p1, v1], dim=-1)   # [B, 2D]
+        x2 = torch.cat([p2, v2], dim=-1)   # [B, 2D]
+
+        # We will call the IPOPT solver in numpy-space (no grads)
+        x1_np = x1.detach().cpu().numpy()
+        x2_np = x2.detach().cpu().numpy()
+
+        u1_list = []
+        u2_list = []
+
+        # Call solver for each batch element
+        for i in range(B):
+            u1_i, u2_i = self.nash_solve(x1_np[i], x2_np[i], self.solver_params)
+            # Expect u1_i, u2_i to be numpy arrays of shape (D,)
+            u1_list.append(np.asarray(u1_i, dtype=np.float32))
+            u2_list.append(np.asarray(u2_i, dtype=np.float32))
+
+        u1_np = np.stack(u1_list, axis=0)   # [B, D]
+        u2_np = np.stack(u2_list, axis=0)   # [B, D]
+
+        u1_prior = torch.as_tensor(u1_np, device=device, dtype=dtype)
+        u2_prior = torch.as_tensor(u2_np, device=device, dtype=dtype)
+        u_prior  = u1_prior if who == "def" else u2_prior
+
+        # As in DiffLS, the "features" are [p1c, p2c, v1, v2]
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # [B, 4D]
+        return feats, u_prior
+    
+
+class NoPriorLayer(nn.Module):
+    """
+    No analytic prior: just repackage the observation into features
+    and return u_prior = 0.
+    """
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self.D = int(cfg["D"])
+        ar = cfg["arena"]
+        c = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
+            dtype=np.float32
+        )[: self.D]
+        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
+
+    def forward(self, obs: torch.Tensor, who: str):
+        """
+        obs: [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
+        Return:
+          feats: [B, 4*D] = [p1c, p2c, v1, v2]
+          u_prior: [B, D] = 0
+        """
+        B, D = obs.shape[0], self.D
+        device, dtype = obs.device, obs.dtype
+
+        p1c = obs[:, 0:D]
+        p2c = obs[:, D:2*D]
+        v1  = obs[:, 3*D:4*D]
+        v2  = obs[:, 4*D:5*D]
+
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # (B, 4D)
+        u_prior = torch.zeros((B, D), device=device, dtype=dtype)
+        return feats, u_prior
+
+
+
 
 
 class ActorCriticDiff(nn.Module):
     def __init__(self, obs_dim: int, act_dim: int, cfg: Dict[str, Any]):
         super().__init__()
         hidden = 128
-        self.layer = DiffNashLayer(cfg)
+
+        # Choose which prior layer to use
+        prior_type = cfg.get("prior_type", "ls")  # "ls", "nash", or "none"
+        if prior_type == "ls":
+            self.layer = DiffLSLayer(cfg)
+        elif prior_type == "nash":
+            self.layer = DiffNashLayer(cfg)
+        elif prior_type == "none":
+            self.layer = NoPriorLayer(cfg)
+        else:
+            raise ValueError(
+                f"Unknown prior_type={prior_type!r}, expected 'ls', 'nash', or 'none'."
+            )
+
+        # Policy (residual over prior)
         self.pi = nn.Sequential(
-            nn.Linear(4*cfg["D"], hidden), nn.Tanh(),
+            nn.Linear(4 * cfg["D"], hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
         self.mu_res = nn.Linear(hidden, act_dim)
         self.logstd = nn.Parameter(torch.full((act_dim,), -1.0))  # std ~ 0.37
+
+        # Value function
         self.vf = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
             nn.Linear(hidden, 1),
         )
+
+        # How strongly to trust the prior in μ = μ_res + blend * u_prior
         self.prior_blend_def = float(cfg.get("prior_blend_def", 0.5))
         self.prior_blend_att = float(cfg.get("prior_blend_att", 1.0))
 
@@ -803,8 +963,10 @@ class ActorCriticDiff(nn.Module):
         feats, u_prior = self.layer(obs, who)
         h = self.pi(feats)
         mu_res = self.mu_res(h)
+
         blend = self.prior_blend_def if who == "def" else self.prior_blend_att
         mu = mu_res + blend * u_prior
+
         std = self.logstd.exp()
         return torch.distributions.Normal(mu, std)
 
@@ -819,6 +981,8 @@ class ActorCriticDiff(nn.Module):
         logp  = logprob_squashed(dist, u_raw)
         val   = self.value(obs)
         return a_env, logp, val
+
+
 
 
 # =============================================================

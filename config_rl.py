@@ -196,15 +196,28 @@ TRAIN: Dict[str, Any] = {
     "train_ic_vmax": 0.05,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
 
+    "prior_type": "ls",                 #ls, nash, none
+    "prior_blend_att":        0.0,    # (optional) disable center prior for def
+    "prior_blend_def":        0.0,    # (optional) disable center prior for def
+
+    # "prior_blend_def":        0.25,    # (optional) disable center prior for def
+
     "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
     "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
     "def_center_coef":        0.0,    # no attractive center tether
-    "prior_blend_def":        0.0,    # (optional) disable center prior for def
+
 
 
     "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
     "att_target_hit_penalty_def": 5.0,      # big negative for defender
     "att_target_hit_reward_att": 5.0,       # matching positive for attacker
+
+
+    "nash_solver": {
+            "module": "nash_ipopt_solver",    # your module name
+            "fn": "solve_nash_ipopt",         # your function name
+            "params": { },
+    }
 
 }
 
@@ -301,3 +314,25 @@ def build_dyn(cfg: Dict[str, Any]):
     Ad, Bd = hcw_discrete_mats(float(n), float(cfg["dt"]))
     cfg["dyn"]["Ad"] = as_numpy_const(Ad).astype(np.float32)
     cfg["dyn"]["Bd"] = as_numpy_const(Bd).astype(np.float32)
+
+    # ---- NEW: populate Nash-solver params if present ----
+    if cfg.get("prior_type", "ls") == "nash" and "nash_solver" in cfg:
+        ns = cfg["nash_solver"]
+        params = ns.get("params", {})
+
+        ar = cfg["arena"]
+        D  = int(cfg["D"])
+        center = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
+            dtype=float
+        )[:D]
+
+        params.setdefault("Ad", cfg["dyn"]["Ad"])
+        params.setdefault("Bd", cfg["dyn"]["Bd"])
+        params.setdefault("center", center)
+        params.setdefault("umax", cfg["umax"])
+        params.setdefault("R", float(ar["r"]))
+
+        ns["params"] = params
+        cfg["nash_solver"] = ns
+
