@@ -91,6 +91,36 @@ COMMON: Dict[str, Any] = {
         "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
     },
 
+    "att_reward": {
+
+        # --- progress / goal terms ---
+        # Reward *decreasing* d2 each step (encourages steady approach, less dithering)
+        "k_prog":  2.0,     # weight on (-delta_d2)
+
+        # Small shaping toward being near the center (optional)
+        # If your r2 already uses "-k_pos * d2", you can keep this 0.
+        "k_cent":  0.0,
+
+        # --- interaction with defender (conservative vs reckless) ---
+        # Penalty for being too close to defender (prevents "suicide charges")
+        "min_sep": 4.0,     # meters; MUST exist if your r2 uses self.att_min_sep
+        "k_close": 2.0,     # how hard to penalize inside min_sep
+
+        # --- speed / overshoot control ---
+        # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
+        # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
+        "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
+
+        # Optional: penalize radial velocity near the center to reduce fly-through
+        "k_vrad":  0.5,     # if you include a vrad2^2 term in r2
+
+        # --- wall behavior ---
+        # Extra "hardening" near boundary; makes wall-bouncing expensive
+        # Usually you don’t need to exceed wall_penalty unless attacker still suicides.
+        "k_wall":  3.0,     # extra weight on wall2-type penalty (often = wall_penalty)
+        "wall_power": 4.0,  # if you implement a (rho2-soft_wall)^wall_power style
+    },
+
     # "att_rule": {
     #     "ridge": 5e-2,       # slightly smoother center controller
     #     "w_center": 0.8,     # still wants the center
@@ -169,13 +199,13 @@ TRAIN: Dict[str, Any] = {
     "att_ckpt_path": None,
 
     # Vectorized rollout & logging
-    # "num_envs": 64,          # was 8
-    # "steps_per_env": 512,    # was 256
-    # "total_updates": 2000,   # was 300
+    "num_envs": 64,          # was 8
+    "steps_per_env": 512,    # was 256
+    "total_updates": 2000,   # was 300
 
-    "num_envs": 8,          # was 8
-    "steps_per_env": 256,    # was 256
-    "total_updates": 300,   # was 300
+    # "num_envs": 8,          # was 8
+    # "steps_per_env": 256,    # was 256
+    # "total_updates": 300,   # was 300
 
     "log_every": 10,
 
