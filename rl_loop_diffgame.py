@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import os  # <---- add this
+import matplotlib.pyplot as plt
 
 
 # --- Single source of truth for config & dynamics ---
@@ -75,6 +76,8 @@ class Env:
     Terminal bonus at done: r_def += β d2 - 0.10 d1, r_att -= β d2.
     """
     def __init__(self, cfg: Dict[str, Any]):
+        # self.scale_invariant = bool(cfg["scale_invariant"])
+
         self.cfg = cfg
         self.D = int(cfg["D"])
         self.dt = float(cfg["dt"])
@@ -140,9 +143,27 @@ class Env:
         self.def_center_avoid_coef  = float(cfg.get("def_center_avoid_coef", 10.0))
 
         # NEW: attacker "hit object" termination around center (normalized wrt arena R)
+
+        oi = cfg.get("oi", {})
+
+
+        self.oi_radius = float(oi.get("r", 0.0))
+        self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
+
         self.att_target_hit_radius = float(cfg.get("att_target_hit_radius", 0.0))
         self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
         self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
+
+
+        self.def_target_hit_penalty_def = float(cfg.get("def_target_hit_penalty_def", 0.0))
+        self.def_target_hit_reward_att  = float(cfg.get("def_target_hit_reward_att", 0.0))
+
+
+        # NEW: collision termination (defender vs any attacker)
+        self.collision_radius_m    = float(cfg.get("collision_radius_m", 0.0))  # meters; 0 disables
+        self.collision_penalty_def = float(cfg.get("collision_penalty_def", 0.0))
+        self.collision_penalty_att = float(cfg.get("collision_penalty_att", 0.0))
+
 
         # ---- UKF / measurement model knobs ----
         self.use_ukf          = bool(cfg.get("use_ukf", False))
@@ -413,20 +434,20 @@ class Env:
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
 
-        # ---- choose geometry p2_geom (belief if UKF on, else truth) ----
-        if self.use_ukf and (self.ukf is not None):
-            p2_geom = self.ukf.x[:self.D].copy()
-            # (keep your sanity clip logic here if you want)
-        else:
-            p2_geom = p2
+        # # ---- choose geometry p2_geom (belief if UKF on, else truth) ----
+        # if self.use_ukf and (self.ukf is not None):
+        #     p2_geom = self.ukf.x[:self.D].copy()
+        #     # (keep your sanity clip logic here if you want)
+        # else:
+        #     p2_geom = p2
 
         # ---- shared geometry needed by whichever reward(s) we compute ----
         # d2 and rel2 are used by both rewards
-        d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
+        d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
         d2 = d2_raw / (self.radius**2)
         delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
-        rel2 = float(np.dot((p2_geom - p1), (p2_geom - p1))) / (self.radius**2)
+        rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
 
         # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
         if need_def:
@@ -442,8 +463,12 @@ class Env:
         vrad1 = 0.0
         k_vrad = self.k_vel * 3.0
 
+        rho1 = np.linalg.norm(p1 - self.center)/ self.radius
+        rho2 = np.linalg.norm(p2 - self.center) / self.radius
+
         if need_def:
-            rho1 = np.linalg.norm(p1 - self.center) / self.radius
+            
+            # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
             wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
             # defender keep-out
@@ -451,13 +476,14 @@ class Env:
                 gap = (self.def_center_safe_radius - rho1)
                 center_keepout = (gap * gap) * self.def_center_avoid_coef
 
+
             # defender radial velocity
             rhat1 = (p1 - self.center)
             rnorm = np.linalg.norm(rhat1) + 1e-9
             vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius
 
         if need_att:
-            rho2 = np.linalg.norm(p2_geom - self.center) / self.radius
+            
             wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- compute only requested reward(s) ----
@@ -529,17 +555,63 @@ class Env:
 
 
 
-        # ---- termination always uses TRUE state (required no matter what) ----
-        rho1_true = np.linalg.norm(p1 - self.center) / self.radius
-        rho2_true = np.linalg.norm(p2 - self.center) / self.radius
+        # ---- termination always uses TRUE state ----
+
+
+        # # target hit: (keep your current meaning = first attacker hits target)
 
         hit_target = False
-        if self.att_target_hit_radius > 0.0 and rho2_true <= self.att_target_hit_radius:
-            hit_target = True
+        # p2_true = pA_list[0]
+        # # rho2_true = np.linalg.norm(p2_true - self.center) / self.radius
+        # rho2_rel_to_target = np.linalg.norm(p2_true - self.center)
 
-        oob1 = (rho1_true >= self.margin)
-        oob2 = (rho2_true >= self.margin)
-        done = (oob1 or oob2 or hit_target) or (self.t >= self.T)
+        # hit_target = False
+        # if self.att_target_hit_radius > 0.0 and rho2_rel_to_target <= (1 + self.att_target_hit_radius)*self.oi_radius:
+        #     hit_target = True
+
+        # attacker target hit: (keep your current meaning = first attacker hits target)
+
+
+        # set once (do this in __init__ ideally, not every step)
+        hit_buffer_def = float(self.def_center_safe_radius)  # dimensionless
+        hit_buffer_att = float(self.att_target_hit_radius)  # dimensionless
+
+
+        # normalized distances to center
+        rho_att = np.linalg.norm(p2 - self.center) / self.radius
+        rho_def = np.linalg.norm(p1 - self.center) / self.radius
+
+        # normalized threshold
+        thresh_def = (1.0 + hit_buffer_def) * self.oi_radius_norm  # dimensionless
+        thresh_att = (1.0 + hit_buffer_att) * self.oi_radius_norm  # dimensionless
+
+
+        att_hit_target = (self.oi_radius_norm > 0.0) and (rho_att <= thresh_att)
+        def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
+
+        hit_target = att_hit_target or def_hit_target
+
+
+        # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
+        collision = False
+        if self.collision_radius_m > 0.0:
+            for pA_true in pA_list:
+                if np.linalg.norm(pA_true - p1) <= self.collision_radius_m:
+                    collision = True
+                    break
+
+        oob1 = (rho1 >= self.margin)
+
+        # oob for ANY attacker
+        oob2_any = False
+        for pA_true in pA_list:
+            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
+            if rhoA_true >= self.margin:
+                oob2_any = True
+                break
+
+        done = (oob1 or oob2_any or hit_target or collision) or (self.t >= self.T)
+
 
         # apply terminal shaping only to the reward(s) you computed
         if done:
@@ -548,15 +620,21 @@ class Env:
                 r1 -= 0.10 * d1
                 if oob1:
                     r1 -= self.wallK
-                if hit_target:
+                if def_hit_target:
                     r1 -= self.att_target_hit_penalty_def
+                if att_hit_target:
+                    r1 -= self.def_target_hit_penalty_def                    
+                if collision:
+                    r1 -= self.collision_penalty_def
 
             if need_att:
                 r2 -= self.beta * d2
-                if oob2:
+                if oob2_any:
                     r2 -= self.wallK
-                if hit_target:
+                if att_hit_target:
                     r2 += self.att_target_hit_reward_att
+                if collision:
+                    r2 -= self.collision_penalty_att
 
         # track d2_prev based on the geometry used for reward (same as your current logic)
         self._d2_prev = d2
@@ -565,20 +643,23 @@ class Env:
         # ---- always compute these for logging ----
         d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
         d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
-        d2_belief_norm = float(np.dot(p2_geom - self.center, p2_geom - self.center)) / (self.radius**2)
+        # d2_belief_norm = float(np.dot(p2_geom - self.center, p2_geom - self.center)) / (self.radius**2)
 
         info = {
             "t": self.t,
             "d2_norm": d2,                 # whatever you used for reward (belief if UKF)
             "rel2_norm": rel2,
             "oob_def": bool(oob1),
-            "oob_att": bool(oob2),
+            "oob_att": bool(oob2_any),
             "hit_target": bool(hit_target),
 
             # NEW: what your logger expects
             "d1_true_norm": d1_true_norm,
             "d2_true_norm": d2_true_norm,
-            "d2_belief_norm": d2_belief_norm,
+            # "d2_belief_norm": d2_belief_norm,
+
+            "collision": bool(collision),
+
         }
 
         if self.use_ukf:
@@ -1808,106 +1889,434 @@ def rollout_metrics(states: np.ndarray, center: np.ndarray, R: float):
     return {"d1_norm": d1, "d2_norm": d2, "rel2_norm": rel2, "d2_delta": d2_delta}
 
 # =============================================================
+# Plotting scripts
+# =============================================================
+
+def load_npz_metrics(path: str) -> dict:
+    """
+    Load a .npz metrics file saved via: np.savez(metrics_path, **metrics)
+
+    Returns
+    -------
+    metrics : dict[str, np.ndarray]
+        Keys map to 1D numpy arrays (or arrays as saved).
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Metrics file not found: {path}")
+
+    data = np.load(path, allow_pickle=True)
+    metrics = {}
+    for k in data.files:
+        metrics[k] = data[k]
+    return metrics
+
+
+def _as_1d(x):
+    """Best-effort convert to 1D float array (for plotting)."""
+    x = np.asarray(x)
+    if x.ndim == 0:
+        return x.reshape(1).astype(float)
+    if x.ndim > 1:
+        # if it's a column vector or similar, flatten
+        x = x.reshape(-1)
+    return x.astype(float)
+
+
+def _smooth_series(y, method="none", param=0.2):
+    """
+    Smooth a 1D series.
+
+    method:
+      - "none": no smoothing
+      - "ema": exponential moving average with alpha=param (0<alpha<=1)
+      - "ma":  moving average with window=int(param)
+    """
+    y = _as_1d(y)
+    if method is None or method == "none":
+        return y
+
+    if method == "ema":
+        alpha = float(param)
+        if not (0.0 < alpha <= 1.0):
+            raise ValueError("EMA alpha must be in (0, 1].")
+        out = np.empty_like(y)
+        out[0] = y[0]
+        for i in range(1, len(y)):
+            out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+        return out
+
+    if method == "ma":
+        win = int(param)
+        if win <= 1:
+            return y
+        # pad at left so length stays the same
+        pad = win - 1
+        ypad = np.pad(y, (pad, 0), mode="edge")
+        kernel = np.ones(win, dtype=float) / win
+        return np.convolve(ypad, kernel, mode="valid")
+
+    raise ValueError(f"Unknown smoothing method: {method!r}")
+
+
+def plot_training_metrics(
+    metrics: dict,
+    title: str = "",
+    smooth: str = "none",         # "none" | "ema" | "ma"
+    smooth_param: float = 0.2,    # ema alpha OR ma window
+    show: bool = False,
+
+    # NEW saving knobs
+    out_dir: str | None = None,
+    save_prefix: str | None = None,
+    dpi: int = 200,
+    close: bool = True,
+):
+    """
+    Plot the metrics saved by your train() loop.
+
+    If out_dir is provided, saves figures there (one PNG per figure) and
+    does not require showing.
+
+    Returns
+    -------
+    figs : list[matplotlib.figure.Figure]
+    saved_paths : list[str]  (empty if out_dir is None)
+    """
+    def _as_1d(x):
+        x = np.asarray(x)
+        if x.ndim == 0:
+            return x.reshape(1).astype(float)
+        if x.ndim > 1:
+            x = x.reshape(-1)
+        return x.astype(float)
+
+    def _smooth_series(y, method="none", param=0.2):
+        y = _as_1d(y)
+        if method is None or method == "none":
+            return y
+        if method == "ema":
+            alpha = float(param)
+            if not (0.0 < alpha <= 1.0):
+                raise ValueError("EMA alpha must be in (0, 1].")
+            out = np.empty_like(y)
+            out[0] = y[0]
+            for i in range(1, len(y)):
+                out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+            return out
+        if method == "ma":
+            win = int(param)
+            if win <= 1:
+                return y
+            pad = win - 1
+            ypad = np.pad(y, (pad, 0), mode="edge")
+            kernel = np.ones(win, dtype=float) / win
+            return np.convolve(ypad, kernel, mode="valid")
+        raise ValueError(f"Unknown smoothing method: {method!r}")
+
+    # x-axis
+    if "update" in metrics:
+        x = _as_1d(metrics["update"])
+    else:
+        for k in ["R_def_mean", "R_att_mean", "d1_mean", "d2_mean", "lr_pi"]:
+            if k in metrics:
+                x = np.arange(len(metrics[k]), dtype=float)
+                break
+        else:
+            raise ValueError("No recognizable metrics keys found to infer x-axis.")
+
+    def _plot_if(ax, key, label=None):
+        if key not in metrics:
+            return False
+        y = _smooth_series(metrics[key], method=smooth, param=smooth_param)
+        ax.plot(x, y, label=(label or key))
+        return True
+
+    figs = []
+    saved_paths = []
+
+    # pick a reasonable prefix for filenames
+    if save_prefix is None:
+        save_prefix = title.strip() if title.strip() else "run"
+
+    # 1) Returns
+    if ("R_def_mean" in metrics) or ("R_att_mean" in metrics):
+        fig = plt.figure()
+        ax = plt.gca()
+        any_plotted = False
+        any_plotted |= _plot_if(ax, "R_def_mean", "R_def_mean (per update)")
+        any_plotted |= _plot_if(ax, "R_att_mean", "R_att_mean (per update)")
+        if any_plotted:
+            ax.set_xlabel("Update")
+            ax.set_ylabel("Mean return (sum over rollout)")
+            ax.set_title(f"{title} — Returns" if title else "Returns")
+            ax.grid(True)
+            ax.legend()
+            figs.append(("returns", fig))
+
+    # 2) Distances
+    dist_keys = [k for k in ["d1_mean", "d2_mean", "d2_true_mean"] if k in metrics]
+    if dist_keys:
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "d1_mean", "Defender true ⟨||p1-center||⟩ (m)")
+        _plot_if(ax, "d2_true_mean", "Attacker true ⟨||p2-center||⟩ (m)")
+        _plot_if(ax, "d2_mean", "Attacker belief ⟨||p2-center||⟩ (m)")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("Distance to center (m)")
+        ax.set_title(f"{title} — Distances" if title else "Distances")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("distances", fig))
+
+    # 3) Learning rates
+    if ("lr_pi" in metrics) or ("lr_vf" in metrics):
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "lr_pi", "lr_pi")
+        _plot_if(ax, "lr_vf", "lr_vf")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("Learning rate")
+        ax.set_title(f"{title} — Learning rates" if title else "Learning rates")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("lrs", fig))
+
+    # 4) Policy stats
+    if ("muD_abs_mean" in metrics) or ("stdD_mean" in metrics):
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "muD_abs_mean", "|mu| mean (def)")
+        _plot_if(ax, "stdD_mean", "std mean (def)")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("Value")
+        ax.set_title(f"{title} — Policy stats" if title else "Policy stats")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("policy_stats", fig))
+
+    # 5) UKF stats
+    if ("meas_innov_mean" in metrics) or ("ukf_trPpos_mean" in metrics):
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "meas_innov_mean", "meas_innov_mean (E[||innov||^2])")
+        _plot_if(ax, "ukf_trPpos_mean", "ukf_trPpos_mean (trace(P_pos))")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("Value")
+        ax.set_title(f"{title} — UKF stats" if title else "UKF stats")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("ukf_stats", fig))
+
+    if not figs:
+        raise ValueError("None of the expected keys were present; nothing to plot.")
+
+    # ---- save if requested ----
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        for tag, fig in figs:
+            fname = f"{save_prefix}__{tag}.png"
+            fpath = os.path.join(out_dir, fname)
+            fig.savefig(fpath, dpi=dpi, bbox_inches="tight")
+            saved_paths.append(fpath)
+
+    # ---- show / close behavior ----
+    if show:
+        plt.show()
+
+    if close:
+        for _, fig in figs:
+            plt.close(fig)
+
+    # return plain fig list for compatibility + saved paths
+    return [fig for _, fig in figs], saved_paths
+
+
+
+def plot_compare_phases(
+    labeled_paths,
+    metric: str,
+    ylabel: str = None,
+    title: str = None,
+    smooth: str = "none",
+    smooth_param: float = 0.2,
+    show: bool = False,
+
+    # NEW saving knobs
+    out_dir: str | None = None,
+    filename: str | None = None,
+    dpi: int = 200,
+    close: bool = True,
+):
+    """
+    Compare a single metric across multiple runs and optionally save it.
+    """
+    fig = plt.figure()
+    ax = plt.gca()
+
+    def _as_1d(x):
+        x = np.asarray(x)
+        if x.ndim == 0:
+            return x.reshape(1).astype(float)
+        if x.ndim > 1:
+            x = x.reshape(-1)
+        return x.astype(float)
+
+    def _smooth_series(y, method="none", param=0.2):
+        y = _as_1d(y)
+        if method is None or method == "none":
+            return y
+        if method == "ema":
+            alpha = float(param)
+            out = np.empty_like(y)
+            out[0] = y[0]
+            for i in range(1, len(y)):
+                out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+            return out
+        if method == "ma":
+            win = int(param)
+            if win <= 1:
+                return y
+            pad = win - 1
+            ypad = np.pad(y, (pad, 0), mode="edge")
+            kernel = np.ones(win, dtype=float) / win
+            return np.convolve(ypad, kernel, mode="valid")
+        raise ValueError(f"Unknown smoothing method: {method!r}")
+
+    for label, path in labeled_paths:
+        m = load_npz_metrics(path)
+        if metric not in m:
+            print(f"[plot_compare_phases] skipping {label}: missing key {metric!r}")
+            continue
+        x = _as_1d(m["update"]) if "update" in m else np.arange(len(m[metric]))
+        y = _smooth_series(m[metric], method=smooth, param=smooth_param)
+        ax.plot(x, y, label=label)
+
+    ax.set_xlabel("Update")
+    ax.set_ylabel(ylabel or metric)
+    ax.set_title(title or f"Compare: {metric}")
+    ax.grid(True)
+    ax.legend()
+
+    saved_path = None
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        if filename is None:
+            safe_metric = metric.replace("/", "_")
+            filename = f"compare__{safe_metric}.png"
+        saved_path = os.path.join(out_dir, filename)
+        fig.savefig(saved_path, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    if close:
+        plt.close(fig)
+
+    return fig, saved_path
+
+
+
+    # ---------------------------------------------------------
+    # Helper: train defender teacher + distill to UKF student
+    # ---------------------------------------------------------
+def train_defender_with_distill(
+    phase_name: str,
+    attacker_mode: str,
+    extra_train_cfg: Dict[str, Any] | None = None,
+):
+    """
+    phase_name: label like 'def0' or 'def1' used in filenames.
+    attacker_mode: 'rule' or 'rl'
+    extra_train_cfg: dict of extra keys to shove into cfg_teacher
+                        (e.g., att_ckpt_path, freeze_attacker, etc.)
+    """
+    # -------- TEACHER (full-state) --------
+    cfg_teacher = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role="def",
+    )
+    cfg_teacher["use_ukf"] = False  # full-state teacher
+
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
+
+    build_dyn(cfg_teacher)
+
+    # Device sanity
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"[{phase_name.upper()} TEACHER] cfg_teacher['device']='cuda' but CUDA is not available.")
+    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+
+    ppo_def, metrics_def = train(cfg_teacher)
+
+    # --- Save defender teacher checkpoint ---
+    def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
+    torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
+    print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
+
+    # --- Optional: evaluate teacher (full-state) ---
+    cfg_eval = config_for_eval(
+        attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
+        umax=cfg_teacher["umax"],
+        T=cfg_teacher["T"],
+    )
+    cfg_eval["use_ukf"] = False
+    build_dyn(cfg_eval)
+    trajs = evaluate(ppo_def, cfg_eval, episodes=2)
+
+    # Example simple metric print (you can re-add all your plotting if you like)
+    ar = cfg_eval["arena"]
+    D = cfg_eval["D"]
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
+        dtype=float
+    )[:D]
+    R = float(ar["r"])
+    m = rollout_metrics(trajs[0]["states"], center, R)
+    print(
+        f"[{phase_name.upper()} TEACHER metrics] "
+        f"d2_T={m['d2_norm'][-1]:.3f}  "
+        f"d1_med={np.median(m['d1_norm']):.3f}  "
+        f"rel2_med={np.median(m['rel2_norm']):.3f}"
+    )
+
+    # --- Save raw teacher metrics ---
+    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+    np.savez(metrics_path, **metrics_def)
+    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    # -------- STUDENT (UKF / partial obs) via distillation --------
+    cfg_student = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role="def",
+    )
+    cfg_student["use_ukf"] = True
+    cfg_student["seed"] = cfg_teacher["seed"] + 1  # different randomness
+    build_dyn(cfg_student)
+
+    if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"[{phase_name.upper()} STUDENT] cfg_student['device']='cuda' but CUDA is not available.")
+    print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+
+    student_out = os.path.join(OUT_DIR, f"{phase_name}_def_ukf_student.pt")
+    student, metrics_student = distill_from_teacher(
+        cfg_student, def_teacher_ckpt, out_path=student_out
+    )
+    print(f"[{phase_name.upper()} STUDENT] Distilled defender UKF student saved to {student_out}")
+
+    # Save distillation metrics
+    distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
+    np.savez(distill_metrics_path, **metrics_student)
+    print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+    return def_teacher_ckpt, student_out
+
+# =============================================================
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
 # =============================================================
 if __name__ == "__main__":
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # ---------------------------------------------------------
-    # Helper: train defender teacher + distill to UKF student
-    # ---------------------------------------------------------
-    def train_defender_with_distill(
-        phase_name: str,
-        attacker_mode: str,
-        extra_train_cfg: Dict[str, Any] | None = None,
-    ):
-        """
-        phase_name: label like 'def0' or 'def1' used in filenames.
-        attacker_mode: 'rule' or 'rl'
-        extra_train_cfg: dict of extra keys to shove into cfg_teacher
-                         (e.g., att_ckpt_path, freeze_attacker, etc.)
-        """
-        # -------- TEACHER (full-state) --------
-        cfg_teacher = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="def",
-        )
-        cfg_teacher["use_ukf"] = False  # full-state teacher
-
-        if extra_train_cfg is not None:
-            cfg_teacher.update(extra_train_cfg)
-
-        build_dyn(cfg_teacher)
-
-        # Device sanity
-        if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"[{phase_name.upper()} TEACHER] cfg_teacher['device']='cuda' but CUDA is not available.")
-        print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-
-        ppo_def, metrics_def = train(cfg_teacher)
-
-        # --- Save defender teacher checkpoint ---
-        def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
-        torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
-        print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
-
-        # --- Optional: evaluate teacher (full-state) ---
-        cfg_eval = config_for_eval(
-            attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
-            umax=cfg_teacher["umax"],
-            T=cfg_teacher["T"],
-        )
-        cfg_eval["use_ukf"] = False
-        build_dyn(cfg_eval)
-        trajs = evaluate(ppo_def, cfg_eval, episodes=2)
-
-        # Example simple metric print (you can re-add all your plotting if you like)
-        ar = cfg_eval["arena"]
-        D = cfg_eval["D"]
-        center = np.array(
-            [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
-            dtype=float
-        )[:D]
-        R = float(ar["r"])
-        m = rollout_metrics(trajs[0]["states"], center, R)
-        print(
-            f"[{phase_name.upper()} TEACHER metrics] "
-            f"d2_T={m['d2_norm'][-1]:.3f}  "
-            f"d1_med={np.median(m['d1_norm']):.3f}  "
-            f"rel2_med={np.median(m['rel2_norm']):.3f}"
-        )
-
-        # --- Save raw teacher metrics ---
-        metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
-        np.savez(metrics_path, **metrics_def)
-        print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
-
-        # -------- STUDENT (UKF / partial obs) via distillation --------
-        cfg_student = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="def",
-        )
-        cfg_student["use_ukf"] = True
-        cfg_student["seed"] = cfg_teacher["seed"] + 1  # different randomness
-        build_dyn(cfg_student)
-
-        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"[{phase_name.upper()} STUDENT] cfg_student['device']='cuda' but CUDA is not available.")
-        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
-
-        student_out = os.path.join(OUT_DIR, f"{phase_name}_def_ukf_student.pt")
-        student, metrics_student = distill_from_teacher(
-            cfg_student, def_teacher_ckpt, out_path=student_out
-        )
-        print(f"[{phase_name.upper()} STUDENT] Distilled defender UKF student saved to {student_out}")
-
-        # Save distillation metrics
-        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
-        np.savez(distill_metrics_path, **metrics_student)
-        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
-
-        return def_teacher_ckpt, student_out
 
     # =========================================================
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
@@ -1992,6 +2401,79 @@ if __name__ == "__main__":
             "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
         },
     )
+
+    PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
+
+    # stage folders
+    PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
+    PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
+    PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
+    PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
+
+    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
+        os.makedirs(d, exist_ok=True)
+
+    # ---- def0 ----
+    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
+    plot_training_metrics(
+        m_def0_teacher,
+        title="def0_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF0,
+        save_prefix="def0_teacher",
+    )
+
+    # ---- att1 ----
+    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
+    plot_training_metrics(
+        m_att1_teacher,
+        title="att1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_ATT1,
+        save_prefix="att1_teacher",
+    )
+
+    # ---- def1 ----
+    m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
+    plot_training_metrics(
+        m_def1_teacher,
+        title="def1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF1,
+        save_prefix="def1_teacher",
+    )
+
+    # ---- comparisons ----
+    plot_compare_phases(
+        [
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz")),
+        ],
+        metric="R_def_mean",
+        ylabel="Mean defender return",
+        title="Defender return across phases",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_COMP,
+        filename="compare__R_def_mean__def0_vs_def1.png",
+    )
+
+    print("Saved plots under:", PLOTS_ROOT)
+    print(" -", PLOTS_DEF0)
+    print(" -", PLOTS_ATT1)
+    print(" -", PLOTS_DEF1)
+    print(" -", PLOTS_COMP)
+
+
+
+
 
     print("\n===== ALL PHASES COMPLETE =====")
     print(f"Defender_0 teacher:  {def0_teacher_ckpt}")

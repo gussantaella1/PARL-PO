@@ -194,18 +194,22 @@ COMMON = _merge(COMMON,VIZ)
 TRAIN: Dict[str, Any] = {
 
     # Optional checkpoints
+    "scale_invariant": True, # Normalizes radii
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,
 
     # Vectorized rollout & logging
-    "num_envs": 64,          # was 8
-    "steps_per_env": 512,    # was 256
-    "total_updates": 2000,   # was 300
 
-    # "num_envs": 8,          # was 8
-    # "steps_per_env": 256,    # was 256
-    # "total_updates": 300,   # was 300
+    # #Long training 
+    # "num_envs": 64,          
+    # "steps_per_env": 512,    
+    # "total_updates": 2000,   
+
+    #Short training 
+    "num_envs": 8,          
+    "steps_per_env": 256,    
+    "total_updates": 300,   
 
     "log_every": 10,
 
@@ -239,22 +243,27 @@ TRAIN: Dict[str, Any] = {
 
     # "prior_blend_def":        0.25,    # (optional) disable center prior for def
 
-    "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
+    "def_center_safe_radius": 0.20,   # e.g. keep-out inside 10% of R
     "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
     "def_center_coef":        0.0,    # no attractive center tether
 
 
 
-    "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
-    "att_target_hit_penalty_def": 5.0,      # big negative for defender
-    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
+
+    "att_target_hit_radius": 0.05,          # attacker within % of R hits object
+    "att_target_hit_penalty_def": 10.0,     # big negative for defender
+    "att_target_hit_reward_att": 15.0,       # matching positive for attacker
+
+    # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
+    "def_target_hit_penalty_def": 20.0,     # big negative for defender
+    "def_target_hit_reward_att": 20.0,       # matching positive for attacker
 
 
-    "nash_solver": {
-            "module": "nash_ipopt_solver",    # your module name
-            "fn": "solve_nash_ipopt",         # your function name
-            "params": { },
-    }
+    #For collision penalties on both agents
+
+    "collision_radius_m": 1.0,            # meters
+    "collision_penalty_def": 10.0,         # penalty applied to defender on collision
+    "collision_penalty_att": 10.0,         # penalty applied to attacker(s) on collision
 
 }
 
