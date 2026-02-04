@@ -169,13 +169,13 @@ TRAIN: Dict[str, Any] = {
     "att_ckpt_path": None,
 
     # Vectorized rollout & logging
-    "num_envs": 64,          
-    "steps_per_env": 512,    
-    "total_updates": 2000,   
+    # "num_envs": 64,          
+    # "steps_per_env": 512,    
+    # "total_updates": 2000,   
 
-    # "num_envs": 8,          
-    # "steps_per_env": 256,    
-    # "total_updates": 300,   
+    "num_envs": 8,          
+    "steps_per_env": 256,    
+    "total_updates": 300,   
 
     "log_every": 10,
 

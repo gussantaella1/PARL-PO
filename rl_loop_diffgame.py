@@ -335,11 +335,14 @@ class Env:
         return self._obs()
 
 
-    def step(self, a1_env: np.ndarray, aA_env: np.ndarray):
+    def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
         """
         a1_env: (D,)
         aA_env: (Na, D) or (D,) for Na=1 (actions for each attacker)
         """
+        need_def = reward_mode in ("def", "both")
+        need_att = reward_mode in ("att", "both")
+
         # Defender action
         a1 = np.clip(np.asarray(a1_env, float), self.u_lo, self.u_hi)
 
@@ -365,81 +368,81 @@ class Env:
 
 
         # ---- UKF + measurement-based metrics (optional) ----
-        meas_innov_sq = 0.0
-        meas_trPpos   = 0.0
+        # meas_innov_sq = 0.0
+        # meas_trPpos   = 0.0
 
-        if self.use_ukf:
-            # Time update (no explicit control input; attacker accel folded into Q)
-            self.ukf.predict(dt=self.dt, u=None, u_cov=None)
+        # if self.use_ukf:
+        #     # Time update (no explicit control input; attacker accel folded into Q)
+        #     self.ukf.predict(dt=self.dt, u=None, u_cov=None)
 
-            p_obs = p1
-            if self.D != 3:
-                raise RuntimeError("UKF bearing logic assumes D=3.")
-            R_wb = np.eye(3)
+        #     p_obs = p1
+        #     if self.D != 3:
+        #         raise RuntimeError("UKF bearing logic assumes D=3.")
+        #     R_wb = np.eye(3)
 
-            # True bearing → noisy measurement
-            v_b = _body_bearing_from_world(p_obs, R_wb, p2)
-            az_true, el_true = _azel_from_body_vec(v_b)
-            z_true = np.array([az_true, el_true], float)
+        #     # True bearing → noisy measurement
+        #     v_b = _body_bearing_from_world(p_obs, R_wb, p2)
+        #     az_true, el_true = _azel_from_body_vec(v_b)
+        #     z_true = np.array([az_true, el_true], float)
 
-            z_noise = np.random.multivariate_normal(
-                mean=np.zeros(2),
-                cov=self._ukf_R
-            )
-            z_meas = z_true + z_noise
+        #     z_noise = np.random.multivariate_normal(
+        #         mean=np.zeros(2),
+        #         cov=self._ukf_R
+        #     )
+        #     z_meas = z_true + z_noise
 
-            # Innovation (for optional reward term)
-            z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
-            innov = z_meas - z_hat_prior
-            innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
-            innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
-            meas_innov_sq = float(innov @ innov)
+        #     # Innovation (for optional reward term)
+        #     z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+        #     innov = z_meas - z_hat_prior
+        #     innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
+        #     innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
+        #     meas_innov_sq = float(innov @ innov)
 
-            # Measurement update
-            self.ukf.update(z_meas, p_obs, R_wb)
+        #     # Measurement update
+        #     self.ukf.update(z_meas, p_obs, R_wb)
 
-            meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
-            self._latest_meas_innov = meas_innov_sq
-            self._latest_meas_trP   = meas_trPpos
-        else:
-            self._latest_meas_innov = 0.0
-            self._latest_meas_trP   = 0.0
+        #     meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
+        #     self._latest_meas_innov = meas_innov_sq
+        #     self._latest_meas_trP   = meas_trPpos
+        # else:
+        #     self._latest_meas_innov = 0.0
+        #     self._latest_meas_trP   = 0.0
 
-        # ---- choose geometry position: BELIEF if UKF is on, else TRUTH ----
-        if self.use_ukf and (self.ukf is not None):
-            p2_geom = self.ukf.x[:self.D].copy()   # belief
+        # # ---- choose geometry position: BELIEF if UKF is on, else TRUTH ----
+        # if self.use_ukf and (self.ukf is not None):
+        #     p2_geom = self.ukf.x[:self.D].copy()   # belief
 
-            # ---- sanity clip on belief ----
-            r_est = np.linalg.norm(p2_geom - self.center)
-            R = self.radius
-            clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))  # e.g., 2× arena radius
-            r_max = clip_factor * R
+        #     # ---- sanity clip on belief ----
+        #     r_est = np.linalg.norm(p2_geom - self.center)
+        #     R = self.radius
+        #     clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))  # e.g., 2× arena radius
+        #     r_max = clip_factor * R
 
-            if (not np.isfinite(r_est)) or (r_est > r_max):
-                # Project back to sphere of radius r_max, or snap to truth if totally broken
-                if np.isfinite(r_est) and r_est > 1e-9:
-                    direction = (p2_geom - self.center) / r_est
-                    p2_geom = self.center + direction * r_max
-                else:
-                    p2_geom = p2.copy()
+        #     if (not np.isfinite(r_est)) or (r_est > r_max):
+        #         # Project back to sphere of radius r_max, or snap to truth if totally broken
+        #         if np.isfinite(r_est) and r_est > 1e-9:
+        #             direction = (p2_geom - self.center) / r_est
+        #             p2_geom = self.center + direction * r_max
+        #         else:
+        #             p2_geom = p2.copy()
 
-                # Optional: also reset the UKF itself so future obs use a sane state
-                if self.cfg.get("reset_ukf_on_diverge", True):
-                    self.ukf.x[:self.D]        = p2          # truth position
-                    self.ukf.x[self.D:2*self.D] = v2         # truth velocity
-                    self.ukf.P = self._ukf_P0.copy()
-        else:
-            p2_geom = p2                            # truth
+        #         # Optional: also reset the UKF itself so future obs use a sane state
+        #         if self.cfg.get("reset_ukf_on_diverge", True):
+        #             self.ukf.x[:self.D]        = p2          # truth position
+        #             self.ukf.x[self.D:2*self.D] = v2         # truth velocity
+        #             self.ukf.P = self._ukf_P0.copy()
+        # else:
+        #     p2_geom = p2                            # truth
 
 
         # ---- distances for reward (using p2_geom) ----
-        d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
+        d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
         d1_raw = float(np.dot(p1       - self.center, p1       - self.center))
         d2 = d2_raw / (self.radius**2)
         d1 = d1_raw / (self.radius**2)
         delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
-        rel2 = float(np.dot((p2_geom - p1), (p2_geom - p1))) / (self.radius**2)
+        rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
 
 
         # ---- TRUE geometry (always from true state) ----
@@ -448,7 +451,7 @@ class Env:
         rel2_true = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
 
         rho1 = np.linalg.norm(p1       - self.center) / self.radius
-        rho2 = np.linalg.norm(p2_geom  - self.center) / self.radius
+        rho2 = np.linalg.norm(p2  - self.center) / self.radius
         wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
@@ -466,27 +469,29 @@ class Env:
         k_vrad = self.k_vel * 3.0
 
         # ---- rewards (using p2_geom everywhere) ----
-        r1 = (
-            self.alpha * delta_d2
-            + self.k_pos * d2
-            - self.k_rel * rel2
-            - self.k_vel * float(np.dot(v1, v1))
-            - k_vrad * (vrad1**2)
-            - self.lD * float(np.dot(a1, a1))
-            - wall1
-            - center_keepout
-        )
 
-        # if self.use_ukf and self.use_meas_reward:
-        #     r1 -= self.meas_innov_coef * meas_innov_sq
-        #     r1 -= self.meas_cov_coef   * meas_trPpos
+        r1 = 0.0
+        r2 = 0.0
 
-        r2 = (- self.alpha * delta_d2
-            - self.k_pos * d2
-            + self.k_rel * rel2
-            - self.k_vel * float(np.dot(v2, v2))
-            - self.lA * float(np.dot(a2, a2))
-            - wall2 )
+        if need_def: 
+            r1 = (
+                self.alpha * delta_d2
+                + self.k_pos * d2
+                - self.k_rel * rel2
+                - self.k_vel * float(np.dot(v1, v1))
+                - k_vrad * (vrad1**2)
+                - self.lD * float(np.dot(a1, a1))
+                - wall1
+                - center_keepout
+            )
+
+        if need_att:
+            r2 = (- self.alpha * delta_d2
+                - self.k_pos * d2
+                + self.k_rel * rel2
+                - self.k_vel * float(np.dot(v2, v2))
+                - self.lA * float(np.dot(a2, a2))
+                - wall2 )
 
         # ---- termination still uses TRUE state ----
         rho1_true = np.linalg.norm(p1 - self.center) / self.radius
@@ -533,13 +538,13 @@ class Env:
             "oob_att": bool(oob2),
             "hit_target": bool(hit_target),
         }
-        if self.use_ukf:
-            info["d2_belief_norm"] = d2        # alias for clarity
-            info["meas_innov_sq"]  = meas_innov_sq
-            info["ukf_trPpos"]     = meas_trPpos
-            info["ukf_est_range_norm"] = float(
-                np.linalg.norm(p2_geom - self.center) / self.radius
-            )
+        # if self.use_ukf:
+        #     info["d2_belief_norm"] = d2        # alias for clarity
+        #     info["meas_innov_sq"]  = meas_innov_sq
+        #     info["ukf_trPpos"]     = meas_trPpos
+        #     info["ukf_est_range_norm"] = float(
+        #         np.linalg.norm(p2_geom - self.center) / self.radius
+        #     )
 
 
         return self._obs(), float(r1), float(r2), bool(done), info
@@ -667,7 +672,7 @@ class VecEnv:
         self.obs = np.stack(o, axis=0)
         return self.obs
 
-    def step(self, a1_env: np.ndarray, aA_env: np.ndarray):
+    def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "none"):
         """
         a1_env: [N_env, D]
         aA_env: [N_env, Na, D]  (for num_attackers > 1)
@@ -1470,11 +1475,19 @@ def distill_from_teacher(
 # Training & Evaluation
 # =============================================================
 def train(cfg: Dict[str, Any]):
+
+
+
     set_seed(cfg["seed"])
     device = cfg["device"]
 
 
     train_role = cfg.get("train_role", "def")  # <-- NEW
+
+    if train_role == "def":
+        reward_mode = "def"
+    elif train_role == "att":
+        reward_mode = "att"
 
     def make_env():
         return Env(cfg)
@@ -1587,8 +1600,11 @@ def train(cfg: Dict[str, Any]):
                 a2, lp2, v2 = ppo.act(o, who="att")
 
             o2_np, r1_np, r2_np, d_np, infos = vec.step(
-                a1.cpu().numpy(), a2.cpu().numpy()
+                a1.cpu().numpy(),
+                a2.cpu().numpy(),
+                reward_mode=reward_mode,   # <-- IMPORTANT
             )
+
             o2 = torch.as_tensor(o2_np, dtype=torch.float32, device=device)
             r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
             r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
@@ -1605,16 +1621,30 @@ def train(cfg: Dict[str, Any]):
 
             # ---- accumulate truth / belief metrics from Env.info ----
             for inf in infos:
-                if "d2_true_norm" in inf:
+                # count every env-step
+                info_count += 1
+
+                # always accumulate if present
+                if "d1_true_norm" in inf:
                     d1_true_acc += inf["d1_true_norm"]
+
+                if "d2_true_norm" in inf:
                     d2_true_acc += inf["d2_true_norm"]
-                    if "d2_belief_norm" in inf:
-                        d2_belief_acc += inf["d2_belief_norm"]
-                    if "meas_innov_sq" in inf:
-                        meas_innov_acc += inf["meas_innov_sq"]
-                    if "ukf_trPpos" in inf:
-                        trP_acc += inf["ukf_trPpos"]
-                    info_count += 1
+
+                # belief distance: fall back safely
+                if "d2_belief_norm" in inf:
+                    d2_belief_acc += inf["d2_belief_norm"]
+                elif "d2_true_norm" in inf:
+                    d2_belief_acc += inf["d2_true_norm"]
+                elif "d2_norm" in inf:
+                    d2_belief_acc += inf["d2_norm"]
+
+                if "meas_innov_sq" in inf:
+                    meas_innov_acc += inf["meas_innov_sq"]
+
+                if "ukf_trPpos" in inf:
+                    trP_acc += inf["ukf_trPpos"]
+
 
 
         with torch.no_grad():
@@ -1634,11 +1664,6 @@ def train(cfg: Dict[str, Any]):
             if bufA is None:
                 raise RuntimeError("train_role='att' requires attacker_mode='rl'")
             ppo.update_attacker_only(bufA)
-
-        elif train_role == "both":
-            if bufA is None:
-                raise RuntimeError("train_role='both' requires attacker_mode='rl'")
-            ppo.update_both(bufD, bufA)
 
         else:
             raise ValueError(f"Unknown train_role={train_role!r}")
