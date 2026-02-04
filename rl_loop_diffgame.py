@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import os  # <---- add this
+import matplotlib.pyplot as plt
 
 
 # --- Single source of truth for config & dynamics ---
@@ -75,6 +76,8 @@ class Env:
     Terminal bonus at done: r_def += β d2 - 0.10 d1, r_att -= β d2.
     """
     def __init__(self, cfg: Dict[str, Any]):
+        # self.scale_invariant = bool(cfg["scale_invariant"])
+
         self.cfg = cfg
         self.D = int(cfg["D"])
         self.dt = float(cfg["dt"])
@@ -140,9 +143,27 @@ class Env:
         self.def_center_avoid_coef  = float(cfg.get("def_center_avoid_coef", 10.0))
 
         # NEW: attacker "hit object" termination around center (normalized wrt arena R)
+
+        oi = cfg.get("oi", {})
+
+
+        self.oi_radius = float(oi.get("r", 0.0))
+        self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
+
         self.att_target_hit_radius = float(cfg.get("att_target_hit_radius", 0.0))
         self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
         self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
+
+
+        self.def_target_hit_penalty_def = float(cfg.get("def_target_hit_penalty_def", 0.0))
+        self.def_target_hit_reward_att  = float(cfg.get("def_target_hit_reward_att", 0.0))
+
+
+        # NEW: collision termination (defender vs any attacker)
+        self.collision_radius_m    = float(cfg.get("collision_radius_m", 0.0))  # meters; 0 disables
+        self.collision_penalty_def = float(cfg.get("collision_penalty_def", 0.0))
+        self.collision_penalty_att = float(cfg.get("collision_penalty_att", 0.0))
+
 
         # ---- UKF / measurement model knobs ----
         self.use_ukf          = bool(cfg.get("use_ukf", False))
@@ -196,6 +217,25 @@ class Env:
         self.state = None
         self.t = 0
         self._d2_prev = None
+
+        # =========================
+        # Attacker reward knobs (read once from cfg)
+        # =========================
+        att = cfg.get("att_reward", {})
+        att_rule = cfg.get("att_rule", {})
+
+        self.k_att_prog     = float(att.get("k_prog", 2.0))
+        self.k_att_cent     = float(att.get("k_cent", 0.0))
+        self.k_att_close    = float(att.get("k_close", 2.0))
+
+        # IMPORTANT: this fixes your old crash too
+        self.att_min_sep    = float(att.get("min_sep", att_rule.get("min_sep", 3.0)))
+
+        self.k_att_vrad     = float(att.get("k_vrad", 0.5))
+        self.k_att_wall     = float(att.get("k_wall", self.wallK))
+        self.att_wall_power = float(att.get("wall_power", 4.0))
+
+
 
     def reset(self) -> np.ndarray:
         self.t = 0
@@ -337,8 +377,7 @@ class Env:
 
     def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
         """
-        a1_env: (D,)
-        aA_env: (Na, D) or (D,) for Na=1 (actions for each attacker)
+        reward_mode: "def", "att", or "both"
         """
         need_def = reward_mode in ("def", "both")
         need_att = reward_mode in ("att", "both")
@@ -348,15 +387,12 @@ class Env:
 
         # Attacker actions; allow (D,) or (Na, D)
         aA = np.clip(np.asarray(aA_env, float), self.u_lo, self.u_hi)
-
-        # For rewards/metrics we still define a2 as the first attacker's action
         if aA.ndim == 1:
-            # Na must be 1 in this case
             a2 = aA
         else:
             a2 = aA[0]
 
-        # propagate true state with ALL attacker actions
+        # propagate true state
         self.state = self._plant_step(self.state, a1, aA)
         self.t += 1
 
@@ -364,116 +400,97 @@ class Env:
         p1, v1, pA_list, vA_list = self._unpack(self.state)
         p2 = pA_list[0]
         v2 = vA_list[0]
-        # ----- keep everything below here exactly as you already have it -----
 
+        # ---- UKF (only if enabled; you can also gate this further if you want) ----
+        meas_innov_sq = 0.0
+        meas_trPpos   = 0.0
 
-        # ---- UKF + measurement-based metrics (optional) ----
-        # meas_innov_sq = 0.0
-        # meas_trPpos   = 0.0
+        if self.use_ukf:
+            self.ukf.predict(dt=self.dt, u=None, u_cov=None)
+            p_obs = p1
+            if self.D != 3:
+                raise RuntimeError("UKF bearing logic assumes D=3.")
+            R_wb = np.eye(3)
 
-        # if self.use_ukf:
-        #     # Time update (no explicit control input; attacker accel folded into Q)
-        #     self.ukf.predict(dt=self.dt, u=None, u_cov=None)
+            v_b = _body_bearing_from_world(p_obs, R_wb, p2)
+            az_true, el_true = _azel_from_body_vec(v_b)
+            z_true = np.array([az_true, el_true], float)
 
-        #     p_obs = p1
-        #     if self.D != 3:
-        #         raise RuntimeError("UKF bearing logic assumes D=3.")
-        #     R_wb = np.eye(3)
+            z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
+            z_meas = z_true + z_noise
 
-        #     # True bearing → noisy measurement
-        #     v_b = _body_bearing_from_world(p_obs, R_wb, p2)
-        #     az_true, el_true = _azel_from_body_vec(v_b)
-        #     z_true = np.array([az_true, el_true], float)
+            z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+            innov = z_meas - z_hat_prior
+            innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
+            innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
+            meas_innov_sq = float(innov @ innov)
 
-        #     z_noise = np.random.multivariate_normal(
-        #         mean=np.zeros(2),
-        #         cov=self._ukf_R
-        #     )
-        #     z_meas = z_true + z_noise
+            self.ukf.update(z_meas, p_obs, R_wb)
 
-        #     # Innovation (for optional reward term)
-        #     z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
-        #     innov = z_meas - z_hat_prior
-        #     innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
-        #     innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
-        #     meas_innov_sq = float(innov @ innov)
+            meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
+            self._latest_meas_innov = meas_innov_sq
+            self._latest_meas_trP   = meas_trPpos
+        else:
+            self._latest_meas_innov = 0.0
+            self._latest_meas_trP   = 0.0
 
-        #     # Measurement update
-        #     self.ukf.update(z_meas, p_obs, R_wb)
-
-        #     meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
-        #     self._latest_meas_innov = meas_innov_sq
-        #     self._latest_meas_trP   = meas_trPpos
-        # else:
-        #     self._latest_meas_innov = 0.0
-        #     self._latest_meas_trP   = 0.0
-
-        # # ---- choose geometry position: BELIEF if UKF is on, else TRUTH ----
+        # # ---- choose geometry p2_geom (belief if UKF on, else truth) ----
         # if self.use_ukf and (self.ukf is not None):
-        #     p2_geom = self.ukf.x[:self.D].copy()   # belief
-
-        #     # ---- sanity clip on belief ----
-        #     r_est = np.linalg.norm(p2_geom - self.center)
-        #     R = self.radius
-        #     clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))  # e.g., 2× arena radius
-        #     r_max = clip_factor * R
-
-        #     if (not np.isfinite(r_est)) or (r_est > r_max):
-        #         # Project back to sphere of radius r_max, or snap to truth if totally broken
-        #         if np.isfinite(r_est) and r_est > 1e-9:
-        #             direction = (p2_geom - self.center) / r_est
-        #             p2_geom = self.center + direction * r_max
-        #         else:
-        #             p2_geom = p2.copy()
-
-        #         # Optional: also reset the UKF itself so future obs use a sane state
-        #         if self.cfg.get("reset_ukf_on_diverge", True):
-        #             self.ukf.x[:self.D]        = p2          # truth position
-        #             self.ukf.x[self.D:2*self.D] = v2         # truth velocity
-        #             self.ukf.P = self._ukf_P0.copy()
+        #     p2_geom = self.ukf.x[:self.D].copy()
+        #     # (keep your sanity clip logic here if you want)
         # else:
-        #     p2_geom = p2                            # truth
+        #     p2_geom = p2
 
-
-        # ---- distances for reward (using p2_geom) ----
+        # ---- shared geometry needed by whichever reward(s) we compute ----
+        # d2 and rel2 are used by both rewards
         d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
-        d1_raw = float(np.dot(p1       - self.center, p1       - self.center))
         d2 = d2_raw / (self.radius**2)
-        d1 = d1_raw / (self.radius**2)
         delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
         rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
 
+        # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
+        if need_def:
+            d1_raw = float(np.dot(p1 - self.center, p1 - self.center))
+            d1 = d1_raw / (self.radius**2)
+        else:
+            d1 = 0.0  # placeholder
 
-        # ---- TRUE geometry (always from true state) ----
-        d2_true_raw = float(np.dot(p2 - self.center, p2 - self.center))
-        d2_true = d2_true_raw / (self.radius**2)
-        rel2_true = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
-
-        rho1 = np.linalg.norm(p1       - self.center) / self.radius
-        rho2 = np.linalg.norm(p2  - self.center) / self.radius
-        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
-        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
-
-        # --- Defender keep-out around object of interest (center) ---
+        # ---- wall penalties: compute only what you need ----
+        wall1 = 0.0
+        wall2 = 0.0
         center_keepout = 0.0
-        if self.def_center_safe_radius > 0.0:
-            if rho1 < self.def_center_safe_radius:
+        vrad1 = 0.0
+        k_vrad = self.k_vel * 3.0
+
+        rho1 = np.linalg.norm(p1 - self.center)/ self.radius
+        rho2 = np.linalg.norm(p2 - self.center) / self.radius
+
+        if need_def:
+            
+            # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
+            wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+
+            # defender keep-out
+            if self.def_center_safe_radius > 0.0 and rho1 < self.def_center_safe_radius:
                 gap = (self.def_center_safe_radius - rho1)
                 center_keepout = (gap * gap) * self.def_center_avoid_coef
 
-        # defender radial velocity (true)
-        rhat1 = (p1 - self.center)
-        rnorm = np.linalg.norm(rhat1) + 1e-9
-        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius
-        k_vrad = self.k_vel * 3.0
 
-        # ---- rewards (using p2_geom everywhere) ----
+            # defender radial velocity
+            rhat1 = (p1 - self.center)
+            rnorm = np.linalg.norm(rhat1) + 1e-9
+            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius
 
+        if need_att:
+            
+            wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+
+        # ---- compute only requested reward(s) ----
         r1 = 0.0
         r2 = 0.0
 
-        if need_def: 
+        if need_def:
             r1 = (
                 self.alpha * delta_d2
                 + self.k_pos * d2
@@ -486,68 +503,172 @@ class Env:
             )
 
         if need_att:
-            r2 = (- self.alpha * delta_d2
+            r2 = (
+                - self.alpha * delta_d2
                 - self.k_pos * d2
                 + self.k_rel * rel2
                 - self.k_vel * float(np.dot(v2, v2))
                 - self.lA * float(np.dot(a2, a2))
-                - wall2 )
+                - wall2
+            )
 
-        # ---- termination still uses TRUE state ----
-        rho1_true = np.linalg.norm(p1 - self.center) / self.radius
-        rho2_true = np.linalg.norm(p2 - self.center) / self.radius
+        # if need_att:
+        #     R = self.radius
 
-        hit_target = False
-        if self.att_target_hit_radius > 0.0 and rho2_true <= self.att_target_hit_radius:
-            hit_target = True
+        #     # --- Progress reward (positive when moving toward center) ---
+        #     d2_prev = (self._d2_prev if self._d2_prev is not None else d2)
+        #     progress = (d2_prev - d2)  # >0 means closer to center
 
-        oob1 = (rho1_true >= self.margin)
-        oob2 = (rho2_true >= self.margin)
-        done = (oob1 or oob2 or hit_target) or (self.t >= self.T)
+        #     # --- Center distance term (optional) ---
+        #     cent_pen = d2  # normalized squared
 
-        if oob1:
-            r1 -= self.wallK
-        if oob2:
-            r2 -= self.wallK
+        #     # --- Keep-out penalty (ONLY if too close to defender) ---
+        #     dist = float(np.linalg.norm(p2_geom - p1))  # meters
+        #     close_pen = 0.0
+        #     if dist < self.att_min_sep:
+        #         gap = (self.att_min_sep - dist) / R
+        #         close_pen = gap * gap
 
-        if done:
-            r1 += self.beta * d2
-            r2 -= self.beta * d2
-            r1 -= 0.10 * d1
-            if hit_target:
-                r1 -= self.att_target_hit_penalty_def
-                r2 += self.att_target_hit_reward_att
+        #     # --- Radial-speed penalty (reduces "fly through center then slam wall") ---
+        #     rhat2 = (p2_geom - self.center)
+        #     rnorm2 = np.linalg.norm(rhat2) + 1e-9
+        #     vrad2 = float(np.dot(v2, rhat2 / rnorm2)) / R  # normalized radial speed
 
-        # d2_prev now always tracks whatever was used in reward (belief or truth)
-        self._d2_prev = d2
+        #     # --- Wall barrier (starts at soft_wall) ---
+        #     rho2 = np.linalg.norm(p2_geom - self.center) / R
+        #     wall_gap = max(0.0, rho2 - self.soft_wall)
+        #     wall2_att = (wall_gap ** self.att_wall_power) * self.k_att_wall
 
-        info = {
-            "t": self.t,
+        #     # --- Regularization (same style as your old r2) ---
+        #     effort_pen = float(np.dot(a2, a2))
+        #     speed_pen  = float(np.dot(v2, v2))
 
-            # geometry used by reward (belief if UKF on, truth otherwise)
-            "d2_norm": d2,
-            "d1_norm": d1,
-            "rel2_norm": rel2,
-
-            # always TRUE geometry
-            "d1_true_norm": d1,           # p1 is always truth anyway
-            "d2_true_norm": d2_true,
-            "rel2_true_norm": rel2_true,
-
-            "oob_def": bool(oob1),
-            "oob_att": bool(oob2),
-            "hit_target": bool(hit_target),
-        }
-        # if self.use_ukf:
-        #     info["d2_belief_norm"] = d2        # alias for clarity
-        #     info["meas_innov_sq"]  = meas_innov_sq
-        #     info["ukf_trPpos"]     = meas_trPpos
-        #     info["ukf_est_range_norm"] = float(
-        #         np.linalg.norm(p2_geom - self.center) / self.radius
+        #     r2 = (
+        #         + self.k_att_prog * progress
+        #         - self.k_att_cent * cent_pen
+        #         - self.k_att_close * close_pen
+        #         - self.k_att_vrad * (vrad2 ** 2)
+        #         - wall2_att
+        #         - self.lA * effort_pen
+        #         - self.k_vel * speed_pen
         #     )
 
 
+
+        # ---- termination always uses TRUE state ----
+
+
+        # # target hit: (keep your current meaning = first attacker hits target)
+
+        hit_target = False
+        # p2_true = pA_list[0]
+        # # rho2_true = np.linalg.norm(p2_true - self.center) / self.radius
+        # rho2_rel_to_target = np.linalg.norm(p2_true - self.center)
+
+        # hit_target = False
+        # if self.att_target_hit_radius > 0.0 and rho2_rel_to_target <= (1 + self.att_target_hit_radius)*self.oi_radius:
+        #     hit_target = True
+
+        # attacker target hit: (keep your current meaning = first attacker hits target)
+
+
+        # set once (do this in __init__ ideally, not every step)
+        hit_buffer_def = float(self.def_center_safe_radius)  # dimensionless
+        hit_buffer_att = float(self.att_target_hit_radius)  # dimensionless
+
+
+        # normalized distances to center
+        rho_att = np.linalg.norm(p2 - self.center) / self.radius
+        rho_def = np.linalg.norm(p1 - self.center) / self.radius
+
+        # normalized threshold
+        thresh_def = (1.0 + hit_buffer_def) * self.oi_radius_norm  # dimensionless
+        thresh_att = (1.0 + hit_buffer_att) * self.oi_radius_norm  # dimensionless
+
+
+        att_hit_target = (self.oi_radius_norm > 0.0) and (rho_att <= thresh_att)
+        def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
+
+        hit_target = att_hit_target or def_hit_target
+
+
+        # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
+        collision = False
+        if self.collision_radius_m > 0.0:
+            for pA_true in pA_list:
+                if np.linalg.norm(pA_true - p1) <= self.collision_radius_m:
+                    collision = True
+                    break
+
+        oob1 = (rho1 >= self.margin)
+
+        # oob for ANY attacker
+        oob2_any = False
+        for pA_true in pA_list:
+            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
+            if rhoA_true >= self.margin:
+                oob2_any = True
+                break
+
+        done = (oob1 or oob2_any or hit_target or collision) or (self.t >= self.T)
+
+
+        # apply terminal shaping only to the reward(s) you computed
+        if done:
+            if need_def:
+                r1 += self.beta * d2
+                r1 -= 0.10 * d1
+                if oob1:
+                    r1 -= self.wallK
+                if def_hit_target:
+                    r1 -= self.att_target_hit_penalty_def
+                if att_hit_target:
+                    r1 -= self.def_target_hit_penalty_def                    
+                if collision:
+                    r1 -= self.collision_penalty_def
+
+            if need_att:
+                r2 -= self.beta * d2
+                if oob2_any:
+                    r2 -= self.wallK
+                if att_hit_target:
+                    r2 += self.att_target_hit_reward_att
+                if collision:
+                    r2 -= self.collision_penalty_att
+
+        # track d2_prev based on the geometry used for reward (same as your current logic)
+        self._d2_prev = d2
+
+        # info: you can also gate what you store here if you want
+        # ---- always compute these for logging ----
+        d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
+        d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
+        # d2_belief_norm = float(np.dot(p2_geom - self.center, p2_geom - self.center)) / (self.radius**2)
+
+        info = {
+            "t": self.t,
+            "d2_norm": d2,                 # whatever you used for reward (belief if UKF)
+            "rel2_norm": rel2,
+            "oob_def": bool(oob1),
+            "oob_att": bool(oob2_any),
+            "hit_target": bool(hit_target),
+
+            # NEW: what your logger expects
+            "d1_true_norm": d1_true_norm,
+            "d2_true_norm": d2_true_norm,
+            # "d2_belief_norm": d2_belief_norm,
+
+            "collision": bool(collision),
+
+        }
+
+        if self.use_ukf:
+            info["meas_innov_sq"] = meas_innov_sq
+            info["ukf_trPpos"] = meas_trPpos
+
         return self._obs(), float(r1), float(r2), bool(done), info
+
+
 
 
     def _obs(self) -> np.ndarray:
@@ -672,21 +793,19 @@ class VecEnv:
         self.obs = np.stack(o, axis=0)
         return self.obs
 
-    def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "none"):
-        """
-        a1_env: [N_env, D]
-        aA_env: [N_env, Na, D]  (for num_attackers > 1)
-        """
-        obs_next = []
-        r1, r2, done, info = [], [], [], []
-        for i, e in enumerate(self.envs):
-            o, R1, R2, d, inf = e.step(a1_env[i], aA_env[i])
-            if d:
-                o = e.reset()
-            obs_next.append(o)
-            r1.append(R1); r2.append(R2); done.append(d); info.append(inf)
-        self.obs = np.stack(obs_next, axis=0)
-        return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
+    def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
+            obs_next = []
+            r1, r2, done, info = [], [], [], []
+            for i, e in enumerate(self.envs):
+                o, R1, R2, d, inf = e.step(a1_env[i], aA_env[i], reward_mode=reward_mode)
+                if d:
+                    o = e.reset()
+                obs_next.append(o)
+                r1.append(R1); r2.append(R2); done.append(d); info.append(inf)
+            self.obs = np.stack(obs_next, axis=0)
+            return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
+
+
 
 
 # =============================================================
@@ -1286,16 +1405,6 @@ class PPO:
         oA, aA, lpA, vA, _, _ = buf_att.get()
         self._update_one(self.att_net, self.att_opt, oA, aA, lpA, vA, advA, retA, who="att")
 
-
-    def update_both(self, buf_def: RolloutBuffer, buf_att: RolloutBuffer):
-        advD, retD = compute_gae_from_buffer(buf_def, self.gamma, self.lam)
-        advA, retA = compute_gae_from_buffer(buf_att, self.gamma, self.lam)
-        oD, aD, lpD, vD, _, _ = buf_def.get()
-        oA, aA, lpA, vA, _, _ = buf_att.get()
-        self._update_one(self.def_net, self.def_opt, oD, aD, lpD, vD, advD, retD, who="def")
-        self._update_one(self.att_net, self.att_opt, oA, aA, lpA, vA, advA, retA, who="att")
-
-
 # =============================================================
 # Distillation helpers (teacher uses full-state; student sees belief)
 # =============================================================
@@ -1778,7 +1887,6 @@ def rollout_metrics(states: np.ndarray, center: np.ndarray, R: float):
     d2_delta = np.diff(d2, prepend=d2[:1])
 
     return {"d1_norm": d1, "d2_norm": d2, "rel2_norm": rel2, "d2_delta": d2_delta}
-
 
 # =============================================================
 # Plotting scripts
