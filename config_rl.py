@@ -91,6 +91,36 @@ COMMON: Dict[str, Any] = {
         "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
     },
 
+    "att_reward": {
+
+        # --- progress / goal terms ---
+        # Reward *decreasing* d2 each step (encourages steady approach, less dithering)
+        "k_prog":  0.0,     # weight on (-delta_d2)
+
+        # Small shaping toward being near the center (optional)
+        # If your r2 already uses "-k_pos * d2", you can keep this 0.
+        "k_cent":  0.0,
+
+        # --- interaction with defender (conservative vs reckless) ---
+        # Penalty for being too close to defender (prevents "suicide charges")
+        "min_sep": 3.0,     # meters; MUST exist if your r2 uses self.att_min_sep
+        "k_close": 2.0,     # how hard to penalize inside min_sep
+
+        # --- speed / overshoot control ---
+        # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
+        # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
+        # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
+
+        # Optional: penalize radial velocity near the center to reduce fly-through
+        "k_vrad":  0.5,     # if you include a vrad2^2 term in r2
+
+        # --- wall behavior ---
+        # Extra "hardening" near boundary; makes wall-bouncing expensive
+        # Usually you don’t need to exceed wall_penalty unless attacker still suicides.
+        "k_wall":  0.5,     # extra weight on wall2-type penalty (often = wall_penalty)
+        "wall_power": 4.0,  # if you implement a (rho2-soft_wall)^wall_power style
+    },
+
     # "att_rule": {
     #     "ridge": 5e-2,       # slightly smoother center controller
     #     "w_center": 0.8,     # still wants the center
@@ -164,6 +194,7 @@ COMMON = _merge(COMMON,VIZ)
 TRAIN: Dict[str, Any] = {
 
     # Optional checkpoints
+    "scale_invariant": True, # Normalizes radii
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,
@@ -209,22 +240,27 @@ TRAIN: Dict[str, Any] = {
 
     # "prior_blend_def":        0.25,    # (optional) disable center prior for def
 
-    "def_center_safe_radius": 0.10,   # e.g. keep-out inside 10% of R
+    "def_center_safe_radius": 0.05,   # e.g. keep-out inside 10% of R
     "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
     "def_center_coef":        0.0,    # no attractive center tether
 
 
 
-    "att_target_hit_radius": 0.05,          # attacker within 5% of R hits object
-    "att_target_hit_penalty_def": 5.0,      # big negative for defender
-    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
+
+    "att_target_hit_radius": 0.00,          # attacker within % of R hits object
+    "att_target_hit_penalty_def": 0.0,     # big negative for defender
+    "att_target_hit_reward_att": 0.0,       # matching positive for attacker
+
+    # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
+    "def_target_hit_penalty_def": 0.0,     # big negative for defender
+    "def_target_hit_reward_att": 0.0,       # matching positive for attacker
 
 
-    "nash_solver": {
-            "module": "nash_ipopt_solver",    # your module name
-            "fn": "solve_nash_ipopt",         # your function name
-            "params": { },
-    }
+    #For collision penalties on both agents
+
+    "collision_radius_m": 0.0,            # meters
+    "collision_penalty_def": 0.0,         # penalty applied to defender on collision
+    "collision_penalty_att": 0.0,         # penalty applied to attacker(s) on collision
 
 }
 
