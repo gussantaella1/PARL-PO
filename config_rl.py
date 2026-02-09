@@ -234,33 +234,33 @@ TRAIN: Dict[str, Any] = {
     "train_ic_vmax": 0.05,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
 
-    "prior_type": "ls",                 #ls, nash, none
+    "prior_type": "none",                 #ls, nash, none
     "prior_blend_att":        0.0,    # (optional) disable center prior for def
     "prior_blend_def":        0.0,    # (optional) disable center prior for def
 
     # "prior_blend_def":        0.25,    # (optional) disable center prior for def
 
-    "def_center_safe_radius": 0.05,   # e.g. keep-out inside 10% of R
+    "def_center_safe_radius": 0.1,   # e.g. keep-out inside 10% of R
     "def_center_avoid_coef":  50.0,   # crank this up if defender still dips in
     "def_center_coef":        0.0,    # no attractive center tether
 
 
 
 
-    "att_target_hit_radius": 0.00,          # attacker within % of R hits object
-    "att_target_hit_penalty_def": 0.0,     # big negative for defender
-    "att_target_hit_reward_att": 0.0,       # matching positive for attacker
+    "att_target_hit_radius": 0.1,          # attacker within % of R hits object
+    "att_target_hit_penalty_def": 3.0,     # big negative for defender
+    "att_target_hit_reward_att": 3.0,       # matching positive for attacker
 
     # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
-    "def_target_hit_penalty_def": 0.0,     # big negative for defender
-    "def_target_hit_reward_att": 0.0,       # matching positive for attacker
+    "def_target_hit_penalty_def": 3.0,     # big negative for defender
+    "def_target_hit_reward_att": 3.0,       # matching positive for attacker
 
 
     #For collision penalties on both agents
 
-    "collision_radius_m": 0.0,            # meters
-    "collision_penalty_def": 0.0,         # penalty applied to defender on collision
-    "collision_penalty_att": 0.0,         # penalty applied to attacker(s) on collision
+    "collision_radius_m": 0.2,            # meters
+    "collision_penalty_def": 3.0,         # penalty applied to defender on collision
+    "collision_penalty_att": 3.0,         # penalty applied to attacker(s) on collision
 
 }
 
