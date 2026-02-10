@@ -472,9 +472,24 @@ class Env:
             wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
             # defender keep-out
-            if self.def_center_safe_radius > 0.0 and rho1 < self.def_center_safe_radius:
+            if self.def_center_safe_radius > 0.0 and rho1 < 3*self.def_center_safe_radius:
                 gap = (self.def_center_safe_radius - rho1)
                 center_keepout = (gap * gap) * self.def_center_avoid_coef
+
+                # # normalized distance from defender to center
+                # rho1 = np.linalg.norm(p1 - self.center) / self.radius  # already computed above
+
+                # # keepout radius: object radius + safety buffer, all normalized by arena radius
+                # r_keepout = self.oi_radius_norm + self.def_center_safe_radius  # if you interpret def_center_safe_radius as BUFFER
+
+                # eps = 1e-6
+                # inside = max(0.0, r_keepout - rho1)   # >0 only if inside keepout
+
+                # # Barrier that grows as you go deeper inside keepout
+                # center_keepout = self.k_cent * (inside**2) / (eps + (rho1 - r_keepout)**2)
+                # # simpler variant:
+                # # center_keepout = self.k_cent * (inside**2) / (eps + inside**2)   # bounded 0..k_cent
+
 
 
             # defender radial velocity
@@ -610,31 +625,44 @@ class Env:
                 oob2_any = True
                 break
 
-        done = (oob1 or oob2_any or hit_target or collision) or (self.t >= self.T)
+        done = (oob1 or oob2_any or hit_target or collision) #or (self.t >= self.T)
 
 
         # apply terminal shaping only to the reward(s) you computed
-        if done:
-            if need_def:
-                r1 += self.beta * d2
-                r1 -= 0.10 * d1
-                if oob1:
-                    r1 -= self.wallK
-                if def_hit_target:
-                    r1 -= self.att_target_hit_penalty_def
-                if att_hit_target:
-                    r1 -= self.def_target_hit_penalty_def                    
-                if collision:
-                    r1 -= self.collision_penalty_def
+        # if done:
+        #     if need_def:
+        #         r1 += self.beta * d2
+        #         r1 -= 0.10 * d1
+        #         if oob1:
+        #             r1 -= self.wallK
+        #         if def_hit_target:
+        #             r1 -= self.att_target_hit_penalty_def
+        #         if att_hit_target:
+        #             r1 -= self.def_target_hit_penalty_def                    
+        #         if collision:
+        #             r1 -= self.collision_penalty_def
 
-            if need_att:
-                r2 -= self.beta * d2
-                if oob2_any:
-                    r2 -= self.wallK
-                if att_hit_target:
-                    r2 += self.att_target_hit_reward_att
-                if collision:
-                    r2 -= self.collision_penalty_att
+        #     if need_att:
+        #         r2 -= self.beta * d2
+        #         if oob2_any:
+        #             r2 -= self.wallK
+        #         if att_hit_target:
+        #             r2 += self.att_target_hit_reward_att
+        #         if collision:
+        #             r2 -= self.collision_penalty_att
+
+        if oob1: r1 -= self.wallK
+        if oob2_any: r2 -= self.wallK
+        if collision:
+            r1 -= self.collision_penalty_def
+            r2 -= self.collision_penalty_att
+        if att_hit_target:
+            r1 -= self.def_target_hit_penalty_def
+            r2 += self.att_target_hit_reward_att
+        if def_hit_target:
+            r1 -= self.att_target_hit_penalty_def
+            r2 += self.def_target_hit_reward_att  # if that’s what you mean
+
 
         # track d2_prev based on the geometry used for reward (same as your current logic)
         self._d2_prev = d2
@@ -1723,9 +1751,12 @@ def train(cfg: Dict[str, Any]):
             if bufA is not None:
                 bufA.add(o, a2, lp2, v2, r2, d)
 
+            if train_role == "def":
+                ep_ret_def += r1_np
 
-            ep_ret_def += r1_np
-            ep_ret_att += r2_np
+            if train_role == "att":
+                ep_ret_att += r2_np
+            
             o = o2
 
             # ---- accumulate truth / belief metrics from Env.info ----
