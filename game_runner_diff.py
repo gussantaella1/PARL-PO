@@ -9,22 +9,9 @@ from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
 from rl_infer_diff import RLPolicyDiff
 from ukf_estimator import KF_CV
 
-
-
 def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                                                steps: int | None = None,
                                                turn_len: int | None = None):
-    """
-    RL-only rollout (no attitude/FOV). Matches Diff-Nash training obs:
-        obs = [p1-center, p2-center, (p2-p1), v1, v2]
-    Returns keys compatible with your animator; attitude fields are identity stubs.
-
-    Optional UKF:
-      - Toggle with cfg["use_ukf"] (bool)
-      - Parameters from cfg["ukf"] dict:
-            sigma_az, sigma_el, init_pos_std, init_vel_std, Q_scale,
-            who (both / '1->2' / '2->1'), every (int)
-    """
 
     # -------------------- basics & dims --------------------
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
@@ -107,18 +94,13 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
              x2_est_vec: np.ndarray,
              deterministic: bool):
         if which == "def":
-            # defender uses belief if UKF 1→2 exists
             x2_for_obs = x2_est_vec if (use_ukf and ukf12 is not None) else x2_true
         else:
-            # attacker always gets truth (full info)
             x2_for_obs = x2_true
 
         obs = build_train_obs(x1_vec, x2_for_obs)
         return (pol.act_def_obs(obs, deterministic=deterministic)
                 if which == "def" else pol.act_att_obs(obs, deterministic=deterministic))
-
-
-
 
     # -------------------- tiny helpers for animator compatibility --------------------
     def _p3_row(x_row):
@@ -140,11 +122,21 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
+    # ===== NEW: command logs (what plot_rollout_thrust_u is looking for) =====
+    # Store as (steps, 3) per agent, regardless of D (pad z=0 if D==2)
+    u_cmd_1, u_cmd_2 = [], []
+    u_cmd_norm_1, u_cmd_norm_2 = [], []
+
+    def _u3(uD: np.ndarray):
+        uD = np.asarray(uD, float).reshape(-1)
+        if D == 3:
+            return uD[:3]
+        # D==2 -> pad z
+        return np.array([uD[0], uD[1], 0.0], dtype=float)
+
     # === optional UKFs (HCW-only, bearing-only) ===
     use_ukf = bool(cfg.get("use_ukf", False))
     est_hist = None
-
-    # belief state for attacker (what the policy will see)
     x2_est = x2.copy()   # default: truth
 
     if use_ukf:
@@ -156,7 +148,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         vel_std0 = float(ukf_cfg.get("init_vel_std", 0.01))
         Q_scale  = float(ukf_cfg.get("Q_scale", 1e-5))
 
-        # who: 'both', '1->2', '2->1'
         who = (ukf_cfg.get("who") or "both").lower()
         meas_every = int(ukf_cfg.get("every", 1))
 
@@ -179,7 +170,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         if ukf12 is not None:
             est_hist["est12_xyz"] = [ukf12.x[:3].copy()]
             est_hist["meas12_azel"] = [None]
-            # initialize x2_est from belief, like in Env.reset
             x2_est[:3] = ukf12.x[:3]
             if x2_est.shape[0] >= 2*D:
                 x2_est[3:6] = ukf12.x[3:6]
@@ -205,8 +195,18 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         # 1) actions from policies
         u1 = np.clip(np.asarray(_act("def", x1, x2, x2_est, deterministic), dtype=np.float32),
                     -umax, +umax)
+        
+        
         u2 = np.clip(np.asarray(_act("att", x1, x2, x2_est, deterministic), dtype=np.float32),
                     -umax, +umax)
+
+        # ===== NEW: log commanded thrust (pre-embedding, post-clip) =====
+        u1_3 = _u3(u1)
+        u2_3 = _u3(u2)
+        u_cmd_1.append(u1_3.copy())
+        u_cmd_2.append(u2_3.copy())
+        u_cmd_norm_1.append(float(np.linalg.norm(u1_3)))
+        u_cmd_norm_2.append(float(np.linalg.norm(u2_3)))
 
         if debug_actions and k < 3:
             x2_for_dbg = x2_est if (use_ukf and ukf12 is not None) else x2
@@ -214,7 +214,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
             print(f"[k={k:02d}] ||a_def||={np.linalg.norm(u1):.3g}, "
                   f"||a_att||={np.linalg.norm(u2):.3g}, "
                   f"first obs entries={obs_dbg[:6]}")
-
 
         # 2) embed into full control vectors
         u1_full = np.zeros(nu, dtype=np.float32)
@@ -228,15 +227,13 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
 
         # 3b) UKF estimation (optional)
         if use_ukf and est_hist is not None:
-            # measurement index (aligned with exec_xyz history)
-            idx  = len(exec_xyz1)  # about to append new state
+            idx  = len(exec_xyz1)
             take = (idx % meas_every) == 0
 
             def _u_tr(u_full):
                 u_full = np.asarray(u_full, float).ravel()
                 return u_full[:3] if u_full.size >= 3 else np.zeros(3, float)
 
-            # --- defender estimates attacker (1 -> 2) ---
             if ukf12 is not None:
                 u2_tr = _u_tr(u2_full)
                 ukf12.predict(dt, u=u2_tr, u_cov=None)
@@ -245,7 +242,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                     p_tgt = x2[:3].copy()
                     d = p_tgt - p_obs
                     d /= (np.linalg.norm(d) + 1e-12)
-                    # body frame = world frame (identity attitude)
                     b_b = d
                     az = np.arctan2(b_b[1], b_b[0]) + np.random.randn()*meas_std_az
                     el = np.arctan2(
@@ -259,7 +255,6 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                     est_hist["meas12_azel"].append(None)
                 est_hist["est12_xyz"].append(ukf12.x[:3].copy())
 
-            # --- attacker estimates defender (2 -> 1) ---
             if ukf21 is not None:
                 u1_tr = _u_tr(u1_full)
                 ukf21.predict(dt, u=u1_tr, u_cov=None)
@@ -280,10 +275,8 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                 else:
                     est_hist["meas21_azel"].append(None)
                 est_hist["est21_xyz"].append(ukf21.x[:3].copy())
-            
-                # after UKF predict/update block:
+
             if use_ukf and ukf12 is not None:
-                # Keep x2_est aligned with current belief state
                 x2_est[:3] = ukf12.x[:3]
                 if x2_est.shape[0] >= 2*D:
                     x2_est[3:6] = ukf12.x[3:6]
@@ -308,11 +301,22 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     # -------------------- pack results --------------------
     out = {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
-        "plan_att1":  plan_att1,  "plan_att2":  plan_att2,      # identity-R horizons
+        "plan_att1":  plan_att1,  "plan_att2":  plan_att2,
         "exec1_xyz":  exec_xyz1,  "exec2_xyz":  exec_xyz2,
-        "exec_att1":  exec_att1,  "exec_att2":  exec_att2,      # identity-R per step
-        "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,      # zeros
+        "exec_att1":  exec_att1,  "exec_att2":  exec_att2,
+        "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,
         "fov_axis_hist": fov_axis_hist, "fov_seen_mask": fov_seen_mask,
+
+        # ===== NEW: keys your plotter will find =====
+        # N-aware format: list-of-arrays, one per agent (agent=1 -> index 0)
+        "u_cmd_all": [
+            np.asarray(u_cmd_1, dtype=float),
+            np.asarray(u_cmd_2, dtype=float),
+        ],
+        "u_cmd_norm_all": [
+            np.asarray(u_cmd_norm_1, dtype=float),
+            np.asarray(u_cmd_norm_2, dtype=float),
+        ],
     }
     if est_hist is not None:
         out.update(est_hist)
