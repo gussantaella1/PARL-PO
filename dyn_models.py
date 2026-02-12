@@ -191,3 +191,209 @@ def make_bounds(cfg: dict):
     v_lb = -vmax * np.ones(D, float); v_ub = vmax * np.ones(D, float)
     x_lb = np.r_[p_lb, v_lb]; x_ub = np.r_[p_ub, v_ub]
     return x_lb, x_ub, u_lb, u_ub
+
+
+
+# Additions for extra dynamics models:
+
+# ----------------------------
+# Kepler helpers
+# ----------------------------
+def _R1(a):
+    ca, sa = np.cos(a), np.sin(a)
+    return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]], dtype=float)
+
+def _R3(a):
+    ca, sa = np.cos(a), np.sin(a)
+    return np.array([[ca,-sa,0],[sa,ca,0],[0,0,1]], dtype=float)
+
+def _kepler_E_from_M(M, e, tol=1e-12, it=50):
+    # Newton solve: E - e sinE = M
+    E = M if e < 0.8 else np.pi
+    for _ in range(it):
+        f = E - e*np.sin(E) - M
+        fp = 1 - e*np.cos(E)
+        dE = -f / fp
+        E = E + dE
+        if abs(dE) < tol:
+            break
+    return E
+
+def _nu_from_E(E, e):
+    # true anomaly
+    s = np.sqrt(1+e)*np.sin(E/2)
+    c = np.sqrt(1-e)*np.cos(E/2)
+    return 2*np.arctan2(s, c)
+
+def _M_from_nu(nu, e):
+    # convert nu -> E -> M
+    E = 2*np.arctan2(np.sqrt(1-e)*np.sin(nu/2), np.sqrt(1+e)*np.cos(nu/2))
+    return E - e*np.sin(E)
+
+def rv_from_orbital_elements(mu, a, e, inc, raan, argp, nu):
+    p = a*(1 - e**2)
+    r = p/(1 + e*np.cos(nu))
+
+    r_pf = np.array([r*np.cos(nu), r*np.sin(nu), 0.0], dtype=float)
+    v_pf = np.sqrt(mu/p) * np.array([-np.sin(nu), e + np.cos(nu), 0.0], dtype=float)
+
+    Q = _R3(raan) @ _R1(inc) @ _R3(argp)  # perifocal -> inertial
+    r_I = Q @ r_pf
+    v_I = Q @ v_pf
+    return r_I, v_I
+
+def rtn_dcm_from_rv(r_I, v_I):
+    rhat = r_I / np.linalg.norm(r_I)
+    h = np.cross(r_I, v_I)
+    nhat = h / np.linalg.norm(h)
+    that = np.cross(nhat, rhat)
+    # columns are RTN axes expressed in inertial
+    C_RTN2I = np.column_stack((rhat, that, nhat))
+    C_I2RTN = C_RTN2I.T
+    return C_RTN2I, C_I2RTN
+
+def omega_rtn_from_rv(r_I, v_I):
+    # angular rate magnitude = |h| / r^2, along +N
+    h = np.cross(r_I, v_I)
+    r = np.linalg.norm(r_I)
+    w = np.linalg.norm(h) / (r*r)
+    return np.array([0.0, 0.0, w], dtype=float)  # in RTN coords
+
+# ----------------------------
+# Chief orbit cache
+# ----------------------------
+def chief_orbit_cache_rtn(chief_orbit: dict, dt: float, N: int):
+    """
+    Precompute chief r,v, DCMs, omega for k=0..N.
+    chief_orbit keys: mu,a,e,i,raan,argp,nu0
+    """
+    mu   = float(chief_orbit["mu"])
+    a    = float(chief_orbit["a"])
+    e    = float(chief_orbit["e"])
+    inc  = float(chief_orbit.get("i", 0.0))
+    raan = float(chief_orbit.get("raan", 0.0))
+    argp = float(chief_orbit.get("argp", 0.0))
+    nu0  = float(chief_orbit.get("nu0", 0.0))
+
+    n = np.sqrt(mu / a**3)
+    M0 = _M_from_nu(nu0, e)
+
+    times = np.arange(N+1, dtype=float) * dt
+
+    rC = np.zeros((N+1, 3), dtype=float)
+    vC = np.zeros((N+1, 3), dtype=float)
+    C_RTN2I = np.zeros((N+1, 3, 3), dtype=float)
+    C_I2RTN = np.zeros((N+1, 3, 3), dtype=float)
+    w_rtn = np.zeros((N+1, 3), dtype=float)
+
+    for k, t in enumerate(times):
+        M = M0 + n*t
+        E = _kepler_E_from_M(M, e)
+        nu = _nu_from_E(E, e)
+        r_I, v_I = rv_from_orbital_elements(mu, a, e, inc, raan, argp, nu)
+        CR2I, CI2R = rtn_dcm_from_rv(r_I, v_I)
+
+        rC[k] = r_I
+        vC[k] = v_I
+        C_RTN2I[k] = CR2I
+        C_I2RTN[k] = CI2R
+        w_rtn[k] = omega_rtn_from_rv(r_I, v_I)
+
+    return {
+        "mu": mu,
+        "dt": float(dt),
+        "N": int(N),
+        "rC": rC,
+        "vC": vC,
+        "C_RTN2I": C_RTN2I,
+        "C_I2RTN": C_I2RTN,
+        "w_rtn": w_rtn,
+    }
+
+# ----------------------------
+# Two-body RK4 step in inertial, state kept in RTN
+# ----------------------------
+def _two_body_acc(mu, r):
+    rn = np.linalg.norm(r)
+    return -mu * r / (rn**3)
+
+def two_body_step_rtn(x6, u3, k, cache):
+    """
+    x6 = [rho_R, rho_T, rho_N, rhod_R, rhod_T, rhod_N] in chief RTN.
+    u3 is accel command in RTN (m/s^2).
+    """
+    mu = cache["mu"]
+    dt = cache["dt"]
+    rC = cache["rC"][k]
+    vC = cache["vC"][k]
+    CR2I = cache["C_RTN2I"][k]
+    CI2R = cache["C_I2RTN"][k]
+    w = cache["w_rtn"][k]  # in RTN
+
+    rho = x6[:3]
+    rhod = x6[3:]
+
+    # RTN -> inertial deputy
+    rD0 = rC + CR2I @ rho
+    vD0 = vC + CR2I @ (rhod + np.cross(w, rho))
+
+    aU_I = CR2I @ u3
+
+    def f(state):
+        r = state[:3]
+        v = state[3:]
+        a = _two_body_acc(mu, r) + aU_I
+        return np.hstack((v, a))
+
+    s0 = np.hstack((rD0, vD0))
+    k1 = f(s0)
+    k2 = f(s0 + 0.5*dt*k1)
+    k3 = f(s0 + 0.5*dt*k2)
+    k4 = f(s0 + dt*k3)
+    s1 = s0 + (dt/6.0)*(k1 + 2*k2 + 2*k3 + k4)
+
+    # Convert back inertial -> RTN at k+1 frame
+    rC1 = cache["rC"][k+1]
+    vC1 = cache["vC"][k+1]
+    CI2R1 = cache["C_I2RTN"][k+1]
+    w1 = cache["w_rtn"][k+1]
+
+    rho1 = CI2R1 @ (s1[:3] - rC1)
+    vrel_rtn = CI2R1 @ (s1[3:] - vC1)
+    rhod1 = vrel_rtn - np.cross(w1, rho1)
+
+    return np.hstack((rho1, rhod1))
+
+# ----------------------------
+# Linearize discrete map for LTV
+# ----------------------------
+def linearize_two_body_rtn_discrete(cache, dt: float, eps: float = 1e-5):
+    """
+    Returns Ad_seq, Bd_seq for k=0..N-1 by finite-diff linearizing the discrete step
+    around x=0, u=0.
+    """
+    N = cache["N"]
+    Ad_seq = np.zeros((N, 6, 6), dtype=float)
+    Bd_seq = np.zeros((N, 6, 3), dtype=float)
+
+    x0 = np.zeros(6, dtype=float)
+    u0 = np.zeros(3, dtype=float)
+
+    for k in range(N):
+        fx0 = two_body_step_rtn(x0, u0, k, cache)
+
+        # A
+        for j in range(6):
+            dx = np.zeros(6); dx[j] = eps
+            f_p = two_body_step_rtn(x0 + dx, u0, k, cache)
+            f_m = two_body_step_rtn(x0 - dx, u0, k, cache)
+            Ad_seq[k, :, j] = (f_p - f_m) / (2*eps)
+
+        # B
+        for j in range(3):
+            du = np.zeros(3); du[j] = eps
+            f_p = two_body_step_rtn(x0, u0 + du, k, cache)
+            f_m = two_body_step_rtn(x0, u0 - du, k, cache)
+            Bd_seq[k, :, j] = (f_p - f_m) / (2*eps)
+
+    return Ad_seq, Bd_seq

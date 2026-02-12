@@ -92,6 +92,11 @@ class Env:
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
 
+
+        self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
+        self.def_target_hit_buffer_frac = float(cfg.get("def_target_hit_buffer_frac", 0.0))
+
+
         umax = float(cfg["umax"]) ; self.u_lo, self.u_hi = -umax, +umax
 
         Ad = cfg["dyn"]["Ad"]; Bd = cfg["dyn"]["Bd"]
@@ -234,6 +239,11 @@ class Env:
         self.k_att_vrad     = float(att.get("k_vrad", 0.5))
         self.k_att_wall     = float(att.get("k_wall", self.wallK))
         self.att_wall_power = float(att.get("wall_power", 4.0))
+
+
+        self.hit_buffer_def = float(self.def_target_hit_buffer_frac)
+        self.hit_buffer_att = float(self.att_target_hit_radius)
+
 
 
 
@@ -466,15 +476,26 @@ class Env:
         rho1 = np.linalg.norm(p1 - self.center)/ self.radius
         rho2 = np.linalg.norm(p2 - self.center) / self.radius
 
+        v_scale = self.radius / self.dt
+
+
         if need_def:
             
             # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
             wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
-            # defender keep-out
-            if self.def_center_safe_radius > 0.0 and rho1 < 3*self.def_center_safe_radius:
-                gap = (self.def_center_safe_radius - rho1)
-                center_keepout = (gap * gap) * self.def_center_avoid_coef
+            # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
+            center_keepout = 0.0
+            if self.oi_radius > 0.0:
+                r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
+                d1_m = float(np.linalg.norm(p1 - self.center))  # meters
+
+                if r_keepout_m > 0.0 and d1_m < r_keepout_m:
+                    gap_m = (r_keepout_m - d1_m)  # meters inside keepout
+                    # normalize gap by arena radius so penalty scale is comparable across different R
+                    gap = gap_m / (self.radius + 1e-9)
+                    center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
+
 
                 # # normalized distance from defender to center
                 # rho1 = np.linalg.norm(p1 - self.center) / self.radius  # already computed above
@@ -495,9 +516,15 @@ class Env:
             # defender radial velocity
             rhat1 = (p1 - self.center)
             rnorm = np.linalg.norm(rhat1) + 1e-9
-            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / self.radius
+
+            v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
+            a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
+
+            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
 
         if need_att:
+            v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
+            a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
             
             wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
@@ -510,9 +537,9 @@ class Env:
                 self.alpha * delta_d2
                 + self.k_pos * d2
                 - self.k_rel * rel2
-                - self.k_vel * float(np.dot(v1, v1))
+                - self.k_vel * v1n2
                 - k_vrad * (vrad1**2)
-                - self.lD * float(np.dot(a1, a1))
+                - self.lD * a1n2
                 - wall1
                 - center_keepout
             )
@@ -522,8 +549,8 @@ class Env:
                 - self.alpha * delta_d2
                 - self.k_pos * d2
                 + self.k_rel * rel2
-                - self.k_vel * float(np.dot(v2, v2))
-                - self.lA * float(np.dot(a2, a2))
+                - self.k_vel * v2n2
+                - self.lA * a2n2
                 - wall2
             )
 
@@ -587,22 +614,17 @@ class Env:
         # attacker target hit: (keep your current meaning = first attacker hits target)
 
 
-        # set once (do this in __init__ ideally, not every step)
-        hit_buffer_def = float(self.def_center_safe_radius)  # dimensionless
-        hit_buffer_att = float(self.att_target_hit_radius)  # dimensionless
 
-
-        # normalized distances to center
         rho_att = np.linalg.norm(p2 - self.center) / self.radius
         rho_def = np.linalg.norm(p1 - self.center) / self.radius
 
-        # normalized threshold
-        thresh_def = (1.0 + hit_buffer_def) * self.oi_radius_norm  # dimensionless
-        thresh_att = (1.0 + hit_buffer_att) * self.oi_radius_norm  # dimensionless
+        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
+        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
 
 
         att_hit_target = (self.oi_radius_norm > 0.0) and (rho_att <= thresh_att)
         def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
+
 
         hit_target = att_hit_target or def_hit_target
 
@@ -626,6 +648,8 @@ class Env:
                 break
 
         done = (oob1 or oob2_any or hit_target or collision) #or (self.t >= self.T)
+        # done = (oob1 or oob2_any or hit_target) #or (self.t >= self.T)
+
 
 
         # apply terminal shaping only to the reward(s) you computed
@@ -651,17 +675,22 @@ class Env:
         #         if collision:
         #             r2 -= self.collision_penalty_att
 
-        if oob1: r1 -= self.wallK
-        if oob2_any: r2 -= self.wallK
-        if collision:
-            r1 -= self.collision_penalty_def
-            r2 -= self.collision_penalty_att
-        if att_hit_target:
-            r1 -= self.def_target_hit_penalty_def
-            r2 += self.att_target_hit_reward_att
-        if def_hit_target:
-            r1 -= self.att_target_hit_penalty_def
-            r2 += self.def_target_hit_reward_att  # if that’s what you mean
+
+        # if collision:
+        #     r1 -= self.collision_penalty_def
+        #     r2 -= self.collision_penalty_att
+
+        if need_def:
+            if oob1: r1 -= self.wallK
+            if att_hit_target: r1 -= self.def_target_hit_penalty_def
+            if def_hit_target: r1 -= self.att_target_hit_penalty_def
+
+        if need_att:
+            if oob2_any: r2 -= self.wallK
+            if att_hit_target: r2 += self.att_target_hit_reward_att
+            if def_hit_target: r2 += self.def_target_hit_reward_att
+
+
 
 
         # track d2_prev based on the geometry used for reward (same as your current logic)
@@ -854,13 +883,17 @@ class RolloutBuffer:
 
     def add(self, obs, act, logp, val, rew, done):
         t = self.ptr
-        self.obs[t]  = obs
-        self.act[t]  = act
-        self.logp[t] = logp
-        self.val[t]  = val
+
+        # Make rollout data "dead" (no grad graph can leak into PPO update)
+        self.obs[t]  = obs.detach()
+        self.act[t]  = act.detach()
+        self.logp[t] = logp.detach()
+        self.val[t]  = val.detach()
+
         self.rew[t]  = rew
         self.done[t] = done
         self.ptr += 1
+
 
     def finalize(self, next_val):
         self.next_val = next_val
@@ -1052,57 +1085,39 @@ class AttackerRuleController:
 # DiffLS Layer & Actor-Critic
 # =============================================================
 class DiffLSLayer(nn.Module):
-    """One-step ridge prior (center pull) for each agent; blended in actor mean."""
-    def __init__(self, cfg: Dict[str, Any]):
+    def __init__(self, cfg):
         super().__init__()
         self.D = int(cfg["D"])
-        self.dt = float(cfg["dt"])
         self.ridge = float(cfg.get("prior_ridge", 1e-2))
 
-        self.register_buffer("Ad", torch.as_tensor(np.asarray(cfg["dyn"]["Ad"], np.float32), dtype=torch.float32))
-        self.register_buffer("Bd", torch.as_tensor(np.asarray(cfg["dyn"]["Bd"], np.float32), dtype=torch.float32))
-
-        P = np.hstack([np.eye(self.D, dtype=np.float32), np.zeros((self.D, self.D), dtype=np.float32)])
-        self.register_buffer("P", torch.tensor(P, dtype=torch.float32))
-
-        ar = cfg["arena"]
-        c = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D==3 else 0.0)], dtype=np.float32)[:self.D]
-        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
+        # robust dt fetch (adjust if your config uses a different key)
+        self.dt = float(cfg.get("dt", cfg.get("h", cfg.get("dyn", {}).get("dt", 1.0))))
 
     def forward(self, obs: torch.Tensor, who: str):
         B, D = obs.shape[0], self.D
-        dtype = obs.dtype
-        Ad = self.Ad.to(dtype=dtype)
-        Bd = self.Bd.to(dtype=dtype)
-        P  = self.P.to(dtype=dtype)
-        center = self.center.to(dtype=dtype)
+        dt = self.dt
 
-        # obs = [p1c, p2c, rel, v1, v2]
+        # obs = [p1c, p2c, rel, v1, v2]  (5D dims total; 15 when D=3)
         p1c = obs[:, 0:D]
         p2c = obs[:, D:2*D]
         v1  = obs[:, 3*D:4*D]
         v2  = obs[:, 4*D:5*D]
-        p1 = p1c + center
-        p2 = p2c + center
 
-        # One-step next-position error relative to center
-        x1 = torch.cat([p1, v1], dim=-1)
-        x2 = torch.cat([p2, v2], dim=-1)
-        E1 = (x1 @ Ad.T) @ P.T - center
-        E2 = (x2 @ Ad.T) @ P.T - center
-        F  = (Bd.T @ P.T).T
+        # one-step position error to center (in centered coordinates)
+        e1 = p1c + dt * v1   # (B, D)
+        e2 = p2c + dt * v2   # (B, D)
 
-        FtF = F.T @ F
-        lamI = self.ridge * torch.eye(D, dtype=dtype, device=obs.device)
-        K = torch.linalg.solve(FtF + lamI, F.T)
+        alpha = 0.5 * (dt * dt)
+        k = alpha / (alpha * alpha + self.ridge)  # scalar
 
-        u_def_prior = -(K @ E1.T).T
-        u_att_prior = -(K @ E2.T).T
+        u_def_prior = -k * e1
+        u_att_prior = -k * e2
         u_prior = u_def_prior if who == "def" else u_att_prior
 
-        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # (B, 4D)
+        # IMPORTANT: feats must be 4D = 12 when D=3
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
         return feats, u_prior
-    
+
 
 class DiffNashLayer(nn.Module):
     """
@@ -1401,6 +1416,10 @@ class PPO:
             for st in range(0, B, self.mb_size):
                 j = idx[st:st+self.mb_size]
                 o = obs[j]; a = act_env[j]; lp_old = old_logp[j]; v_old = old_val[j]; A = adv[j]; R = ret[j]
+
+                assert not lp_old.requires_grad
+                assert not v_old.requires_grad
+
 
                 dist = net.dist(o, who)
                 u_raw = atanh(torch.clamp(a / self.act_scale, -0.999999, 0.999999))
@@ -1747,9 +1766,10 @@ def train(cfg: Dict[str, Any]):
             r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
             d  = torch.as_tensor(d_np,  dtype=torch.float32, device=device)
 
-            bufD.add(o, a1, lp1, v1, r1, d)
+            bufD.add(o.detach(), a1.detach(), lp1.detach(), v1.detach(), r1, d)
             if bufA is not None:
-                bufA.add(o, a2, lp2, v2, r2, d)
+                bufA.add(o.detach(), a2.detach(), lp2.detach(), v2.detach(), r2, d)
+
 
             if train_role == "def":
                 ep_ret_def += r1_np

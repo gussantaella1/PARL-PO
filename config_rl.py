@@ -36,6 +36,26 @@ COMMON: Dict[str, Any] = {
     "dynamics": "hcw",
     "hcw": {"mu": 3.986004418e14, "r0": 6_371_000.0 + 400_000.0},
 
+    # NEW (chief orbit for elliptical/two-body)
+    "chief_orbit": {
+        "mu": 3.986004418e14,
+        "a":  6_371_000.0 + 400_000.0,  # semi-major axis (m)
+        "e":  0.0,                      # eccentricity
+        "i":  0.0,                      # rad
+        "raan": 0.0,                    # rad
+        "argp": 0.0,                    # rad
+        "nu0":  0.0,                    # rad (true anomaly at t=0)
+    },
+
+    # Dyn container (extended)
+    "dyn": {
+        "type": None,     # "lti" | "ltv" | "nonlinear"
+        "Ad": None, "Bd": None,
+        "Ad_seq": None, "Bd_seq": None, # for LTV
+        "model": None,                  # "hcw" | "two_body_rtn"
+        "chief_cache": None,            # for two_body / elliptic linearization
+    },
+
     # Arena
     "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
     "arena_terminate_margin": 1.0,
@@ -43,7 +63,7 @@ COMMON: Dict[str, Any] = {
     "wall_penalty": 3.0,
 
     # Action bounds
-    "umax": 2,
+    "umax": 2.0,
 
     # Initial conditions
     "x0": np.array([
@@ -200,13 +220,19 @@ TRAIN: Dict[str, Any] = {
     "att_ckpt_path": None,
 
     # Vectorized rollout & logging
-    # "num_envs": 64,          
-    # "steps_per_env": 512,    
-    # "total_updates": 2000,   
+    #Long training
+    "num_envs": 64,          
+    "steps_per_env": 512,    
+    "total_updates": 2000,   
+    "train_epochs": 3,
+    "minibatch_size": 8192,  
 
-    "num_envs": 8,          
-    "steps_per_env": 256,    
-    "total_updates": 300,   
+    #Short training
+    # "num_envs": 8,          
+    # "steps_per_env": 256,    
+    # "total_updates": 300, 
+    # "train_epochs": 10,
+    # "minibatch_size": 1024,  
 
     "log_every": 10,
 
@@ -216,8 +242,6 @@ TRAIN: Dict[str, Any] = {
     "clip_eps": 0.2,
     "policy_lr": 3e-4,
     "value_lr": 1e-3,
-    "train_epochs": 10,
-    "minibatch_size": 1024,
     "entropy_coef": 0.02,
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
@@ -249,18 +273,22 @@ TRAIN: Dict[str, Any] = {
 
     "att_target_hit_radius": 0.1,          # attacker within % of R hits object
     "att_target_hit_penalty_def": 3.0,     # big negative for defender
-    "att_target_hit_reward_att": 3.0,       # matching positive for attacker
+    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
 
     # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
-    "def_target_hit_penalty_def": 3.0,     # big negative for defender
+    "def_target_hit_penalty_def": 5.0,     # big negative for defender
     "def_target_hit_reward_att": 0.0,       # matching positive for attacker
+
+    "def_keepout_buffer_m": 1.0,        # meters (keepout buffer around object)
+    "def_target_hit_buffer_frac": 0.0,  # dimensionless fraction of object radius
+
 
 
     #For collision penalties on both agents
 
-    "collision_radius_m": 0.1,            # meters
+    "collision_radius_m": 0.2,            # meters
     "collision_penalty_def": 3.0,         # penalty applied to defender on collision
-    "collision_penalty_att": 3.0,         # penalty applied to attacker(s) on collision
+    "collision_penalty_att": 5.0,         # penalty applied to attacker(s) on collision
 
 }
 
@@ -350,32 +378,95 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
     return cfg
 
 # ---------- Dynamics builder ----------
+# def build_dyn(cfg: Dict[str, Any]):
+#     from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+#     assert cfg["dynamics"].lower() == "hcw", "Only HCW supported in this helper."
+#     n = hcw_mean_motion(cfg["hcw"])
+#     Ad, Bd = hcw_discrete_mats(float(n), float(cfg["dt"]))
+#     cfg["dyn"]["Ad"] = as_numpy_const(Ad).astype(np.float32)
+#     cfg["dyn"]["Bd"] = as_numpy_const(Bd).astype(np.float32)
+
+#     # ---- NEW: populate Nash-solver params if present ----
+#     if cfg.get("prior_type", "ls") == "nash" and "nash_solver" in cfg:
+#         ns = cfg["nash_solver"]
+#         params = ns.get("params", {})
+
+#         ar = cfg["arena"]
+#         D  = int(cfg["D"])
+#         center = np.array(
+#             [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
+#             dtype=float
+#         )[:D]
+
+#         params.setdefault("Ad", cfg["dyn"]["Ad"])
+#         params.setdefault("Bd", cfg["dyn"]["Bd"])
+#         params.setdefault("center", center)
+#         params.setdefault("umax", cfg["umax"])
+#         params.setdefault("R", float(ar["r"]))
+
+#         ns["params"] = params
+#         cfg["nash_solver"] = ns
+
+
 def build_dyn(cfg: Dict[str, Any]):
-    from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
-    assert cfg["dynamics"].lower() == "hcw", "Only HCW supported in this helper."
-    n = hcw_mean_motion(cfg["hcw"])
-    Ad, Bd = hcw_discrete_mats(float(n), float(cfg["dt"]))
-    cfg["dyn"]["Ad"] = as_numpy_const(Ad).astype(np.float32)
-    cfg["dyn"]["Bd"] = as_numpy_const(Bd).astype(np.float32)
+    import numpy as np
+    from dyn_models import (
+        hcw_mean_motion, hcw_discrete_mats, as_numpy_const,
+        chief_orbit_cache_rtn, linearize_two_body_rtn_discrete
+    )
 
-    # ---- NEW: populate Nash-solver params if present ----
-    if cfg.get("prior_type", "ls") == "nash" and "nash_solver" in cfg:
-        ns = cfg["nash_solver"]
-        params = ns.get("params", {})
+    dyn_name = cfg["dynamics"].lower()
+    dt = float(cfg["dt"])
+    N = int(cfg["T"])  # assuming T is number of steps (as your code implies)
 
-        ar = cfg["arena"]
-        D  = int(cfg["D"])
-        center = np.array(
-            [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
-            dtype=float
-        )[:D]
+    cfg.setdefault("dyn", {})
+    cfg["dyn"].setdefault("Ad", None)
+    cfg["dyn"].setdefault("Bd", None)
+    cfg["dyn"].setdefault("Ad_seq", None)
+    cfg["dyn"].setdefault("Bd_seq", None)
+    cfg["dyn"].setdefault("chief_cache", None)
+    cfg["dyn"].setdefault("model", None)
+    cfg["dyn"].setdefault("type", None)
 
-        params.setdefault("Ad", cfg["dyn"]["Ad"])
-        params.setdefault("Bd", cfg["dyn"]["Bd"])
-        params.setdefault("center", center)
-        params.setdefault("umax", cfg["umax"])
-        params.setdefault("R", float(ar["r"]))
+    # ---------------------------
+    # 1) HCW (LTI)
+    # ---------------------------
+    if dyn_name == "hcw":
+        from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+        n = hcw_mean_motion(cfg["hcw"])
+        Ad, Bd = hcw_discrete_mats(float(n), dt)
+        cfg["dyn"]["Ad"] = as_numpy_const(Ad).astype(np.float32)
+        cfg["dyn"]["Bd"] = as_numpy_const(Bd).astype(np.float32)
+        cfg["dyn"]["type"] = "lti"
+        cfg["dyn"]["model"] = "hcw"
 
-        ns["params"] = params
-        cfg["nash_solver"] = ns
+    # ---------------------------
+    # 2) Two-body nonlinear in RTN/LVLH
+    # ---------------------------
+    elif dyn_name == "two_body":
+        orb = cfg.get("chief_orbit", {})
+        cache = chief_orbit_cache_rtn(orb, dt=dt, N=N)
+        cfg["dyn"]["chief_cache"] = cache
+        cfg["dyn"]["type"] = "nonlinear"
+        cfg["dyn"]["model"] = "two_body_rtn"
+        # leave Ad/Bd None on purpose
+
+    # ---------------------------
+    # 3) Elliptical “non-LTI” (LTV) via per-step linearization of two-body RTN
+    # ---------------------------
+    elif dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+        orb = cfg.get("chief_orbit", {})
+        cache = chief_orbit_cache_rtn(orb, dt=dt, N=N)
+        Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(cache, dt=dt, eps=1e-5)
+        cfg["dyn"]["chief_cache"] = cache
+        cfg["dyn"]["Ad_seq"] = Ad_seq.astype(np.float32)  # (N,6,6)
+        cfg["dyn"]["Bd_seq"] = Bd_seq.astype(np.float32)  # (N,6,3)
+        cfg["dyn"]["Ad"] = cfg["dyn"]["Ad_seq"][0]
+        cfg["dyn"]["Bd"] = cfg["dyn"]["Bd_seq"][0]
+        cfg["dyn"]["type"] = "ltv"
+        cfg["dyn"]["model"] = "two_body_rtn_ltv"
+
+    else:
+        raise ValueError(f"Unknown dynamics='{cfg['dynamics']}'")
+
 

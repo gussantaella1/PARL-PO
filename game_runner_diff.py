@@ -1,36 +1,27 @@
 # game_runner_diff.py
-# RL-only rollout for Diff-Nash policy; HCW dynamics; no attitude/FOV (identity stubs)
+# RL-only rollout for Diff-Nash policy; supports HCW (LTI), elliptic LTV, and two-body nonlinear.
+# No attitude/FOV (identity stubs)
 
 from __future__ import annotations
 from typing import Dict, Any
 import numpy as np
 
-from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
 from rl_infer_diff import RLPolicyDiff
 from ukf_estimator import KF_CV
 
-def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
-                                               steps: int | None = None,
-                                               turn_len: int | None = None):
 
+def run_rhc_with_rl_and_collect_frames_3d_diff(
+    cfg: Dict[str, Any],
+    steps: int | None = None,
+    turn_len: int | None = None
+):
     # -------------------- basics & dims --------------------
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
-    nx = 2 * D         # [p, v] per agent
-    nu = D             # LVLH accel per agent
+    nx = 2 * D         # [p, v] per agent in D dims
+    nu = D             # accel command in D dims
     T, dt = int(cfg["T"]), float(cfg["dt"])
 
-    # -------------------- dynamics (Ad,Bd) --------------------
     dyn_name = (cfg.get("dynamics") or "hcw").lower()
-    if dyn_name != "hcw":
-        raise ValueError("This runner expects 'hcw' dynamics.")
-    n = hcw_mean_motion(cfg.get("hcw", {}))
-    Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
-    Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-
-    def step_plant_single(x, u):
-        x = np.asarray(x, dtype=np.float32)
-        u = np.asarray(u, dtype=np.float32)
-        return (Ad_np @ x + Bd_np @ u).astype(np.float32)
 
     # -------------------- sim length --------------------
     if steps is None:
@@ -49,8 +40,8 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     )[:D]
 
     # -------------------- initial states --------------------
-    x1 = np.asarray(cfg["x0"][0], dtype=np.float32)[:2*D].copy()
-    x2 = np.asarray(cfg["x0"][1], dtype=np.float32)[:2*D].copy()
+    x1 = np.asarray(cfg["x0"][0], dtype=np.float32)[:nx].copy()
+    x2 = np.asarray(cfg["x0"][1], dtype=np.float32)[:nx].copy()
 
     # -------------------- obs normalization (optional) --------------------
     use_obsnorm = bool(cfg.get("obsnorm", False))
@@ -88,6 +79,40 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
             f"but runner will feed {5*D}. Make sure checkpoints are Diff-Nash."
         )
 
+    # -------------------- tiny helpers for animator compatibility --------------------
+    def _p3_row(x_row):
+        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D == 3 else \
+               (float(x_row[0]), float(x_row[1]), 0.0)
+
+    def _p3_vec(x_vec):
+        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D == 3 else \
+               (float(x_vec[0]), float(x_vec[1]), 0.0)
+
+    def _identity_R():
+        return np.eye(3, dtype=float)
+
+    def _u3(uD: np.ndarray):
+        """Pad D-accel to 3 for two-body RTN."""
+        uD = np.asarray(uD, float).reshape(-1)
+        if D == 3:
+            return uD[:3]
+        return np.array([uD[0], uD[1], 0.0], dtype=float)
+
+    def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        """Embed D-state into 6-state [R,T,N,Rd,Td,Nd] for dynamics that operate in 3D."""
+        xD = np.asarray(xD, dtype=np.float32).reshape(-1)
+        if D == 3:
+            return xD.astype(np.float32)
+        # D==2: [x,y,vx,vy] -> [x,y,0,vx,vy,0]
+        return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
+
+    def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        """Project 6-state back to D-state."""
+        x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
+        if D == 3:
+            return x6.astype(np.float32)
+        return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
+
     def _act(which: str,
              x1_vec: np.ndarray,
              x2_true: np.ndarray,
@@ -102,17 +127,70 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         return (pol.act_def_obs(obs, deterministic=deterministic)
                 if which == "def" else pol.act_att_obs(obs, deterministic=deterministic))
 
-    # -------------------- tiny helpers for animator compatibility --------------------
-    def _p3_row(x_row):
-        return (float(x_row[0]), float(x_row[1]), float(x_row[2])) if D == 3 else \
-               (float(x_row[0]), float(x_row[1]), 0.0)
+    # -------------------- dynamics selection (LTI/LTV/nonlinear) --------------------
+    # Prefer already-built cfg["dyn"] if present, otherwise build locally.
+    dyn = cfg.get("dyn", {}) if isinstance(cfg.get("dyn", {}), dict) else {}
 
-    def _p3_vec(x_vec):
-        return (float(x_vec[0]), float(x_vec[1]), float(x_vec[2])) if D == 3 else \
-               (float(x_vec[0]), float(x_vec[1]), 0.0)
+    dyn_type = dyn.get("type", None)   # "lti" | "ltv" | "nonlinear"
+    Ad = dyn.get("Ad", None)
+    Bd = dyn.get("Bd", None)
+    Ad_seq = dyn.get("Ad_seq", None)
+    Bd_seq = dyn.get("Bd_seq", None)
+    chief_cache = dyn.get("chief_cache", None)
 
-    def _identity_R():
-        return np.eye(3, dtype=float)
+    # Local build if needed
+    if dyn_name == "hcw":
+        if Ad is None or Bd is None:
+            from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+            n = hcw_mean_motion(cfg.get("hcw", {}))
+            Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)   # typically 6x6, 6x3
+            Ad = as_numpy_const(Ad_mx).astype(np.float32)
+            Bd = as_numpy_const(Bd_mx).astype(np.float32)
+        dyn_type = "lti"
+
+    elif dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+        if Ad_seq is None or Bd_seq is None or chief_cache is None:
+            from dyn_models import chief_orbit_cache_rtn, linearize_two_body_rtn_discrete
+            orb = cfg.get("chief_orbit", {})
+            chief_cache = chief_orbit_cache_rtn(orb, dt=dt, N=steps)  # only need up to steps
+            Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(chief_cache, dt=dt, eps=1e-5)
+            Ad_seq = Ad_seq.astype(np.float32)
+            Bd_seq = Bd_seq.astype(np.float32)
+        dyn_type = "ltv"
+
+    elif dyn_name in ("two_body", "twobody", "two-body"):
+        if chief_cache is None:
+            from dyn_models import chief_orbit_cache_rtn
+            orb = cfg.get("chief_orbit", {})
+            chief_cache = chief_orbit_cache_rtn(orb, dt=dt, N=steps)
+        dyn_type = "nonlinear"
+
+    else:
+        raise ValueError(f"Unknown dynamics '{cfg.get('dynamics')}'")
+
+    # Unified plant step: works even if D==2 by embedding/projection
+    def step_plant_single(xD: np.ndarray, uD: np.ndarray, k: int) -> np.ndarray:
+        x6 = _x6_from_xD(xD)
+        u3 = _u3(uD)
+
+        if dyn_type == "lti":
+            # HCW: Ad,Bd are (6x6, 6x3)
+            x6n = (Ad @ x6 + Bd @ u3).astype(np.float32)
+
+        elif dyn_type == "ltv":
+            # Elliptic LTV: Ad_seq,Bd_seq are (N,6,6) and (N,6,3)
+            Ak = Ad_seq[k]
+            Bk = Bd_seq[k]
+            x6n = (Ak @ x6 + Bk @ u3).astype(np.float32)
+
+        elif dyn_type == "nonlinear":
+            from dyn_models import two_body_step_rtn
+            x6n = two_body_step_rtn(x6, u3, k, chief_cache).astype(np.float32)
+
+        else:
+            raise RuntimeError(f"dyn_type='{dyn_type}' not recognized")
+
+        return _xD_from_x6(x6n)
 
     # -------------------- logs for animator (attitude = stubs) --------------------
     plan_hist1, plan_hist2 = [], []
@@ -122,22 +200,18 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     phi_hist1,  phi_hist2  = [], []
     fov_axis_hist, fov_seen_mask = [], []
 
-    # ===== NEW: command logs (what plot_rollout_thrust_u is looking for) =====
-    # Store as (steps, 3) per agent, regardless of D (pad z=0 if D==2)
+    # command logs
     u_cmd_1, u_cmd_2 = [], []
     u_cmd_norm_1, u_cmd_norm_2 = [], []
 
-    def _u3(uD: np.ndarray):
-        uD = np.asarray(uD, float).reshape(-1)
-        if D == 3:
-            return uD[:3]
-        # D==2 -> pad z
-        return np.array([uD[0], uD[1], 0.0], dtype=float)
-
-    # === optional UKFs (HCW-only, bearing-only) ===
+    # -------------------- optional UKFs (HCW-only) --------------------
     use_ukf = bool(cfg.get("use_ukf", False))
+    if use_ukf and dyn_name != "hcw":
+        print("[warn] UKF in this runner is HCW-only; disabling use_ukf for non-HCW dynamics.")
+        use_ukf = False
+
     est_hist = None
-    x2_est = x2.copy()   # default: truth
+    x2_est = x2.copy()  # default: truth
 
     if use_ukf:
         ukf_cfg = cfg.get("ukf", {})
@@ -151,18 +225,23 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         who = (ukf_cfg.get("who") or "both").lower()
         meas_every = int(ukf_cfg.get("every", 1))
 
+        # KF expects 3D state; pad if D==2
         P0 = np.diag([pos_std0**2]*3 + [vel_std0**2]*3)
         Q  = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
         Rm = np.diag([sigma_az**2, sigma_el**2])
         hcw_params = cfg.get("hcw", {})
 
+        # Filter state is [pos(3), vel(3)] in RTN
+        x2_6 = _x6_from_xD(x2)
+        x1_6 = _x6_from_xD(x1)
+
         ukf12 = KF_CV(
-            np.r_[x2[:3], np.zeros(3, dtype=float)], P0, Q, Rm, dt,
+            np.r_[x2_6[:3], x2_6[3:6]], P0, Q, Rm, dt,
             kind="ukf", dyn="hcw", hcw=hcw_params
         ) if who in ("both", "1->2") else None
 
         ukf21 = KF_CV(
-            np.r_[x1[:3], np.zeros(3, dtype=float)], P0, Q, Rm, dt,
+            np.r_[x1_6[:3], x1_6[3:6]], P0, Q, Rm, dt,
             kind="ukf", dyn="hcw", hcw=hcw_params
         ) if who in ("both", "2->1") else None
 
@@ -170,9 +249,8 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         if ukf12 is not None:
             est_hist["est12_xyz"] = [ukf12.x[:3].copy()]
             est_hist["meas12_azel"] = [None]
-            x2_est[:3] = ukf12.x[:3]
-            if x2_est.shape[0] >= 2*D:
-                x2_est[3:6] = ukf12.x[3:6]
+            # update x2_est (project back to D)
+            x2_est = _xD_from_x6(np.r_[ukf12.x[:3], ukf12.x[3:6]]).astype(np.float32)
 
         if ukf21 is not None:
             est_hist["est21_xyz"] = [ukf21.x[:3].copy()]
@@ -193,14 +271,16 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
     # ==================== ROLLOUT ====================
     for k in range(steps):
         # 1) actions from policies
-        u1 = np.clip(np.asarray(_act("def", x1, x2, x2_est, deterministic), dtype=np.float32),
-                    -umax, +umax)
-        
-        
-        u2 = np.clip(np.asarray(_act("att", x1, x2, x2_est, deterministic), dtype=np.float32),
-                    -umax, +umax)
+        u1 = np.clip(
+            np.asarray(_act("def", x1, x2, x2_est, deterministic), dtype=np.float32),
+            -umax, +umax
+        )
+        u2 = np.clip(
+            np.asarray(_act("att", x1, x2, x2_est, deterministic), dtype=np.float32),
+            -umax, +umax
+        )
 
-        # ===== NEW: log commanded thrust (pre-embedding, post-clip) =====
+        # log commanded thrust (post-clip)
         u1_3 = _u3(u1)
         u2_3 = _u3(u2)
         u_cmd_1.append(u1_3.copy())
@@ -215,31 +295,28 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                   f"||a_att||={np.linalg.norm(u2):.3g}, "
                   f"first obs entries={obs_dbg[:6]}")
 
-        # 2) embed into full control vectors
-        u1_full = np.zeros(nu, dtype=np.float32)
-        u2_full = np.zeros(nu, dtype=np.float32)
-        u1_full[:D] = u1
-        u2_full[:D] = u2
+        # 2) plant step (supports LTI/LTV/nonlinear)
+        x1 = step_plant_single(x1, u1, k)
+        x2 = step_plant_single(x2, u2, k)
 
-        # 3) plant step
-        x1 = step_plant_single(x1, u1_full)
-        x2 = step_plant_single(x2, u2_full)
-
-        # 3b) UKF estimation (optional)
+        # 3) UKF estimation (HCW-only)
         if use_ukf and est_hist is not None:
             idx  = len(exec_xyz1)
             take = (idx % meas_every) == 0
 
-            def _u_tr(u_full):
-                u_full = np.asarray(u_full, float).ravel()
-                return u_full[:3] if u_full.size >= 3 else np.zeros(3, float)
+            def _to3_pos(xD):
+                p = np.zeros(3, dtype=float)
+                p[:D] = np.asarray(xD[:D], float)
+                return p
+
+            def _to3_u(uD):
+                return _u3(uD)
 
             if ukf12 is not None:
-                u2_tr = _u_tr(u2_full)
-                ukf12.predict(dt, u=u2_tr, u_cov=None)
+                ukf12.predict(dt, u=_to3_u(u2), u_cov=None)
                 if take:
-                    p_obs = x1[:3].copy()
-                    p_tgt = x2[:3].copy()
+                    p_obs = _to3_pos(x1)
+                    p_tgt = _to3_pos(x2)
                     d = p_tgt - p_obs
                     d /= (np.linalg.norm(d) + 1e-12)
                     b_b = d
@@ -256,11 +333,10 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                 est_hist["est12_xyz"].append(ukf12.x[:3].copy())
 
             if ukf21 is not None:
-                u1_tr = _u_tr(u1_full)
-                ukf21.predict(dt, u=u1_tr, u_cov=None)
+                ukf21.predict(dt, u=_to3_u(u1), u_cov=None)
                 if take:
-                    p_obs = x2[:3].copy()
-                    p_tgt = x1[:3].copy()
+                    p_obs = _to3_pos(x2)
+                    p_tgt = _to3_pos(x1)
                     d = p_tgt - p_obs
                     d /= (np.linalg.norm(d) + 1e-12)
                     b_b = d
@@ -276,17 +352,16 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
                     est_hist["meas21_azel"].append(None)
                 est_hist["est21_xyz"].append(ukf21.x[:3].copy())
 
-            if use_ukf and ukf12 is not None:
-                x2_est[:3] = ukf12.x[:3]
-                if x2_est.shape[0] >= 2*D:
-                    x2_est[3:6] = ukf12.x[3:6]
+            if ukf12 is not None:
+                # update x2_est from ukf12 state (project back to D)
+                x2_est = _xD_from_x6(np.r_[ukf12.x[:3], ukf12.x[3:6]]).astype(np.float32)
 
         # 4) "plan" horizons (flat, just repeat current pos)
         plan1 = [_p3_row(x1)] * T
         plan2 = [_p3_row(x2)] * T
         plan_hist1.append(plan1); plan_hist2.append(plan2)
 
-        # 5) attitude stubs (keep shapes)
+        # 5) attitude stubs
         I = _identity_R()
         att_stub = [{"R": I, "phi": 0.0} for _ in range(T)]
         plan_att1.append(att_stub); plan_att2.append(att_stub)
@@ -307,8 +382,7 @@ def run_rhc_with_rl_and_collect_frames_3d_diff(cfg: Dict[str, Any],
         "phi_hist1":  phi_hist1,  "phi_hist2":  phi_hist2,
         "fov_axis_hist": fov_axis_hist, "fov_seen_mask": fov_seen_mask,
 
-        # ===== NEW: keys your plotter will find =====
-        # N-aware format: list-of-arrays, one per agent (agent=1 -> index 0)
+        # commanded thrust logs
         "u_cmd_all": [
             np.asarray(u_cmd_1, dtype=float),
             np.asarray(u_cmd_2, dtype=float),

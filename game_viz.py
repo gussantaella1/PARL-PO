@@ -23,6 +23,8 @@ __all__ = [
     "draw_fov_cone_3d", "draw_camera_frustum_3d",
     "add_triad_legend",
     "animate_rollout_3d", "interactive_rollout_3d",
+    "plot_rollout_thrust_u",
+
 ]
 
 
@@ -1589,3 +1591,177 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
     for p in proxies:
         p.set_label('_nolegend_')
     return leg_axes
+
+
+def plot_rollout_thrust_u(
+    frames_dict,
+    cfg=None,
+    agent: int = 1,
+    rollout_idx: int | None = None,
+    dt: float | None = None,
+    title: str | None = None,
+    show: bool = True,
+):
+    """
+    Plot commanded thrust u in x,y,z and total magnitude for a rollout.
+
+    Parameters
+    ----------
+    frames_dict : dict
+        Your rollout dict. This function looks for u histories in common keys:
+        - N-aware:
+            * frames_dict['u_cmd_all'] -> list length N of (T,3) arrays/lists
+            * frames_dict['u_all']     -> same idea
+            * frames_dict['act_all']   -> same idea
+        - 2-agent legacy:
+            * frames_dict['u1_cmd_xyz'], frames_dict['u2_cmd_xyz']
+            * frames_dict['u1_xyz'],     frames_dict['u2_xyz']
+            * frames_dict['act1'],       frames_dict['act2']
+        - Generic:
+            * frames_dict['u_cmd'], frames_dict['u'], frames_dict['act'], frames_dict['actions']
+            * frames_dict['u_hist'] (common naming)
+
+        Each should be shape (T,3) (or list of 3-vectors).
+
+    cfg : dict | None
+        Optional. Used to infer dt if not provided: cfg.get('dt') or cfg['dyn']['dt'] if present.
+
+    agent : int
+        1-indexed agent id.
+
+    rollout_idx : int | None
+        If your frames_dict stores multiple rollouts per key (e.g., list of rollouts),
+        set rollout_idx to pick one. If None, uses the data as-is.
+
+    dt : float | None
+        Time step for x-axis in seconds. If None, tries cfg, otherwise uses step index.
+
+    title : str | None
+        Optional plot title.
+
+    show : bool
+        If True, calls plt.show().
+
+    Returns
+    -------
+    fig, ax : matplotlib Figure and Axes
+    """
+
+    def _as_u_array(u_like):
+        if u_like is None:
+            return None
+        U = np.asarray(u_like, dtype=float)
+        # Accept shape (T,3) or (T,>=3) (take first 3); reject weird
+        if U.ndim != 2 or U.shape[0] < 1:
+            return None
+        if U.shape[1] < 3:
+            return None
+        return U[:, :3]
+
+    def _maybe_pick_rollout(obj):
+        # If obj is a list of rollouts (e.g. list length K where each is (T,3)),
+        # select rollout_idx.
+        if rollout_idx is None:
+            return obj
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            try:
+                return obj[rollout_idx]
+            except Exception:
+                return obj
+        return obj
+
+    def _first_present(keys):
+        for k in keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                return k, frames_dict[k]
+        return None, None
+
+    # --- 1) N-aware: u_cmd_all / u_all / act_all ---
+    N = None
+    if cfg is not None:
+        try:
+            N = int(cfg.get("N", 0)) or None
+        except Exception:
+            N = None
+
+    u_src = None
+
+    # Preferred N-aware containers: list length N of (T,3)
+    for k in ("u_cmd_all", "u_all", "act_all", "actions_all"):
+        if k in frames_dict and frames_dict[k] is not None:
+            container = _maybe_pick_rollout(frames_dict[k])
+            if isinstance(container, (list, tuple)):
+                a = agent - 1
+                if 0 <= a < len(container):
+                    u_src = container[a]
+                    break
+
+    # --- 2) Legacy 2-agent keyed ---
+    if u_src is None:
+        a = agent
+        legacy_keys = [
+            f"u{a}_cmd_xyz", f"u{a}_xyz",
+            f"u{a}_cmd",     f"u{a}",
+            f"act{a}",       f"action{a}", f"actions{a}",
+        ]
+        for k in legacy_keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                u_src = _maybe_pick_rollout(frames_dict[k])
+                break
+
+    # --- 3) Generic single-key fallback ---
+    if u_src is None:
+        _, u_src = _first_present(("u_cmd", "u", "u_hist", "act", "actions", "u_cmd_xyz"))
+
+    U = _as_u_array(_maybe_pick_rollout(u_src))
+    if U is None:
+        known = [k for k in frames_dict.keys() if any(s in k.lower() for s in ("u", "act", "action"))]
+        raise KeyError(
+            "Could not find a (T,3) thrust/command history in frames_dict.\n"
+            "Tried N-aware: u_cmd_all/u_all/act_all; legacy u{a}_* and act{a}; generic u_cmd/u/u_hist/act/actions.\n"
+            f"Keys containing 'u'/'act'/'action' that *do* exist:\n  {known}"
+        )
+
+    # --- time axis ---
+    if dt is None and cfg is not None:
+        # Try common dt placements
+        for path in (("dt",), ("dyn", "dt"), ("sim", "dt")):
+            try:
+                val = cfg
+                for p in path:
+                    val = val[p]
+                dt = float(val)
+                break
+            except Exception:
+                pass
+
+    T = U.shape[0]
+    if dt is None:
+        t = np.arange(T)
+        xlab = "step"
+    else:
+        t = dt * np.arange(T)
+        xlab = "time [s]"
+
+    ux, uy, uz = U[:, 0], U[:, 1], U[:, 2]
+    unorm = np.linalg.norm(U, axis=1)
+
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.plot(t, ux, label=r"$u_x$")
+    ax.plot(t, uy, label=r"$u_y$")
+    ax.plot(t, uz, label=r"$u_z$")
+    ax.plot(t, unorm, label=r"$\|u\|$", linewidth=2.0)
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("commanded thrust")
+    ax.grid(True, alpha=0.35)
+
+    if title is None:
+        title = f"Commanded thrust u (agent {agent})"
+    ax.set_title(title)
+    ax.legend()
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
