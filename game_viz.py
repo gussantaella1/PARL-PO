@@ -24,7 +24,7 @@ __all__ = [
     "add_triad_legend",
     "animate_rollout_3d", "interactive_rollout_3d",
     "plot_rollout_thrust_u",
-
+    "plot_rollout_center_distance"
 ]
 
 
@@ -1758,6 +1758,184 @@ def plot_rollout_thrust_u(
 
     if title is None:
         title = f"Commanded thrust u (agent {agent})"
+    ax.set_title(title)
+    ax.legend()
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_rollout_center_distance(
+    frames_dict,
+    cfg=None,
+    agents=(1, 2),
+    rollout_idx: int | None = None,
+    dt: float | None = None,
+    center: tuple[float, float, float] | None = None,
+    title: str | None = None,
+    show: bool = True,
+    show_oi_radius: bool = True,
+):
+    """
+    Plot distance-to-center over rollout time for multiple agents.
+
+    Adds optional horizontal line(s) for object-of-interest radius from cfg['oi'].
+    """
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    def _maybe_pick_rollout(obj):
+        if rollout_idx is None:
+            return obj
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            try:
+                return obj[rollout_idx]
+            except Exception:
+                return obj
+        return obj
+
+    def _as_xyz(seq):
+        """Coerce list/array of positions to (T,3) float array. Accepts (T,2)->z=0."""
+        if seq is None:
+            return None
+        X = np.asarray(seq, dtype=float)
+        if X.ndim != 2 or X.shape[0] < 1:
+            return None
+        if X.shape[1] == 2:
+            z = np.zeros((X.shape[0], 1), dtype=float)
+            return np.hstack([X, z])
+        if X.shape[1] >= 3:
+            return X[:, :3]
+        return None
+
+    def _infer_dt():
+        if dt is not None:
+            return float(dt)
+        if cfg is None:
+            return None
+        for path in (("dt",), ("dyn", "dt"), ("sim", "dt")):
+            try:
+                val = cfg
+                for p in path:
+                    val = val[p]
+                return float(val)
+            except Exception:
+                pass
+        return None
+
+    def _infer_center():
+        if center is not None:
+            c = np.asarray(center, float).ravel()
+            if c.size == 2:
+                return np.array([c[0], c[1], 0.0], float)
+            if c.size >= 3:
+                return c[:3].astype(float)
+            return np.zeros(3, float)
+
+        if cfg is not None:
+            ar = cfg.get("arena", {}) or {}
+            if {"cx", "cy", "cz"} <= set(ar.keys()):
+                return np.array([float(ar["cx"]), float(ar["cy"]), float(ar["cz"])], float)
+            if {"xmin", "xmax", "ymin", "ymax"} <= set(ar.keys()):
+                cx = 0.5 * (float(ar["xmin"]) + float(ar["xmax"]))
+                cy = 0.5 * (float(ar["ymin"]) + float(ar["ymax"]))
+                if "zmin" in ar and "zmax" in ar:
+                    cz = 0.5 * (float(ar["zmin"]) + float(ar["zmax"]))
+                else:
+                    cz = 0.0
+                return np.array([cx, cy, cz], float)
+
+        return np.zeros(3, float)
+
+    def _normalize_oi_list(oi_cfg):
+        """Return list of enabled OI dicts (accept dict or list-of-dicts)."""
+        if not oi_cfg:
+            return []
+        if isinstance(oi_cfg, (list, tuple)):
+            return [d for d in oi_cfg if d and bool(d.get("enabled", True))]
+        return [oi_cfg] if bool(oi_cfg.get("enabled", True)) else []
+
+    # --------- get exec trajectories for each agent ----------
+    exec_all = None
+    if "exec_xyz_all" in frames_dict and frames_dict["exec_xyz_all"] is not None:
+        exec_all = _maybe_pick_rollout(frames_dict["exec_xyz_all"])
+    elif "exec_all" in frames_dict and frames_dict["exec_all"] is not None:
+        exec_all = _maybe_pick_rollout(frames_dict["exec_all"])
+
+    def _get_exec_for_agent(a1_indexed: int):
+        a0 = a1_indexed - 1
+
+        if isinstance(exec_all, (list, tuple)) and 0 <= a0 < len(exec_all):
+            return _as_xyz(_maybe_pick_rollout(exec_all[a0]))
+
+        for k in (f"exec{a1_indexed}_xyz", f"exec{a1_indexed}_xy"):
+            if k in frames_dict and frames_dict[k] is not None:
+                return _as_xyz(_maybe_pick_rollout(frames_dict[k]))
+
+        for k in (f"exec{a1_indexed}", f"x{a1_indexed}_xyz", f"x{a1_indexed}_xy"):
+            if k in frames_dict and frames_dict[k] is not None:
+                return _as_xyz(_maybe_pick_rollout(frames_dict[k]))
+
+        return None
+
+    exec_by_agent = {}
+    for a in agents:
+        X = _get_exec_for_agent(int(a))
+        if X is None:
+            maybe = [k for k in frames_dict.keys() if f"{a}" in k and any(s in k.lower() for s in ("exec", "x"))]
+            raise KeyError(
+                f"Could not find executed trajectory for agent {a}.\n"
+                f"Tried N-aware exec_xyz_all and legacy exec{a}_xyz/exec{a}_xy.\n"
+                f"Nearby keys containing '{a}' and ('exec' or 'x'):\n  {maybe}"
+            )
+        exec_by_agent[int(a)] = X
+
+    # align lengths (min T across selected agents)
+    T = min(X.shape[0] for X in exec_by_agent.values())
+    if T < 1:
+        raise ValueError("No rollout samples found (T < 1).")
+    for a in list(exec_by_agent.keys()):
+        exec_by_agent[a] = exec_by_agent[a][:T]
+
+    # --------- compute distances ----------
+    c = _infer_center().reshape(1, 3)
+    dist_by_agent = {a: np.linalg.norm(X - c, axis=1) for a, X in exec_by_agent.items()}
+
+    # --------- time axis ----------
+    _dt = _infer_dt()
+    if _dt is None:
+        t = np.arange(T)
+        xlab = "step"
+    else:
+        t = _dt * np.arange(T)
+        xlab = "time [s]"
+
+    # --------- plot ----------
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    for a in agents:
+        a = int(a)
+        ax.plot(t, dist_by_agent[a], label=f"Agent {a}")
+
+    # --- NEW: OI radius horizontal line(s) ---
+    if show_oi_radius and cfg is not None:
+        oi_list = _normalize_oi_list(cfg.get("oi"))
+        # add a line for each OI that has an 'r'
+        for k, oi in enumerate(oi_list):
+            if oi is None or "r" not in oi:
+                continue
+            r = float(oi["r"])
+            lab = "OI radius" if len(oi_list) == 1 else f"OI{(k+1)} radius"
+            ax.axhline(r, linestyle="--", linewidth=1.5, alpha=0.8, label=lab)
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("distance to center")
+    ax.grid(True, alpha=0.35)
+
+    if title is None:
+        title = "Distance to center vs time"
     ax.set_title(title)
     ax.legend()
 
