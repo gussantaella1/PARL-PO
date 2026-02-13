@@ -111,35 +111,90 @@ COMMON: Dict[str, Any] = {
         "repulse_gain": 1.0, # tuned so repulsion doesn't instantly saturate
     },
 
+    #Smart attacker 
+
+    # "att_reward": {
+
+    #     # --- progress / goal terms ---
+    #     # Reward *decreasing* d2 each step (encourages steady approach, less dithering)
+    #     "k_prog":  4.0,     # weight on (-delta_d2)
+
+    #     # Small shaping toward being near the center (optional)
+    #     # If your r2 already uses "-k_pos * d2", you can keep this 0.
+    #     "k_cent":  0.5,
+
+    #     # --- interaction with defender (conservative vs reckless) ---
+    #     # Penalty for being too close to defender (prevents "suicide charges")
+    #     "min_sep": 2.0,     # meters; MUST exist if your r2 uses self.att_min_sep
+    #     "k_close": 1.0,     # how hard to penalize inside min_sep
+
+    #     # --- speed / overshoot control ---
+    #     # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
+    #     # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
+    #     # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
+
+    #     # Optional: penalize radial velocity near the center to reduce fly-through
+    #     "k_vrad":  0.0,     # if you include a vrad2^2 term in r2
+
+    #     # --- wall behavior ---
+    #     # Extra "hardening" near boundary; makes wall-bouncing expensive
+    #     # Usually you don’t need to exceed wall_penalty unless attacker still suicides.
+    #     "k_wall":  0.5,     # extra weight on wall2-type penalty (often = wall_penalty)
+    #     "wall_power": 4.0,  # if you implement a (rho2-soft_wall)^wall_power style
+    # },
+
+    #Killer attacker
+    # "att_reward": {
+
+    #     # --- progress / goal terms ---
+    #     # Reward *decreasing* d2 each step (encourages steady approach, less dithering)
+    #     "k_prog":  6.0,     # weight on (-delta_d2)
+
+    #     # Small shaping toward being near the center (optional)
+    #     # If your r2 already uses "-k_pos * d2", you can keep this 0.
+    #     "k_cent":  1.0,
+
+    #     # --- interaction with defender (conservative vs reckless) ---
+    #     # Penalty for being too close to defender (prevents "suicide charges")
+    #     "min_sep": 1.0,     # meters; MUST exist if your r2 uses self.att_min_sep
+    #     "k_close": 0.5,     # how hard to penalize inside min_sep
+
+    #     # --- speed / overshoot control ---
+    #     # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
+    #     # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
+    #     # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
+
+    #     # Optional: penalize radial velocity near the center to reduce fly-through
+    #     "k_vrad":  0.0,     # if you include a vrad2^2 term in r2
+
+    #     # --- wall behavior ---
+    #     # Extra "hardening" near boundary; makes wall-bouncing expensive
+    #     # Usually you don’t need to exceed wall_penalty unless attacker still suicides.
+    #     "k_wall":  0.5,     # extra weight on wall2-type penalty (often = wall_penalty)
+    #     "wall_power": 4.0,  # if you implement a (rho2-soft_wall)^wall_power style
+    # },
+
+    #Simple test 
     "att_reward": {
-
-        # --- progress / goal terms ---
-        # Reward *decreasing* d2 each step (encourages steady approach, less dithering)
-        "k_prog":  0.0,     # weight on (-delta_d2)
-
-        # Small shaping toward being near the center (optional)
-        # If your r2 already uses "-k_pos * d2", you can keep this 0.
-        "k_cent":  0.0,
-
-        # --- interaction with defender (conservative vs reckless) ---
-        # Penalty for being too close to defender (prevents "suicide charges")
-        "min_sep": 3.0,     # meters; MUST exist if your r2 uses self.att_min_sep
-        "k_close": 2.0,     # how hard to penalize inside min_sep
-
-        # --- speed / overshoot control ---
-        # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
-        # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
-        # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
-
-        # Optional: penalize radial velocity near the center to reduce fly-through
-        "k_vrad":  0.5,     # if you include a vrad2^2 term in r2
-
-        # --- wall behavior ---
-        # Extra "hardening" near boundary; makes wall-bouncing expensive
-        # Usually you don’t need to exceed wall_penalty unless attacker still suicides.
-        "k_wall":  0.5,     # extra weight on wall2-type penalty (often = wall_penalty)
-        "wall_power": 4.0,  # if you implement a (rho2-soft_wall)^wall_power style
+        "k_cent":  1.0,   # start at 1.0
+        "k_prog":  0.0,
+        "k_close": 0.0,
+        "k_vrad":  0.0,
+        "k_wall":  0.0,
+        "wall_power": 2.0,
+        "min_sep": 3.0,   # irrelevant here but fine to keep
     },
+
+
+
+    
+
+    
+
+
+
+
+    
 
     # "att_rule": {
     #     "ridge": 5e-2,       # slightly smoother center controller
@@ -216,23 +271,27 @@ TRAIN: Dict[str, Any] = {
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
+    "distill": False, #Does policy distillation, True or False
+
     "def_ckpt_path": None,
     "att_ckpt_path": None,
+    "verify_freeze": True,
+    "freeze_tol": 0.0,
 
     # Vectorized rollout & logging
     #Long training
-    "num_envs": 64,          
-    "steps_per_env": 512,    
-    "total_updates": 2000,   
-    "train_epochs": 3,
-    "minibatch_size": 8192,  
+    # "num_envs": 64,          
+    # "steps_per_env": 512,    
+    # "total_updates": 2000,   
+    # "train_epochs": 3,
+    # "minibatch_size": 8192,  
 
     #Short training
-    # "num_envs": 8,          
-    # "steps_per_env": 256,    
-    # "total_updates": 300, 
-    # "train_epochs": 10,
-    # "minibatch_size": 1024,  
+    "num_envs": 8,          
+    "steps_per_env": 256,    
+    "total_updates": 300, 
+    "train_epochs": 10,
+    "minibatch_size": 1024,  
 
     "log_every": 10,
 
@@ -279,7 +338,7 @@ TRAIN: Dict[str, Any] = {
     "def_target_hit_penalty_def": 5.0,     # big negative for defender
     "def_target_hit_reward_att": 0.0,       # matching positive for attacker
 
-    "def_keepout_buffer_m": 1.0,        # meters (keepout buffer around object)
+    "def_keepout_buffer_m": 1.5,        # meters (keepout buffer around object)
     "def_target_hit_buffer_frac": 0.0,  # dimensionless fraction of object radius
 
 
@@ -288,7 +347,7 @@ TRAIN: Dict[str, Any] = {
 
     "collision_radius_m": 0.2,            # meters
     "collision_penalty_def": 3.0,         # penalty applied to defender on collision
-    "collision_penalty_att": 5.0,         # penalty applied to attacker(s) on collision
+    "collision_penalty_att": 3.0,         # penalty applied to attacker(s) on collision
 
 }
 
