@@ -1779,6 +1779,8 @@ def pretrain_attacker_from_rule(
     set_seed(cfg["seed"])
     device = cfg["device"]
 
+    build_dyn(cfg)             # <-- ADD THIS (or ensure_dyn(cfg))
+
     def make_env():
         return Env(cfg)
 
@@ -2733,11 +2735,8 @@ def train_defender_with_distill(
 
 def train_attacker_with_distill(
     phase_name: str,
-    attacker_mode: str = "rl",
-    extra_train_cfg: dict | None = None,
-    *,
-    do_rule_pretrain: bool = True,
-    rule_pretrain_kwargs: dict | None = None,
+    attacker_mode: str,
+    extra_train_cfg: Dict[str, Any] | None = None,
 ):
     """
     Wrapper that (1) optionally rule-pretrains the attacker, then (2) trains with PPO (teacher),
@@ -2750,64 +2749,118 @@ def train_attacker_with_distill(
         do_rule_pretrain: if True, call pretrain_attacker_from_rule before PPO
         rule_pretrain_kwargs: forwarded into pretrain_attacker_from_rule(...)
     """
-    extra_train_cfg = extra_train_cfg or {}
-    rule_pretrain_kwargs = rule_pretrain_kwargs or {}
+    # -------- TEACHER (full-state) --------
+    cfg_teacher = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role="att",
+    )
+    cfg_teacher["use_ukf"] = False  # teacher is full-state
 
-    # --- build cfg_teacher however you already do it ---
-    cfg_teacher = config_for_train(phase_name=phase_name, attacker_mode=attacker_mode)
 
-    # Merge user overrides
-    cfg_teacher.update(extra_train_cfg)
+    # --- NEW: BC pretrain attacker from rule controller ---
+    att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
+    cfg_for_bc = cfg_teacher.copy()
 
-    # ---------------------------
-    # (1) RULE-BASED PRETRAIN
-    # ---------------------------
-    if do_rule_pretrain or cfg_teacher.get("do_rule_pretrain", False):
-        # Let kwargs come from either explicit arg or cfg
-        rp_kwargs = {}
-        rp_kwargs.update(cfg_teacher.get("rule_pretrain_kwargs", {}))
-        rp_kwargs.update(rule_pretrain_kwargs)
+    # During BC we still want an RL attacker net to exist,
+    # but labels come from the rule controller.
+    # Make sure attacker_mode is 'rl' (it already is here).
+    cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
 
-        # If your function needs cfg, pass it; if not, remove.
-        # Common return patterns:
-        #   - returns ckpt_path (string)
-        #   - returns policy/model object
-        #   - returns dict with {"ckpt_path": ...}
-        rule_pretrain_out = pretrain_attacker_from_rule(cfg_teacher, **rp_kwargs)
+    pretrain_attacker_from_rule(
+        cfg_for_bc,
+        out_path=att_bc_ckpt,
+        steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
+        total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
+        bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
+        bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
+    )
 
-        # ---- normalize outputs into a checkpoint path if possible ----
-        ckpt_path = None
-        if isinstance(rule_pretrain_out, str):
-            ckpt_path = rule_pretrain_out
-        elif isinstance(rule_pretrain_out, dict):
-            ckpt_path = rule_pretrain_out.get("ckpt_path") or rule_pretrain_out.get("checkpoint")
-        else:
-            # If it returns a model object, you may need to save it here.
-            # Leave as None unless you know how your code handles it.
-            ckpt_path = None
+    # Now train attacker with PPO starting from the BC init
+    cfg_teacher["att_init_path"] = att_bc_ckpt
 
-        # Point PPO training at the pretrained weights if your train() supports it.
-        if ckpt_path is not None:
-            # Rename this key to whatever your trainer reads.
-            cfg_teacher["attacker_init_ckpt"] = ckpt_path
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
 
-            # If your code uses "resume" semantics instead of init-weights, use one of these:
-            # cfg_teacher["resume_path"] = ckpt_path
-            # cfg_teacher["load_path"] = ckpt_path
+    # IMPORTANT: read the flag AFTER updates, and default to False if absent
+    DISTILL = bool(cfg_teacher.get("distill", False))
 
-    # ---------------------------
-    # (2) PPO TRAIN (TEACHER)
-    # ---------------------------
+    build_dyn(cfg_teacher)
+
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
+    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+    print(f"[{phase_name.upper()}] distill={DISTILL}")
+
     ppo_att, metrics_att = train(cfg_teacher)
 
-    # ---------------------------
-    # (3) DISTILL (STUDENT)  <-- keep your existing distillation logic here
-    # ---------------------------
-    # cfg_student = make_student_cfg(...)
-    # student = distill_from_teacher(ppo_att, cfg_student)
-    # return student, metrics_att
+    # --- Save defender teacher checkpoint ---
+    att_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
+    torch.save(ppo_att.def_net.state_dict(), att_teacher_ckpt)
+    print(f"[{phase_name.upper()} TEACHER] Saved attacker teacher to {att_teacher_ckpt}")
 
-    return ppo_att, metrics_att
+    # --- Save teacher metrics ---
+    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+    np.savez(metrics_path, **metrics_att)
+    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    # --- Optional: evaluate teacher (full-state) ---
+    cfg_eval = config_for_eval(
+        attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
+        umax=cfg_teacher["umax"],
+        T=cfg_teacher["T"],
+    )
+    cfg_eval["use_ukf"] = False
+    build_dyn(cfg_eval)
+    trajs = evaluate(ppo_att, cfg_eval, episodes=2)
+
+    ar = cfg_eval["arena"]
+    D = cfg_eval["D"]
+    center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
+    R = float(ar["r"])
+    m = rollout_metrics(trajs[0]["states"], center, R)
+    print(
+        f"[{phase_name.upper()} TEACHER metrics] "
+        f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
+    )
+
+    # -------- STUDENT (UKF) via distillation (optional) --------
+    student_out = None
+    if DISTILL:
+        cfg_student = config_for_train(
+            attacker_mode="rl",
+            train_role="att",
+        )
+        cfg_student["use_ukf"] = True
+        cfg_student["seed"] = cfg_teacher["seed"] + 1
+
+        # If you want the student to inherit any relevant training knobs, do it here:
+        # (e.g., same attacker opponent checkpoint/freeze settings)
+        if extra_train_cfg is not None:
+            cfg_student.update(extra_train_cfg)
+
+        build_dyn(cfg_student)
+
+        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
+        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+
+        student_out = os.path.join(OUT_DIR, f"{phase_name}_att_ukf_student.pt")
+        student, metrics_student = distill_from_teacher(
+            cfg_student, att_teacher_ckpt, out_path=student_out
+        )
+        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
+
+        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
+        np.savez(distill_metrics_path, **metrics_student)
+        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+    #Clearing cache
+    # del ppo_def
+    # del env
+    # gc.collect()
+    # torch.cuda.empty_cache()
+
+    return att_teacher_ckpt, student_out
 
 
 
@@ -2853,6 +2906,8 @@ def assert_deterministic_action(ppo, obs_batch: torch.Tensor, who: str, tol: flo
     return d
 
 
+
+
 # =============================================================
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
 # =============================================================
@@ -2861,8 +2916,8 @@ if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
 
     cfg_distillation = config_for_train(
-        attacker_mode="rl",
-        train_role="att",
+        attacker_mode="rl",   # attacker is RL now
+        train_role="att",     # PPO will only update attacker
     )
     DISTILL = cfg_distillation["distill"]
 
@@ -2871,104 +2926,48 @@ if __name__ == "__main__":
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
     print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
-    def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
-        phase_name="def0",
-        attacker_mode="rule",
-        extra_train_cfg=None,
-    )
+    # def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+    #     phase_name="def0",
+    #     attacker_mode="rule",
+    #     extra_train_cfg=None,  # training vs the built-in rule-based attacker
+    # )
 
+    def0_teacher_ckpt = os.path.join(OUT_DIR, "def0_def_teacher.pt")
 
     # =========================================================
-    # PHASE 1: Attacker₁ vs fixed Defender₀
-    #   NEW: wrapper will do rule-BC pretrain automatically
+    # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
     # =========================================================
-    print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 (rule-pretrain + PPO) =====")
+    print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
 
-    # Any PPO/train-time settings for att1 go here
-    extra_att1_cfg = config_for_train(
-        attacker_mode="rl",
-        train_role="att",
-    )
-    extra_att1_cfg["use_ukf"] = False                 # full-state attacker teacher
-    extra_att1_cfg["def_ckpt_path"] = def0_teacher_ckpt
-    extra_att1_cfg["freeze_defender"] = True
-    extra_att1_cfg["seed"] = extra_att1_cfg.get("seed", 0) + 123
 
-    # If build_dyn mutates cfg, keep it here (or inside your wrapper)
-    build_dyn(extra_att1_cfg)
-
-    # --- Call your updated wrapper (this is the whole point) ---
-    # Assumes your wrapper does:
-    #   1) (optional) pretrain_attacker_from_rule(cfg, ...)
-    #   2) train(cfg) with warm-start from the BC ckpt
-    ppo_att1, metrics_att1 = train_attacker_with_distill(
+    att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
         phase_name="att1",
         attacker_mode="rl",
-        extra_train_cfg=extra_att1_cfg,
-        do_rule_pretrain=True,
-        rule_pretrain_kwargs={
-            # These kwargs must match your pretrain_attacker_from_rule signature
-            "out_path": os.path.join(OUT_DIR, "att1_bc_init.pt"),
-            "steps_per_env": int(extra_att1_cfg.get("steps_per_env", 256)),
-            "total_updates": int(extra_att1_cfg.get("att_bc_updates", 200)),
-            "bc_epochs": int(extra_att1_cfg.get("att_bc_epochs", 4)),
-            "bc_mb_size": int(extra_att1_cfg.get("att_bc_mb_size", 2048)),
-        },
+        extra_train_cfg=None,  # training vs the built-in rule-based attacker
     )
 
-    # Save attacker teacher ckpt
-    att1_teacher_ckpt = os.path.join(OUT_DIR, "att1_teacher.pt")
-    if getattr(ppo_att1, "attacker_mode", None) != "rl" or getattr(ppo_att1, "att_net", None) is None:
-        raise RuntimeError("Expected attacker_mode='rl' with a learned attacker net for ATT1.")
-    torch.save(ppo_att1.att_net.state_dict(), att1_teacher_ckpt)
-    print(f"[ATT1 TEACHER] Saved attacker teacher to {att1_teacher_ckpt}")
-
-    metrics_att1_path = os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz")
-    np.savez(metrics_att1_path, **metrics_att1)
-    print(f"[ATT1 TEACHER] Saved metrics to {metrics_att1_path}")
-
-
-    # Optional: evaluate attacker₁ vs def₀ (full state)
-    cfg_eval_att1 = config_for_eval(
-        attacker_mode="rl",
-        umax=extra_att1_cfg["umax"],
-        T=extra_att1_cfg["T"],
-    )
-    cfg_eval_att1["use_ukf"] = False
-    build_dyn(cfg_eval_att1)
-    trajs_att1 = evaluate(ppo_att1, cfg_eval_att1, episodes=2)
-
-    ar = cfg_eval_att1["arena"]
-    D = cfg_eval_att1["D"]
-    center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
-    R = float(ar["r"])
-    m_att1 = rollout_metrics(trajs_att1[0]["states"], center, R)
-    print(
-        f"[ATT1 TEACHER metrics] d2_T={m_att1['d2_norm'][-1]:.3f}  "
-        f"d1_med={np.median(m_att1['d1_norm']):.3f}  "
-        f"rel2_med={np.median(m_att1['rel2_norm']):.3f}"
-    )
-
+    # NOTE: we are *not* yet distilling the attacker here.
+    # To distill the attacker, we'd need a clear attacker-side sensor / partial
+    # observation model (UKF or otherwise). Once that's designed, we can add a
+    # distillation routine analogous to distill_from_teacher but with who='att'.
 
     # =========================================================
     # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
     # =========================================================
     print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
+
     def1_teacher_ckpt, def1_student_ckpt = train_defender_with_distill(
         phase_name="def1",
-        attacker_mode="rl",
+        attacker_mode="rl",   # attacker is RL now
         extra_train_cfg={
             "att_ckpt_path": att1_teacher_ckpt,
-            "freeze_attacker": True,
+            "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
         },
     )
 
-
-    # =========================================================
-    # PLOTTING (unchanged)
-    # =========================================================
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
 
+    # stage folders
     PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
     PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
     PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
@@ -2977,6 +2976,7 @@ if __name__ == "__main__":
     for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
         os.makedirs(d, exist_ok=True)
 
+    # ---- def0 ----
     m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
     plot_training_metrics(
         m_def0_teacher,
@@ -2988,6 +2988,7 @@ if __name__ == "__main__":
         save_prefix="def0_teacher",
     )
 
+    # ---- att1 ----
     m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
     plot_training_metrics(
         m_att1_teacher,
@@ -2999,6 +3000,7 @@ if __name__ == "__main__":
         save_prefix="att1_teacher",
     )
 
+    # ---- def1 ----
     m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
     plot_training_metrics(
         m_def1_teacher,
@@ -3010,6 +3012,7 @@ if __name__ == "__main__":
         save_prefix="def1_teacher",
     )
 
+    # ---- comparisons ----
     plot_compare_phases(
         [
             ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
@@ -3031,9 +3034,15 @@ if __name__ == "__main__":
     print(" -", PLOTS_DEF1)
     print(" -", PLOTS_COMP)
 
+
+
+
+
     print("\n===== ALL PHASES COMPLETE =====")
     print(f"Defender_0 teacher:  {def0_teacher_ckpt}")
     print(f"Defender_0 student:  {def0_student_ckpt if def0_student_ckpt else '(skipped)'}")
+
     print(f"Attacker_1 teacher:  {att1_teacher_ckpt}")
     print(f"Defender_1 teacher:  {def1_teacher_ckpt}")
     print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
+
