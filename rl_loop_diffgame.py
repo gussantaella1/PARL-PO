@@ -1779,7 +1779,7 @@ def pretrain_attacker_from_rule(
     set_seed(cfg["seed"])
     device = cfg["device"]
 
-    build_dyn(cfg)             # <-- ADD THIS (or ensure_dyn(cfg))
+    # build_dyn(cfg)             # <-- ADD THIS (or ensure_dyn(cfg))
 
     def make_env():
         return Env(cfg)
@@ -2755,7 +2755,10 @@ def train_attacker_with_distill(
         train_role="att",
     )
     cfg_teacher["use_ukf"] = False  # teacher is full-state
+    cfg_teacher["def_ckpt_path"] = def0_teacher_ckpt   # load defender₀ as opponent
+    cfg_teacher["freeze_defender"] = True              # keep defender fixed
 
+    build_dyn(cfg_teacher)
 
     # --- NEW: BC pretrain attacker from rule controller ---
     att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
@@ -2784,7 +2787,7 @@ def train_attacker_with_distill(
     # IMPORTANT: read the flag AFTER updates, and default to False if absent
     DISTILL = bool(cfg_teacher.get("distill", False))
 
-    build_dyn(cfg_teacher)
+    # build_dyn(cfg_teacher)
 
     if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
@@ -2793,9 +2796,9 @@ def train_attacker_with_distill(
 
     ppo_att, metrics_att = train(cfg_teacher)
 
-    # --- Save defender teacher checkpoint ---
-    att_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
-    torch.save(ppo_att.def_net.state_dict(), att_teacher_ckpt)
+    # --- Save attacker teacher checkpoint ---
+    att_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_att_teacher.pt")
+    torch.save(ppo_att.att_net.state_dict(), att_teacher_ckpt)
     print(f"[{phase_name.upper()} TEACHER] Saved attacker teacher to {att_teacher_ckpt}")
 
     # --- Save teacher metrics ---
@@ -2943,7 +2946,10 @@ if __name__ == "__main__":
     att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
         phase_name="att1",
         attacker_mode="rl",
-        extra_train_cfg=None,  # training vs the built-in rule-based attacker
+        extra_train_cfg={
+            "att_ckpt_path": def0_teacher_ckpt,
+            "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
+        },       
     )
 
     # NOTE: we are *not* yet distilling the attacker here.
