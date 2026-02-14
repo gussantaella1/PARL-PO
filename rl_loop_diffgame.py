@@ -2947,8 +2947,8 @@ if __name__ == "__main__":
         phase_name="att1",
         attacker_mode="rl",
         extra_train_cfg={
-            "att_ckpt_path": def0_teacher_ckpt,
-            "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
+            "def_ckpt_path": def0_teacher_ckpt,
+            # "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
         },       
     )
 
