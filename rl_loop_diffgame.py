@@ -19,6 +19,10 @@ from typing import Dict, Any, Tuple, Callable, List
 
 import numpy as np
 import torch
+import gc
+import time
+
+
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
@@ -94,7 +98,7 @@ class Env:
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
-        self.def_target_hit_buffer_frac = float(cfg.get("def_target_hit_buffer_frac", 0.0))
+        # self.def_target_hit_buffer_frac = float(cfg.get("def_target_hit_buffer_frac", 0.0))
 
 
         umax = float(cfg["umax"]) ; self.u_lo, self.u_hi = -umax, +umax
@@ -159,13 +163,13 @@ class Env:
         self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
         self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
 
-
+        self.def_oi_safety_buffer = float(cfg.get("def_oi_safety_buffer", 0.0))
         self.def_target_hit_penalty_def = float(cfg.get("def_target_hit_penalty_def", 0.0))
         self.def_target_hit_reward_att  = float(cfg.get("def_target_hit_reward_att", 0.0))
 
 
         # NEW: collision termination (defender vs any attacker)
-        self.collision_radius_m    = float(cfg.get("collision_radius_m", 0.0))  # meters; 0 disables
+        self.collision_radius_m    = float(cfg.get("collision_radius_m", 0.2))  # meters; 0 disables
         self.collision_penalty_def = float(cfg.get("collision_penalty_def", 0.0))
         self.collision_penalty_att = float(cfg.get("collision_penalty_att", 0.0))
 
@@ -241,7 +245,7 @@ class Env:
         self.att_wall_power = float(att.get("wall_power", 4.0))
 
 
-        self.hit_buffer_def = float(self.def_target_hit_buffer_frac)
+        self.hit_buffer_def = float(self.def_oi_safety_buffer)
         self.hit_buffer_att = float(self.att_target_hit_radius)
 
 
@@ -595,18 +599,36 @@ class Env:
         #         - wall2
         #     )
 
+        # if need_att:
+        #     # normalized squared distance to center (you already computed d2)
+        #     # d2 = ||p2-center||^2 / R^2
+
+        #     # normalized effort (you already computed a2n2)
+        #     # a2n2 = ||a2||^2 / umax^2
+
+        #     r2 = (
+        #         - self.k_att_cent * d2
+        #         - self.lA         * a2n2
+        #         - wall2
+        #     )
+
+
         if need_att:
-            # normalized squared distance to center (you already computed d2)
-            # d2 = ||p2-center||^2 / R^2
 
-            # normalized effort (you already computed a2n2)
-            # a2n2 = ||a2||^2 / umax^2
+            dist = float(np.linalg.norm(p2 - p1))  # meters
+            x = dist / (float(self.att_min_sep) + 1e-9)  # 1.0 at the boundary
+            close_pen = max(0.0, 1.0 - x) ** 2           # ramps up as dist -> min_sep
+            d2_prev = float(self._d2_prev if self._d2_prev is not None else d2)
 
+            progress = d2_prev - d2  # positive inward
             r2 = (
-                - self.k_att_cent * d2
-                - self.lA         * a2n2
+                + self.k_att_prog * progress
+                - self.k_att_close * close_pen
+                - self.lA  * a2n2
                 - wall2
             )
+
+
 
 
 
@@ -706,28 +728,33 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
-        if collision:
-            r1 -= self.collision_penalty_def
-            r2 -= self.collision_penalty_att
+
 
         if need_def:
+
+            if collision:
+                r1 -= self.collision_penalty_def
+
             if oob1: r1 -= self.wallK
-            if att_hit_target: r1 -= self.def_target_hit_penalty_def
-            if def_hit_target: r1 -= self.att_target_hit_penalty_def
+            if done and att_hit_target: r1 -= self.def_target_hit_penalty_def
+            if done and def_hit_target: r1 -= self.att_target_hit_penalty_def
 
         if need_att:
-            if oob2_any: r2 -= self.wallK
-            if att_hit_target: r2 += self.att_target_hit_reward_att
-            if def_hit_target: r2 += self.def_target_hit_reward_att
+            if collision:
+                r2 -= self.collision_penalty_att
 
-        if need_att and done:
-            # reward only if attacker ended near target
-            # (oi_radius_norm > 0 means you actually defined a target)
-            if self.oi_radius_norm > 0.0:
-                if att_hit_target:
-                    r2 += float(self.beta)   # e.g. beta = 1.0 or 2.0
-                else:
-                    r2 -= float(self.beta)   # optional: discourage ending without hitting
+            if oob2_any: r2 -= self.wallK
+            if done and att_hit_target: r2 += self.att_target_hit_reward_att
+            # if done and def_hit_target: r2 += self.def_target_hit_reward_att
+
+        # if need_att and done:
+        #     # reward only if attacker ended near target
+        #     # (oi_radius_norm > 0 means you actually defined a target)
+        #     if self.oi_radius_norm > 0.0:
+        #         if att_hit_target:
+        #             r2 += float(self.beta)   # e.g. beta = 1.0 or 2.0
+        #         else:
+        #             r2 -= float(self.beta)   # optional: discourage ending without hitting
 
 
 
@@ -2252,6 +2279,23 @@ def train(cfg: Dict[str, Any]):
             if cfg.get("use_ukf", False):
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
+            
+    # ---- end-of-train cleanup ----
+    try:
+        del bufD
+    except: pass
+    try:
+        del bufA
+    except: pass
+    try:
+        del vec
+    except: pass
+
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 
 
 
@@ -2694,6 +2738,10 @@ def train_defender_with_distill(
         f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
     )
 
+    try:
+        del ppo_def, metrics_def
+    except: pass
+
     # -------- STUDENT (UKF) via distillation (optional) --------
     student_out = None
     if DISTILL:
@@ -2724,6 +2772,10 @@ def train_defender_with_distill(
         distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
         np.savez(distill_metrics_path, **metrics_student)
         print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+        try:
+            del student, metrics_student
+        except: pass
 
     #Clearing cache
     # del ppo_def
@@ -2826,6 +2878,10 @@ def train_attacker_with_distill(
         f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
     )
 
+    try:
+        del ppo_att, metrics_att
+    except: pass
+
     # -------- STUDENT (UKF) via distillation (optional) --------
     student_out = None
     if DISTILL:
@@ -2856,6 +2912,10 @@ def train_attacker_with_distill(
         distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
         np.savez(distill_metrics_path, **metrics_student)
         print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+        try:
+            del student, metrics_student
+        except: pass
 
     #Clearing cache
     # del ppo_def
@@ -2910,6 +2970,64 @@ def assert_deterministic_action(ppo, obs_batch: torch.Tensor, who: str, tol: flo
 
 
 
+# =============================================================
+# End phase cleanup
+# =============================================================
+
+def end_phase_cleanup(
+    tag: str = "",
+    *,
+    clear_cuda: bool = True,
+    clear_ipc: bool = True,
+    clear_mps: bool = True,
+    clear_matplotlib: bool = True,
+    sleep_s: float = 0.0,
+):
+    """
+    Best-effort memory cleanup after a training phase.
+
+    - CPU RAM: delete references + gc.collect()
+    - GPU VRAM (CUDA): empty_cache(), ipc_collect()
+    - MPS (Apple): empty_cache()
+    - Matplotlib: close figures so they don't accumulate
+    """
+    print(f"\n[cleanup] {tag} ...")
+
+    # ---- close any lingering matplotlib figures (common silent RAM leak) ----
+    if clear_matplotlib:
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+
+    # ---- Python heap cleanup ----
+    gc.collect()
+
+    # ---- PyTorch device-specific cleanup ----
+    if clear_cuda and torch.cuda.is_available():
+        # Clears cached blocks held by the CUDA allocator (does not free tensors you still reference).
+        torch.cuda.empty_cache()
+
+        if clear_ipc:
+            # Helps in some multi-process / DataLoader / vector-env setups.
+            torch.cuda.ipc_collect()
+
+        # Optional: if you're debugging fragmentation, you can print stats:
+        # print(torch.cuda.memory_summary())
+
+    if clear_mps and hasattr(torch, "mps") and torch.mps.is_available():
+        # Apple Silicon
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            pass
+
+    if sleep_s > 0:
+        time.sleep(sleep_s)
+
+    print(f"[cleanup] {tag} done.")
+
 
 # =============================================================
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
@@ -2929,13 +3047,13 @@ if __name__ == "__main__":
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
     print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
-    # def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
-    #     phase_name="def0",
-    #     attacker_mode="rule",
-    #     extra_train_cfg=None,  # training vs the built-in rule-based attacker
-    # )
+    def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+        phase_name="def0",
+        attacker_mode="rule",
+        extra_train_cfg=None,  # training vs the built-in rule-based attacker
+    )
+    end_phase_cleanup("Cleanup after PHASE 0")
 
-    def0_teacher_ckpt = os.path.join(OUT_DIR, "def0_def_teacher.pt")
 
     # =========================================================
     # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
@@ -2951,6 +3069,8 @@ if __name__ == "__main__":
             # "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
         },       
     )
+    end_phase_cleanup("Cleanup after PHASE 1")
+
 
     # NOTE: we are *not* yet distilling the attacker here.
     # To distill the attacker, we'd need a clear attacker-side sensor / partial
@@ -2970,6 +3090,8 @@ if __name__ == "__main__":
             "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
         },
     )
+    end_phase_cleanup("Cleanup after PHASE 2")
+
 
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
 

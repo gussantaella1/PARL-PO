@@ -131,7 +131,7 @@ COMMON: Dict[str, Any] = {
     #     # --- speed / overshoot control ---
     #     # Stronger velocity penalty makes it stop overshooting center and stop slamming walls
     #     # (this adds to your existing -k_vel*||v2||^2 if you keep that in r2)
-    #     # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in r2
+    #     # "k_speed": 0.0,     # set >0 only if you add an explicit speed term in 
 
     #     # Optional: penalize radial velocity near the center to reduce fly-through
     #     "k_vrad":  0.0,     # if you include a vrad2^2 term in r2
@@ -176,14 +176,15 @@ COMMON: Dict[str, Any] = {
 
     #Simple test 
     "att_reward": {
-        "k_cent":  1.0,   # start at 1.0
-        "k_prog":  0.0,
+        "k_cent":  0.2,
+        "k_prog":  2.0,
         "k_close": 0.0,
         "k_vrad":  0.0,
         "k_wall":  0.0,
         "wall_power": 2.0,
-        "min_sep": 3.0,   # irrelevant here but fine to keep
+        "min_sep": 3.0
     },
+
 
 
 
@@ -285,6 +286,7 @@ TRAIN: Dict[str, Any] = {
     # "total_updates": 2000,   
     # "train_epochs": 3,
     # "minibatch_size": 8192,  
+    # "log_every": 100,
 
     #Short training
     "num_envs": 8,          
@@ -292,7 +294,6 @@ TRAIN: Dict[str, Any] = {
     "total_updates": 300, 
     "train_epochs": 10,
     "minibatch_size": 1024,  
-
     "log_every": 10,
 
     # PPO hyperparams
@@ -330,11 +331,12 @@ TRAIN: Dict[str, Any] = {
 
 
 
-    "att_target_hit_radius": 0.1,          # attacker within % of R hits object
+    "att_target_hit_radius": 0.0,          # attacker within % of R hits object
     "att_target_hit_penalty_def": 3.0,     # big negative for defender
     "att_target_hit_reward_att": 5.0,       # matching positive for attacker
 
     # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
+    "def_oi_safety_buffer": 0.75,
     "def_target_hit_penalty_def": 5.0,     # big negative for defender
     "def_target_hit_reward_att": 0.0,       # matching positive for attacker
 
@@ -437,36 +439,6 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
     return cfg
 
 # ---------- Dynamics builder ----------
-# def build_dyn(cfg: Dict[str, Any]):
-#     from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
-#     assert cfg["dynamics"].lower() == "hcw", "Only HCW supported in this helper."
-#     n = hcw_mean_motion(cfg["hcw"])
-#     Ad, Bd = hcw_discrete_mats(float(n), float(cfg["dt"]))
-#     cfg["dyn"]["Ad"] = as_numpy_const(Ad).astype(np.float32)
-#     cfg["dyn"]["Bd"] = as_numpy_const(Bd).astype(np.float32)
-
-#     # ---- NEW: populate Nash-solver params if present ----
-#     if cfg.get("prior_type", "ls") == "nash" and "nash_solver" in cfg:
-#         ns = cfg["nash_solver"]
-#         params = ns.get("params", {})
-
-#         ar = cfg["arena"]
-#         D  = int(cfg["D"])
-#         center = np.array(
-#             [ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)],
-#             dtype=float
-#         )[:D]
-
-#         params.setdefault("Ad", cfg["dyn"]["Ad"])
-#         params.setdefault("Bd", cfg["dyn"]["Bd"])
-#         params.setdefault("center", center)
-#         params.setdefault("umax", cfg["umax"])
-#         params.setdefault("R", float(ar["r"]))
-
-#         ns["params"] = params
-#         cfg["nash_solver"] = ns
-
-
 def build_dyn(cfg: Dict[str, Any]):
     import numpy as np
     from dyn_models import (
