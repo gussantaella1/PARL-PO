@@ -2,22 +2,27 @@
 """
 evaluate_policy.py
 
-Statistical verification harness that uses your canonical config code:
-  - config_rl.config_for_eval()
-  - config_rl.build_dyn()
-and reuses your rollout runner:
-  - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff(cfg, ...)
+Statistical verification harness for your Diff-Nash RL rollout runner:
+
+  - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff(cfg, steps=...)
+
+This version is explicitly aligned with your *current* game_runner_diff.py
+(the one that:
+  - uses RLPolicyDiff
+  - supports HCW (LTI), elliptic LTV, and two-body nonlinear dynamics
+  - optionally uses HCW-only UKF via cfg["use_ukf"]
+  - logs commanded thrust via out["u_cmd_norm_all"], out["u_cmd_all"]
+  - returns exec1_xyz/exec2_xyz etc. with attitude stubs)
 
 Outputs:
-  - results.json: aggregate stats + Wilson CI on pass rate
-  - trials.csv  : per-trial metrics + seed + initial conditions
-  - starts_xy.png, starts_xz.png: start position coverage (def + attacker(s))
+  - results.json : aggregate stats + Wilson CI on pass rate
+  - trials.csv   : per-trial metrics + seed + initial conditions
+  - starts_xy.png, starts_xz.png : start position coverage (def + attacker(s))
 
 Notes:
-  - Your provided runner is currently 1 defender vs 1 attacker.
-    This harness supports num_attackers>1 in *scenario generation + plotting*.
-    For rollouts, it evaluates defender vs attacker_i in separate episodes and
-    aggregates worst-case (or average) depending on --multi_att_mode.
+  - The runner is 1 defender vs 1 attacker per rollout.
+    If cfg["num_attackers"] > 1, this harness evaluates defender vs attacker_j
+    in separate episodes and aggregates using --multi_att_mode.
 """
 
 from __future__ import annotations
@@ -33,6 +38,7 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 
+# IMPORTANT: this must match your CURRENT runner file
 from game_runner_diff import run_rhc_with_rl_and_collect_frames_3d_diff
 
 
@@ -61,7 +67,7 @@ def _quantiles(x: np.ndarray, qs=(0.0, 0.25, 0.5, 0.75, 1.0)) -> Dict[str, float
 # ------------------------- config helpers -------------------------
 
 def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
-    ar = cfg.get("arena", {})
+    ar = cfg.get("arena", {}) or {}
     cx, cy = float(ar.get("cx", 0.0)), float(ar.get("cy", 0.0))
     cz = float(ar.get("cz", 0.0)) if D == 3 else 0.0
     r = float(ar.get("r", 20.0))
@@ -71,8 +77,7 @@ def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, flo
 
 def _radius_from_cfg(val: float, arena_r: float) -> float:
     """
-    Interpret some radii in your config that are documented as "fraction of R"
-    but sometimes may be given in meters.
+    Interpret radii that may be "fraction of arena R" or meters.
 
     Rule:
       - if val <= 0: disabled -> 0
@@ -108,8 +113,14 @@ def _sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: f
     return center + rad * v
 
 
-def _sample_x0(cfg: Dict[str, Any], rng: np.random.Generator, num_attackers: int,
-              pos_scale: float, vel_scale: float, min_sep: float = 0.0) -> np.ndarray:
+def _sample_x0(
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    num_attackers: int,
+    pos_scale: float,
+    vel_scale: float,
+    min_sep: float = 0.0
+) -> np.ndarray:
     """
     Returns x0 with shape (1 + num_attackers, 2D).
     Enforces a minimum defender-attacker separation if min_sep > 0.
@@ -128,9 +139,7 @@ def _sample_x0(cfg: Dict[str, Any], rng: np.random.Generator, num_attackers: int
     for _ in range(num_attackers):
         for _try in range(200):
             p_att = _sample_uniform_ball(rng, center, sample_r)
-            if min_sep <= 0:
-                break
-            if np.linalg.norm(p_att - p_def) >= min_sep:
+            if min_sep <= 0 or np.linalg.norm(p_att - p_def) >= min_sep:
                 break
         v_att = rng.normal(size=D) * float(vel_scale)
         x_att = np.concatenate([p_att, v_att], dtype=float)[:nx]
@@ -142,8 +151,16 @@ def _sample_x0(cfg: Dict[str, Any], rng: np.random.Generator, num_attackers: int
 # ------------------------- metrics -------------------------
 
 def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndarray]:
-    p1 = np.asarray(out["exec1_xyz"], dtype=float)[:, :max(D, 3)]
-    p2 = np.asarray(out["exec2_xyz"], dtype=float)[:, :max(D, 3)]
+    """
+    game_runner_diff returns:
+      out["exec1_xyz"] : list of (x,y,z) tuples
+      out["exec2_xyz"] : list of (x,y,z) tuples
+    We'll slice to D dims for computations.
+    """
+    p1 = np.asarray(out["exec1_xyz"], dtype=float)
+    p2 = np.asarray(out["exec2_xyz"], dtype=float)
+    p1 = p1[:, :max(3, D)]  # keep 3 if present, safe for plotting/compat
+    p2 = p2[:, :max(3, D)]
     return p1, p2
 
 
@@ -187,26 +204,20 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
     avoid_by = list(avoid_by) if isinstance(avoid_by, (list, tuple)) else [avoid_by]
 
     def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
-    # This looks like a % buffer in your comments, but the name is ambiguous.
-    # We'll treat def_oi_safety_buffer as "extra meters" if >1 else fraction of oi_r.
     buf_val = float(cfg.get("def_oi_safety_buffer", 0.0))
     extra = (buf_val * oi_r) if (0.0 < buf_val <= 1.0) else buf_val
-
     oi_safe_r = oi_r + def_keepout_buffer_m + extra
 
     oi_viol_def = False
     oi_viol_att = False
     if oi_enabled and oi_safe_r > 0:
-        # Agent indexing in cfg is ambiguous (you use avoid_by:[1] comment "only player 1 must avoid").
-        # We'll assume: defender=0, attacker=1. If avoid_by contains 1 => defender should avoid.
-        if 0 in avoid_by or 1 in avoid_by:
-            # to be safe, check both possibilities:
-            if 0 in avoid_by:  # defender avoids
-                oi_viol_def = bool(np.any(def_center <= oi_safe_r))
-            if 1 in avoid_by:  # attacker avoids (or your convention says player 1)
-                oi_viol_att = bool(np.any(att_center <= oi_safe_r))
+        # Convention ambiguity: be conservative and check both flags if present.
+        if 0 in avoid_by:
+            oi_viol_def = bool(np.any(def_center <= oi_safe_r))
+        if 1 in avoid_by:
+            oi_viol_att = bool(np.any(att_center <= oi_safe_r))
 
-    # Thrust norms (already clipped) from runner
+    # Thrust norms (post-clip) logged by your runner
     u_norms = out.get("u_cmd_norm_all", None)
     udef_mean = uatt_mean = udef_max = uatt_max = float("nan")
     if u_norms is not None and len(u_norms) >= 2:
@@ -217,9 +228,8 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
         if uatt.size:
             uatt_mean, uatt_max = float(np.mean(uatt)), float(np.max(uatt))
 
-    # Default verification objective for *defender policy readiness*:
+    # Default verification objective for defender policy readiness:
     # PASS if attacker does NOT hit target AND no terminations AND no keepout violation
-    # (collision is a plus but not strictly required unless you set verify_require_capture)
     verify_require_capture = bool(cfg.get("verify_require_capture", False))
     pass_flag = (
         (not attacker_hit)
@@ -344,7 +354,7 @@ def main():
     # Base cfg from your canonical builder
     cfg0: Dict[str, Any] = mod.config_for_eval()
 
-    # Apply simple overrides
+    # Apply simple overrides (used by RLPolicyDiff)
     if args.device is not None:
         cfg0["device"] = args.device
     if args.def_ckpt_path is not None:
@@ -363,7 +373,7 @@ def main():
         if args.x0_vel_jitter is not None:
             cfg0["x0_jitter"]["vel"] = float(args.x0_vel_jitter)
 
-    # Steps override: set cfg["T"] BEFORE build_dyn so LTV sequences match
+    # Steps override: set cfg["T"] BEFORE build_dyn so Ad_seq/Bd_seq sizing matches
     if args.steps is not None:
         cfg0["T"] = int(args.steps)
 
@@ -373,12 +383,13 @@ def main():
     if num_attackers < 1:
         num_attackers = 1
 
-    # Build dynamics once for this cfg (HCW LTI) or sized to T (LTV/two-body cache)
+    # Build dyn once for this cfg (may populate cfg0["dyn"] with Ad/Bd or sequences/caches)
+    # Your runner can also build locally if dyn is missing, but prebuilding is preferred.
     mod.build_dyn(cfg0)
 
     # Start position logs for plots
-    starts_def = []
-    starts_atts = [[] for _ in range(num_attackers)]
+    starts_def: List[np.ndarray] = []
+    starts_atts: List[List[np.ndarray]] = [[] for _ in range(num_attackers)]
 
     # Trial rows
     trial_rows: List[Dict[str, Any]] = []
@@ -386,21 +397,24 @@ def main():
 
     for i in range(int(args.num_trials)):
         seed = int(args.seed + i)
-        np.random.seed(seed)  # runner uses np.random.randn inside UKF measurement noise
+        np.random.seed(seed)  # runner uses np.random.randn for measurement noise
         rng = np.random.default_rng(seed)
 
         cfg_trial = copy.deepcopy(cfg0)
 
         # Build x0 (either sampled or from cfg)
         if args.sample_ic:
-            x0 = _sample_x0(cfg_trial, rng, num_attackers=num_attackers,
-                            pos_scale=float(args.pos_scale),
-                            vel_scale=float(args.vel_scale),
-                            min_sep=float(args.min_sep))
+            x0 = _sample_x0(
+                cfg_trial, rng,
+                num_attackers=num_attackers,
+                pos_scale=float(args.pos_scale),
+                vel_scale=float(args.vel_scale),
+                min_sep=float(args.min_sep),
+            )
         else:
             x0 = np.asarray(cfg_trial["x0"], dtype=float)
 
-        # Optional jitter (cfg_for_eval defaults to 0, but you can override)
+        # Optional jitter
         x0 = _apply_x0_jitter(cfg_trial, x0, rng)
 
         # Record starts (all attackers for plotting)
@@ -430,7 +444,6 @@ def main():
 
         # Aggregate across attackers for the trial
         if args.multi_att_mode == "worst":
-            # worst-case: if any attacker causes failure, trial fails
             pass_trial = int(all(m.get("pass", 0) == 1 for m in per_att_metrics))
         else:
             pass_trial = int(round(np.mean([m.get("pass", 0) for m in per_att_metrics])))
@@ -468,7 +481,6 @@ def main():
     sr = k / max(1, n)
     lo, hi = wilson_ci(k, n, alpha=float(args.alpha))
 
-    # Arrays for metric summaries (att1_*)
     def _col(name: str) -> np.ndarray:
         vals = []
         for r in trial_rows:
@@ -489,7 +501,8 @@ def main():
         "config_module": args.config_module,
         "multi_att_mode": args.multi_att_mode,
         "notes": [
-            "Rollouts use your game_runner_diff (1v1). For num_attackers>1 we run separate episodes def vs att_j.",
+            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff (Diff-Nash RL-only runner).",
+            "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
             "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
             "Set cfg['verify_require_capture']=True to require collision/capture as well.",
         ],
@@ -524,7 +537,10 @@ def main():
 
     # Start plots
     starts_def_arr = np.asarray(starts_def, dtype=float)
-    starts_att_arrs = [np.asarray(sa, dtype=float) if len(sa) else np.zeros((0, D)) for sa in starts_atts]
+    starts_att_arrs = [
+        np.asarray(sa, dtype=float) if len(sa) else np.zeros((0, D))
+        for sa in starts_atts
+    ]
     _save_start_plots(out_dir, D, starts_def_arr, starts_att_arrs)
 
     print(f"[eval] trials={n} passes={k} success_rate={sr:.3f} CI={lo:.3f}..{hi:.3f}")

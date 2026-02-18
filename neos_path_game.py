@@ -4,7 +4,7 @@ import numpy as np
 from pyomo.environ import *
 from pyomo.mpec import Complementarity, complements
 from pyomo.core.expr.calculus.derivatives import differentiate, Modes
-from game_costs import build_game_costs
+from Archive.game_costs import build_game_costs
 
 
 
