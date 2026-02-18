@@ -281,21 +281,21 @@ TRAIN: Dict[str, Any] = {
 
     # Vectorized rollout & logging
     #Long training
-    # "num_envs": 64,   
-    # "steps_per_env": 512,    
-    # "total_updates": 2000,   
-    # "train_epochs": 3,
-    # # "minibatch_size": 8192,  
+    "num_envs": 64,   
+    "steps_per_env": 512,    
+    "total_updates": 2000,   
+    "train_epochs": 3,
+    "minibatch_size": 8192,  
     # "minibatch_size": 6114,  
-    # "log_every": 100,
+    "log_every": 100,
 
     #Short training
-    "num_envs": 8,          
-    "steps_per_env": 256,    
-    "total_updates": 300, 
-    "train_epochs": 10,
-    "minibatch_size": 1024,  
-    "log_every": 10,
+    # "num_envs": 8,          
+    # "steps_per_env": 256,    
+    # "total_updates": 300, 
+    # "train_epochs": 10,
+    # "minibatch_size": 1024,  
+    # "log_every": 10,
 
     # PPO hyperparams
     "gamma": 0.99,
