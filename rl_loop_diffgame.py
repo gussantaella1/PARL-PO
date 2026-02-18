@@ -15,7 +15,7 @@ Key points
 
 import importlib
 import os
-from typing import Dict, Any, Tuple, Callable, List
+from typing import Callable, Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import torch
@@ -26,6 +26,18 @@ import time
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+
+# from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass
+
+
+from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
+import json
+
 
 
 
@@ -508,22 +520,6 @@ class Env:
                     center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
 
 
-                # # normalized distance from defender to center
-                # rho1 = np.linalg.norm(p1 - self.center) / self.radius  # already computed above
-
-                # # keepout radius: object radius + safety buffer, all normalized by arena radius
-                # r_keepout = self.oi_radius_norm + self.def_center_safe_radius  # if you interpret def_center_safe_radius as BUFFER
-
-                # eps = 1e-6
-                # inside = max(0.0, r_keepout - rho1)   # >0 only if inside keepout
-
-                # # Barrier that grows as you go deeper inside keepout
-                # center_keepout = self.k_cent * (inside**2) / (eps + (rho1 - r_keepout)**2)
-                # # simpler variant:
-                # # center_keepout = self.k_cent * (inside**2) / (eps + inside**2)   # bounded 0..k_cent
-
-
-
             # defender radial velocity
             rhat1 = (p1 - self.center)
             rnorm = np.linalg.norm(rhat1) + 1e-9
@@ -554,50 +550,6 @@ class Env:
                 - wall1
                 - center_keepout
             )
-
-        # if need_att:
-        #     R = float(self.radius)
-
-        #     # --- progress toward center (positive is good) ---
-        #     # d2 is normalized squared radius; use radius = sqrt(d2) for better scaling
-        #     d2_prev = float(self._d2_prev if self._d2_prev is not None else d2)
-
-        #     r_prev = np.sqrt(max(d2_prev, 0.0))
-        #     r_now  = np.sqrt(max(float(d2), 0.0))
-        #     progress_r = (r_prev - r_now)  # bigger, better-shaped signal than (d2_prev - d2)
-
-        #     # --- smooth keep-out penalty near defender ---
-        #     # Penalize *approaching* min_sep smoothly (not just violating it).
-        #     dist = float(np.linalg.norm(p2 - p1))  # meters
-        #     x = dist / (float(self.att_min_sep) + 1e-9)  # 1.0 at the boundary
-        #     close_pen = max(0.0, 1.0 - x) ** 2           # ramps up as dist -> min_sep
-
-        #     # --- optional: "defender blocks direct path to center" shaping ---
-        #     # Encourages attacker to approach center from angles that avoid defender being "in front".
-        #     block_pen = 0.0
-        #     if getattr(self, "k_att_block", 0.0) != 0.0:
-        #         u = (self.center - p2)  # attacker -> center
-        #         w = (p1 - p2)           # attacker -> defender
-        #         u_norm = float(np.linalg.norm(u))
-        #         w_norm = float(np.linalg.norm(w))
-        #         if u_norm > 1e-9 and w_norm > 1e-9:
-        #             u_hat = u / u_norm
-        #             # positive if defender lies roughly along the approach direction to center
-        #             proj = float(np.dot(w, u_hat)) / (w_norm + 1e-9)
-        #             block_pen = max(0.0, proj) ** 2
-
-        #     # wall penalty (already computed wall2)
-        #     # speed/effort (already computed v2n2, a2n2)
-
-        #     r2 = (
-        #         + self.k_att_prog  * progress_r
-        #         - self.k_att_cent  * r_now
-        #         - self.k_att_close * close_pen
-        #         - getattr(self, "k_att_block", 0.0) * block_pen
-        #         - self.k_vel       * v2n2
-        #         - self.lA          * a2n2
-        #         - wall2
-        #     )
 
         # if need_att:
         #     # normalized squared distance to center (you already computed d2)
@@ -676,7 +628,7 @@ class Env:
 
 
 
-        # ---- termination always uses TRUE state ----
+        # ---- termination scenariosalways uses TRUE state ----
 
 
         # # target hit: (keep your current meaning = first attacker hits target)
@@ -728,23 +680,27 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
-
-
         if need_def:
-
-            if collision:
-                r1 -= self.collision_penalty_def
-
-            if oob1: r1 -= self.wallK
-            if done and att_hit_target: r1 -= self.def_target_hit_penalty_def
-            if done and def_hit_target: r1 -= self.att_target_hit_penalty_def
+            if done:
+                if collision:
+                    r1 -= self.collision_penalty_def
+                if oob1: 
+                    r1 -= self.wallK
+                if att_hit_target: 
+                    r1 -= self.def_target_hit_penalty_def
+                if def_hit_target: 
+                    r1 -= self.att_target_hit_penalty_def
 
         if need_att:
-            if collision:
-                r2 -= self.collision_penalty_att
+            if done:
+                if collision:
+                    r2 -= self.collision_penalty_att
+                if oob2_any: 
+                    r2 -= self.wallK
+                if att_hit_target: 
+                    r2 += self.att_target_hit_reward_att
 
-            if oob2_any: r2 -= self.wallK
-            if done and att_hit_target: r2 += self.att_target_hit_reward_att
+
             # if done and def_hit_target: r2 += self.def_target_hit_reward_att
 
         # if need_att and done:
@@ -1630,157 +1586,345 @@ def build_full_obs_from_envs(vec: VecEnv, device: str) -> torch.Tensor:
     obs_full_np = np.stack(obs_list, axis=0)
     return torch.as_tensor(obs_full_np, dtype=torch.float32, device=device)
 
+
+#Distillation helpers. 
+# Distillation based on https://arxiv.org/pdf/2308.16185
+
+# -----------------------------
+# Data container (one episode)
+# -----------------------------
+@dataclass
+class DistillEpisode:
+    # Student inputs (what the partially-observable policy is allowed to use)
+    xhat_rel: torch.Tensor       # (T, Dx)   estimated relative state from KF
+    sigma: torch.Tensor          # (T, Ds)   KF covariance features (flattened or compressed)
+    u_prev: torch.Tensor         # (T, Du)   previous pursuer action applied (u_{t-1}), with u_prev[0]=0
+
+    # Teacher labels
+    u_star: torch.Tensor         # (T, Du)   teacher action label
+    z_star: torch.Tensor         # (T, Dz)   teacher intent label
+
+
+# ---------------------------------------
+# Helper: chunk an episode for TBPTT
+# ---------------------------------------
+def _iter_tbptt_chunks(ep: DistillEpisode, chunk_len: int):
+    T = ep.xhat_rel.shape[0]
+    for t0 in range(0, T, chunk_len):
+        t1 = min(T, t0 + chunk_len)
+        yield (
+            ep.xhat_rel[t0:t1],
+            ep.sigma[t0:t1],
+            ep.u_prev[t0:t1],
+            ep.u_star[t0:t1],
+            ep.z_star[t0:t1],
+        )
+
+
+# ---------------------------------------
+# Main distillation function (paper-style)
+# ---------------------------------------
+
+def get_true_rel_state_from_env(env, attacker_idx: int = 0) -> np.ndarray:
+    """
+    x_rel = [p_att - p_def, v_att - v_def]  (Dx = 2*D)
+    Uses TRUE state (not UKF belief).
+    """
+    p1, v1, pA_list, vA_list = env._unpack(env.state)
+    p2 = pA_list[attacker_idx]
+    v2 = vA_list[attacker_idx]
+    x_rel = np.concatenate([p2 - p1, v2 - v1]).astype(np.float32)
+    return x_rel
+
+
+def build_true_teacher_obs_from_env(env, attacker_idx: int = 0) -> np.ndarray:
+    """
+    Teacher-style observation for *one* attacker:
+      o_full = [p1-center, p2-center, (p2-p1), v1, v2]  (shape = 5*D)
+    Uses TRUE p2, v2 (not UKF belief).
+    """
+    p1, v1, pA_list, vA_list = env._unpack(env.state)
+    p2 = pA_list[attacker_idx]
+    v2 = vA_list[attacker_idx]
+    c = env.center
+
+    p1c = p1 - c
+    p2c = p2 - c
+    rel = p2 - p1
+    return np.concatenate([p1c, p2c, rel, v1, v2]).astype(np.float32)
+
 def distill_from_teacher(
-    cfg: Dict[str, Any],
-    teacher_ckpt_path: str,
-    out_path: str = "ppo_def_ukf_distilled.pt",
-):
+    *,
+    env,
+    student: nn.Module,
+    optimizer: torch.optim.Optimizer,
+
+    # --- Paper hooks ---
+    detector_fn: Callable[[Any], Any],
+    kf_step_fn: Callable[[Any, Any], Tuple[np.ndarray, np.ndarray]],
+
+    teacher_label_fn: Callable[[Dict[str, Any]], Tuple[np.ndarray, np.ndarray]],
+
+    # --- Privileged GT hooks ---
+    get_x_rel_t_fn: Callable[[Any], np.ndarray],
+    get_x_rel_future_fn: Callable[[Any, int, int], np.ndarray],
+
+    # --- NEW: attacker action source for stepping your Env ---
+    attacker_action_fn: Optional[Callable[[Any], np.ndarray]] = None,
+    # If None:
+    #   - if env.cfg says attacker_mode='rule', we auto-use AttackerRuleController(cfg)
+    #   - else we default attacker action = zeros
+
+    attacker_idx_for_teacher: int = 0,   # which attacker to label against (teacher/student)
+
+    # --- Training/config ---
+    device: str = "cuda",
+    episodes_per_iter: int = 8,
+    max_steps: int = 300,
+    lookahead_H: int = 15,
+    lambda_intent: float = 1.0,
+    dagger_beta_start: float = 1.0,
+    dagger_beta_end: float = 0.0,
+    dagger_decay_iters: int = 50,
+    iters: int = 100,
+    tbptt_chunk_len: int = 40,
+    grad_clip_norm: float = 1.0,
+    action_loss: str = "mse",
+    intent_loss: str = "mse",
+    reward_mode_for_step: str = "def",   # your Env.step expects "def"/"att"/"both"
+    log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
+) -> None:
     """
-    Distillation phase:
-      - Env runs with UKF / partial observation (cfg['use_ukf']=True).
-      - Defender actions come from a frozen full-state teacher policy.
-      - Student defender sees *belief-based* obs and imitates teacher actions
-        via supervised MSE on the mean action (behavior cloning).
+    Adapted for your Env.step(a1_env, aA_env, reward_mode) signature.
 
-    Returns
-    -------
-    student : ActorCriticDiff
-        The distilled student network.
-    metrics : Dict[str, List[float]]
-        Simple metrics over distillation, currently:
-            - "update": list of update indices where we logged
-            - "bc_mse_dbg": behavior cloning MSE on a debug batch
+    Student is learning the *defender* action u1 (Du = D).
+    Attacker action is supplied by attacker_action_fn (or auto rule/zeros).
     """
-    set_seed(cfg["seed"])
-    device = cfg["device"]
 
-    def make_env():
-        return Env(cfg)
+    student.to(device)
+    student.train()
 
-    num_envs      = int(cfg.get("num_envs", 8))
-    steps_per_env = int(cfg.get("steps_per_env", 256))
-    total_updates = int(cfg.get("total_updates", 300))
-    log_every     = int(cfg.get("log_every", 10))
+    # ----- losses -----
+    if action_loss == "mse":
+        act_crit = nn.MSELoss()
+    elif action_loss == "huber":
+        act_crit = nn.SmoothL1Loss()
+    else:
+        raise ValueError(f"Unsupported action_loss: {action_loss}")
 
-    # Vectorized UKF env (student view)
-    vec = VecEnv(make_env, num_envs)
-    obs_dim = vec.obs.shape[1]
-    act_dim = int(cfg["D"])
+    if intent_loss == "mse":
+        z_crit = nn.MSELoss()
+    elif intent_loss == "huber":
+        z_crit = nn.SmoothL1Loss()
+    else:
+        raise ValueError(f"Unsupported intent_loss: {intent_loss}")
 
-    # ---------- Teacher (full-state policy) ----------
-    teacher = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
-    teacher_state = torch.load(teacher_ckpt_path, map_location=device)
-    teacher.load_state_dict(teacher_state)
-    teacher.eval()   # freeze
-    for p in teacher.parameters():
-        p.requires_grad_(False)
+    def beta_at(iter_idx: int) -> float:
+        if dagger_decay_iters <= 0:
+            return dagger_beta_end
+        a = min(1.0, max(0.0, iter_idx / float(dagger_decay_iters)))
+        return (1.0 - a) * dagger_beta_start + a * dagger_beta_end
 
-    # ---------- Student (belief-based policy) ----------
-    student = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
-    bc_lr = float(cfg.get("distill_lr", cfg["policy_lr"]))
-    student_opt = optim.Adam(
-        list(student.pi.parameters()) + list(student.mu_res.parameters()) + [student.logstd],
-        lr=bc_lr,
-    )
+    # ----- attacker action default (rule if available, else zeros) -----
+    rule_ctrl = None
+    if attacker_action_fn is None:
+        cfg = getattr(env, "cfg", {})
+        mode = cfg.get("attacker_mode", "rule") if isinstance(cfg, dict) else "rule"
 
-    # Attacker remains the same rule-based controller
-    rule_ctrl = AttackerRuleController(cfg)
+        if mode == "rule" and isinstance(cfg, dict) and ("dyn" in cfg):
+            rule_ctrl = AttackerRuleController(cfg)
 
-    mb_size    = int(cfg.get("distill_mb_size", 1024))
-    bc_epochs  = int(cfg.get("distill_epochs", 4))
+        def attacker_action_fn_default(env_local):
+            D = int(env_local.D)
+            Na = int(getattr(env_local, "num_attackers", 1))
 
-    # --- metrics container for distillation ---
-    metrics = {
-        "update": [],
-        "bc_mse_dbg": [],
-    }
+            if rule_ctrl is not None:
+                p1, v1, pA_list, vA_list = env_local._unpack(env_local.state)
+                uA = rule_ctrl.act_multi(p1, v1, pA_list, vA_list)  # (Na, D)
+                # Env.step accepts (D,) when Na=1, or (Na, D) otherwise
+                if Na == 1:
+                    return uA[0]
+                return uA
 
-    print("=== Distillation: teacher -> UKF student ===")
-    print(f"Teacher checkpoint: {teacher_ckpt_path}")
-    print(f"Saving distilled student to: {out_path}")
+            # fallback: zero attacker
+            if Na == 1:
+                return np.zeros((D,), dtype=np.float32)
+            return np.zeros((Na, D), dtype=np.float32)
 
-    for upd in range(1, total_updates + 1):
-        # Storage for this "update"
-        obs_buf = torch.zeros(steps_per_env, num_envs, obs_dim, device=device)
-        act_buf = torch.zeros(steps_per_env, num_envs, act_dim, device=device)
+        attacker_action_fn = attacker_action_fn_default
 
-        # --------- Data collection (teacher drives, student observes) ---------
-        for t in range(steps_per_env):
-            # Student obs (belief-based) from UKF env
-            o_student = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
+    # ============================
+    # Main DAgger distill loop
+    # ============================
+    for it in range(iters):
+        beta = beta_at(it)
 
-            # Build full-state obs for teacher from TRUE state
-            o_teacher = build_full_obs_from_envs(vec, device)
+        # -----------------------------
+        # 1) Collect DAgger rollouts
+        # -----------------------------
+        episodes: List[DistillEpisode] = []
 
-            with torch.no_grad():
-                # Teacher action (env-scaled)
-                a_teacher, _, _ = teacher.act(o_teacher, who="def", act_scale=float(cfg["umax"]))
+        for _ in range(episodes_per_iter):
+            obs = env.reset()
 
-            # Attacker actions from rule controller
-            acts_att = []
-            for e in vec.envs:
-                p1, v1, pA_list, vA_list = e._unpack(e.state)
-                # For now we assume num_attackers == 1
-                p2 = pA_list[0]
-                v2 = vA_list[0]
-                a2 = rule_ctrl.act(p1, v1, p2, v2).astype(np.float32)
-                acts_att.append(a2)
-            a2_env = np.stack(acts_att, axis=0)  # shape [num_envs, D]
+            x_rel_hist: List[np.ndarray] = []
+            u_hist: List[np.ndarray] = []
 
-            # Step env using teacher actions for defender
-            o2_np, _, _, _, _ = vec.step(
-                a_teacher.cpu().numpy(), a2_env
+            xhat_list: List[np.ndarray] = []
+            sig_list: List[np.ndarray] = []
+            u_prev_list: List[np.ndarray] = []
+
+            u_star_list: List[np.ndarray] = []
+            z_star_list: List[np.ndarray] = []
+
+            u_prev = None
+
+            hidden = None
+            if hasattr(student, "init_hidden"):
+                hidden = student.init_hidden(batch_size=1, device=device)
+
+            for t in range(max_steps):
+                # ----- student pipeline: detector -> KF -> (xhat_rel, Sigma) -----
+                y_t = detector_fn(obs)
+                xhat_rel_t_np, Sigma_t_np = kf_step_fn(env, y_t)
+
+                # ----- privileged teacher inputs: GT rel + hist + future -----
+                x_rel_t_np = get_x_rel_t_fn(env)
+                x_rel_hist.append(x_rel_t_np)
+
+                x_rel_future_np = get_x_rel_future_fn(env, t, lookahead_H)
+
+                teacher_in = {
+                    "t": t,
+                    "x_rel_t": x_rel_t_np,
+                    "x_rel_hist": x_rel_hist,
+                    "u_hist": u_hist,
+                    "x_rel_future": x_rel_future_np,
+                    "env_info": {},  # you can stuff anything here if you want
+                }
+                with torch.no_grad():
+                    u_star_t_np, z_star_t_np = teacher_label_fn(teacher_in)
+
+                # ----- student forward -----
+                xhat_rel_t = torch.as_tensor(xhat_rel_t_np, dtype=torch.float32, device=device).view(-1)
+                sigma_t    = torch.as_tensor(Sigma_t_np,    dtype=torch.float32, device=device).view(-1)
+
+                if u_prev is None:
+                    u_prev_np = np.zeros_like(u_star_t_np, dtype=np.float32)
+                else:
+                    u_prev_np = u_prev
+                u_prev_t = torch.as_tensor(u_prev_np, dtype=torch.float32, device=device).view(-1)
+
+                u_pred_t, z_hat_t, hidden = student.step(xhat_rel_t, sigma_t, u_prev_t, hidden)
+
+                # ----- DAgger mixture -----
+                use_teacher = (random.random() < beta)
+                u_apply_np = u_star_t_np if use_teacher else u_pred_t.detach().cpu().numpy()
+
+                # ----- compute attacker action & step YOUR env -----
+                aA_apply_np = attacker_action_fn(env)
+
+                obs, r1, r2, done, info = env.step(
+                    a1_env=u_apply_np,
+                    aA_env=aA_apply_np,
+                    reward_mode=reward_mode_for_step,
+                )
+
+                # (optional) keep latest info handy
+                env.info = info
+
+                # ----- log supervised data (always teacher-labeled) -----
+                xhat_list.append(xhat_rel_t_np.astype(np.float32))
+                sig_list.append(np.asarray(Sigma_t_np, dtype=np.float32).reshape(-1))
+                u_prev_list.append(u_prev_np.astype(np.float32))
+
+                u_star_list.append(np.asarray(u_star_t_np, dtype=np.float32))
+                z_star_list.append(np.asarray(z_star_t_np, dtype=np.float32))
+
+                # histories
+                u_hist.append(np.asarray(u_apply_np, dtype=np.float32))
+                u_prev = np.asarray(u_apply_np, dtype=np.float32)
+
+                if done:
+                    break
+
+            ep = DistillEpisode(
+                xhat_rel=torch.as_tensor(np.stack(xhat_list), device=device),
+                sigma=torch.as_tensor(np.stack(sig_list), device=device),
+                u_prev=torch.as_tensor(np.stack(u_prev_list), device=device),
+                u_star=torch.as_tensor(np.stack(u_star_list), device=device),
+                z_star=torch.as_tensor(np.stack(z_star_list), device=device),
+            )
+            episodes.append(ep)
+
+        # -----------------------------
+        # 2) Supervised update (TBPTT)
+        # -----------------------------
+        total_loss = 0.0
+        total_act  = 0.0
+        total_z    = 0.0
+        n_chunks   = 0
+
+        optimizer.zero_grad(set_to_none=True)
+
+        for ep in episodes:
+            hidden = None
+            if hasattr(student, "init_hidden"):
+                hidden = student.init_hidden(batch_size=1, device=device)
+
+            for (xhat_seq, sig_seq, uprev_seq, ustar_seq, zstar_seq) in _iter_tbptt_chunks(ep, tbptt_chunk_len):
+                # detach hidden between chunks
+                if hidden is not None:
+                    if isinstance(hidden, (tuple, list)):
+                        hidden = tuple(h.detach() for h in hidden)
+                    else:
+                        hidden = hidden.detach()
+
+                u_preds = []
+                z_hats  = []
+
+                Tchunk = xhat_seq.shape[0]
+                for k in range(Tchunk):
+                    u_pred, z_hat, hidden = student.step(
+                        xhat_seq[k].view(-1),
+                        sig_seq[k].view(-1),
+                        uprev_seq[k].view(-1),
+                        hidden,
+                    )
+                    u_preds.append(u_pred.view(1, -1))
+                    z_hats.append(z_hat.view(1, -1))
+
+                u_preds = torch.cat(u_preds, dim=0)
+                z_hats  = torch.cat(z_hats,  dim=0)
+
+                loss_act = act_crit(u_preds, ustar_seq)
+                loss_z   = z_crit(z_hats,  zstar_seq)
+                loss     = loss_act + lambda_intent * loss_z
+
+                loss.backward()
+
+                total_loss += float(loss.detach().cpu())
+                total_act  += float(loss_act.detach().cpu())
+                total_z    += float(loss_z.detach().cpu())
+                n_chunks   += 1
+
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm)
+
+        optimizer.step()
+
+        if log_fn is not None and n_chunks > 0:
+            log_fn(
+                {
+                    "iter": float(it),
+                    "dagger_beta": float(beta),
+                    "loss": total_loss / n_chunks,
+                    "loss_action": total_act / n_chunks,
+                    "loss_intent": total_z / n_chunks,
+                }
             )
 
 
-            # Store belief-obs + teacher action for BC
-            obs_buf[t] = o_student
-            act_buf[t] = a_teacher
-
-            vec.obs = o2_np
-
-        # --------- Behavior cloning update on collected batch ---------
-        B = steps_per_env * num_envs
-        obs_flat = obs_buf.reshape(B, obs_dim)
-        act_flat = act_buf.reshape(B, act_dim)
-
-        # ✅ Option C cleanup at the end of distillation
-        # del obs_buf, act_buf
-        # gc.collect()
-        # if torch.cuda.is_available():
-        #     torch.cuda.empty_cache()
-
-        for _ in range(bc_epochs):
-            perm = torch.randperm(B, device=device)
-            for start in range(0, B, mb_size):
-                idx = perm[start:start + mb_size]
-                o = obs_flat[idx]
-                target = act_flat[idx]
-
-                dist = student.dist(o, who="def")
-                mu = dist.mean
-                bc_loss = ((mu - target) ** 2).mean()
-
-                student_opt.zero_grad(set_to_none=True)
-                bc_loss.backward()
-                nn.utils.clip_grad_norm_(student.parameters(), cfg["max_grad_norm"])
-                student_opt.step()
-
-        # --- logging on a debug batch ---
-        if upd % log_every == 0:
-            with torch.no_grad():
-                dist_dbg = student.dist(obs_flat[:min(B, 2048)], who="def")
-                mse_dbg  = ((dist_dbg.mean - act_flat[:min(B, 2048)])**2).mean().item()
-            print(f"[distill {upd:05d}] BC MSE (dbg batch) = {mse_dbg:.3e}")
-
-            metrics["update"].append(upd)
-            metrics["bc_mse_dbg"].append(mse_dbg)
-
-    # Save student weights
-    torch.save(student.state_dict(), out_path)
-    print(f"Distillation finished. Saved student defender to '{out_path}'.")
-
-    return student, metrics
 
 
 def pretrain_attacker_from_rule(
@@ -1805,6 +1949,7 @@ def pretrain_attacker_from_rule(
 
     set_seed(cfg["seed"])
     device = cfg["device"]
+
 
     # build_dyn(cfg)             # <-- ADD THIS (or ensure_dyn(cfg))
 
@@ -1924,6 +2069,17 @@ def train(cfg: Dict[str, Any]):
     set_seed(cfg["seed"])
     device = cfg["device"]
 
+    writer = None
+    tb_logdir = None
+    global_env_step = 0
+
+    if cfg.get("use_tensorboard", False):
+        writer, tb_logdir = make_tb_writer(cfg)
+
+        # Optional: show model graphs once (often noisy / can break with custom ops)
+        # writer.add_text("notes", "PPO Diffgame run", 0)
+
+
 
     train_role = cfg.get("train_role", "def")  # <-- NEW
 
@@ -2029,6 +2185,8 @@ def train(cfg: Dict[str, Any]):
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
 
     for upd in range(1, total_updates + 1):
+        term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
+
 
         # ---------- optional LR decay (linear) ----------
         if lr_schedule == "linear":
@@ -2142,6 +2300,15 @@ def train(cfg: Dict[str, Any]):
 
                 if "ukf_trPpos" in inf:
                     trP_acc += inf["ukf_trPpos"]
+
+                if inf.get("oob_def", False): term_counts["oob_def"] += 1
+                if inf.get("oob_att", False): term_counts["oob_att"] += 1
+                if inf.get("hit_target", False): term_counts["hit_target"] += 1
+                if inf.get("collision", False): term_counts["collision"] += 1
+
+
+            global_env_step += num_envs
+
 
 
 
@@ -2279,6 +2446,51 @@ def train(cfg: Dict[str, Any]):
             if cfg.get("use_ukf", False):
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
+
+            
+            if writer is not None:
+                gs = global_env_step  # x-axis = env steps
+
+                # ===== Returns =====
+                writer.add_scalar("returns/def_mean", R_def_mean, gs)
+                writer.add_scalar("returns/att_mean", R_att_mean, gs)
+
+                # ===== Distances (meters) =====
+                writer.add_scalar("dist/def_true_p1_to_center_m", d1_true_mean, gs)
+                writer.add_scalar("dist/att_true_p2_to_center_m", d2_true_mean, gs)
+                writer.add_scalar("dist/att_belief_p2_to_center_m", d2_belief_mean, gs)
+
+                # ===== Policy stats =====
+                writer.add_scalar("policy/def_mu_abs_mean", muD, gs)
+                writer.add_scalar("policy/def_std_mean", stdD, gs)
+
+                # ===== Learning rates =====
+                writer.add_scalar("lr/def_policy", lr_pi, gs)
+                writer.add_scalar("lr/def_value",  lr_vf, gs)
+
+                # ===== UKF stats (if enabled) =====
+                if cfg.get("use_ukf", False):
+                    writer.add_scalar("ukf/meas_innov_sq_mean", meas_innov_mean, gs)
+                    writer.add_scalar("ukf/trP_pos_mean", trP_mean, gs)
+
+                if info_count > 0:
+                    term_rates = {k: v / info_count for k, v in term_counts.items()}
+                else:
+                    term_rates = {k: 0.0 for k in term_counts}
+
+
+                writer.add_scalar("term_rate/oob_def", term_rates["oob_def"], gs)
+                writer.add_scalar("term_rate/oob_att", term_rates["oob_att"], gs)
+                writer.add_scalar("term_rate/hit_target", term_rates["hit_target"], gs)
+                writer.add_scalar("term_rate/collision", term_rates["collision"], gs)
+
+                writer.add_scalar("act/def_abs_mean", a1.abs().mean().item(), global_env_step)
+                writer.add_scalar("act/def_abs_max",  a1.abs().max().item(),  global_env_step)
+
+
+
+
+            
             
     # ---- end-of-train cleanup ----
     try:
@@ -2295,10 +2507,9 @@ def train(cfg: Dict[str, Any]):
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-
-
+    if writer is not None:
+        writer.flush()
+        writer.close()
 
     print("Training finished.")
     return ppo, metrics
@@ -2312,6 +2523,7 @@ def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
         states = [env.state.copy()]
         actions = []
         infos = []
+
         done = False
         while not done:
             o_t = torch.as_tensor(obs[None, :], dtype=torch.float32, device=ppo.def_net.logstd.device)
@@ -2670,6 +2882,31 @@ def plot_compare_phases(
 
     return fig, saved_path
 
+def make_tb_writer(cfg: dict, run_name: str | None = None):
+    """
+    Creates a TensorBoard SummaryWriter under:
+      runs/<run_name or timestamped name>/
+
+    Also writes config.json for reproducibility.
+    """
+    root = cfg.get("tb_logdir", "runs")
+    if run_name is None:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = cfg.get("tb_run_name", f"diffgame_{stamp}")
+
+    logdir = os.path.join(root, run_name)
+    os.makedirs(logdir, exist_ok=True)
+
+    # Save config snapshot next to TB logs (nice for later)
+    try:
+        with open(os.path.join(logdir, "config.json"), "w") as f:
+            json.dump(cfg, f, indent=2, default=str)
+    except Exception as e:
+        print("[tb] could not write config.json:", e)
+
+    writer = SummaryWriter(log_dir=logdir)
+    print(f"[tb] logging to: {logdir}")
+    return writer, logdir
 
 
     # ---------------------------------------------------------
@@ -2719,24 +2956,24 @@ def train_defender_with_distill(
     print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
 
     # --- Optional: evaluate teacher (full-state) ---
-    cfg_eval = config_for_eval(
-        attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
-        umax=cfg_teacher["umax"],
-        T=cfg_teacher["T"],
-    )
-    cfg_eval["use_ukf"] = False
-    build_dyn(cfg_eval)
-    trajs = evaluate(ppo_def, cfg_eval, episodes=2)
+    # cfg_eval = config_for_eval(
+    #     attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
+    #     umax=cfg_teacher["umax"],
+    #     T=cfg_teacher["T"],
+    # )
+    # cfg_eval["use_ukf"] = False
+    # build_dyn(cfg_eval)
+    # trajs = evaluate(ppo_def, cfg_eval, episodes=2)
 
-    ar = cfg_eval["arena"]
-    D = cfg_eval["D"]
-    center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
-    R = float(ar["r"])
-    m = rollout_metrics(trajs[0]["states"], center, R)
-    print(
-        f"[{phase_name.upper()} TEACHER metrics] "
-        f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
-    )
+    # ar = cfg_eval["arena"]
+    # D = cfg_eval["D"]
+    # center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
+    # R = float(ar["r"])
+    # m = rollout_metrics(trajs[0]["states"], center, R)
+    # print(
+    #     f"[{phase_name.upper()} TEACHER metrics] "
+    #     f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
+    # )
 
     try:
         del ppo_def, metrics_def
@@ -2859,24 +3096,24 @@ def train_attacker_with_distill(
     print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
 
     # --- Optional: evaluate teacher (full-state) ---
-    cfg_eval = config_for_eval(
-        attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
-        umax=cfg_teacher["umax"],
-        T=cfg_teacher["T"],
-    )
-    cfg_eval["use_ukf"] = False
-    build_dyn(cfg_eval)
-    trajs = evaluate(ppo_att, cfg_eval, episodes=2)
+    # cfg_eval = config_for_eval(
+    #     attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
+    #     umax=cfg_teacher["umax"],
+    #     T=cfg_teacher["T"],
+    # )
+    # cfg_eval["use_ukf"] = False
+    # build_dyn(cfg_eval)
+    # trajs = evaluate(ppo_att, cfg_eval, episodes=2)
 
-    ar = cfg_eval["arena"]
-    D = cfg_eval["D"]
-    center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
-    R = float(ar["r"])
-    m = rollout_metrics(trajs[0]["states"], center, R)
-    print(
-        f"[{phase_name.upper()} TEACHER metrics] "
-        f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
-    )
+    # ar = cfg_eval["arena"]
+    # D = cfg_eval["D"]
+    # center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
+    # R = float(ar["r"])
+    # m = rollout_metrics(trajs[0]["states"], center, R)
+    # print(
+    #     f"[{phase_name.upper()} TEACHER metrics] "
+    #     f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
+    # )
 
     try:
         del ppo_att, metrics_att

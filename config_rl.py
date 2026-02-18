@@ -281,11 +281,12 @@ TRAIN: Dict[str, Any] = {
 
     # Vectorized rollout & logging
     #Long training
-    # "num_envs": 64,          
+    # "num_envs": 64,   
     # "steps_per_env": 512,    
     # "total_updates": 2000,   
     # "train_epochs": 3,
-    # "minibatch_size": 8192,  
+    # # "minibatch_size": 8192,  
+    # "minibatch_size": 6114,  
     # "log_every": 100,
 
     #Short training
@@ -336,12 +337,11 @@ TRAIN: Dict[str, Any] = {
     "att_target_hit_reward_att": 5.0,       # matching positive for attacker
 
     # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
-    "def_oi_safety_buffer": 0.75,
     "def_target_hit_penalty_def": 5.0,     # big negative for defender
     "def_target_hit_reward_att": 0.0,       # matching positive for attacker
 
-    "def_keepout_buffer_m": 1.5,        # meters (keepout buffer around object)
-    "def_target_hit_buffer_frac": 0.0,  # dimensionless fraction of object radius
+    "def_keepout_buffer_m": 1.5,        # meters (keepout buffer around object) - Reward function
+    "def_oi_safety_buffer": 0.25,       #extra percentage - Termination
 
 
 
@@ -350,6 +350,13 @@ TRAIN: Dict[str, Any] = {
     "collision_radius_m": 0.2,            # meters
     "collision_penalty_def": 3.0,         # penalty applied to defender on collision
     "collision_penalty_att": 3.0,         # penalty applied to attacker(s) on collision
+
+
+    #Learning stat tracking
+    "use_tensorboard": True,
+    "tb_logdir": "runs",
+    "tb_run_name": "ppo_diffgame_def",  # customize per experiment
+
 
 }
 
