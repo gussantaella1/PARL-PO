@@ -38,6 +38,9 @@ from torch.utils.tensorboard import SummaryWriter
 from datetime import datetime
 import json
 
+from pathlib import Path
+
+
 
 
 
@@ -1653,278 +1656,646 @@ def build_true_teacher_obs_from_env(env, attacker_idx: int = 0) -> np.ndarray:
     rel = p2 - p1
     return np.concatenate([p1c, p2c, rel, v1, v2]).astype(np.float32)
 
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+import random
+import numpy as np
+import torch
+import torch.nn as nn
+
+
+# def distill_from_teacher(
+#     cfg_student,
+#     def_teacher_ckpt,
+#     *,
+#     out_path=None,
+# ) -> Tuple[nn.Module, Dict[str, float]]:
+
+#     # -------------------------
+#     # Resolve cfg + device
+#     # -------------------------
+#     def _extract_cfg_from_teacher_ckpt(ckpt_path: str) -> Dict[str, Any]:
+#         ckpt = torch.load(str(ckpt_path), map_location="cpu")
+#         cfg = ckpt.get("cfg", None) if isinstance(ckpt, dict) else None
+#         if isinstance(cfg, dict):
+#             return cfg
+#         raise ValueError("Teacher checkpoint missing ['cfg'] dict.")
+
+#     def _extract_cfg() -> Dict[str, Any]:
+#         # 1) Preferred: cfg_student.cfg
+#         cfg = getattr(cfg_student, "cfg", None)
+#         if isinstance(cfg, dict):
+#             return cfg
+
+#         # 2) Allow cfg_student to be dict-like
+#         if isinstance(cfg_student, dict):
+#             return cfg_student.get("cfg", cfg_student)
+
+#         # 3) Fallback: teacher ckpt
+#         if def_teacher_ckpt is not None:
+#             return _extract_cfg_from_teacher_ckpt(def_teacher_ckpt)
+
+#         raise ValueError("Could not resolve cfg dict for distillation.")
+
+#     def _ensure_dyn(cfg: Dict[str, Any]) -> Dict[str, Any]:
+#         dyn = cfg.setdefault("dyn", {})
+#         if dyn.get("Ad", None) is None or dyn.get("Bd", None) is None:
+#             build_dyn(cfg)  # mutates cfg
+#         return cfg
+
+#     cfg = _ensure_dyn(_extract_cfg())
+
+#     device = getattr(cfg_student, "device", None) or cfg.get("device", None)
+#     if device is None:
+#         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+#     # Construct env AFTER dyn is built
+#     env = Env(cfg)
+
+#     # -------------------------
+#     # Build student + required hooks
+#     # -------------------------
+#     cfg_student = config_for_train(
+#             attacker_mode=attacker_mode,
+#             train_role="def",
+#         )
+#     optimizer = cfg_student.make_optimizer(student)
+#     detector_fn = cfg_student.make_detector()
+#     kf_step_fn = cfg_student.make_kf(env)
+#     teacher_label_fn = cfg_student.make_teacher_label_fn(def_teacher_ckpt)
+
+#     get_x_rel_t_fn = getattr(cfg_student, "get_x_rel_t", None)
+#     get_x_rel_future_fn = getattr(cfg_student, "get_x_rel_future", None)
+
+#     attacker_action_fn = getattr(cfg_student, "attacker_action_fn", None)
+
+#     student.to(device)
+#     student.train()
+
+
+#     metrics_last: Dict[str, float] = {}
+
+#     # ----- losses -----
+#     if action_loss == "mse":
+#         act_crit = nn.MSELoss()
+#     elif action_loss == "huber":
+#         act_crit = nn.SmoothL1Loss()
+#     else:
+#         raise ValueError(f"Unsupported action_loss: {action_loss}")
+
+#     if intent_loss == "mse":
+#         z_crit = nn.MSELoss()
+#     elif intent_loss == "huber":
+#         z_crit = nn.SmoothL1Loss()
+#     else:
+#         raise ValueError(f"Unsupported intent_loss: {intent_loss}")
+
+#     def beta_at(iter_idx: int) -> float:
+#         if dagger_decay_iters <= 0:
+#             return float(dagger_beta_end)
+#         a = min(1.0, max(0.0, iter_idx / float(dagger_decay_iters)))
+#         return float((1.0 - a) * dagger_beta_start + a * dagger_beta_end)
+
+#     # ----- attacker action default (rule if available, else zeros) -----
+#     rule_ctrl = None
+#     if attacker_action_fn is None:
+#         cfg = getattr(env, "cfg", {})
+#         mode = cfg.get("attacker_mode", "rule") if isinstance(cfg, dict) else "rule"
+
+#         if mode == "rule" and isinstance(cfg, dict) and ("dyn" in cfg):
+#             # If your project defines this elsewhere, keep it.
+#             rule_ctrl = AttackerRuleController(cfg)
+
+#         def attacker_action_fn(env_local):
+#             D = int(env_local.D)
+#             Na = int(getattr(env_local, "num_attackers", 1))
+
+#             if rule_ctrl is not None:
+#                 p1, v1, pA_list, vA_list = env_local._unpack(env_local.state)
+#                 uA = rule_ctrl.act_multi(p1, v1, pA_list, vA_list)  # (Na, D)
+#                 return uA[0] if Na == 1 else uA
+
+#             return np.zeros((D,), dtype=np.float32) if Na == 1 else np.zeros((Na, D), dtype=np.float32)
+
+#     # -------------------------
+#     # 1) (Optional but loyal) DAgger dataset aggregation
+#     # -------------------------
+#     dataset: List[DistillEpisode] = []
+
+#     # ============================
+#     # Main DAgger distill loop
+#     # ============================
+#     for it in range(iters):
+#         beta = beta_at(it)
+
+#         # -----------------------------
+#         # 1a) Collect DAgger rollouts (new episodes this iter)
+#         # -----------------------------
+#         new_episodes: List[DistillEpisode] = []
+
+#         for _ in range(episodes_per_iter):
+#             obs = env.reset()
+
+#             x_rel_hist: List[np.ndarray] = []
+#             u_hist: List[np.ndarray] = []
+
+#             xhat_list: List[np.ndarray] = []
+#             sig_list: List[np.ndarray] = []
+#             u_prev_list: List[np.ndarray] = []
+
+#             u_star_list: List[np.ndarray] = []
+#             z_star_list: List[np.ndarray] = []
+
+#             u_prev = None
+
+#             hidden = None
+#             if hasattr(student, "init_hidden"):
+#                 hidden = student.init_hidden(batch_size=1, device=device)
+
+#             for t in range(max_steps):
+#                 # ----- student pipeline: detector -> KF -> (xhat_rel, Sigma) -----
+#                 y_t = detector_fn(obs)
+#                 xhat_rel_t_np, Sigma_t_np = kf_step_fn(env, y_t)
+
+#                 # ----- privileged teacher inputs -----
+#                 x_rel_t_np = get_x_rel_t_fn(env)
+#                 x_rel_hist.append(x_rel_t_np)
+
+#                 x_rel_future_np = get_x_rel_future_fn(env, t, lookahead_H)
+
+#                 teacher_in = {
+#                     "t": t,
+#                     "x_rel_t": x_rel_t_np,
+#                     "x_rel_hist": x_rel_hist,
+#                     "u_hist": u_hist,
+#                     "x_rel_future": x_rel_future_np,
+#                     "env_info": {},
+#                 }
+#                 with torch.no_grad():
+#                     u_star_t_np, z_star_t_np = teacher_label_fn(teacher_in)
+
+#                 # ----- student forward -----
+#                 xhat_rel_t = torch.as_tensor(xhat_rel_t_np, dtype=torch.float32, device=device).view(-1)
+#                 sigma_t    = torch.as_tensor(Sigma_t_np,    dtype=torch.float32, device=device).view(-1)
+
+#                 u_prev_np = np.zeros_like(u_star_t_np, dtype=np.float32) if u_prev is None else u_prev
+#                 u_prev_t  = torch.as_tensor(u_prev_np, dtype=torch.float32, device=device).view(-1)
+
+#                 u_pred_t, z_hat_t, hidden = student.step(xhat_rel_t, sigma_t, u_prev_t, hidden)
+
+#                 # ----- DAgger mixture -----
+#                 use_teacher = (random.random() < beta)
+#                 u_apply_np = u_star_t_np if use_teacher else u_pred_t.detach().cpu().numpy()
+
+#                 # ----- attacker action & step env -----
+#                 aA_apply_np = attacker_action_fn(env)
+
+#                 obs, r1, r2, done, info = env.step(
+#                     a1_env=u_apply_np,
+#                     aA_env=aA_apply_np,
+#                     reward_mode=reward_mode_for_step,
+#                 )
+#                 env.info = info
+
+#                 # ----- log supervised data (teacher-labeled) -----
+#                 xhat_list.append(np.asarray(xhat_rel_t_np, dtype=np.float32).reshape(-1))
+#                 sig_list.append(np.asarray(Sigma_t_np, dtype=np.float32).reshape(-1))
+#                 u_prev_list.append(np.asarray(u_prev_np, dtype=np.float32).reshape(-1))
+
+#                 u_star_list.append(np.asarray(u_star_t_np, dtype=np.float32).reshape(-1))
+#                 z_star_list.append(np.asarray(z_star_t_np, dtype=np.float32).reshape(-1))
+
+#                 # histories should match executed action distribution
+#                 u_hist.append(np.asarray(u_apply_np, dtype=np.float32).reshape(-1))
+#                 u_prev = np.asarray(u_apply_np, dtype=np.float32).reshape(-1)
+
+#                 if done:
+#                     break
+
+#             ep = DistillEpisode(
+#                 xhat_rel=torch.as_tensor(np.stack(xhat_list), device=device),
+#                 sigma=torch.as_tensor(np.stack(sig_list), device=device),
+#                 u_prev=torch.as_tensor(np.stack(u_prev_list), device=device),
+#                 u_star=torch.as_tensor(np.stack(u_star_list), device=device),
+#                 z_star=torch.as_tensor(np.stack(z_star_list), device=device),
+#             )
+#             new_episodes.append(ep)
+
+#         # Aggregate (loyal DAgger)
+#         dataset.extend(new_episodes)
+#         if max_dataset_episodes is not None and len(dataset) > int(max_dataset_episodes):
+#             dataset = dataset[-int(max_dataset_episodes):]
+
+#         # -----------------------------
+#         # 1b) Supervised update (TBPTT) over aggregated dataset
+#         # -----------------------------
+#         total_loss = 0.0
+#         total_act  = 0.0
+#         total_z    = 0.0
+#         n_chunks   = 0
+
+#         optimizer.zero_grad(set_to_none=True)
+
+#         for ep in dataset:
+#             hidden = None
+#             if hasattr(student, "init_hidden"):
+#                 hidden = student.init_hidden(batch_size=1, device=device)
+
+#             for (xhat_seq, sig_seq, uprev_seq, ustar_seq, zstar_seq) in _iter_tbptt_chunks(ep, tbptt_chunk_len):
+#                 # detach hidden between chunks
+#                 if hidden is not None:
+#                     if isinstance(hidden, (tuple, list)):
+#                         hidden = tuple(h.detach() for h in hidden)
+#                     else:
+#                         hidden = hidden.detach()
+
+#                 u_preds = []
+#                 z_hats  = []
+
+#                 Tchunk = xhat_seq.shape[0]
+#                 for k in range(Tchunk):
+#                     u_pred, z_hat, hidden = student.step(
+#                         xhat_seq[k].view(-1),
+#                         sig_seq[k].view(-1),
+#                         uprev_seq[k].view(-1),
+#                         hidden,
+#                     )
+#                     u_preds.append(u_pred.view(1, -1))
+#                     z_hats.append(z_hat.view(1, -1))
+
+#                 u_preds = torch.cat(u_preds, dim=0)
+#                 z_hats  = torch.cat(z_hats,  dim=0)
+
+#                 loss_act = act_crit(u_preds, ustar_seq)
+#                 loss_z   = z_crit(z_hats,  zstar_seq)
+#                 loss     = loss_act + lambda_intent * loss_z
+
+#                 loss.backward()
+
+#                 total_loss += float(loss.detach().cpu())
+#                 total_act  += float(loss_act.detach().cpu())
+#                 total_z    += float(loss_z.detach().cpu())
+#                 n_chunks   += 1
+
+#         if grad_clip_norm is not None and grad_clip_norm > 0:
+#             torch.nn.utils.clip_grad_norm_(student.parameters(), float(grad_clip_norm))
+
+#         optimizer.step()
+
+#         if n_chunks > 0:
+#             metrics_last = {
+#                 "iter": float(it),
+#                 "dagger_beta": float(beta),
+#                 "loss": total_loss / n_chunks,
+#                 "loss_action": total_act / n_chunks,
+#                 "loss_intent": total_z / n_chunks,
+#                 "dataset_episodes": float(len(dataset)),
+#             }
+#             if log_fn is not None:
+#                 log_fn(metrics_last)
+
+#     # ============================
+#     # Save distilled student
+#     # ============================
+#     if out_path is not None:
+#         out_path = str(out_path)
+#         Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+
+#         payload = {
+#             "state_dict": student.state_dict(),
+#             "cfg": getattr(env, "cfg", None),
+#             "metrics": metrics_last,
+#             "meta": {
+#                 "iters": int(iters),
+#                 "episodes_per_iter": int(episodes_per_iter),
+#                 "max_steps": int(max_steps),
+#                 "lookahead_H": int(lookahead_H),
+#                 "lambda_intent": float(lambda_intent),
+#                 "dagger_beta_start": float(dagger_beta_start),
+#                 "dagger_beta_end": float(dagger_beta_end),
+#                 "dagger_decay_iters": int(dagger_decay_iters),
+#                 "tbptt_chunk_len": int(tbptt_chunk_len),
+#                 "grad_clip_norm": float(grad_clip_norm) if grad_clip_norm is not None else None,
+#                 "action_loss": str(action_loss),
+#                 "intent_loss": str(intent_loss),
+#                 "reward_mode_for_step": str(reward_mode_for_step),
+#                 "max_dataset_episodes": int(max_dataset_episodes) if max_dataset_episodes is not None else None,
+#             },
+#         }
+#         torch.save(payload, out_path)
+#         print(f"[distill] saved student checkpoint -> {out_path}", flush=True)
+
+#     return student, metrics_last
+
 def distill_from_teacher(
-    *,
-    env,
-    student: nn.Module,
-    optimizer: torch.optim.Optimizer,
-
-    # --- Paper hooks ---
-    detector_fn: Callable[[Any], Any],
-    kf_step_fn: Callable[[Any, Any], Tuple[np.ndarray, np.ndarray]],
-
-    teacher_label_fn: Callable[[Dict[str, Any]], Tuple[np.ndarray, np.ndarray]],
-
-    # --- Privileged GT hooks ---
-    get_x_rel_t_fn: Callable[[Any], np.ndarray],
-    get_x_rel_future_fn: Callable[[Any, int, int], np.ndarray],
-
-    # --- NEW: attacker action source for stepping your Env ---
-    attacker_action_fn: Optional[Callable[[Any], np.ndarray]] = None,
-    # If None:
-    #   - if env.cfg says attacker_mode='rule', we auto-use AttackerRuleController(cfg)
-    #   - else we default attacker action = zeros
-
-    attacker_idx_for_teacher: int = 0,   # which attacker to label against (teacher/student)
-
-    # --- Training/config ---
-    device: str = "cuda",
-    episodes_per_iter: int = 8,
-    max_steps: int = 300,
-    lookahead_H: int = 15,
-    lambda_intent: float = 1.0,
-    dagger_beta_start: float = 1.0,
-    dagger_beta_end: float = 0.0,
-    dagger_decay_iters: int = 50,
-    iters: int = 100,
-    tbptt_chunk_len: int = 40,
-    grad_clip_norm: float = 1.0,
-    action_loss: str = "mse",
-    intent_loss: str = "mse",
-    reward_mode_for_step: str = "def",   # your Env.step expects "def"/"att"/"both"
-    log_fn: Optional[Callable[[Dict[str, float]], None]] = None,
-) -> None:
+    cfg: Dict[str, Any],
+    teacher_ckpt_path: str,
+    out_path: str = "ppo_def_ukf_distilled.pt",
+):
     """
-    Adapted for your Env.step(a1_env, aA_env, reward_mode) signature.
+    Distillation phase (DAgger + distribution matching):
+      - Env runs with UKF / partial observation (cfg['use_ukf']=True).
+      - Teacher defender is frozen PPO policy that acts on *full-state obs* we build from TRUE env state.
+      - Student defender sees UKF belief-based obs (vec.obs) and imitates teacher.
 
-    Student is learning the *defender* action u1 (Du = D).
-    Attacker action is supplied by attacker_action_fn (or auto rule/zeros).
+    Signature + outputs intentionally match your previous distill_from_teacher for swappability.
+
+    Returns
+    -------
+    student : ActorCriticDiff
+        The distilled student network.
+    metrics : Dict[str, List[float]]
+        Logged metrics over distillation:
+          - "update"
+          - "dbg_mse_mean"   : MSE(student_mean, teacher_action) on a debug batch
+          - "dbg_nll"        : -log pi_student(a_teacher) on debug batch (squashed action)
+          - "dbg_kl"         : KL(teacher || student) on debug batch (Gaussian, pre-squash)
+          - "dbg_v_mse"      : optional value distill MSE on debug batch
+          - "beta_exec"      : DAgger mixing prob of executing TEACHER (vs student) this update
     """
+    set_seed(cfg["seed"])
+    device = cfg["device"]
 
-    student.to(device)
-    student.train()
+    # -----------------------
+    # Distill hyperparams
+    # -----------------------
+    num_envs      = int(cfg.get("num_envs", 8))
+    steps_per_env = int(cfg.get("steps_per_env", 256))
+    total_updates = int(cfg.get("total_updates", 300))
+    log_every     = int(cfg.get("log_every", 10))
 
-    # ----- losses -----
-    if action_loss == "mse":
-        act_crit = nn.MSELoss()
-    elif action_loss == "huber":
-        act_crit = nn.SmoothL1Loss()
-    else:
-        raise ValueError(f"Unsupported action_loss: {action_loss}")
+    # DAgger schedule: probability of executing teacher action in the env
+    # Starts high then decays to beta_final.
+    beta0       = float(cfg.get("distill_beta0", 1.0))
+    beta_final  = float(cfg.get("distill_beta_final", 0.05))
+    beta_decay  = cfg.get("distill_beta_decay", "linear")  # "linear" or "exp"
+    beta_exp_k  = float(cfg.get("distill_beta_exp_k", 5.0))  # only if "exp"
 
-    if intent_loss == "mse":
-        z_crit = nn.MSELoss()
-    elif intent_loss == "huber":
-        z_crit = nn.SmoothL1Loss()
-    else:
-        raise ValueError(f"Unsupported intent_loss: {intent_loss}")
+    # Supervised optimization
+    bc_lr     = float(cfg.get("distill_lr", cfg.get("policy_lr", 3e-4)))
+    mb_size   = int(cfg.get("distill_mb_size", 2048))
+    bc_epochs = int(cfg.get("distill_epochs", 4))
 
-    def beta_at(iter_idx: int) -> float:
-        if dagger_decay_iters <= 0:
-            return dagger_beta_end
-        a = min(1.0, max(0.0, iter_idx / float(dagger_decay_iters)))
-        return (1.0 - a) * dagger_beta_start + a * dagger_beta_end
+    # Loss weights
+    w_nll = float(cfg.get("distill_w_nll", 1.0))   # NLL of teacher action under student
+    w_kl  = float(cfg.get("distill_w_kl", 0.25))   # KL(teacher||student) (pre-squash)
+    w_mse = float(cfg.get("distill_w_mse", 0.0))   # optional mean-MSE term (usually 0 if using NLL)
+    w_v   = float(cfg.get("distill_w_v", 0.0))     # optional value distill MSE
 
-    # ----- attacker action default (rule if available, else zeros) -----
-    rule_ctrl = None
-    if attacker_action_fn is None:
-        cfg = getattr(env, "cfg", {})
-        mode = cfg.get("attacker_mode", "rule") if isinstance(cfg, dict) else "rule"
+    # Teacher labeling mode: mean (deterministic) is usually best for distillation
+    teacher_label_mode = cfg.get("distill_teacher_label", "mean")  # "mean" or "sample"
+    assert teacher_label_mode in ("mean", "sample")
 
-        if mode == "rule" and isinstance(cfg, dict) and ("dyn" in cfg):
-            rule_ctrl = AttackerRuleController(cfg)
+    act_scale = float(cfg["umax"])
 
-        def attacker_action_fn_default(env_local):
-            D = int(env_local.D)
-            Na = int(getattr(env_local, "num_attackers", 1))
+    # -----------------------
+    # Build UKF env (student view)
+    # -----------------------
+    def make_env():
+        return Env(cfg)
 
-            if rule_ctrl is not None:
-                p1, v1, pA_list, vA_list = env_local._unpack(env_local.state)
-                uA = rule_ctrl.act_multi(p1, v1, pA_list, vA_list)  # (Na, D)
-                # Env.step accepts (D,) when Na=1, or (Na, D) otherwise
-                if Na == 1:
-                    return uA[0]
-                return uA
+    vec = VecEnv(make_env, num_envs)
+    obs_dim = vec.obs.shape[1]
+    act_dim = int(cfg["D"])
 
-            # fallback: zero attacker
-            if Na == 1:
-                return np.zeros((D,), dtype=np.float32)
-            return np.zeros((Na, D), dtype=np.float32)
+    # -----------------------
+    # Load frozen teacher (full-state)
+    # -----------------------
+    teacher = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
 
-        attacker_action_fn = attacker_action_fn_default
+    def _load_state_dict_robust(model: torch.nn.Module, path: str):
+        payload = torch.load(path, map_location=device)
 
-    # ============================
-    # Main DAgger distill loop
-    # ============================
-    for it in range(iters):
-        beta = beta_at(it)
+        # Case 1: direct state_dict
+        if isinstance(payload, dict) and all(isinstance(k, str) for k in payload.keys()):
+            # Heuristic: if keys look like a state_dict for this model, load directly.
+            try:
+                model.load_state_dict(payload, strict=True)
+                return
+            except Exception:
+                pass
 
-        # -----------------------------
-        # 1) Collect DAgger rollouts
-        # -----------------------------
-        episodes: List[DistillEpisode] = []
+            # Case 2: nested common keys
+            for key in ["state_dict", "model", "policy", "net", "def_net", "actor_critic"]:
+                if key in payload and isinstance(payload[key], dict):
+                    try:
+                        model.load_state_dict(payload[key], strict=True)
+                        return
+                    except Exception:
+                        pass
 
-        for _ in range(episodes_per_iter):
-            obs = env.reset()
+            # Case 3: checkpoint saved from PPO wrapper: keys prefixed with "def_net."
+            if any(k.startswith("def_net.") for k in payload.keys()):
+                stripped = {k[len("def_net."):]: v for k, v in payload.items() if k.startswith("def_net.")}
+                model.load_state_dict(stripped, strict=True)
+                return
 
-            x_rel_hist: List[np.ndarray] = []
-            u_hist: List[np.ndarray] = []
+        raise RuntimeError(
+            f"Could not load teacher checkpoint from {path}. "
+            f"Expected ActorCriticDiff state_dict or a dict containing it."
+        )
 
-            xhat_list: List[np.ndarray] = []
-            sig_list: List[np.ndarray] = []
-            u_prev_list: List[np.ndarray] = []
+    _load_state_dict_robust(teacher, teacher_ckpt_path)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
 
-            u_star_list: List[np.ndarray] = []
-            z_star_list: List[np.ndarray] = []
+    # -----------------------
+    # Student to train (belief-based)
+    # -----------------------
+    student = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    student_opt = optim.Adam(
+        list(student.pi.parameters()) + list(student.mu_res.parameters()) + [student.logstd],
+        lr=bc_lr,
+    )
 
-            u_prev = None
+    # Attacker stays rule-based (true state)
+    rule_ctrl = AttackerRuleController(cfg)
 
-            hidden = None
-            if hasattr(student, "init_hidden"):
-                hidden = student.init_hidden(batch_size=1, device=device)
+    # -----------------------
+    # Metrics
+    # -----------------------
+    metrics = {
+        "update": [],
+        "dbg_mse_mean": [],
+        "dbg_nll": [],
+        "dbg_kl": [],
+        "dbg_v_mse": [],
+        "beta_exec": [],
+    }
 
-            for t in range(max_steps):
-                # ----- student pipeline: detector -> KF -> (xhat_rel, Sigma) -----
-                y_t = detector_fn(obs)
-                xhat_rel_t_np, Sigma_t_np = kf_step_fn(env, y_t)
+    print("=== Distillation (DAgger + NLL/KL) : teacher -> UKF student ===")
+    print(f"Teacher checkpoint: {teacher_ckpt_path}")
+    print(f"Saving distilled student to: {out_path}")
+    print(f"w_nll={w_nll}, w_kl={w_kl}, w_mse={w_mse}, w_v={w_v}")
+    print(f"beta0={beta0}, beta_final={beta_final}, beta_decay={beta_decay}")
 
-                # ----- privileged teacher inputs: GT rel + hist + future -----
-                x_rel_t_np = get_x_rel_t_fn(env)
-                x_rel_hist.append(x_rel_t_np)
+    # -----------------------
+    # Helper: beta schedule
+    # -----------------------
+    def _beta_for_update(upd: int) -> float:
+        if total_updates <= 1:
+            return beta_final
+        frac = (upd - 1) / (total_updates - 1)
+        if beta_decay == "linear":
+            return float(beta0 + (beta_final - beta0) * frac)
+        elif beta_decay == "exp":
+            # beta = beta_final + (beta0-beta_final)*exp(-k*frac)
+            return float(beta_final + (beta0 - beta_final) * np.exp(-beta_exp_k * frac))
+        else:
+            raise ValueError(f"Unknown distill_beta_decay={beta_decay!r}")
 
-                x_rel_future_np = get_x_rel_future_fn(env, t, lookahead_H)
+    # -----------------------
+    # Main distill loop
+    # -----------------------
+    for upd in range(1, total_updates + 1):
+        beta_exec = _beta_for_update(upd)
 
-                teacher_in = {
-                    "t": t,
-                    "x_rel_t": x_rel_t_np,
-                    "x_rel_hist": x_rel_hist,
-                    "u_hist": u_hist,
-                    "x_rel_future": x_rel_future_np,
-                    "env_info": {},  # you can stuff anything here if you want
-                }
-                with torch.no_grad():
-                    u_star_t_np, z_star_t_np = teacher_label_fn(teacher_in)
+        # Buffers (we store BOTH student-obs and teacher-full-obs so we can compute KL + value)
+        obs_student_buf = torch.zeros(steps_per_env, num_envs, obs_dim, device=device)
+        obs_teacher_buf = torch.zeros(steps_per_env, num_envs, obs_dim, device=device)
+        act_teacher_buf = torch.zeros(steps_per_env, num_envs, act_dim, device=device)
 
-                # ----- student forward -----
-                xhat_rel_t = torch.as_tensor(xhat_rel_t_np, dtype=torch.float32, device=device).view(-1)
-                sigma_t    = torch.as_tensor(Sigma_t_np,    dtype=torch.float32, device=device).view(-1)
+        # -------- data collection --------
+        for t in range(steps_per_env):
+            o_student = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
+            o_teacher = build_full_obs_from_envs(vec, device)
 
-                if u_prev is None:
-                    u_prev_np = np.zeros_like(u_star_t_np, dtype=np.float32)
+            with torch.no_grad():
+                dist_t = teacher.dist(o_teacher, who="def")
+                if teacher_label_mode == "mean":
+                    # Deterministic label in env action space (squashed)
+                    a_teacher = squash_action(dist_t.mean, act_scale)
                 else:
-                    u_prev_np = u_prev
-                u_prev_t = torch.as_tensor(u_prev_np, dtype=torch.float32, device=device).view(-1)
+                    # Stochastic label (less common for distill; can help if teacher is very stochastic)
+                    u_raw = dist_t.rsample()
+                    a_teacher = squash_action(u_raw, act_scale)
 
-                u_pred_t, z_hat_t, hidden = student.step(xhat_rel_t, sigma_t, u_prev_t, hidden)
+                # Student action to possibly execute (DAgger)
+                # Use mean for stability in execution (you can flip via cfg if desired)
+                dist_s_exec = student.dist(o_student, who="def")
+                a_student_exec = squash_action(dist_s_exec.mean, act_scale)
 
-                # ----- DAgger mixture -----
-                use_teacher = (random.random() < beta)
-                u_apply_np = u_star_t_np if use_teacher else u_pred_t.detach().cpu().numpy()
+            # Choose which action actually drives the env this step
+            if np.random.rand() < beta_exec:
+                a1_exec = a_teacher
+            else:
+                a1_exec = a_student_exec
 
-                # ----- compute attacker action & step YOUR env -----
-                aA_apply_np = attacker_action_fn(env)
+            # Attacker actions (rule) using TRUE state
+            acts_att = []
+            for e in vec.envs:
+                p1, v1, pA_list, vA_list = e._unpack(e.state)
+                p2 = pA_list[0]
+                v2 = vA_list[0]
+                a2 = rule_ctrl.act(p1, v1, p2, v2).astype(np.float32)
+                acts_att.append(a2)
+            a2_env = np.stack(acts_att, axis=0)  # (N, D)
 
-                obs, r1, r2, done, info = env.step(
-                    a1_env=u_apply_np,
-                    aA_env=aA_apply_np,
-                    reward_mode=reward_mode_for_step,
-                )
-
-                # (optional) keep latest info handy
-                env.info = info
-
-                # ----- log supervised data (always teacher-labeled) -----
-                xhat_list.append(xhat_rel_t_np.astype(np.float32))
-                sig_list.append(np.asarray(Sigma_t_np, dtype=np.float32).reshape(-1))
-                u_prev_list.append(u_prev_np.astype(np.float32))
-
-                u_star_list.append(np.asarray(u_star_t_np, dtype=np.float32))
-                z_star_list.append(np.asarray(z_star_t_np, dtype=np.float32))
-
-                # histories
-                u_hist.append(np.asarray(u_apply_np, dtype=np.float32))
-                u_prev = np.asarray(u_apply_np, dtype=np.float32)
-
-                if done:
-                    break
-
-            ep = DistillEpisode(
-                xhat_rel=torch.as_tensor(np.stack(xhat_list), device=device),
-                sigma=torch.as_tensor(np.stack(sig_list), device=device),
-                u_prev=torch.as_tensor(np.stack(u_prev_list), device=device),
-                u_star=torch.as_tensor(np.stack(u_star_list), device=device),
-                z_star=torch.as_tensor(np.stack(z_star_list), device=device),
+            # Step env
+            o2_np, _, _, _, _ = vec.step(
+                a1_exec.detach().cpu().numpy(),
+                a2_env,
             )
-            episodes.append(ep)
+            vec.obs = o2_np
 
-        # -----------------------------
-        # 2) Supervised update (TBPTT)
-        # -----------------------------
-        total_loss = 0.0
-        total_act  = 0.0
-        total_z    = 0.0
-        n_chunks   = 0
+            # Store for supervised update
+            obs_student_buf[t] = o_student
+            obs_teacher_buf[t] = o_teacher
+            act_teacher_buf[t] = a_teacher
 
-        optimizer.zero_grad(set_to_none=True)
+        # -------- supervised update --------
+        B = steps_per_env * num_envs
+        obs_s = obs_student_buf.reshape(B, obs_dim)
+        obs_t = obs_teacher_buf.reshape(B, obs_dim)
+        act_t = act_teacher_buf.reshape(B, act_dim)
 
-        for ep in episodes:
-            hidden = None
-            if hasattr(student, "init_hidden"):
-                hidden = student.init_hidden(batch_size=1, device=device)
+        for _ in range(bc_epochs):
+            perm = torch.randperm(B, device=device)
+            for start in range(0, B, mb_size):
+                idx = perm[start:start + mb_size]
+                o_s_mb = obs_s[idx]
+                o_t_mb = obs_t[idx]
+                a_t_mb = act_t[idx]
 
-            for (xhat_seq, sig_seq, uprev_seq, ustar_seq, zstar_seq) in _iter_tbptt_chunks(ep, tbptt_chunk_len):
-                # detach hidden between chunks
-                if hidden is not None:
-                    if isinstance(hidden, (tuple, list)):
-                        hidden = tuple(h.detach() for h in hidden)
-                    else:
-                        hidden = hidden.detach()
+                # Student distribution on UKF obs
+                dist_s = student.dist(o_s_mb, who="def")
 
-                u_preds = []
-                z_hats  = []
+                # Teacher distribution on full-state obs (no grad)
+                with torch.no_grad():
+                    dist_t_mb = teacher.dist(o_t_mb, who="def")
 
-                Tchunk = xhat_seq.shape[0]
-                for k in range(Tchunk):
-                    u_pred, z_hat, hidden = student.step(
-                        xhat_seq[k].view(-1),
-                        sig_seq[k].view(-1),
-                        uprev_seq[k].view(-1),
-                        hidden,
-                    )
-                    u_preds.append(u_pred.view(1, -1))
-                    z_hats.append(z_hat.view(1, -1))
+                # (1) NLL of teacher action under student (squashed action)
+                # Convert env action -> raw via atanh for correct squashed logprob
+                u_raw = atanh(torch.clamp(a_t_mb / act_scale, -0.999999, 0.999999))
+                nll = -logprob_squashed(dist_s, u_raw).mean()
 
-                u_preds = torch.cat(u_preds, dim=0)
-                z_hats  = torch.cat(z_hats,  dim=0)
+                # (2) KL(teacher || student) in pre-squash Gaussian space
+                # torch KL returns per-dim; sum dims then mean batch
+                kl = torch.distributions.kl_divergence(dist_t_mb, dist_s).sum(-1).mean()
 
-                loss_act = act_crit(u_preds, ustar_seq)
-                loss_z   = z_crit(z_hats,  zstar_seq)
-                loss     = loss_act + lambda_intent * loss_z
+                # (3) Optional MSE on mean (sometimes helps early)
+                mse = ((dist_s.mean - a_t_mb) ** 2).mean()
 
+                # (4) Optional value distillation: V_student(UKF-obs) ~ V_teacher(full-obs)
+                if w_v != 0.0:
+                    v_s = student.value(o_s_mb)
+                    with torch.no_grad():
+                        v_t = teacher.value(o_t_mb)
+                    v_mse = ((v_s - v_t) ** 2).mean()
+                else:
+                    v_mse = torch.zeros((), device=device)
+
+                loss = (w_nll * nll) + (w_kl * kl) + (w_mse * mse) + (w_v * v_mse)
+
+                student_opt.zero_grad(set_to_none=True)
                 loss.backward()
+                nn.utils.clip_grad_norm_(student.parameters(), cfg.get("max_grad_norm", 0.5))
+                student_opt.step()
 
-                total_loss += float(loss.detach().cpu())
-                total_act  += float(loss_act.detach().cpu())
-                total_z    += float(loss_z.detach().cpu())
-                n_chunks   += 1
+        # -------- logging --------
+        if upd % log_every == 0:
+            with torch.no_grad():
+                dbg_B = min(B, 4096)
+                o_s_dbg = obs_s[:dbg_B]
+                o_t_dbg = obs_t[:dbg_B]
+                a_t_dbg = act_t[:dbg_B]
 
-        if grad_clip_norm is not None and grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm)
+                dist_s_dbg = student.dist(o_s_dbg, who="def")
+                dist_t_dbg = teacher.dist(o_t_dbg, who="def")
 
-        optimizer.step()
+                # Debug metrics
+                dbg_mse = ((dist_s_dbg.mean - a_t_dbg) ** 2).mean().item()
 
-        if log_fn is not None and n_chunks > 0:
-            log_fn(
-                {
-                    "iter": float(it),
-                    "dagger_beta": float(beta),
-                    "loss": total_loss / n_chunks,
-                    "loss_action": total_act / n_chunks,
-                    "loss_intent": total_z / n_chunks,
-                }
+                u_raw_dbg = atanh(torch.clamp(a_t_dbg / act_scale, -0.999999, 0.999999))
+                dbg_nll = (-logprob_squashed(dist_s_dbg, u_raw_dbg)).mean().item()
+
+                dbg_kl = torch.distributions.kl_divergence(dist_t_dbg, dist_s_dbg).sum(-1).mean().item()
+
+                if w_v != 0.0:
+                    v_s = student.value(o_s_dbg)
+                    v_t = teacher.value(o_t_dbg)
+                    dbg_v_mse = ((v_s - v_t) ** 2).mean().item()
+                else:
+                    dbg_v_mse = 0.0
+
+            print(
+                f"[distill {upd:05d}] beta_exec={beta_exec:.3f}  "
+                f"MSE(mean)={dbg_mse:.3e}  NLL={dbg_nll:.3e}  KL={dbg_kl:.3e}  V_MSE={dbg_v_mse:.3e}"
             )
 
+            metrics["update"].append(upd)
+            metrics["dbg_mse_mean"].append(dbg_mse)
+            metrics["dbg_nll"].append(dbg_nll)
+            metrics["dbg_kl"].append(dbg_kl)
+            metrics["dbg_v_mse"].append(dbg_v_mse)
+            metrics["beta_exec"].append(beta_exec)
 
+    # Save student
+    torch.save(student.state_dict(), out_path)
+    print(f"Distillation finished. Saved student defender to '{out_path}'.")
+
+    return student, metrics
 
 
 def pretrain_attacker_from_rule(
@@ -2924,36 +3295,45 @@ def train_defender_with_distill(
     """
 
     # -------- TEACHER (full-state) --------
+
     cfg_teacher = config_for_train(
-        attacker_mode=attacker_mode,
-        train_role="def",
-    )
-    cfg_teacher["use_ukf"] = False  # teacher is full-state
-
-    if extra_train_cfg is not None:
-        cfg_teacher.update(extra_train_cfg)
-
-    # IMPORTANT: read the flag AFTER updates, and default to False if absent
+            attacker_mode=attacker_mode,
+            train_role="def",
+        )
+    
+    BUILD_TEACHER = True
     DISTILL = bool(cfg_teacher.get("distill", False))
 
-    build_dyn(cfg_teacher)
+    if BUILD_TEACHER: 
+        cfg_teacher = config_for_train(
+            attacker_mode=attacker_mode,
+            train_role="def",
+        )
+        cfg_teacher["use_ukf"] = False  # teacher is full-state
 
-    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
-    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-    print(f"[{phase_name.upper()}] distill={DISTILL}")
+        if extra_train_cfg is not None:
+            cfg_teacher.update(extra_train_cfg)
 
-    ppo_def, metrics_def = train(cfg_teacher)
+        # IMPORTANT: read the flag AFTER updates, and default to False if absent
 
-    # --- Save defender teacher checkpoint ---
-    def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
-    torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
-    print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
+        build_dyn(cfg_teacher)
 
-    # --- Save teacher metrics ---
-    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
-    np.savez(metrics_path, **metrics_def)
-    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+        if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
+        print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+        print(f"[{phase_name.upper()}] distill={DISTILL}")
+
+        ppo_def, metrics_def = train(cfg_teacher)
+
+        # --- Save defender teacher checkpoint ---
+        def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_def_teacher.pt")
+        torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
+        print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
+
+        # --- Save teacher metrics ---
+        metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+        np.savez(metrics_path, **metrics_def)
+        print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
 
     # --- Optional: evaluate teacher (full-state) ---
     # cfg_eval = config_for_eval(
@@ -2979,6 +3359,8 @@ def train_defender_with_distill(
         del ppo_def, metrics_def
     except: pass
 
+    # def_teacher_ckpt = "Training_Policy/def0_def_teacher.pt"
+
     # -------- STUDENT (UKF) via distillation (optional) --------
     student_out = None
     if DISTILL:
@@ -2986,6 +3368,7 @@ def train_defender_with_distill(
             attacker_mode=attacker_mode,
             train_role="def",
         )
+
         cfg_student["use_ukf"] = True
         cfg_student["seed"] = cfg_teacher["seed"] + 1
 
@@ -3002,7 +3385,7 @@ def train_defender_with_distill(
 
         student_out = os.path.join(OUT_DIR, f"{phase_name}_def_ukf_student.pt")
         student, metrics_student = distill_from_teacher(
-            cfg_student, def_teacher_ckpt, out_path=student_out
+            cfg_student, def_teacher_ckpt, out_path=student_out,
         )
         print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
 
@@ -3121,7 +3504,7 @@ def train_attacker_with_distill(
 
     # -------- STUDENT (UKF) via distillation (optional) --------
     student_out = None
-    if DISTILL:
+    if False:
         cfg_student = config_for_train(
             attacker_mode="rl",
             train_role="att",
@@ -3142,7 +3525,7 @@ def train_attacker_with_distill(
 
         student_out = os.path.join(OUT_DIR, f"{phase_name}_att_ukf_student.pt")
         student, metrics_student = distill_from_teacher(
-            cfg_student, att_teacher_ckpt, out_path=student_out
+            cfg_student, att_teacher_ckpt, optimizer = torch.optim.Adam(student.parameters(), lr=3e-4), out_path=student_out
         )
         print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
 

@@ -272,7 +272,7 @@ TRAIN: Dict[str, Any] = {
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
-    "distill": False, #Does policy distillation, True or False
+    "distill": True, #Does policy distillation, True or False
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,
@@ -281,21 +281,21 @@ TRAIN: Dict[str, Any] = {
 
     # Vectorized rollout & logging
     #Long training
-    "num_envs": 64,   
-    "steps_per_env": 512,    
-    "total_updates": 2000,   
-    "train_epochs": 3,
-    "minibatch_size": 8192,  
-    # "minibatch_size": 6114,  
-    "log_every": 100,
+    # "num_envs": 64,   
+    # "steps_per_env": 512,    
+    # "total_updates": 2000,   
+    # "train_epochs": 3,
+    # "minibatch_size": 8192,  
+    # # "minibatch_size": 6114,  
+    # "log_every": 100,
 
     #Short training
-    # "num_envs": 8,          
-    # "steps_per_env": 256,    
-    # "total_updates": 300, 
-    # "train_epochs": 10,
-    # "minibatch_size": 1024,  
-    # "log_every": 10,
+    "num_envs": 8,          
+    "steps_per_env": 256,    
+    "total_updates": 300, 
+    "train_epochs": 10,
+    "minibatch_size": 1024,  
+    "log_every": 10,
 
     # PPO hyperparams
     "gamma": 0.99,
@@ -356,6 +356,20 @@ TRAIN: Dict[str, Any] = {
     "use_tensorboard": True,
     "tb_logdir": "runs",
     "tb_run_name": "ppo_diffgame_def",  # customize per experiment
+
+
+    "episodes_per_iter": 8,
+    "max_steps": 300,
+    "lookahead_H": 15,
+    "iters": 100,
+    "tbptt_chunk_len": 40,
+    "dagger_beta_start": 1.0,
+    "dagger_beta_end": 0.0,
+    "dagger_decay_iters": 50,
+    "lambda_intent": 1.0,
+    "reward_mode_for_step": "def",
+
+
 
 
 }
@@ -443,6 +457,56 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
     # ensure placeholders exist
     cfg.setdefault("dyn", {}).setdefault("Ad", None)
     cfg.setdefault("dyn", {}).setdefault("Bd", None)
+
+
+
+    cfg["dispersion"] = {
+        "enabled": True,
+
+        # -------- Initial conditions (episode-level) --------
+        "ic": {
+            "mode": "csv",      # "fixed" | "sample_ball" | "csv"
+            "pos_scale": 0.95,    # only used for sample_ball (fraction of arena_r)
+            "vel_sigma": 0.0,     # m/s (or whatever units your state uses)
+            "min_sep": 0.0,       # meters
+        },
+
+        # -------- Small perturbations around chosen IC --------
+        "x0_jitter": {
+            "pos_sigma": 0.0,     # meters
+            "vel_sigma": 0.0,     # m/s
+        },
+
+        # -------- Observation / measurement noise (inside runner) --------
+        "meas_noise": {
+            "enabled": True,
+            "pos_sigma": 0.0,
+            "vel_sigma": 0.0,
+        },
+
+        # -------- Process noise / acceleration disturbance --------
+        "proc_noise": {
+            "enabled": False,
+            "acc_sigma": 0.0,     # m/s^2
+        },
+
+        # -------- Optional: parameter randomization --------
+        "params": {
+            "enabled": False,
+            # examples:
+            "umax": {"dist": "lognormal", "sigma": 0.10},  # 10% multiplicative
+            "dt":   {"dist": "normal",    "sigma": 0.00},
+            # "mass": {"dist": "normal", "sigma": 0.05},
+        },
+
+        # -------- Random seeds --------
+        "seed": {
+            "episode_seed_base": 0,     # used for IC + jitter + param draws
+            "noise_seed_base": 0,       # used for meas/proc noise (if you separate)
+            "use_global_np_seed": True, # because your runner uses np.random.randn
+        },
+    }
+
     return cfg
 
 # ---------- Dynamics builder ----------
