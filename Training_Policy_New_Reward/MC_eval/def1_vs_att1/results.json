@@ -1,0 +1,62 @@
+{
+  "num_trials": 200,
+  "passes": 140,
+  "success_rate": 0.7,
+  "success_rate_ci_wilson": {
+    "alpha": 0.05,
+    "lo": 0.6332093162728074,
+    "hi": 0.7592525531762859
+  },
+  "config_module": "config_rl",
+  "multi_att_mode": "worst",
+  "timing_sec": {
+    "total": 9.460243701934814,
+    "trial_loop": 9.280051231384277
+  },
+  "notes": [
+    "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff (Diff-Nash RL-only runner).",
+    "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
+    "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
+    "Set cfg['verify_require_capture']=True to require collision/capture as well."
+  ],
+  "metrics_att1": {
+    "min_rel_dist": {
+      "mean": 0.8098443313170938,
+      "q00": 0.12473349599715247,
+      "q25": 0.5682200960450937,
+      "q50": 0.765539713728383,
+      "q75": 1.0517883027699406,
+      "q100": 1.6038147281437034
+    },
+    "min_att_center": {
+      "mean": 1.1738733811370474,
+      "q00": 0.2818628930433524,
+      "q25": 0.9191709499162759,
+      "q50": 1.222694535933981,
+      "q75": 1.4624407082213358,
+      "q100": 1.5833333725876708
+    },
+    "attacker_hit_rate": 0.0,
+    "collision_rate": 0.0,
+    "att_term_rate": 0.0,
+    "def_term_rate": 0.0,
+    "oi_viol_def_rate": 0.0,
+    "oi_viol_att_rate": 0.3,
+    "udef_mean": {
+      "mean": 0.9717632295281937,
+      "q00": 0.8287227632269965,
+      "q25": 0.9317377218021893,
+      "q50": 0.9704052626345961,
+      "q75": 1.0097376211895694,
+      "q100": 1.1472714983823105
+    },
+    "uatt_mean": {
+      "mean": 2.1387052013241514,
+      "q00": 1.5275644866200524,
+      "q25": 1.9756395166752856,
+      "q50": 2.1324179734432396,
+      "q75": 2.3106382662407343,
+      "q100": 2.701499391133155
+    }
+  }
+}

@@ -6,18 +6,17 @@ Statistical verification harness for your Diff-Nash RL rollout runner:
 
   - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff(cfg, steps=...)
 
-This version is explicitly aligned with your *current* game_runner_diff.py
-(the one that:
-  - uses RLPolicyDiff
-  - supports HCW (LTI), elliptic LTV, and two-body nonlinear dynamics
-  - optionally uses HCW-only UKF via cfg["use_ukf"]
-  - logs commanded thrust via out["u_cmd_norm_all"], out["u_cmd_all"]
-  - returns exec1_xyz/exec2_xyz etc. with attitude stubs)
+This version is aligned with your current game_runner_diff.py.
 
-Outputs:
+Outputs (all written under --out_dir):
   - results.json : aggregate stats + Wilson CI on pass rate
-  - trials.csv   : per-trial metrics + seed + initial conditions
+  - trials.csv   : per-trial metrics + seed + initial conditions (+ grid indices if cartesian)
   - starts_xy.png, starts_xz.png : start position coverage (def + attacker(s))
+
+NEW:
+  - --grid_mode paired|cartesian
+    * paired    : use --trials_in rows as (def,att) pairs (your current behavior)
+    * cartesian : use --def_trials_in x --att_trials_in Cartesian product (optionally capped by --max_pairs)
 """
 
 from __future__ import annotations
@@ -31,20 +30,20 @@ import math
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 
-# IMPORTANT: this must match your CURRENT runner file
+# IMPORTANT: must match your CURRENT runner
 from game_runner_diff import run_rhc_with_rl_and_collect_frames_3d_diff
 from dispersion import build_episode_cfg_and_x0
 
-from pathlib import Path
+
+# ------------------------- ckpt overrides -------------------------
 
 def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
     if def_path is not None:
         dp = str(Path(def_path))
-        # keys various loaders might use
         cfg["def_ckpt_path"] = dp
         cfg["def_ckpt"] = dp
         cfg["def_policy_path"] = dp
@@ -60,19 +59,20 @@ def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
         cfg["attacker_ckpt"] = ap
 
 
+# ------------------------- CSV loaders -------------------------
+
 def _load_trials_csv(path: str, D: int) -> List[Dict[str, float]]:
     """
-    Expect columns:
+    Paired mode:
       def_x,def_y,def_z,(optional def_vx,def_vy,def_vz)
       att1_x,att1_y,att1_z,(optional att1_vx,att1_vy,att1_vz)
-    Returns list of dict rows with floats.
     """
     rows: List[Dict[str, float]] = []
     with open(path, "r", newline="") as f:
         r = csv.DictReader(f)
         required = ["def_x", "def_y", "def_z", "att1_x", "att1_y", "att1_z"]
         for k in required:
-            if k not in r.fieldnames:
+            if k not in (r.fieldnames or []):
                 raise RuntimeError(f"trials_in CSV missing required column: '{k}'")
 
         for row in r:
@@ -83,12 +83,69 @@ def _load_trials_csv(path: str, D: int) -> List[Dict[str, float]]:
                 try:
                     out[k] = float(v)
                 except Exception:
-                    # ignore non-numeric columns like 'trial' if present
                     pass
             rows.append(out)
 
     if D != 3:
         raise RuntimeError(f"_load_trials_csv currently expects D=3, got D={D}")
+    return rows
+
+
+def _load_def_csv(path: str, D: int) -> List[Dict[str, float]]:
+    """
+    Defender-only grid:
+      def_x,def_y,def_z,(optional def_vx,def_vy,def_vz)
+    """
+    rows: List[Dict[str, float]] = []
+    with open(path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        required = ["def_x", "def_y", "def_z"]
+        for k in required:
+            if k not in (r.fieldnames or []):
+                raise RuntimeError(f"def_trials_in CSV missing required column: '{k}'")
+
+        for row in r:
+            out: Dict[str, float] = {}
+            for k, v in row.items():
+                if v is None or v == "":
+                    continue
+                try:
+                    out[k] = float(v)
+                except Exception:
+                    pass
+            rows.append(out)
+
+    if D != 3:
+        raise RuntimeError(f"_load_def_csv currently expects D=3, got D={D}")
+    return rows
+
+
+def _load_att_csv(path: str, D: int) -> List[Dict[str, float]]:
+    """
+    Attacker-only grid:
+      att1_x,att1_y,att1_z,(optional att1_vx,att1_vy,att1_vz)
+    """
+    rows: List[Dict[str, float]] = []
+    with open(path, "r", newline="") as f:
+        r = csv.DictReader(f)
+        required = ["att1_x", "att1_y", "att1_z"]
+        for k in required:
+            if k not in (r.fieldnames or []):
+                raise RuntimeError(f"att_trials_in CSV missing required column: '{k}'")
+
+        for row in r:
+            out: Dict[str, float] = {}
+            for k, v in row.items():
+                if v is None or v == "":
+                    continue
+                try:
+                    out[k] = float(v)
+                except Exception:
+                    pass
+            rows.append(out)
+
+    if D != 3:
+        raise RuntimeError(f"_load_att_csv currently expects D=3, got D={D}")
     return rows
 
 
@@ -349,7 +406,7 @@ def main():
     ap.add_argument("--config_module", default="config_rl",
                     help="Python module containing config_for_eval and build_dyn (default: config_rl).")
     ap.add_argument("--out_dir", default="eval_out", help="Output directory.")
-    ap.add_argument("--num_trials", type=int, default=200, help="Number of trials.")
+    ap.add_argument("--num_trials", type=int, default=200, help="Number of trials (paired mode).")
     ap.add_argument("--seed", type=int, default=0, help="Base seed.")
     ap.add_argument("--steps", type=int, default=None,
                     help="Override rollout steps (also sets cfg['T'] for eval and dyn sizing).")
@@ -383,10 +440,21 @@ def main():
                     help="Print exception messages when a trial fails.")
     ap.add_argument("--trace_errors", action="store_true",
                     help="Also print full traceback for failed trials (implies --print_errors).")
-    
-    ap.add_argument("--trials_in", default=None,
-                help="CSV of start states (def/att pos/vel). Overrides cfg['x0'] and --sample_ic.")
 
+    # ---- paired CSV (existing) ----
+    ap.add_argument("--trials_in", default=None,
+                    help="CSV of paired start states (def+att). Overrides cfg['x0'] and --sample_ic (paired mode).")
+
+    # ---- NEW: grid mode ----
+    ap.add_argument("--grid_mode", default="paired", choices=["paired", "cartesian"],
+                    help="paired: use --trials_in as (def,att) rows. "
+                         "cartesian: use --def_trials_in x --att_trials_in product.")
+    ap.add_argument("--def_trials_in", default=None,
+                    help="CSV of defender start states (def_x,def_y,def_z[,def_vx,def_vy,def_vz]).")
+    ap.add_argument("--att_trials_in", default=None,
+                    help="CSV of attacker start states (att1_x,att1_y,att1_z[,att1_vx,att1_vy,att1_vz]).")
+    ap.add_argument("--max_pairs", type=int, default=None,
+                    help="If set in cartesian mode, cap total evaluated pairs (sampled).")
 
     args = ap.parse_args()
     if args.trace_errors:
@@ -397,9 +465,7 @@ def main():
 
     t_global0 = time.time()
     log(f"[eval] starting; out_dir={out_dir.resolve()}")
-    log(f"[eval] config_module={args.config_module} num_trials={args.num_trials} seed_base={args.seed}")
-    if args.steps is not None:
-        log(f"[eval] steps override: {args.steps}")
+    log(f"[eval] config_module={args.config_module}")
 
     # Import config module
     log("[eval] importing config module...")
@@ -411,17 +477,6 @@ def main():
     cfg0: Dict[str, Any] = mod.config_for_eval()
     log("[eval] base cfg created from config_for_eval().")
 
-    trials_in_rows = None
-    if args.trials_in is not None:
-        trials_in_rows = _load_trials_csv(args.trials_in, int(cfg0.get("D", 3)))
-        log(f"[eval] loaded trials_in: {args.trials_in} ({len(trials_in_rows)} rows)")
-        if len(trials_in_rows) < args.num_trials:
-            raise RuntimeError(
-                f"--trials_in has {len(trials_in_rows)} rows but --num_trials={args.num_trials}. "
-                "Either reduce --num_trials or generate a bigger CSV."
-            )
-
-
     # Apply overrides
     if args.device is not None:
         cfg0["device"] = args.device
@@ -432,7 +487,6 @@ def main():
         cfg0["rl_eval_deterministic"] = True
     if args.use_ukf:
         cfg0["use_ukf"] = True
-
 
     if args.x0_pos_jitter is not None or args.x0_vel_jitter is not None:
         cfg0.setdefault("x0_jitter", {})
@@ -446,17 +500,62 @@ def main():
 
     D = int(cfg0.get("D", 3))
     num_attackers = int(cfg0.get("num_attackers", 1))
-    if num_attackers < 1:
-        num_attackers = 1
+    num_attackers = max(1, num_attackers)
 
     dyn_name = str(cfg0.get("dynamics", "hcw"))
     log(f"[eval] cfg summary: D={D} num_attackers={num_attackers} dynamics={dyn_name}")
     log(f"[eval] ckpts: def={cfg0.get('def_ckpt_path', None)} att={cfg0.get('att_ckpt_path', None)} "
         f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} use_ukf={cfg0.get('use_ukf', False)}")
+
+    # ---------------------------
+    # Load trial lists for paired/cartesian
+    # ---------------------------
+    paired_rows: Optional[List[Dict[str, float]]] = None
+    def_rows: Optional[List[Dict[str, float]]] = None
+    att_rows: Optional[List[Dict[str, float]]] = None
+
+    if args.grid_mode == "paired":
+        if args.trials_in is not None:
+            paired_rows = _load_trials_csv(args.trials_in, D)
+            log(f"[eval] loaded paired trials_in: {args.trials_in} ({len(paired_rows)} rows)")
+            if len(paired_rows) < int(args.num_trials):
+                raise RuntimeError(
+                    f"--trials_in has {len(paired_rows)} rows but --num_trials={args.num_trials}. "
+                    "Either reduce --num_trials or provide more rows."
+                )
+        log(f"[eval] paired mode: num_trials={args.num_trials}")
+
+        n_total = int(args.num_trials)
+
+    elif args.grid_mode == "cartesian":
+        if args.def_trials_in is None or args.att_trials_in is None:
+            raise RuntimeError("cartesian mode requires --def_trials_in and --att_trials_in")
+
+        def_rows = _load_def_csv(args.def_trials_in, D)
+        att_rows = _load_att_csv(args.att_trials_in, D)
+
+        total_pairs = len(def_rows) * len(att_rows)
+        if total_pairs <= 0:
+            raise RuntimeError("cartesian mode: empty def/att grids")
+
+        if args.max_pairs is None:
+            n_total = total_pairs
+            log(f"[eval] cartesian mode: evaluating ALL pairs = {total_pairs}")
+        else:
+            n_total = min(int(args.max_pairs), total_pairs)
+            log(f"[eval] cartesian mode: total pairs={total_pairs}, evaluating={n_total} (sampled)")
+
+        log(f"[eval] loaded defender grid: {args.def_trials_in} ({len(def_rows)} rows)")
+        log(f"[eval] loaded attacker grid: {args.att_trials_in} ({len(att_rows)} rows)")
+
+    else:
+        raise RuntimeError(f"Unknown grid_mode={args.grid_mode}")
+
+    # If neither paired csv nor cartesian csv is used, user may sample_ic or cfg['x0']
+    if args.grid_mode == "paired" and paired_rows is None and (not args.sample_ic):
+        log("[eval] using cfg['x0'] (no sampling).")
     if args.sample_ic:
         log(f"[eval] sampling ICs: pos_scale={args.pos_scale} vel_scale={args.vel_scale} min_sep={args.min_sep}")
-    else:
-        log("[eval] using cfg['x0'] (no sampling).")
 
     # Build dyn
     log("[eval] building dynamics via build_dyn(cfg)...")
@@ -470,7 +569,6 @@ def main():
 
     trial_rows: List[Dict[str, Any]] = []
     passes = 0
-    n_total = int(args.num_trials)
 
     log("[eval] beginning trials...")
     t_loop0 = time.time()
@@ -481,19 +579,21 @@ def main():
         np.random.seed(seed)  # runner uses np.random.randn for measurement noise
         rng = np.random.default_rng(seed)
 
-        cfg_trial, x0, ep_seed = build_episode_cfg_and_x0(
+        # Let your dispersion module mutate cfg per episode (kept)
+        cfg_trial, x0_unused, ep_seed = build_episode_cfg_and_x0(
             cfg0,
             episode_idx=i,
-            trials_row=(trials_in_rows[i] if trials_in_rows is not None else None)
+            trials_row=None,  # we handle our own grids below
         )
+        np.random.seed(ep_seed)
 
-        np.random.seed(ep_seed)  # consistent with cfg_trial dispersion seed
-
-
+        # ---------------------------
         # Build x0
-        if trials_in_rows is not None:
-            r = trials_in_rows[i]
+        # ---------------------------
+        cart_di = cart_ai = None
 
+        if args.grid_mode == "paired" and paired_rows is not None:
+            r = paired_rows[i]
             p_def = np.array([r["def_x"], r["def_y"], r["def_z"]], dtype=float)
             v_def = np.array([r.get("def_vx", 0.0), r.get("def_vy", 0.0), r.get("def_vz", 0.0)], dtype=float)
 
@@ -501,7 +601,33 @@ def main():
             v_att = np.array([r.get("att1_vx", 0.0), r.get("att1_vy", 0.0), r.get("att1_vz", 0.0)], dtype=float)
 
             x0 = np.stack([np.concatenate([p_def, v_def]),
-                        np.concatenate([p_att, v_att])], axis=0)
+                           np.concatenate([p_att, v_att])], axis=0)
+
+        elif args.grid_mode == "cartesian":
+            assert def_rows is not None and att_rows is not None
+            total_pairs = len(def_rows) * len(att_rows)
+
+            if args.max_pairs is None:
+                pair_idx = i
+            else:
+                # cheap sampling; not guaranteeing uniqueness (fine for MC)
+                pair_idx = int(rng.integers(0, total_pairs))
+
+            di = pair_idx // len(att_rows)
+            ai = pair_idx % len(att_rows)
+            cart_di, cart_ai = int(di), int(ai)
+
+            rd = def_rows[di]
+            ra = att_rows[ai]
+
+            p_def = np.array([rd["def_x"], rd["def_y"], rd["def_z"]], dtype=float)
+            v_def = np.array([rd.get("def_vx", 0.0), rd.get("def_vy", 0.0), rd.get("def_vz", 0.0)], dtype=float)
+
+            p_att = np.array([ra["att1_x"], ra["att1_y"], ra["att1_z"]], dtype=float)
+            v_att = np.array([ra.get("att1_vx", 0.0), ra.get("att1_vy", 0.0), ra.get("att1_vz", 0.0)], dtype=float)
+
+            x0 = np.stack([np.concatenate([p_def, v_def]),
+                           np.concatenate([p_att, v_att])], axis=0)
 
         elif args.sample_ic:
             x0 = _sample_x0(
@@ -514,9 +640,9 @@ def main():
         else:
             x0 = np.asarray(cfg_trial["x0"], dtype=float)
 
-
         x0 = _apply_x0_jitter(cfg_trial, x0, rng)
 
+        # log starts (for plots)
         starts_def.append(x0[0, :D].copy())
         for j in range(num_attackers):
             if 1 + j < x0.shape[0]:
@@ -525,15 +651,15 @@ def main():
         per_att_metrics = []
         per_att_errors = 0
 
+        # For multi-attackers, you evaluate def vs each attacker separately
         for j in range(num_attackers):
             if 1 + j >= x0.shape[0]:
                 continue
 
-            # inside the inner loop, right before calling run_rhc...
             cfg_run = copy.deepcopy(cfg_trial)
             cfg_run["x0"] = np.asarray([x0[0], x0[1 + j]], dtype=float).tolist()
 
-            # force the CLI ckpt paths onto the actual cfg used in the rollout
+            # force CLI ckpt paths into the rollout cfg
             _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
             try:
@@ -542,7 +668,6 @@ def main():
                 if (i == 0 and j == 0 and args.print_first_out_keys):
                     log("[eval] first rollout returned keys:")
                     log("  " + ", ".join(sorted(list(out.keys()))))
-                    # quick sanity checks
                     p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
                     p2 = np.asarray(out.get("exec2_xyz", []), dtype=float)
                     log(f"[eval] first rollout sanity: len(exec1_xyz)={len(p1)} len(exec2_xyz)={len(p2)}")
@@ -575,19 +700,27 @@ def main():
 
         passes += pass_trial
 
+        # Write one row per trial (stores metrics for attacker #1 only by default, consistent with your current file)
         row: Dict[str, Any] = {
             "trial": i,
             "seed": seed,
+            "grid_mode": args.grid_mode,
             "pass_trial": pass_trial,
             "num_attackers": num_attackers,
             "num_att_errors": per_att_errors,
+
             "def_x": float(x0[0, 0]),
             "def_y": float(x0[0, 1]) if D >= 2 else 0.0,
             "def_z": float(x0[0, 2]) if D == 3 else 0.0,
-            "att1_x": float(x0[1, 0]),
-            "att1_y": float(x0[1, 1]) if D >= 2 else 0.0,
-            "att1_z": float(x0[1, 2]) if D == 3 else 0.0,
+
+            "att1_x": float(x0[1, 0]) if x0.shape[0] > 1 else float("nan"),
+            "att1_y": float(x0[1, 1]) if (x0.shape[0] > 1 and D >= 2) else float("nan"),
+            "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
         }
+
+        if args.grid_mode == "cartesian":
+            row["def_idx"] = cart_di
+            row["att_idx"] = cart_ai
 
         m0 = per_att_metrics[0]
         for k_, v_ in m0.items():
@@ -595,21 +728,24 @@ def main():
 
         trial_rows.append(row)
 
-        # ---- progress print ----
+        # Progress print
         if (i == 0) or ((i + 1) % max(1, int(args.log_every)) == 0) or (i == n_total - 1):
             sr_sofar = passes / float(i + 1)
             dt_trial = time.time() - t_trial0
 
-            # pick a few “am I alive?” indicators
             last_min_rel = row.get("att1_min_rel_dist", None)
             last_hit = row.get("att1_attacker_hit", None)
             last_def_term = row.get("att1_def_term", None)
             last_att_term = row.get("att1_att_term", None)
 
+            extra = ""
+            if args.grid_mode == "cartesian":
+                extra = f" | def_idx={row.get('def_idx')} att_idx={row.get('att_idx')}"
+
             log(f"[eval] progress {i+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
                 f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
                 f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
-                f"errors_this_trial={per_att_errors}")
+                f"errors_this_trial={per_att_errors}{extra}")
 
     # Aggregate stats
     n = len(trial_rows)
@@ -635,16 +771,19 @@ def main():
         "success_rate": float(sr),
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
+        "grid_mode": args.grid_mode,
         "multi_att_mode": args.multi_att_mode,
         "timing_sec": {
             "total": float(time.time() - t_global0),
             "trial_loop": float(time.time() - t_loop0),
         },
         "notes": [
-            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff (Diff-Nash RL-only runner).",
+            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff.",
             "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
             "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
             "Set cfg['verify_require_capture']=True to require collision/capture as well.",
+            "grid_mode=paired uses --trials_in rows; grid_mode=cartesian uses product of --def_trials_in x --att_trials_in.",
+            "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
         ],
         "metrics_att1": {
             "min_rel_dist": {"mean": float(np.nanmean(_col("att1_min_rel_dist"))) if _col("att1_min_rel_dist").size else float("nan"),
@@ -691,3 +830,34 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+
+python evaluate_policy.py \
+  --def_ckpt_path Training_Policy/def1_def_teacher.pt \
+  --att_ckpt_path Training_Policy/att1_att_teacher.pt \
+  --out_dir Training_Policy/MC_eval/def1_vs_att1
+
+"""
+
+"""
+
+python evaluate_policy.py \
+  --def_ckpt_path Training_Policy_New_Reward/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_New_Reward/att1_teacher.pt \
+  --out_dir Training_Policy_New_Reward/MC_eval/def1_vs_att1 \
+  --trials_in shelled_trials.csv
+  
+
+"""
+
+"""
+python evaluate_policy.py \
+  --def_ckpt_path Training_Policy_New_Reward/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_New_Reward/att1_teacher.pt \
+  --out_dir Training_Policy_New_Reward/MC_eval/cart_def1_vs_att1 \
+  --grid_mode cartesian \
+  --def_trials_in shelled_trials.csv \
+  --att_trials_in shelled_trials.csv
+  --max_pairs 5000
+"""

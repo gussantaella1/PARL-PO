@@ -297,12 +297,12 @@ TRAIN: Dict[str, Any] = {
     "log_every": 10,
 
     #Test training
-    "num_envs": 1,          
-    "steps_per_env": 256,    
-    "total_updates": 100, 
-    "train_epochs": 3,
-    "minibatch_size": 1024,  
-    "log_every": 10,
+    # "num_envs": 1,          
+    # "steps_per_env": 256,    
+    # "total_updates": 100, 
+    # "train_epochs": 3,
+    # "minibatch_size": 1024,  
+    # "log_every": 10,
 
     # PPO hyperparams
     "gamma": 0.99,
