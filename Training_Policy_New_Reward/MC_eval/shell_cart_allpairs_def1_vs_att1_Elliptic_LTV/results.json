@@ -1,0 +1,70 @@
+{
+  "num_trials": 6400,
+  "passes": 5341,
+  "success_rate": 0.83453125,
+  "success_rate_ci_wilson": {
+    "alpha": 0.05,
+    "lo": 0.8252269864794248,
+    "hi": 0.8434341644149252
+  },
+  "config_module": "config_rl",
+  "grid_mode": "cartesian",
+  "auto_shell_grid": true,
+  "shell_fracs": "0.25,0.5,0.75,0.9",
+  "points_per_shell": 20,
+  "include_center": false,
+  "multi_att_mode": "worst",
+  "timing_sec": {
+    "total": 2735.7128491401672,
+    "trial_loop": 2734.7397027015686
+  },
+  "notes": [
+    "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff.",
+    "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
+    "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
+    "Set cfg['verify_require_capture']=True to require collision/capture as well.",
+    "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
+    "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
+    "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique)."
+  ],
+  "metrics_att1": {
+    "min_rel_dist": {
+      "mean": 0.7401911184125283,
+      "q00": 0.06977364871786783,
+      "q25": 0.6301658789525499,
+      "q50": 0.7457584241701414,
+      "q75": 0.8550010363653047,
+      "q100": 3.895794903572581
+    },
+    "min_att_center": {
+      "mean": 2.2197843104439117,
+      "q00": 0.06128772420274317,
+      "q25": 1.5627721112262343,
+      "q50": 2.420718843480813,
+      "q75": 2.9906486526022222,
+      "q100": 4.484853088599979
+    },
+    "attacker_hit_rate": 0.0,
+    "collision_rate": 0.0,
+    "att_term_rate": 0.03859375,
+    "def_term_rate": 0.0,
+    "oi_viol_def_rate": 0.0,
+    "oi_viol_att_rate": 0.1340625,
+    "udef_mean": {
+      "mean": 1.1746413346870543,
+      "q00": 0.9126632911674305,
+      "q25": 1.114758479794633,
+      "q50": 1.1692143311597942,
+      "q75": 1.2280928510361737,
+      "q100": 1.467343051084568
+    },
+    "uatt_mean": {
+      "mean": 2.380247218442565,
+      "q00": 2.0203777875941356,
+      "q25": 2.2686484621645815,
+      "q50": 2.35651505008318,
+      "q75": 2.46443588875479,
+      "q100": 3.1608432457327034
+    }
+  }
+}

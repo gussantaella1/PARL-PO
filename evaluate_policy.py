@@ -13,10 +13,16 @@ Outputs (all written under --out_dir):
   - trials.csv   : per-trial metrics + seed + initial conditions (+ grid indices if cartesian)
   - starts_xy.png, starts_xz.png : start position coverage (def + attacker(s))
 
+Grid options:
+  1) --trials_in (paired CSV)                 [grid_mode=paired]
+  2) --def_trials_in + --att_trials_in        [grid_mode=cartesian]
+  3) --auto_shell_grid                        [paired or cartesian, no CSV]
+  4) --sample_ic                              [random sampling, no CSV]
+  5) default: use cfg['x0']                   [single IC]
+
 NEW:
-  - --grid_mode paired|cartesian
-    * paired    : use --trials_in rows as (def,att) pairs (your current behavior)
-    * cartesian : use --def_trials_in x --att_trials_in Cartesian product (optionally capped by --max_pairs)
+  - --auto_shell_grid creates discrete testing points on concentric spherical shells
+    inside the arena, without needing CSV files.
 """
 
 from __future__ import annotations
@@ -209,7 +215,105 @@ def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generat
     return out
 
 
-# ------------------------- scenario generation -------------------------
+# ------------------------- auto shell grid (no CSV) -------------------------
+
+def _fibonacci_sphere_points(n: int, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+    """
+    Points on unit sphere via Fibonacci lattice. Returns (n,3).
+    If rng is provided, applies a random rotation (scramble) while keeping uniformity.
+    """
+    n = int(n)
+    if n <= 0:
+        return np.zeros((0, 3), dtype=float)
+
+    i = np.arange(n, dtype=float)
+    phi = (1.0 + 5.0 ** 0.5) / 2.0
+    theta = 2.0 * np.pi * i / phi
+    z = 1.0 - 2.0 * (i + 0.5) / n
+    r_xy = np.sqrt(np.clip(1.0 - z * z, 0.0, 1.0))
+    x = r_xy * np.cos(theta)
+    y = r_xy * np.sin(theta)
+    pts = np.stack([x, y, z], axis=1)
+
+    if rng is not None:
+        u1, u2, u3 = rng.random(3)
+        q1 = np.sqrt(1 - u1) * np.sin(2 * np.pi * u2)
+        q2 = np.sqrt(1 - u1) * np.cos(2 * np.pi * u2)
+        q3 = np.sqrt(u1) * np.sin(2 * np.pi * u3)
+        q4 = np.sqrt(u1) * np.cos(2 * np.pi * u3)
+        xq, yq, zq, wq = q1, q2, q3, q4
+        R = np.array([
+            [1 - 2*(yq*yq + zq*zq),     2*(xq*yq - zq*wq),     2*(xq*zq + yq*wq)],
+            [    2*(xq*yq + zq*wq), 1 - 2*(xq*xq + zq*zq),     2*(yq*zq - xq*wq)],
+            [    2*(xq*zq - yq*wq),     2*(yq*zq + xq*wq), 1 - 2*(xq*xq + yq*yq)],
+        ], dtype=float)
+        pts = pts @ R.T
+
+    return pts
+
+
+def _generate_shelled_positions(
+    center: np.ndarray,
+    arena_r: float,
+    shell_fracs: List[float],
+    points_per_shell: int,
+    rng: Optional[np.random.Generator] = None,
+    include_center: bool = False,
+) -> np.ndarray:
+    """
+    Generate positions on shells at radii = frac * arena_r. Returns (N,3).
+    """
+    shell_fracs = [float(s) for s in shell_fracs if float(s) > 0.0]
+    pts_all = []
+    if include_center:
+        pts_all.append(center.reshape(1, 3).copy())
+
+    for frac in shell_fracs:
+        rad = frac * float(arena_r)
+        unit = _fibonacci_sphere_points(points_per_shell, rng=rng)
+        pts_all.append(center[None, :] + rad * unit)
+
+    if not pts_all:
+        return np.zeros((0, 3), dtype=float)
+
+    return np.concatenate(pts_all, axis=0)
+
+
+def _rows_from_positions(prefix: str, positions: np.ndarray) -> List[Dict[str, float]]:
+    """
+    Convert positions (N,3) to dict rows with zero velocity.
+    prefix: "def" or "att1"
+    """
+    rows: List[Dict[str, float]] = []
+    for p in positions:
+        rows.append({
+            f"{prefix}_x": float(p[0]),
+            f"{prefix}_y": float(p[1]),
+            f"{prefix}_z": float(p[2]),
+            f"{prefix}_vx": 0.0,
+            f"{prefix}_vy": 0.0,
+            f"{prefix}_vz": 0.0,
+        })
+    return rows
+
+
+def _make_paired_rows_from_def_att(def_rows: List[Dict[str, float]],
+                                   att_rows: List[Dict[str, float]],
+                                   n: int) -> List[Dict[str, float]]:
+    n_pair = min(len(def_rows), len(att_rows), int(n))
+    out: List[Dict[str, float]] = []
+    for i in range(n_pair):
+        rd, ra = def_rows[i], att_rows[i]
+        out.append({
+            "def_x": rd["def_x"], "def_y": rd["def_y"], "def_z": rd["def_z"],
+            "def_vx": rd.get("def_vx", 0.0), "def_vy": rd.get("def_vy", 0.0), "def_vz": rd.get("def_vz", 0.0),
+            "att1_x": ra["att1_x"], "att1_y": ra["att1_y"], "att1_z": ra["att1_z"],
+            "att1_vx": ra.get("att1_vx", 0.0), "att1_vy": ra.get("att1_vy", 0.0), "att1_vz": ra.get("att1_vz", 0.0),
+        })
+    return out
+
+
+# ------------------------- scenario generation (random sampling) -------------------------
 
 def _sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: float) -> np.ndarray:
     D = center.size
@@ -364,36 +468,201 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
 
 # ------------------------- plotting -------------------------
 
-def _save_start_plots(out_dir: Path, D: int,
-                      starts_def: np.ndarray,
-                      starts_atts: List[np.ndarray]) -> None:
+def _save_start_plots(
+    out_dir: Path,
+    cfg: Dict[str, Any],
+    D: int,
+    starts_def: np.ndarray,
+    starts_atts: List[np.ndarray],
+    trial_rows: List[Dict[str, Any]],
+    cmap: str = "viridis",
+    edge_lw: float = 0.7,
+    marker_size: float = 45.0,
+) -> None:
     import matplotlib.pyplot as plt
 
-    plt.figure()
-    plt.scatter(starts_def[:, 0], starts_def[:, 1], marker="o", label="def_start")
-    for j, sa in enumerate(starts_atts):
-        if sa.size == 0:
-            continue
-        plt.scatter(sa[:, 0], sa[:, 1], marker="x", label=f"att{j+1}_start")
-    plt.xlabel("x"); plt.ylabel("y")
-    plt.title("Evaluated Starting Positions (XY)")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    plt.savefig(out_dir / "starts_xy.png", dpi=180)
-    plt.close()
+    if D != 3:
+        raise RuntimeError("_save_start_plots currently expects D=3.")
 
-    plt.figure()
-    z_def = starts_def[:, 2] if D == 3 else np.zeros(starts_def.shape[0])
-    plt.scatter(starts_def[:, 0], z_def, marker="o", label="def_start")
+    center, arena_r = _get_center_and_radius(cfg, D)
+
+    # Pull OI from cfg (like other functions)
+    oi = cfg.get("oi", {}) or {}
+    oi_enabled = bool(oi.get("enabled", False))
+    oi_r = float(oi.get("r", 0.0)) if oi_enabled else 0.0
+
+    # -------------------------
+    # helpers
+    # -------------------------
+    def _set_equal(ax):
+        ax.set_aspect("equal", adjustable="box")
+
+    def _draw_circle(ax, plane: str, r: float, label: str = None, lw: float = 1.2):
+        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        if plane == "xy":
+            circ = plt.Circle((cx, cy), r, fill=False, linewidth=lw)
+            ax.add_patch(circ)
+            if label:
+                ax.text(cx + r, cy, label, fontsize=8, va="center")
+        elif plane == "xz":
+            circ = plt.Circle((cx, cz), r, fill=False, linewidth=lw)
+            ax.add_patch(circ)
+            if label:
+                ax.text(cx + r, cz, label, fontsize=8, va="center")
+        else:
+            raise ValueError(f"unknown plane={plane}")
+
+    def _decorate(ax, plane: str, title: str, xlabel: str, ylabel: str):
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+
+        # Arena boundary
+        _draw_circle(ax, plane, float(arena_r), label="arena", lw=1.2)
+
+        # OI radius
+        if oi_enabled and oi_r > 0:
+            _draw_circle(ax, plane, float(oi_r), label="OI", lw=1.2)
+
+        _set_equal(ax)
+
+    # -------------------------
+    # 1) Plain coverage plots
+    # -------------------------
+    # XY
+    fig, ax = plt.subplots()
+    ax.scatter(
+        starts_def[:, 0], starts_def[:, 1],
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw,
+        label="def_start"
+    )
     for j, sa in enumerate(starts_atts):
         if sa.size == 0:
             continue
-        z_att = sa[:, 2] if D == 3 else np.zeros(sa.shape[0])
-        plt.scatter(sa[:, 0], z_att, marker="x", label=f"att{j+1}_start")
-    plt.xlabel("x"); plt.ylabel("z")
-    plt.title("Evaluated Starting Positions (XZ)")
-    plt.grid(True, alpha=0.3); plt.legend(); plt.tight_layout()
-    plt.savefig(out_dir / "starts_xz.png", dpi=180)
-    plt.close()
+        ax.scatter(
+            sa[:, 0], sa[:, 1],
+            marker="o", s=marker_size,
+            edgecolors="k", linewidths=edge_lw,
+            label=f"att{j+1}_start"
+        )
+    _decorate(ax, "xy", "Evaluated Starting Positions (XY)", "x", "y")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "starts_xy.png", dpi=180)
+    plt.close(fig)
+
+    # XZ
+    fig, ax = plt.subplots()
+    ax.scatter(
+        starts_def[:, 0], starts_def[:, 2],
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw,
+        label="def_start"
+    )
+    for j, sa in enumerate(starts_atts):
+        if sa.size == 0:
+            continue
+        ax.scatter(
+            sa[:, 0], sa[:, 2],
+            marker="o", s=marker_size,
+            edgecolors="k", linewidths=edge_lw,
+            label=f"att{j+1}_start"
+        )
+    _decorate(ax, "xz", "Evaluated Starting Positions (XZ)", "x", "z")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / "starts_xz.png", dpi=180)
+    plt.close(fig)
+
+    # -------------------------
+    # 2) Success-rate overlays
+    # -------------------------
+    def _key(p, nd=6):
+        return (round(float(p[0]), nd), round(float(p[1]), nd), round(float(p[2]), nd))
+
+    def_counts: Dict[Tuple[float, float, float], List[int]] = {}
+    att_counts: Dict[Tuple[float, float, float], List[int]] = {}
+
+    for r in trial_rows:
+        p = int(r.get("pass_trial", 0))
+        kd = _key([r["def_x"], r["def_y"], r["def_z"]])
+        ka = _key([r["att1_x"], r["att1_y"], r["att1_z"]])
+
+        def_counts.setdefault(kd, [0, 0])
+        att_counts.setdefault(ka, [0, 0])
+
+        def_counts[kd][0] += p
+        def_counts[kd][1] += 1
+        att_counts[ka][0] += p
+        att_counts[ka][1] += 1
+
+    def_pts = np.array(list(def_counts.keys()), dtype=float)
+    def_rates = np.array([def_counts[k][0] / max(1, def_counts[k][1]) for k in def_counts], dtype=float)
+
+    att_pts = np.array(list(att_counts.keys()), dtype=float)
+    att_rates = np.array([att_counts[k][0] / max(1, att_counts[k][1]) for k in att_counts], dtype=float)
+
+    # Defender success XY
+    fig, ax = plt.subplots()
+    sc = ax.scatter(
+        def_pts[:, 0], def_pts[:, 1],
+        c=def_rates, cmap=cmap,
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw
+    )
+    _decorate(ax, "xy", "Defender start: pass rate over attacker starts (XY)", "x", "y")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("pass rate")
+    fig.tight_layout()
+    fig.savefig(out_dir / "def_success_xy.png", dpi=180)
+    plt.close(fig)
+
+    # Defender success XZ
+    fig, ax = plt.subplots()
+    sc = ax.scatter(
+        def_pts[:, 0], def_pts[:, 2],
+        c=def_rates, cmap=cmap,
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw
+    )
+    _decorate(ax, "xz", "Defender start: pass rate over attacker starts (XZ)", "x", "z")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("pass rate")
+    fig.tight_layout()
+    fig.savefig(out_dir / "def_success_xz.png", dpi=180)
+    plt.close(fig)
+
+    # Attacker success XY
+    fig, ax = plt.subplots()
+    sc = ax.scatter(
+        att_pts[:, 0], att_pts[:, 1],
+        c=att_rates, cmap=cmap,
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw
+    )
+    _decorate(ax, "xy", "Attacker start: pass rate over defender starts (XY)", "x", "y")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("pass rate")
+    fig.tight_layout()
+    fig.savefig(out_dir / "att_success_xy.png", dpi=180)
+    plt.close(fig)
+
+    # Attacker success XZ
+    fig, ax = plt.subplots()
+    sc = ax.scatter(
+        att_pts[:, 0], att_pts[:, 2],
+        c=att_rates, cmap=cmap,
+        marker="o", s=marker_size,
+        edgecolors="k", linewidths=edge_lw
+    )
+    _decorate(ax, "xz", "Attacker start: pass rate over defender starts (XZ)", "x", "z")
+    cbar = fig.colorbar(sc, ax=ax)
+    cbar.set_label("pass rate")
+    fig.tight_layout()
+    fig.savefig(out_dir / "att_success_xz.png", dpi=180)
+    plt.close(fig)
 
 
 # ------------------------- main -------------------------
@@ -411,16 +680,19 @@ def main():
     ap.add_argument("--steps", type=int, default=None,
                     help="Override rollout steps (also sets cfg['T'] for eval and dyn sizing).")
 
+    # sampling option (random ICs)
     ap.add_argument("--sample_ic", action="store_true",
                     help="If set, ignore cfg['x0'] and sample starts in arena.")
     ap.add_argument("--pos_scale", type=float, default=0.95, help="Sample within pos_scale * arena_r.")
     ap.add_argument("--vel_scale", type=float, default=0.0, help="Stddev of sampled initial velocities.")
     ap.add_argument("--min_sep", type=float, default=0.0, help="Min defender-attacker separation when sampling.")
 
+    # multi-attacker aggregation mode
     ap.add_argument("--multi_att_mode", default="worst",
                     choices=["worst", "avg"],
                     help="If num_attackers>1, evaluate defender vs each attacker separately then aggregate.")
 
+    # common overrides
     ap.add_argument("--device", default=None)
     ap.add_argument("--def_ckpt_path", default=None)
     ap.add_argument("--att_ckpt_path", default=None)
@@ -431,7 +703,7 @@ def main():
 
     ap.add_argument("--alpha", type=float, default=0.05, help="CI alpha (0.05 => 95% CI).")
 
-    # ---- progress / debugging flags ----
+    # progress/debug
     ap.add_argument("--log_every", type=int, default=10,
                     help="Print progress every N trials (default: 10).")
     ap.add_argument("--print_first_out_keys", action="store_true",
@@ -441,11 +713,11 @@ def main():
     ap.add_argument("--trace_errors", action="store_true",
                     help="Also print full traceback for failed trials (implies --print_errors).")
 
-    # ---- paired CSV (existing) ----
+    # paired CSV (existing)
     ap.add_argument("--trials_in", default=None,
                     help="CSV of paired start states (def+att). Overrides cfg['x0'] and --sample_ic (paired mode).")
 
-    # ---- NEW: grid mode ----
+    # grid mode (existing)
     ap.add_argument("--grid_mode", default="paired", choices=["paired", "cartesian"],
                     help="paired: use --trials_in as (def,att) rows. "
                          "cartesian: use --def_trials_in x --att_trials_in product.")
@@ -455,6 +727,29 @@ def main():
                     help="CSV of attacker start states (att1_x,att1_y,att1_z[,att1_vx,att1_vy,att1_vz]).")
     ap.add_argument("--max_pairs", type=int, default=None,
                     help="If set in cartesian mode, cap total evaluated pairs (sampled).")
+
+    # NEW: auto shell grid (no CSV)
+    ap.add_argument("--auto_shell_grid", action="store_true",
+                    help="Generate discrete defender/attacker start grids on spherical shells (no CSV).")
+    ap.add_argument("--shell_fracs", type=str, default="0.2,0.4,0.6,0.8",
+                    help="Comma-separated shell radii as fractions of arena radius (0,1].")
+    ap.add_argument("--points_per_shell", type=int, default=40,
+                    help="Number of points per shell (per agent grid).")
+    ap.add_argument("--include_center", action="store_true",
+                    help="Also include the arena center as an additional point in the grid.")
+    
+    ap.add_argument(
+        "--dynamics",
+        default=None,
+        choices=["hcw", "two_body", "elliptic_ltv"],
+        help="Override dynamics model used in rollouts (overrides cfg['dynamics'])."
+    )
+    ap.add_argument(
+        "--dt",
+        type=float,
+        default=None,
+        help="Optional override for cfg['dt'] (if you want)."
+    )
 
     args = ap.parse_args()
     if args.trace_errors:
@@ -475,7 +770,18 @@ def main():
     log("[eval] config module imported OK.")
 
     cfg0: Dict[str, Any] = mod.config_for_eval()
+
     log("[eval] base cfg created from config_for_eval().")
+
+
+    # Dynamics override (must happen before build_dyn)
+    if args.dynamics is not None:
+        cfg0["dynamics"] = str(args.dynamics)
+
+    if args.dt is not None:
+        cfg0["dt"] = float(args.dt)
+
+    mod.build_dyn(cfg0)
 
     # Apply overrides
     if args.device is not None:
@@ -499,38 +805,89 @@ def main():
         cfg0["T"] = int(args.steps)
 
     D = int(cfg0.get("D", 3))
-    num_attackers = int(cfg0.get("num_attackers", 1))
-    num_attackers = max(1, num_attackers)
-
+    num_attackers = max(1, int(cfg0.get("num_attackers", 1)))
     dyn_name = str(cfg0.get("dynamics", "hcw"))
     log(f"[eval] cfg summary: D={D} num_attackers={num_attackers} dynamics={dyn_name}")
     log(f"[eval] ckpts: def={cfg0.get('def_ckpt_path', None)} att={cfg0.get('att_ckpt_path', None)} "
         f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} use_ukf={cfg0.get('use_ukf', False)}")
 
     # ---------------------------
-    # Load trial lists for paired/cartesian
+    # Build dyn (once, based on cfg0)
+    # ---------------------------
+    log("[eval] building dynamics via build_dyn(cfg)...")
+    t_dyn0 = time.time()
+    mod.build_dyn(cfg0)
+    log(f"[eval] build_dyn done in {time.time() - t_dyn0:.3f}s.")
+
+    # ---------------------------
+    # Prepare trial lists (paired/cartesian/auto/random/default)
     # ---------------------------
     paired_rows: Optional[List[Dict[str, float]]] = None
     def_rows: Optional[List[Dict[str, float]]] = None
     att_rows: Optional[List[Dict[str, float]]] = None
 
-    if args.grid_mode == "paired":
-        if args.trials_in is not None:
-            paired_rows = _load_trials_csv(args.trials_in, D)
-            log(f"[eval] loaded paired trials_in: {args.trials_in} ({len(paired_rows)} rows)")
-            if len(paired_rows) < int(args.num_trials):
-                raise RuntimeError(
-                    f"--trials_in has {len(paired_rows)} rows but --num_trials={args.num_trials}. "
-                    "Either reduce --num_trials or provide more rows."
-                )
-        log(f"[eval] paired mode: num_trials={args.num_trials}")
+    n_total: int
 
+    # 3) AUTO SHELL GRID (no CSV)
+    if args.auto_shell_grid:
+        if D != 3:
+            raise RuntimeError("--auto_shell_grid currently supports only D=3 (sphere).")
+
+        center, arena_r = _get_center_and_radius(cfg0, D)
+
+        shell_fracs = [float(s.strip()) for s in args.shell_fracs.split(",") if s.strip() != ""]
+        shell_fracs = [s for s in shell_fracs if 0.0 < s <= 1.0]
+        if not shell_fracs:
+            raise RuntimeError("No valid --shell_fracs provided (must be in (0,1]).")
+
+        rng_grid = np.random.default_rng(int(args.seed) + 12345)
+
+        def_pos = _generate_shelled_positions(center, arena_r, shell_fracs, int(args.points_per_shell),
+                                              rng=rng_grid, include_center=bool(args.include_center))
+        att_pos = _generate_shelled_positions(center, arena_r, shell_fracs, int(args.points_per_shell),
+                                              rng=rng_grid, include_center=bool(args.include_center))
+
+        def_rows = _rows_from_positions("def", def_pos)
+        att_rows = _rows_from_positions("att1", att_pos)
+
+        # Now choose how to pair them
+        if args.grid_mode == "paired":
+            # n_total bounded by requested num_trials and available pairs
+            n_total = min(int(args.num_trials), min(len(def_rows), len(att_rows)))
+            paired_rows = _make_paired_rows_from_def_att(def_rows, att_rows, n_total)
+            log(f"[eval] auto_shell_grid paired: shells={shell_fracs} points_per_shell={args.points_per_shell} "
+                f"include_center={args.include_center} -> paired_rows={len(paired_rows)}")
+        else:
+            total_pairs = len(def_rows) * len(att_rows)
+            if args.max_pairs is None:
+                n_total = total_pairs
+                log(f"[eval] auto_shell_grid cartesian: evaluating ALL pairs = {total_pairs}")
+            else:
+                n_total = min(int(args.max_pairs), total_pairs)
+                log(f"[eval] auto_shell_grid cartesian: total pairs={total_pairs}, evaluating={n_total} (sampled)")
+            log(f"[eval] auto_shell_grid cartesian grids: def_rows={len(def_rows)} att_rows={len(att_rows)}")
+
+        # Make CSV args irrelevant
+        args.trials_in = None
+        args.def_trials_in = None
+        args.att_trials_in = None
+
+    # 1) PAIRED CSV
+    elif args.grid_mode == "paired" and args.trials_in is not None:
+        paired_rows = _load_trials_csv(args.trials_in, D)
+        log(f"[eval] loaded paired trials_in: {args.trials_in} ({len(paired_rows)} rows)")
+        if len(paired_rows) < int(args.num_trials):
+            raise RuntimeError(
+                f"--trials_in has {len(paired_rows)} rows but --num_trials={args.num_trials}. "
+                "Either reduce --num_trials or provide more rows."
+            )
         n_total = int(args.num_trials)
+        log(f"[eval] paired CSV mode: num_trials={n_total}")
 
+    # 2) CARTESIAN CSV
     elif args.grid_mode == "cartesian":
         if args.def_trials_in is None or args.att_trials_in is None:
-            raise RuntimeError("cartesian mode requires --def_trials_in and --att_trials_in")
-
+            raise RuntimeError("cartesian mode requires --def_trials_in and --att_trials_in (unless using --auto_shell_grid)")
         def_rows = _load_def_csv(args.def_trials_in, D)
         att_rows = _load_att_csv(args.att_trials_in, D)
 
@@ -548,20 +905,15 @@ def main():
         log(f"[eval] loaded defender grid: {args.def_trials_in} ({len(def_rows)} rows)")
         log(f"[eval] loaded attacker grid: {args.att_trials_in} ({len(att_rows)} rows)")
 
+    # 4) RANDOM SAMPLING
+    elif args.sample_ic:
+        n_total = int(args.num_trials)
+        log(f"[eval] random sampling: num_trials={n_total} pos_scale={args.pos_scale} vel_scale={args.vel_scale} min_sep={args.min_sep}")
+
+    # 5) DEFAULT SINGLE x0
     else:
-        raise RuntimeError(f"Unknown grid_mode={args.grid_mode}")
-
-    # If neither paired csv nor cartesian csv is used, user may sample_ic or cfg['x0']
-    if args.grid_mode == "paired" and paired_rows is None and (not args.sample_ic):
-        log("[eval] using cfg['x0'] (no sampling).")
-    if args.sample_ic:
-        log(f"[eval] sampling ICs: pos_scale={args.pos_scale} vel_scale={args.vel_scale} min_sep={args.min_sep}")
-
-    # Build dyn
-    log("[eval] building dynamics via build_dyn(cfg)...")
-    t_dyn0 = time.time()
-    mod.build_dyn(cfg0)
-    log(f"[eval] build_dyn done in {time.time() - t_dyn0:.3f}s. dyn keys={list((cfg0.get('dyn', {}) or {}).keys())}")
+        n_total = 1
+        log("[eval] default mode: using cfg['x0'] once (n_total=1).")
 
     # Start position logs
     starts_def: List[np.ndarray] = []
@@ -576,23 +928,36 @@ def main():
     for i in range(n_total):
         t_trial0 = time.time()
         seed = int(args.seed + i)
-        np.random.seed(seed)  # runner uses np.random.randn for measurement noise
+
+        # Runner uses np.random for measurement noise, so set it
+        np.random.seed(seed)
         rng = np.random.default_rng(seed)
 
-        # Let your dispersion module mutate cfg per episode (kept)
-        cfg_trial, x0_unused, ep_seed = build_episode_cfg_and_x0(
+        # Let dispersion mutate cfg per episode (kept)
+        cfg_trial, _x0_unused, ep_seed = build_episode_cfg_and_x0(
             cfg0,
             episode_idx=i,
             trials_row=None,  # we handle our own grids below
         )
-        np.random.seed(ep_seed)
+
+
+        if args.dynamics is not None:
+            cfg_trial["dynamics"] = str(args.dynamics)
+        if args.dt is not None:
+            cfg_trial["dt"] = float(args.dt)
+        
+        np.random.seed(int(ep_seed))
+
+        # Always keep T as a clean int if it exists
+        if "T" in cfg_trial and cfg_trial["T"] is not None:
+            cfg_trial["T"] = int(cfg_trial["T"])
 
         # ---------------------------
-        # Build x0
+        # Build x0 for this trial
         # ---------------------------
         cart_di = cart_ai = None
 
-        if args.grid_mode == "paired" and paired_rows is not None:
+        if paired_rows is not None:
             r = paired_rows[i]
             p_def = np.array([r["def_x"], r["def_y"], r["def_z"]], dtype=float)
             v_def = np.array([r.get("def_vx", 0.0), r.get("def_vy", 0.0), r.get("def_vz", 0.0)], dtype=float)
@@ -603,14 +968,13 @@ def main():
             x0 = np.stack([np.concatenate([p_def, v_def]),
                            np.concatenate([p_att, v_att])], axis=0)
 
-        elif args.grid_mode == "cartesian":
-            assert def_rows is not None and att_rows is not None
+        elif args.grid_mode == "cartesian" and (def_rows is not None and att_rows is not None):
             total_pairs = len(def_rows) * len(att_rows)
 
             if args.max_pairs is None:
                 pair_idx = i
             else:
-                # cheap sampling; not guaranteeing uniqueness (fine for MC)
+                # sampled pairs (not guaranteed unique) - fine for MC
                 pair_idx = int(rng.integers(0, total_pairs))
 
             di = pair_idx // len(att_rows)
@@ -637,6 +1001,7 @@ def main():
                 vel_scale=float(args.vel_scale),
                 min_sep=float(args.min_sep),
             )
+
         else:
             x0 = np.asarray(cfg_trial["x0"], dtype=float)
 
@@ -651,7 +1016,7 @@ def main():
         per_att_metrics = []
         per_att_errors = 0
 
-        # For multi-attackers, you evaluate def vs each attacker separately
+        # For multi-attackers, evaluate def vs each attacker separately
         for j in range(num_attackers):
             if 1 + j >= x0.shape[0]:
                 continue
@@ -662,8 +1027,16 @@ def main():
             # force CLI ckpt paths into the rollout cfg
             _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
+            # Determine steps for this rollout (never pass None)
+            steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
+            if steps_run <= 0:
+                raise RuntimeError(f"Invalid steps_run={steps_run}. Provide --steps or ensure cfg['T'] is set.")
+
+            # Also keep cfg_run['T'] consistent with steps
+            cfg_run["T"] = steps_run
+
             try:
-                out = run_rhc_with_rl_and_collect_frames_3d_diff(cfg_run, steps=args.steps)
+                out = run_rhc_with_rl_and_collect_frames_3d_diff(cfg_run, steps=steps_run)
 
                 if (i == 0 and j == 0 and args.print_first_out_keys):
                     log("[eval] first rollout returned keys:")
@@ -700,11 +1073,11 @@ def main():
 
         passes += pass_trial
 
-        # Write one row per trial (stores metrics for attacker #1 only by default, consistent with your current file)
+        # One row per trial; stores attacker #1 metrics by default
         row: Dict[str, Any] = {
             "trial": i,
             "seed": seed,
-            "grid_mode": args.grid_mode,
+            "grid_mode": args.grid_mode if not args.auto_shell_grid else f"{args.grid_mode}+auto_shell",
             "pass_trial": pass_trial,
             "num_attackers": num_attackers,
             "num_att_errors": per_att_errors,
@@ -718,7 +1091,7 @@ def main():
             "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
         }
 
-        if args.grid_mode == "cartesian":
+        if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
             row["def_idx"] = cart_di
             row["att_idx"] = cart_ai
 
@@ -772,6 +1145,10 @@ def main():
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
         "grid_mode": args.grid_mode,
+        "auto_shell_grid": bool(args.auto_shell_grid),
+        "shell_fracs": args.shell_fracs if args.auto_shell_grid else None,
+        "points_per_shell": int(args.points_per_shell) if args.auto_shell_grid else None,
+        "include_center": bool(args.include_center) if args.auto_shell_grid else None,
         "multi_att_mode": args.multi_att_mode,
         "timing_sec": {
             "total": float(time.time() - t_global0),
@@ -782,7 +1159,8 @@ def main():
             "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
             "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
             "Set cfg['verify_require_capture']=True to require collision/capture as well.",
-            "grid_mode=paired uses --trials_in rows; grid_mode=cartesian uses product of --def_trials_in x --att_trials_in.",
+            "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
+            "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
             "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
         ],
         "metrics_att1": {
@@ -818,7 +1196,18 @@ def main():
         np.asarray(sa, dtype=float) if len(sa) else np.zeros((0, D))
         for sa in starts_atts
     ]
-    _save_start_plots(out_dir, D, starts_def_arr, starts_att_arrs)
+
+    center, arena_r = _get_center_and_radius(cfg0, D)
+
+    _save_start_plots(
+        out_dir=out_dir,
+        cfg=cfg0,                 # <-- gives plot fn access to oi + arena
+        D=D,
+        starts_def=starts_def_arr,
+        starts_atts=starts_att_arrs,
+        trial_rows=trial_rows,
+        cmap="coolwarm",          # or whatever you want
+    )
 
     log(f"[eval] DONE | trials={n} passes={k} success_rate={sr:.3f} CI={lo:.3f}..{hi:.3f}")
     log(f"[eval] wrote: {out_dir/'results.json'}")
@@ -860,4 +1249,23 @@ python evaluate_policy.py \
   --def_trials_in shelled_trials.csv \
   --att_trials_in shelled_trials.csv
   --max_pairs 5000
+"""
+
+
+"""
+python evaluate_policy.py \
+  --def_ckpt_path Training_Policy/def1_teacher.pt \
+  --att_ckpt_path Training_Policy/att1_teacher.pt \
+  --out_dir Training_Policy/MC_eval/two_body_shell_cart \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.25,0.5,0.75,0.9 \
+  --points_per_shell 10 \
+  --dynamics elliptic_ltv
+"""
+
+
+"""
+python evaluate_policy.py   --def_ckpt_path Training_Policy_New_Reward/def1_teacher.pt   --att_ckpt_path Training_Policy_New_Reward/att1_teacher.pt   --out_dir Training_Policy_New_Reward/MC_eval/shell_cart_allpairs_def1_vs_att1_tester   --auto_shell_grid   --grid_mode cartesian   --shell_fracs 0.25,0.5,0.75,0.90   --points_per_shell 10
+
 """

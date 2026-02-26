@@ -40,7 +40,7 @@ COMMON: Dict[str, Any] = {
     "chief_orbit": {
         "mu": 3.986004418e14,
         "a":  6_371_000.0 + 400_000.0,  # semi-major axis (m)
-        "e":  0.0,                      # eccentricity
+        "e":  0.1,                      # eccentricity
         "i":  0.0,                      # rad
         "raan": 0.0,                    # rad
         "argp": 0.0,                    # rad
