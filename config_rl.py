@@ -24,7 +24,7 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
-    "num_attackers": 1,   # default
+    "num_attackers": 2,   # default is 1
     "seed": 42,
     "device": "cuda",  # "cuda" if available
 
@@ -272,7 +272,7 @@ TRAIN: Dict[str, Any] = {
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
-    "distill": True, #Does policy distillation, True or False
+    "distill": False, #Does policy distillation, True or False
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,

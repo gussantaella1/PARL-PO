@@ -7,7 +7,7 @@ import numpy as np
 import torch
 
 # Import the Diff-Nash network + rule-based attacker from training script
-from rl_loop_diffgame import ActorCriticDiff, AttackerRuleController
+from rl_loop_multi import ActorCriticDiff, AttackerRuleController
 
 
 class RLPolicyDiff:

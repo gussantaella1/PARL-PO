@@ -6,7 +6,7 @@ from __future__ import annotations
 from typing import Dict, Any
 import numpy as np
 
-from rl_infer_diff import RLPolicyDiff
+from rl_infer import RLPolicyDiff
 from ukf_estimator import KF_CV
 
 

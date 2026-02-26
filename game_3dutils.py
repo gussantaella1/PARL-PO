@@ -16,7 +16,7 @@ from dyn_models import (
 
 
 
-import importlib, game_3dutils, neos_path_game#,rl_infer, game_costs
+import importlib, game_3dutils, Archive.neos_path_game as neos_path_game#,rl_infer, game_costs
 importlib.reload(game_3dutils)
 # importlib.reload(game_costs)
 importlib.reload(neos_path_game)
@@ -47,7 +47,7 @@ __all__ = [
 ]
 
 try:
-    from neos_path_game import (
+    from Archive.neos_path_game import (
         build_mcp_two_player_one_shot,
         solve_with_local_path,
         extract_trajectories,

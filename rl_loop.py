@@ -647,30 +647,21 @@ class Env:
 
         # attacker target hit: (keep your current meaning = first attacker hits target)
 
-        # -------------------------
-        # termination (TRUE state)
-        # -------------------------
 
+
+        rho_att = np.linalg.norm(p2 - self.center) / self.radius
         rho_def = np.linalg.norm(p1 - self.center) / self.radius
 
         thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
         thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
 
-        # Defender hits target?
+
+        att_hit_target = (self.oi_radius_norm > 0.0) and (rho_att <= thresh_att)
         def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
 
-        # Any attacker hits target?
-        att_hit_target = False
-        att_hit_idx = -1
-        if self.oi_radius_norm > 0.0:
-            for k, pA_true in enumerate(pA_list):
-                rhoA = np.linalg.norm(pA_true - self.center) / self.radius
-                if rhoA <= thresh_att:
-                    att_hit_target = True
-                    att_hit_idx = k
-                    break
 
         hit_target = att_hit_target or def_hit_target
+
 
         # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
         collision = False
@@ -680,10 +671,9 @@ class Env:
                     collision = True
                     break
 
-        # out-of-bounds for defender
         oob1 = (rho1 >= self.margin)
 
-        # out-of-bounds for ANY attacker
+        # oob for ANY attacker
         oob2_any = False
         for pA_true in pA_list:
             rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
@@ -693,26 +683,25 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
-        # -------------------------
-        # terminal shaping
-        # -------------------------
-        if need_def and done:
-            if collision:
-                r1 -= self.collision_penalty_def
-            if oob1:
-                r1 -= self.wallK
-            if att_hit_target:
-                r1 -= self.def_target_hit_penalty_def
-            if def_hit_target:
-                r1 -= self.att_target_hit_penalty_def
+        if need_def:
+            if done:
+                if collision:
+                    r1 -= self.collision_penalty_def
+                if oob1: 
+                    r1 -= self.wallK
+                if att_hit_target: 
+                    r1 -= self.def_target_hit_penalty_def
+                if def_hit_target: 
+                    r1 -= self.att_target_hit_penalty_def
 
-        if need_att and done:
-            if collision:
-                r2 -= self.collision_penalty_att
-            if oob2_any:
-                r2 -= self.wallK
-            if att_hit_target:
-                r2 += self.att_target_hit_reward_att
+        if need_att:
+            if done:
+                if collision:
+                    r2 -= self.collision_penalty_att
+                if oob2_any: 
+                    r2 -= self.wallK
+                if att_hit_target: 
+                    r2 += self.att_target_hit_reward_att
 
 
             # if done and def_hit_target: r2 += self.def_target_hit_reward_att
@@ -1137,63 +1126,176 @@ class AttackerRuleController:
 # =============================================================
 # DiffLS Layer & Actor-Critic
 # =============================================================
+class DiffLSLayer(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.D = int(cfg["D"])
+        self.ridge = float(cfg.get("prior_ridge", 1e-2))
 
+        # robust dt fetch (adjust if your config uses a different key)
+        self.dt = float(cfg.get("dt", cfg.get("h", cfg.get("dyn", {}).get("dt", 1.0))))
+
+    def forward(self, obs: torch.Tensor, who: str):
+        B, D = obs.shape[0], self.D
+        dt = self.dt
+
+        # obs = [p1c, p2c, rel, v1, v2]  (5D dims total; 15 when D=3)
+        p1c = obs[:, 0:D]
+        p2c = obs[:, D:2*D]
+        v1  = obs[:, 3*D:4*D]
+        v2  = obs[:, 4*D:5*D]
+
+        # one-step position error to center (in centered coordinates)
+        e1 = p1c + dt * v1   # (B, D)
+        e2 = p2c + dt * v2   # (B, D)
+
+        alpha = 0.5 * (dt * dt)
+        k = alpha / (alpha * alpha + self.ridge)  # scalar
+
+        u_def_prior = -k * e1
+        u_att_prior = -k * e2
+        u_prior = u_def_prior if who == "def" else u_att_prior
+
+        # IMPORTANT: feats must be 4D = 12 when D=3
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
+        return feats, u_prior
+
+
+class DiffNashLayer(nn.Module):
+    """
+    One-step Nash prior via an external IPOPT-based game solver.
+
+    - Reconstructs (x1, x2) = [p1, v1], [p2, v2] from the observation.
+    - Calls an external 'Nash game solver' (IPOPT-based) that returns (u1*, u2*).
+    - Returns u1* as prior if who='def', u2* if who='att'.
+
+    Notes:
+    - This layer *does not* backprop through the IPOPT solver; u_prior is treated
+      as a fixed, non-differentiable prior. Gradients only flow through the
+      learned residual policy on top of u_prior.
+    - The actual game definition (costs, constraints) is inside the external
+      solver you provide (e.g. nash_ipopt_solver.solve_nash_ipopt).
+    """
+
+    def __init__(self, cfg: Dict[str, Any]):
+        super().__init__()
+        self.D = int(cfg["D"])
+        self.dt = float(cfg["dt"])
+
+        # Dynamics, center, etc., same geometry as DiffLS
+        self.register_buffer(
+            "Ad",
+            torch.as_tensor(np.asarray(cfg["dyn"]["Ad"], np.float32), dtype=torch.float32)
+        )
+        self.register_buffer(
+            "Bd",
+            torch.as_tensor(np.asarray(cfg["dyn"]["Bd"], np.float32), dtype=torch.float32)
+        )
+
+        ar = cfg["arena"]
+        c = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
+            dtype=np.float32
+        )[: self.D]
+        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
+
+        # Where to find the IPOPT game solver
+        # Example expected structure in cfg:
+        # cfg["nash_solver"] = {
+        #     "module": "nash_ipopt_solver",
+        #     "fn":     "solve_nash_ipopt",
+        #     "params": {...}   # optional dict passed to solver
+        # }
+        solver_cfg = cfg.get("nash_solver", {})
+        module_name = solver_cfg.get("module", "nash_ipopt_solver")
+        fn_name     = solver_cfg.get("fn", "solve_nash_ipopt")
+        self.solver_params = solver_cfg.get("params", {})
+
+        mod = importlib.import_module(module_name)
+        self.nash_solve = getattr(mod, fn_name)
+
+    def forward(self, obs: torch.Tensor, who: str):
+        """
+        obs:  [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
+        who:  'def' or 'att'
+        """
+        B, D = obs.shape[0], self.D
+        device = obs.device
+        dtype  = obs.dtype
+
+        center = self.center.to(dtype=dtype, device=device)
+
+        # Decompose obs into pieces
+        p1c = obs[:, 0:D]          # defender pos (centered)
+        p2c = obs[:, D:2*D]        # attacker pos (centered)
+        v1  = obs[:, 3*D:4*D]
+        v2  = obs[:, 4*D:5*D]
+
+        # Recover absolute positions
+        p1 = p1c + center          # [B, D]
+        p2 = p2c + center          # [B, D]
+
+        # Construct state vectors x1, x2 = [p, v]
+        x1 = torch.cat([p1, v1], dim=-1)   # [B, 2D]
+        x2 = torch.cat([p2, v2], dim=-1)   # [B, 2D]
+
+        # We will call the IPOPT solver in numpy-space (no grads)
+        x1_np = x1.detach().cpu().numpy()
+        x2_np = x2.detach().cpu().numpy()
+
+        u1_list = []
+        u2_list = []
+
+        # Call solver for each batch element
+        for i in range(B):
+            u1_i, u2_i = self.nash_solve(x1_np[i], x2_np[i], self.solver_params)
+            # Expect u1_i, u2_i to be numpy arrays of shape (D,)
+            u1_list.append(np.asarray(u1_i, dtype=np.float32))
+            u2_list.append(np.asarray(u2_i, dtype=np.float32))
+
+        u1_np = np.stack(u1_list, axis=0)   # [B, D]
+        u2_np = np.stack(u2_list, axis=0)   # [B, D]
+
+        u1_prior = torch.as_tensor(u1_np, device=device, dtype=dtype)
+        u2_prior = torch.as_tensor(u2_np, device=device, dtype=dtype)
+        u_prior  = u1_prior if who == "def" else u2_prior
+
+        # As in DiffLS, the "features" are [p1c, p2c, v1, v2]
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # [B, 4D]
+        return feats, u_prior
     
 
 class NoPriorLayer(nn.Module):
+    """
+    No analytic prior: just repackage the observation into features
+    and return u_prior = 0.
+    """
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         self.D = int(cfg["D"])
         ar = cfg["arena"]
-        c = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[: self.D]
+        c = np.array(
+            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
+            dtype=np.float32
+        )[: self.D]
         self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
 
     def forward(self, obs: torch.Tensor, who: str):
         """
-        Supports both:
-          - legacy Na=1: obs_dim = 5*D
-          - multiattacker: obs_dim = (2 + 3*Na)*D, where:
-              [p1c, pA_c (Na*D), rel (Na*D), v1, vA (Na*D)]
-        We use attacker 0 as the "primary" attacker for features.
+        obs: [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
+        Return:
+          feats: [B, 4*D] = [p1c, p2c, v1, v2]
+          u_prior: [B, D] = 0
         """
-        B, obs_dim = obs.shape
-        D = self.D
+        B, D = obs.shape[0], self.D
         device, dtype = obs.device, obs.dtype
 
-        if obs_dim % D != 0:
-            raise RuntimeError(f"obs_dim={obs_dim} not divisible by D={D}")
+        p1c = obs[:, 0:D]
+        p2c = obs[:, D:2*D]
+        v1  = obs[:, 3*D:4*D]
+        v2  = obs[:, 4*D:5*D]
 
-        blocks = obs_dim // D
-
-        # legacy case: 5 blocks
-        if blocks == 5:
-            p1c = obs[:, 0:D]
-            p2c = obs[:, D:2*D]
-            v1  = obs[:, 3*D:4*D]
-            v2  = obs[:, 4*D:5*D]
-        else:
-            # multiattacker layout: blocks = 2 + 3*Na  => Na = (blocks - 2)//3
-            if (blocks - 2) % 3 != 0:
-                raise RuntimeError(f"Unexpected obs layout: blocks={blocks} not of form 2+3*Na")
-            Na = (blocks - 2) // 3
-
-            off = 0
-            p1c = obs[:, off:off + D]; off += D
-
-            # pA_c: Na blocks, take attacker0
-            p2c = obs[:, off:off + D]  # attacker 0
-            off += Na * D
-
-            # rel: skip Na blocks
-            off += Na * D
-
-            # v1
-            v1 = obs[:, off:off + D]; off += D
-
-            # vA: Na blocks, take attacker0
-            v2 = obs[:, off:off + D]
-
-        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)         # (B, 4D)
+        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # (B, 4D)
         u_prior = torch.zeros((B, D), device=device, dtype=dtype)
         return feats, u_prior
 
@@ -1208,7 +1310,11 @@ class ActorCriticDiff(nn.Module):
 
         # Choose which prior layer to use
         prior_type = cfg.get("prior_type", "ls")  # "ls", "nash", or "none"
-        if prior_type == "none":
+        if prior_type == "ls":
+            self.layer = DiffLSLayer(cfg)
+        elif prior_type == "nash":
+            self.layer = DiffNashLayer(cfg)
+        elif prior_type == "none":
             self.layer = NoPriorLayer(cfg)
         else:
             raise ValueError(
@@ -1267,11 +1373,6 @@ class ActorCriticDiff(nn.Module):
 # =============================================================
 class PPO:
     def __init__(self, obs_dim: int, act_dim: int, cfg: Dict[str, Any], device="cpu"):
-
-        self.cfg = cfg
-        self.num_attackers = int(cfg.get("num_attackers", 1))
-        self.D = int(cfg["D"])
-
         self.device    = device
         self.clip_eps  = cfg["clip_eps"]
         self.ent_coef  = cfg["entropy_coef"]
@@ -1349,45 +1450,54 @@ class PPO:
 
         # -------- RULE ATTACKER --------
         if who == "att" and self.attacker_mode == "rule":
-            D  = self.D
-            Na = self.num_attackers
-            ob = obs_batch.detach().cpu().numpy()  # (B, obs_dim)
-            B  = ob.shape[0]
+            # obs layout: [p1c, pA1c..pANc, rel1..relN, v1, vA1..vAN]
+            # We must parse based on Na.
+            D = int(self.act_scale * 0 + obs_batch.shape[-1])  # noop keep torch happy
+            D = int((obs_batch.shape[1]) // (2 + 2*Na + 1 + Na))  # not reliable
+            # Instead use cfg D (robust):
+            D = int(self.def_net.layer.D) if hasattr(self.def_net, "layer") else int(obs_batch.shape[1] // 5)
 
-            expected_dim = (2 + 3 * Na) * D
-            if ob.shape[1] != expected_dim:
-                raise RuntimeError(
-                    f"[rule_att] obs_dim mismatch: got {ob.shape[1]}, expected {(2 + 3*Na)*D} "
-                    f"(D={D}, Na={Na}). If you changed _obs(), update this parser."
-                )
+            ob = obs_batch.detach().cpu().numpy()
+            # parse p1c
+            p1c = ob[:, 0:D]
+            off = D
+
+            # pA centered (Na blocks)
+            pA_c = []
+            for k in range(Na):
+                pA_c.append(ob[:, off:off + D])
+                off += D
+
+            # rel blocks (Na)
+            rels = []
+            for k in range(Na):
+                rels.append(ob[:, off:off + D])
+                off += D
+
+            # v1
+            v1 = ob[:, off:off + D]
+            off += D
+
+            # vA blocks (Na)
+            vA = []
+            for k in range(Na):
+                vA.append(ob[:, off:off + D])
+                off += D
 
             center = self.rule_ctrl.center
 
-            # offsets
-            off = 0
-            p1c = ob[:, off:off + D]; off += D
-
-            pA_c = []
-            for k in range(Na):
-                pA_c.append(ob[:, off:off + D]); off += D
-
-            # rel blocks (we actually don't need these for rule controller)
-            off += Na * D
-
-            v1 = ob[:, off:off + D]; off += D
-
-            vA = []
-            for k in range(Na):
-                vA.append(ob[:, off:off + D]); off += D
-
-            acts = np.zeros((B, Na, D), dtype=np.float32)
+            acts = []
             for i in range(B):
                 p1 = p1c[i] + center
+                # recover absolute attackers:
                 pA_list = [pA_c[k][i] + center for k in range(Na)]
                 vA_list = [vA[k][i] for k in range(Na)]
-                acts[i] = self.rule_ctrl.act_multi(p1, v1[i], pA_list, vA_list)  # (Na, D)
+                uA = self.rule_ctrl.act_multi(p1, v1[i], pA_list, vA_list)  # (Na, D)
+                acts.append(uA)
 
-            a_t = torch.as_tensor(acts, dtype=obs_batch.dtype, device=obs_batch.device)
+            a_np = np.stack(acts, axis=0)  # (B, Na, D)
+            a_t = torch.as_tensor(a_np, dtype=obs_batch.dtype, device=obs_batch.device)
+
             zero = torch.zeros(B, dtype=obs_batch.dtype, device=obs_batch.device)
             return a_t, zero, zero
 
@@ -2557,20 +2667,8 @@ def train(cfg: Dict[str, Any]):
             # - if attacker RL: (B, D) ok
             # - if rule attacker: (B, Na, D) ok
             # - if rule attacker but produced (B, D): expand to (B,1,D)
-            Na = int(cfg.get("num_attackers", 1))
-            D  = int(cfg["D"])
-
-            # ✅ Always pass attacker actions as (B, Na, D)
-            if a2_np.ndim == 2:
-                # (B, D) -> (B, 1, D)
+            if a2_np.ndim == 2 and cfg.get("attacker_mode", "rule") == "rule" and cfg.get("num_attackers", 1) == 1:
                 a2_np = a2_np[:, None, :]
-            elif a2_np.ndim == 3:
-                pass
-            else:
-                raise RuntimeError(f"Unexpected attacker action shape: {a2_np.shape}")
-
-            if a2_np.shape[1] != Na or a2_np.shape[2] != D:
-                raise RuntimeError(f"Attacker action shape mismatch: got {a2_np.shape}, expected (B,{Na},{D})")
 
             o2_np, r1_np, r2_np, d_np, infos = vec.step(
                 a1_np,
@@ -2853,9 +2951,7 @@ def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
                 a1, _, _ = ppo.act(o_t, who="def")
                 a2, _, _ = ppo.act(o_t, who="att")
             a1_np = a1.squeeze(0).cpu().numpy()
-            a2_np = a2.squeeze(0).cpu().numpy()  # could be (D,) or (Na,D)
-            if a2_np.ndim == 1:
-                a2_np = a2_np[None, :]          # -> (1, D)
+            a2_np = a2.squeeze(0).cpu().numpy()
             obs, r1, r2, done, info = env.step(a1_np, a2_np)
             states.append(env.state.copy())
             actions.append((a1_np.copy(), a2_np.copy()))
@@ -3287,6 +3383,26 @@ def train_defender_with_distill(
         metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
         np.savez(metrics_path, **metrics_def)
         print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    # --- Optional: evaluate teacher (full-state) ---
+    # cfg_eval = config_for_eval(
+    #     attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
+    #     umax=cfg_teacher["umax"],
+    #     T=cfg_teacher["T"],
+    # )
+    # cfg_eval["use_ukf"] = False
+    # build_dyn(cfg_eval)
+    # trajs = evaluate(ppo_def, cfg_eval, episodes=2)
+
+    # ar = cfg_eval["arena"]
+    # D = cfg_eval["D"]
+    # center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
+    # R = float(ar["r"])
+    # m = rollout_metrics(trajs[0]["states"], center, R)
+    # print(
+    #     f"[{phase_name.upper()} TEACHER metrics] "
+    #     f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
+    # )
 
     try:
         del ppo_def, metrics_def
