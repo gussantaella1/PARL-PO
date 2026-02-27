@@ -24,7 +24,7 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
-    "num_attackers": 2,   # default is 1
+    "num_attackers": 1,   # default is 1
     "seed": 42,
     "device": "cuda",  # "cuda" if available
 
@@ -280,6 +280,16 @@ TRAIN: Dict[str, Any] = {
     "freeze_tol": 0.0,
 
     # Vectorized rollout & logging
+    #Ultra long training: 
+
+    "num_envs": 128,   
+    "steps_per_env": 1024,    
+    "total_updates": 3000,   
+    "train_epochs": 10,
+    "minibatch_size": 10240,  
+    "log_every": 100,
+
+
     #Long training
     # "num_envs": 64,   
     # "steps_per_env": 512,    
@@ -289,12 +299,12 @@ TRAIN: Dict[str, Any] = {
     # "log_every": 100,
 
     #Short training
-    "num_envs": 8,          
-    "steps_per_env": 256,    
-    "total_updates": 300, 
-    "train_epochs": 10,
-    "minibatch_size": 1024,  
-    "log_every": 10,
+    # "num_envs": 8,          
+    # "steps_per_env": 256,    
+    # "total_updates": 300, 
+    # "train_epochs": 10,
+    # "minibatch_size": 1024,  
+    # "log_every": 10,
 
     #Test training
     # "num_envs": 1,          

@@ -1026,7 +1026,8 @@ class ActorCriticDiff(nn.Module):
         super().__init__()
         hidden = 128
 
-        prior_type = cfg.get("prior_type", "ls")
+        prior_type = cfg.get("prior_type", "none")
+
         if prior_type == "ls":
             self.layer = DiffLSLayer(obs_dim, cfg)
         elif prior_type == "nash":
@@ -1909,6 +1910,87 @@ def plot_training_metrics(
 
     return [fig for _, fig in figs], saved_paths
 
+def plot_compare_phases(
+    labeled_paths,
+    metric: str,
+    ylabel: str = None,
+    title: str = None,
+    smooth: str = "none",
+    smooth_param: float = 0.2,
+    show: bool = False,
+
+    # NEW saving knobs
+    out_dir: str | None = None,
+    filename: str | None = None,
+    dpi: int = 200,
+    close: bool = True,
+):
+    """
+    Compare a single metric across multiple runs and optionally save it.
+    """
+    fig = plt.figure()
+    ax = plt.gca()
+
+    def _as_1d(x):
+        x = np.asarray(x)
+        if x.ndim == 0:
+            return x.reshape(1).astype(float)
+        if x.ndim > 1:
+            x = x.reshape(-1)
+        return x.astype(float)
+
+    def _smooth_series(y, method="none", param=0.2):
+        y = _as_1d(y)
+        if method is None or method == "none":
+            return y
+        if method == "ema":
+            alpha = float(param)
+            out = np.empty_like(y)
+            out[0] = y[0]
+            for i in range(1, len(y)):
+                out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+            return out
+        if method == "ma":
+            win = int(param)
+            if win <= 1:
+                return y
+            pad = win - 1
+            ypad = np.pad(y, (pad, 0), mode="edge")
+            kernel = np.ones(win, dtype=float) / win
+            return np.convolve(ypad, kernel, mode="valid")
+        raise ValueError(f"Unknown smoothing method: {method!r}")
+
+    for label, path in labeled_paths:
+        m = load_npz_metrics(path)
+        if metric not in m:
+            print(f"[plot_compare_phases] skipping {label}: missing key {metric!r}")
+            continue
+        x = _as_1d(m["update"]) if "update" in m else np.arange(len(m[metric]))
+        y = _smooth_series(m[metric], method=smooth, param=smooth_param)
+        ax.plot(x, y, label=label)
+
+    ax.set_xlabel("Update")
+    ax.set_ylabel(ylabel or metric)
+    ax.set_title(title or f"Compare: {metric}")
+    ax.grid(True)
+    ax.legend()
+
+    saved_path = None
+    if out_dir is not None:
+        os.makedirs(out_dir, exist_ok=True)
+        if filename is None:
+            safe_metric = metric.replace("/", "_")
+            filename = f"compare__{safe_metric}.png"
+        saved_path = os.path.join(out_dir, filename)
+        fig.savefig(saved_path, dpi=dpi, bbox_inches="tight")
+
+    if show:
+        plt.show()
+    if close:
+        plt.close(fig)
+
+    return fig, saved_path
+
 
 def make_tb_writer(cfg: dict, run_name: str | None = None):
     root = cfg.get("tb_logdir", "runs")
@@ -1975,16 +2057,513 @@ def end_phase_cleanup(
 # Main (kept as in your script; just remember cfg["num_attackers"]=2)
 # =============================================================
 
+# if __name__ == "__main__":
+#     OUT_DIR = "Training_Policy"
+#     os.makedirs(OUT_DIR, exist_ok=True)
+
+#     # Example: set num_attackers=2 in the config builder you use
+#     # (You can do this inside config_for_train if you prefer.)
+#     cfg = config_for_train(attacker_mode="rl", train_role="def")
+#     cfg["num_attackers"] = 2
+#     build_dyn(cfg)
+#     ppo, metrics = train(cfg)
+
+#     print("This script is now 1 defender vs N attackers (shared attacker policy).")
+#     print("Set cfg['num_attackers']=2 and run your existing phase logic as before.")
+
+
+# =============================================================
+# (1v2) FULL PHASED TRAINING CYCLE: Def0 -> Att1 -> Def1
+# Drop this into your patched rl_loop.py (below make_tb_writer / plotting helpers),
+# and replace your current __main__ with the __main__ at the bottom of this block.
+#
+# IMPORTANT:
+# - This preserves the *same* phase print statements and the same PPO training logic.
+# - The ONLY changes are the 1v2 plumbing: setting cfg["num_attackers"]=2 everywhere,
+#   and making attacker BC-pretrain work with Na>1 (shared attacker policy) the same
+#   way PPO does (obs permutation + stacking).
+# - UKF distillation is still 1-attacker only in your code; for Na=2 we simply skip
+#   distillation by forcing DISTILL=False in the wrappers (no extra prints).
+# =============================================================
+
+# ---- global knob for 1 defender vs 2 attackers ----
+NUM_ATTACKERS = 2
+
+
+# =============================================================
+# BC PRETRAIN (patched for Na>=1, shared attacker policy)
+# =============================================================
+def pretrain_attacker_from_rule(
+    cfg: Dict[str, Any],
+    out_path: str,
+    steps_per_env: int = 256,
+    total_updates: int = 200,
+    bc_epochs: int = 4,
+    bc_mb_size: int = 2048,
+):
+    """
+    Behavior clone the rule-based attacker into ppo.att_net (attacker_mode='rl').
+
+    Na==1: identical behavior to your old function.
+    Na>1 : collect (obs_perm_k, a_rule_k) for each attacker k using:
+             - obs permutation (ego attacker in slot 0)
+             - rule labels generated from TRUE state for each attacker
+           and train shared attacker policy on the stacked dataset.
+    """
+    assert cfg.get("attacker_mode", "rule") == "rl", "BC pretrain requires attacker_mode='rl'"
+
+    cfg = dict(cfg)
+    cfg["num_attackers"] = int(cfg.get("num_attackers", NUM_ATTACKERS))
+
+    set_seed(cfg["seed"])
+    device = cfg["device"]
+
+    def make_env():
+        return Env(cfg)
+
+    num_envs = int(cfg.get("num_envs", 8))
+    vec = VecEnv(make_env, num_envs)
+    obs_dim = vec.obs.shape[1]
+    act_dim = int(cfg["D"])
+    Na = int(cfg.get("num_attackers", 1))
+
+    # PPO container (we'll only use its networks)
+    ppo = PPO(obs_dim, act_dim, cfg, device=device)
+
+    # Optional: load a defender checkpoint to make the data distribution realistic
+    def_ckpt = cfg.get("def_ckpt_path", None)
+    if def_ckpt is not None:
+        state = torch.load(def_ckpt, map_location=device)
+        ppo.def_net.load_state_dict(state)
+        ppo.def_net.eval()
+        for p in ppo.def_net.parameters():
+            p.requires_grad_(False)
+
+    # Rule controller to generate labels
+    rule_ctrl = AttackerRuleController(cfg)
+
+    # Optimizer for BC (attacker policy head only)
+    bc_lr = float(cfg.get("att_bc_lr", cfg.get("policy_lr", 3e-4)))
+    bc_opt = optim.Adam(
+        list(ppo.att_net.pi.parameters()) + list(ppo.att_net.mu_res.parameters()) + [ppo.att_net.logstd],
+        lr=bc_lr
+    )
+
+    print("=== BC PRETRAIN: attacker net imitates rule controller ===")
+    print(f"Saving attacker BC checkpoint to: {out_path}")
+    print(f"updates={total_updates}, steps_per_env={steps_per_env}, num_envs={num_envs}")
+
+    for upd in range(1, total_updates + 1):
+        # collect a batch
+        obs_buf = torch.zeros(steps_per_env, num_envs, obs_dim, device=device)
+        act_buf = torch.zeros(steps_per_env, num_envs, Na, act_dim, device=device)  # per-attacker labels
+
+        for t in range(steps_per_env):
+            o = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
+
+            # Defender action: deterministic if frozen, else sample
+            with torch.no_grad():
+                det_def = (def_ckpt is not None)
+                a1, _, _ = ppo.act(o, who="def", deterministic=det_def)
+
+            # Rule attacker labels from TRUE state: one label per attacker
+            aA_list = []
+            for e in vec.envs:
+                p1, v1, pA_list, vA_list = e._unpack(e.state)
+                uA = rule_ctrl.act_multi(p1, v1, pA_list, vA_list).astype(np.float32)  # (Na, D)
+                aA_list.append(uA)
+            aA_np = np.stack(aA_list, axis=0)  # (B, Na, D)
+
+            # Step env using defender action + rule attacker action
+            o2_np, _, _, _, _ = vec.step(a1.cpu().numpy(), aA_np, reward_mode="both")
+
+            obs_buf[t] = o
+            act_buf[t] = torch.as_tensor(aA_np, dtype=torch.float32, device=device)
+
+            vec.obs = o2_np
+
+        # ---- flatten & (if Na>1) expand per-attacker samples via permutation ----
+        B = steps_per_env * num_envs
+        obs_flat = obs_buf.reshape(B, obs_dim)
+        act_flat = act_buf.reshape(B, Na, act_dim)
+
+        if Na == 1:
+            # old shape
+            obs_train = obs_flat
+            act_train = act_flat[:, 0, :]
+        else:
+            # stack per attacker with permuted obs
+            obs_list = []
+            act_list = []
+            for k in range(Na):
+                obs_list.append(permute_obs_for_attacker(obs_flat, k, cfg["D"], Na))
+                act_list.append(act_flat[:, k, :])
+            obs_train = torch.cat(obs_list, dim=0)  # (B*Na, obs_dim)
+            act_train = torch.cat(act_list, dim=0)  # (B*Na, D)
+            B = B * Na
+
+        # BC epochs
+        for _ in range(bc_epochs):
+            perm = torch.randperm(B, device=device)
+            for st in range(0, B, bc_mb_size):
+                idx = perm[st:st + bc_mb_size]
+                o_mb = obs_train[idx]
+                a_mb = act_train[idx]
+
+                dist = ppo.att_net.dist(o_mb, who="att")
+                mu = dist.mean
+
+                bc_loss = ((mu - a_mb) ** 2).mean()
+
+                bc_opt.zero_grad(set_to_none=True)
+                bc_loss.backward()
+                nn.utils.clip_grad_norm_(ppo.att_net.parameters(), cfg.get("max_grad_norm", 0.5))
+                bc_opt.step()
+
+        if upd % int(cfg.get("log_every", 10)) == 0:
+            with torch.no_grad():
+                take = min(B, 4096)
+                dist_dbg = ppo.att_net.dist(obs_train[:take], who="att")
+                mse_dbg = ((dist_dbg.mean - act_train[:take]) ** 2).mean().item()
+            print(f"[att_bc {upd:05d}] BC MSE (dbg) = {mse_dbg:.3e}")
+
+    torch.save(ppo.att_net.state_dict(), out_path)
+    print(f"BC pretrain finished. Saved: {out_path}")
+    return out_path
+
+
+# =============================================================
+# Phase wrappers (same prints/flow as your original)
+# =============================================================
+
+def train_defender_with_distill(
+    phase_name: str,
+    attacker_mode: str,
+    extra_train_cfg: Dict[str, Any] | None = None,
+):
+    """
+    Same structure as your original wrapper, with 1v2 added via cfg["num_attackers"]=NUM_ATTACKERS.
+
+    NOTE: UKF distillation is not implemented for Na>1 in your codebase.
+    For Na>1 we force DISTILL=False (no extra prints).
+    """
+    cfg_teacher = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role="def",
+    )
+    cfg_teacher["num_attackers"] = int(cfg_teacher.get("num_attackers", NUM_ATTACKERS))
+    cfg_teacher["use_ukf"] = False  # teacher is full-state
+
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
+        cfg_teacher["num_attackers"] = int(cfg_teacher.get("num_attackers", NUM_ATTACKERS))
+
+    # Force distill off if Na>1 (UKF only supports Na==1)
+    DISTILL = bool(cfg_teacher.get("distill", False)) and (int(cfg_teacher["num_attackers"]) == 1)
+
+    build_dyn(cfg_teacher)
+
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
+    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+    print(f"[{phase_name.upper()}] distill={DISTILL}")
+
+    ppo_def, metrics_def = train(cfg_teacher)
+
+    def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_teacher.pt")
+    torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
+    print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
+
+    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+    np.savez(metrics_path, **metrics_def)
+    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    try:
+        del ppo_def, metrics_def
+    except:
+        pass
+
+    # Student distill (skipped for Na>1 by DISTILL flag)
+    student_out = None
+    if DISTILL:
+        cfg_student = config_for_train(
+            attacker_mode=attacker_mode,
+            train_role="def",
+        )
+        cfg_student["num_attackers"] = int(cfg_teacher["num_attackers"])  # =1 in this branch
+        cfg_student["use_ukf"] = True
+        cfg_student["seed"] = cfg_teacher["seed"] + 1
+
+        if extra_train_cfg is not None:
+            cfg_student.update(extra_train_cfg)
+            cfg_student["num_attackers"] = int(cfg_teacher["num_attackers"])  # keep 1
+
+        build_dyn(cfg_student)
+
+        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
+        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+
+        student_out = os.path.join(OUT_DIR, f"{phase_name}_ukf_student.pt")
+        student, metrics_student = distill_from_teacher(
+            cfg_student, def_teacher_ckpt, out_path=student_out,
+        )
+        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
+
+        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
+        np.savez(distill_metrics_path, **metrics_student)
+        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+        try:
+            del student, metrics_student
+        except:
+            pass
+
+    return def_teacher_ckpt, student_out
+
+
+def train_attacker_with_distill(
+    phase_name: str,
+    attacker_mode: str,
+    extra_train_cfg: Dict[str, Any] | None = None,
+):
+    """
+    Same structure as your original wrapper, with 1v2 added via cfg["num_attackers"]=NUM_ATTACKERS.
+
+    NOTE:
+    - We keep your BC pretrain -> PPO attacker training structure.
+    - Distillation of attacker is still not done (same as your original note).
+    """
+    cfg_teacher = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role="att",
+    )
+    cfg_teacher["num_attackers"] = int(cfg_teacher.get("num_attackers", NUM_ATTACKERS))
+    cfg_teacher["use_ukf"] = False  # teacher is full-state
+    cfg_teacher["def_ckpt_path"] = def0_teacher_ckpt
+    cfg_teacher["freeze_defender"] = True
+
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
+        cfg_teacher["num_attackers"] = int(cfg_teacher.get("num_attackers", NUM_ATTACKERS))
+
+    # Attacker distill still off (as in your original)
+    DISTILL = bool(cfg_teacher.get("distill", False)) and (int(cfg_teacher["num_attackers"]) == 1)
+
+    build_dyn(cfg_teacher)
+
+    # --- BC pretrain attacker from rule controller (now supports Na>1) ---
+    att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
+    cfg_for_bc = cfg_teacher.copy()
+    cfg_for_bc["seed"] = cfg_teacher["seed"] + 123
+
+    pretrain_attacker_from_rule(
+        cfg_for_bc,
+        out_path=att_bc_ckpt,
+        steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
+        total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
+        bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
+        bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
+    )
+
+    cfg_teacher["att_init_path"] = att_bc_ckpt
+
+    # Re-read DISTILL after updates (same idea as your original)
+    DISTILL = bool(cfg_teacher.get("distill", False)) and (int(cfg_teacher["num_attackers"]) == 1)
+
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
+    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+    print(f"[{phase_name.upper()}] distill={DISTILL}")
+
+    ppo_att, metrics_att = train(cfg_teacher)
+
+    att_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_teacher.pt")
+    torch.save(ppo_att.att_net.state_dict(), att_teacher_ckpt)
+    print(f"[{phase_name.upper()} TEACHER] Saved attacker teacher to {att_teacher_ckpt}")
+
+    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+    np.savez(metrics_path, **metrics_att)
+    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    try:
+        del ppo_att, metrics_att
+    except:
+        pass
+
+    student_out = None
+    if DISTILL:
+        # This branch is effectively unreachable for Na=2 (forced off),
+        # but left structurally identical.
+        cfg_student = config_for_train(
+            attacker_mode=attacker_mode,
+            train_role="att",
+        )
+        cfg_student["num_attackers"] = int(cfg_teacher["num_attackers"])  # would be 1 here
+        cfg_student["use_ukf"] = True
+        cfg_student["seed"] = cfg_teacher["seed"] + 1
+
+        if extra_train_cfg is not None:
+            cfg_student.update(extra_train_cfg)
+            cfg_student["num_attackers"] = int(cfg_teacher["num_attackers"])
+
+        build_dyn(cfg_student)
+
+        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
+        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+
+        student_out = os.path.join(OUT_DIR, f"{phase_name}_ukf_student.pt")
+        student, metrics_student = distill_from_teacher(
+            cfg_student, att_teacher_ckpt, out_path=student_out,
+        )
+        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
+
+        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
+        np.savez(distill_metrics_path, **metrics_student)
+        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+        try:
+            del student, metrics_student
+        except:
+            pass
+
+    return att_teacher_ckpt, student_out
+
+
+# =============================================================
+# Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
+# (identical prints + flow; only adds num_attackers=2 via wrappers)
+# =============================================================
 if __name__ == "__main__":
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
 
-    # Example: set num_attackers=2 in the config builder you use
-    # (You can do this inside config_for_train if you prefer.)
-    cfg = config_for_train(attacker_mode="rl", train_role="def")
-    cfg["num_attackers"] = 2
-    build_dyn(cfg)
-    ppo, metrics = train(cfg)
+    cfg_distillation = config_for_train(
+        attacker_mode="rl",   # attacker is RL now
+        train_role="att",     # PPO will only update attacker
+    )
+    cfg_distillation["num_attackers"] = int(cfg_distillation.get("num_attackers", NUM_ATTACKERS))
+    DISTILL = cfg_distillation["distill"]
 
-    print("This script is now 1 defender vs N attackers (shared attacker policy).")
-    print("Set cfg['num_attackers']=2 and run your existing phase logic as before.")
+    # =========================================================
+    # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
+    # =========================================================
+    print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
+    def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+        phase_name="def0",
+        attacker_mode="rule",
+        extra_train_cfg={
+            "num_attackers": NUM_ATTACKERS,
+        },
+    )
+    end_phase_cleanup("Cleanup after PHASE 0")
+
+    # =========================================================
+    # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
+    # =========================================================
+    print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
+    att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
+        phase_name="att1",
+        attacker_mode="rl",
+        extra_train_cfg={
+            "def_ckpt_path": def0_teacher_ckpt,
+            "num_attackers": NUM_ATTACKERS,
+            # "freeze_attacker": True,
+        },
+    )
+    end_phase_cleanup("Cleanup after PHASE 1")
+
+    # =========================================================
+    # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
+    # =========================================================
+    print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
+    def1_teacher_ckpt, def1_student_ckpt = train_defender_with_distill(
+        phase_name="def1",
+        attacker_mode="rl",
+        extra_train_cfg={
+            "att_ckpt_path": att1_teacher_ckpt,
+            "freeze_attacker": True,
+            "num_attackers": NUM_ATTACKERS,
+        },
+    )
+    end_phase_cleanup("Cleanup after PHASE 2")
+
+    PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
+
+    # stage folders
+    PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
+    PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
+    PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
+    PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
+
+    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
+        os.makedirs(d, exist_ok=True)
+
+    # ---- def0 ----
+    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
+    plot_training_metrics(
+        m_def0_teacher,
+        title="def0_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF0,
+        save_prefix="def0_teacher",
+    )
+
+    # ---- att1 ----
+    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
+    plot_training_metrics(
+        m_att1_teacher,
+        title="att1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_ATT1,
+        save_prefix="att1_teacher",
+    )
+
+    # ---- def1 ----
+    m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
+    plot_training_metrics(
+        m_def1_teacher,
+        title="def1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF1,
+        save_prefix="def1_teacher",
+    )
+
+    # ---- comparisons ----
+    plot_compare_phases(
+        [
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz")),
+        ],
+        metric="R_def_mean",
+        ylabel="Mean defender return",
+        title="Defender return across phases",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_COMP,
+        filename="compare__R_def_mean__def0_vs_def1.png",
+    )
+
+    print("Saved plots under:", PLOTS_ROOT)
+    print(" -", PLOTS_DEF0)
+    print(" -", PLOTS_ATT1)
+    print(" -", PLOTS_DEF1)
+    print(" -", PLOTS_COMP)
+
+    print("\n===== ALL PHASES COMPLETE =====")
+    print(f"Defender_0 teacher:  {def0_teacher_ckpt if def0_teacher_ckpt else '(skipped)'}")
+    print(f"Defender_0 student:  {def0_student_ckpt if def0_student_ckpt else '(skipped)'}")
+
+    print(f"Attacker_1 teacher:  {att1_teacher_ckpt if att1_teacher_ckpt else '(skipped)'}")
+    print(f"Attacker_1 student:  {att1_student_ckpt if att1_student_ckpt else '(skipped)'}")
+
+    print(f"Defender_1 teacher:  {def1_teacher_ckpt if def1_teacher_ckpt else '(skipped)'}")
+    print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")

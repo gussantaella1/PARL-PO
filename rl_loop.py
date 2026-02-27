@@ -1309,7 +1309,8 @@ class ActorCriticDiff(nn.Module):
         hidden = 128
 
         # Choose which prior layer to use
-        prior_type = cfg.get("prior_type", "ls")  # "ls", "nash", or "none"
+        prior_type = cfg.get("prior_type", "none")  # "ls", "nash", or "none"
+
         if prior_type == "ls":
             self.layer = DiffLSLayer(cfg)
         elif prior_type == "nash":

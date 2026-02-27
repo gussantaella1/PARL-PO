@@ -4,7 +4,7 @@ evaluate_policy.py
 
 Statistical verification harness for your Diff-Nash RL rollout runner:
 
-  - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff(cfg, steps=...)
+  - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d(cfg, steps=...)
 
 This version is aligned with your current game_runner_diff.py.
 
@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 
 # IMPORTANT: must match your CURRENT runner
-from game_runner_diff import run_rhc_with_rl_and_collect_frames_3d_diff
+from game_runner import run_rhc_with_rl_and_collect_frames_3d
 from dispersion import build_episode_cfg_and_x0
 
 
@@ -1036,7 +1036,7 @@ def main():
             cfg_run["T"] = steps_run
 
             try:
-                out = run_rhc_with_rl_and_collect_frames_3d_diff(cfg_run, steps=steps_run)
+                out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
 
                 if (i == 0 and j == 0 and args.print_first_out_keys):
                     log("[eval] first rollout returned keys:")
@@ -1155,7 +1155,7 @@ def main():
             "trial_loop": float(time.time() - t_loop0),
         },
         "notes": [
-            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d_diff.",
+            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d.",
             "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
             "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
             "Set cfg['verify_require_capture']=True to require collision/capture as well.",
