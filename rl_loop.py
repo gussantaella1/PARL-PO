@@ -505,147 +505,47 @@ class Env:
         v_scale = self.radius / self.dt
 
 
-        if need_def:
             
-            # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
-            wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+        # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
+        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
-            # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
-            center_keepout = 0.0
-            if self.oi_radius > 0.0:
-                r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
-                d1_m = float(np.linalg.norm(p1 - self.center))  # meters
+        # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
+        center_keepout = 0.0
+        if self.oi_radius > 0.0:
+            r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
+            d1_m = float(np.linalg.norm(p1 - self.center))  # meters
 
-                if r_keepout_m > 0.0 and d1_m < r_keepout_m:
-                    gap_m = (r_keepout_m - d1_m)  # meters inside keepout
-                    # normalize gap by arena radius so penalty scale is comparable across different R
-                    gap = gap_m / (self.radius + 1e-9)
-                    center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
+            if r_keepout_m > 0.0 and d1_m < r_keepout_m:
+                gap_m = (r_keepout_m - d1_m)  # meters inside keepout
+                # normalize gap by arena radius so penalty scale is comparable across different R
+                gap = gap_m / (self.radius + 1e-9)
+                center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
 
 
-            # defender radial velocity
-            rhat1 = (p1 - self.center)
-            rnorm = np.linalg.norm(rhat1) + 1e-9
+        # defender radial velocity
+        rhat1 = (p1 - self.center)
+        rnorm = np.linalg.norm(rhat1) + 1e-9
 
-            v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
-            a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
+        v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
+        a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
 
-            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
+        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
 
-        if need_att:
-            v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
-            a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
-            
-            wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+        v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
+        a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
+        
+        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- compute only requested reward(s) ----
         r1 = 0.0
         r2 = 0.0
 
-        if need_def:
-            r1 = (
-                self.alpha * delta_d2
-                + self.k_pos * d2
-                # - self.k_rel * rel2
-                # - self.k_vel * v1n2
-                # - k_vrad * (vrad1**2)
-                - self.lD * a1n2
-                - wall1
-                - center_keepout
-            )
-
-        # if need_att:
-        #     # normalized squared distance to center (you already computed d2)
-        #     # d2 = ||p2-center||^2 / R^2
-
-        #     # normalized effort (you already computed a2n2)
-        #     # a2n2 = ||a2||^2 / umax^2
-
-        #     r2 = (
-        #         - self.k_att_cent * d2
-        #         - self.lA         * a2n2
-        #         - wall2
-        #     )
-
-
-        if need_att:
-
-            dist = float(np.linalg.norm(p2 - p1))  # meters
-            x = dist / (float(self.att_min_sep) + 1e-9)  # 1.0 at the boundary
-            close_pen = max(0.0, 1.0 - x) ** 2           # ramps up as dist -> min_sep
-            d2_prev = float(self._d2_prev if self._d2_prev is not None else d2)
-
-            progress = d2_prev - d2  # positive inward
-            r2 = (
-                + self.k_att_prog * progress
-                - self.k_att_close * close_pen
-                - self.lA  * a2n2
-                - wall2
-            )
-
-
-
-
-
-
-        # if need_att:
-        #     R = self.radius
-
-        #     # --- Progress reward (positive when moving toward center) ---
-        #     d2_prev = (self._d2_prev if self._d2_prev is not None else d2)
-        #     progress = (d2_prev - d2)  # >0 means closer to center
-
-        #     # --- Center distance term (optional) ---
-        #     cent_pen = d2  # normalized squared
-
-        #     # --- Keep-out penalty (ONLY if too close to defender) ---
-        #     dist = float(np.linalg.norm(p2_geom - p1))  # meters
-        #     close_pen = 0.0
-        #     if dist < self.att_min_sep:
-        #         gap = (self.att_min_sep - dist) / R
-        #         close_pen = gap * gap
-
-        #     # --- Radial-speed penalty (reduces "fly through center then slam wall") ---
-        #     rhat2 = (p2_geom - self.center)
-        #     rnorm2 = np.linalg.norm(rhat2) + 1e-9
-        #     vrad2 = float(np.dot(v2, rhat2 / rnorm2)) / R  # normalized radial speed
-
-        #     # --- Wall barrier (starts at soft_wall) ---
-        #     rho2 = np.linalg.norm(p2_geom - self.center) / R
-        #     wall_gap = max(0.0, rho2 - self.soft_wall)
-        #     wall2_att = (wall_gap ** self.att_wall_power) * self.k_att_wall
-
-        #     # --- Regularization (same style as your old r2) ---
-        #     effort_pen = float(np.dot(a2, a2))
-        #     speed_pen  = float(np.dot(v2, v2))
-
-        #     r2 = (
-        #         + self.k_att_prog * progress
-        #         - self.k_att_cent * cent_pen
-        #         - self.k_att_close * close_pen
-        #         - self.k_att_vrad * (vrad2 ** 2)
-        #         - wall2_att
-        #         - self.lA * effort_pen
-        #         - self.k_vel * speed_pen
-        #     )
-
-
+        use_security = True
 
         # ---- termination scenariosalways uses TRUE state ----
 
 
-        # # target hit: (keep your current meaning = first attacker hits target)
-
         hit_target = False
-        # p2_true = pA_list[0]
-        # # rho2_true = np.linalg.norm(p2_true - self.center) / self.radius
-        # rho2_rel_to_target = np.linalg.norm(p2_true - self.center)
-
-        # hit_target = False
-        # if self.att_target_hit_radius > 0.0 and rho2_rel_to_target <= (1 + self.att_target_hit_radius)*self.oi_radius:
-        #     hit_target = True
-
-        # attacker target hit: (keep your current meaning = first attacker hits target)
 
 
 
@@ -683,25 +583,109 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
-        if need_def:
-            if done:
-                if collision:
-                    r1 -= self.collision_penalty_def
-                if oob1: 
-                    r1 -= self.wallK
-                if att_hit_target: 
-                    r1 -= self.def_target_hit_penalty_def
-                if def_hit_target: 
-                    r1 -= self.att_target_hit_penalty_def
+        if use_security:
 
-        if need_att:
+            # build scalar g (defender maximizes, attacker minimizes)
+            # d2 and delta_d2 already computed above.
+            # a1n2, wall1, center_keepout already computed under need_def, but
+            # for security we must compute them regardless (since g depends on them).
+            # So ensure these are computed even if reward_mode == "att".
+            # (Easiest: compute a1n2, wall1, center_keepout unconditionally when use_security.)
+
+            g = (
+                self.k_pos * d2
+                + self.alpha * delta_d2
+                - self.lD * a1n2
+                - wall1
+                - center_keepout
+            )
+
+            g_clip = 5.0
+
+            g = np.clip(g,-g_clip,+g_clip)
+
+            # terminal handling must also be zero-sum
             if done:
+                # Example: encode hit_target / collision / oob into g so the sign flip is consistent
                 if collision:
-                    r2 -= self.collision_penalty_att
-                if oob2_any: 
-                    r2 -= self.wallK
-                if att_hit_target: 
-                    r2 += self.att_target_hit_reward_att
+                    g -= self.collision_penalty_def
+                if oob1:
+                    g -= self.wallK
+                if att_hit_target:
+                    g -= self.def_target_hit_penalty_def
+                if def_hit_target:
+                    g -= self.att_target_hit_penalty_def
+
+                # If you want attacker “success” to matter, it should reduce defender g,
+                # which automatically increases attacker reward via -g.
+
+            if need_def:
+                r1 = g
+            if need_att:
+                r2 = -g
+
+        else:
+
+            if need_def:
+                r1 = (
+                    self.alpha * delta_d2
+                    + self.k_pos * d2
+                    # - self.k_rel * rel2
+                    # - self.k_vel * v1n2
+                    # - k_vrad * (vrad1**2)
+                    - self.lD * a1n2
+                    - wall1
+                    - center_keepout
+                )
+
+            # if need_att:
+            #     # normalized squared distance to center (you already computed d2)
+            #     # d2 = ||p2-center||^2 / R^2
+
+            #     # normalized effort (you already computed a2n2)
+            #     # a2n2 = ||a2||^2 / umax^2
+
+            #     r2 = (
+            #         - self.k_att_cent * d2
+            #         - self.lA         * a2n2
+            #         - wall2
+            #     )
+
+
+            if need_att:
+
+                dist = float(np.linalg.norm(p2 - p1))  # meters
+                x = dist / (float(self.att_min_sep) + 1e-9)  # 1.0 at the boundary
+                close_pen = max(0.0, 1.0 - x) ** 2           # ramps up as dist -> min_sep
+                d2_prev = float(self._d2_prev if self._d2_prev is not None else d2)
+
+                progress = d2_prev - d2  # positive inward
+                r2 = (
+                    + self.k_att_prog * progress
+                    - self.k_att_close * close_pen
+                    - self.lA  * a2n2
+                    - wall2
+                )
+
+            if need_def:
+                if done:
+                    if collision:
+                        r1 -= self.collision_penalty_def
+                    if oob1: 
+                        r1 -= self.wallK
+                    if att_hit_target: 
+                        r1 -= self.def_target_hit_penalty_def
+                    if def_hit_target: 
+                        r1 -= self.att_target_hit_penalty_def
+
+            if need_att:
+                if done:
+                    if collision:
+                        r2 -= self.collision_penalty_att
+                    if oob2_any: 
+                        r2 -= self.wallK
+                    if att_hit_target: 
+                        r2 += self.att_target_hit_reward_att
 
 
             # if done and def_hit_target: r2 += self.def_target_hit_reward_att
