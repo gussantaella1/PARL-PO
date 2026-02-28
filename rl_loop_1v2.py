@@ -506,30 +506,26 @@ class Env:
         # ---- rewards ----
         r1 = 0.0
         r_att_each = np.zeros((self.num_attackers,), dtype=np.float32)
-
-        if need_def:
-            r1 = (
-                self.alpha * delta_d2
-                + self.k_pos * d2
-                - self.lD * a1n2
-                - wall1
-                - center_keepout
-            )
-
-        if need_att:
-            progress_each = (self._d2_prev - d2_each).astype(np.float32)  # inward progress
-            dist_each = np.array([np.linalg.norm(pA_list[k] - p1) for k in range(self.num_attackers)], dtype=np.float32)
-            x = dist_each / (float(self.att_min_sep) + 1e-9)
-            close_pen_each = (np.maximum(0.0, 1.0 - x) ** 2).astype(np.float32)
-
-            r_att_each = (
-                + self.k_att_prog * progress_each
-                - self.k_att_close * close_pen_each
-                - self.lA * aA_n2
-                - wallA
-            ).astype(np.float32)
-
         r2 = float(r_att_each.mean()) if need_att else 0.0
+
+        # ---- rewards ----
+        # threat index (closest to center)
+        k_threat = int(np.argmin(d2_each))
+        d2_th = float(d2_each[k_threat])
+
+        # progress for threat attacker (continuity: compare same index)
+        prog_th = float(d2_each[k_threat] - self._d2_prev[k_threat])   # <-- IMPORTANT: per-attacker prev
+
+        # defender payoff g (higher = worse for defender if k_pos>0; tune signs accordingly)
+        g_step = (
+            + self.k_pos * d2_th
+            + self.alpha * prog_th
+            - self.lD    * a1n2
+            - wall1
+            - center_keepout
+        )
+
+
 
         # ---- termination (TRUE state) ----
         rho_def = np.linalg.norm(p1 - self.center) / self.radius
@@ -567,27 +563,40 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
+        g_term = 0.0
+
         if need_def and done:
             if collision:
-                r1 -= self.collision_penalty_def
+                g_term -= self.collision_penalty_def
             if oob1:
-                r1 -= self.wallK
+                g_term -= self.wallK
             if att_hit_any:
-                r1 -= self.def_target_hit_penalty_def
+                g_term -= self.def_target_hit_penalty_def
             if def_hit_target:
-                r1 -= self.att_target_hit_penalty_def
+                g_term -= self.att_target_hit_penalty_def
 
         if need_att and done:
             if collision:
                 # penalize each attacker the same (keeps old single-scalar return behavior)
                 r_att_each -= self.collision_penalty_att
-                r2 = float(r_att_each.mean())
+                g_term = float(r_att_each.mean())
             if oob2_any:
                 r_att_each -= self.wallK
-                r2 = float(r_att_each.mean())
+                g_term = float(r_att_each.mean())
             if att_hit_any:
                 r_att_each += self.att_target_hit_reward_att
-                r2 = float(r_att_each.mean())
+                g_term = float(r_att_each.mean())
+
+        g_total = g_step + g_term
+
+        # defender scalar reward
+        r1 = float(g_total) if need_def else 0.0
+
+        # cooperative attacker team: each attacker gets the same payoff = -g_total
+        r_att_each = np.full((self.num_attackers,), -float(g_total), dtype=np.float32)
+
+        # scalar attacker reward for backward-compat + existing logging
+        r2 = float(r_att_each.mean()) if need_att else 0.0
 
         # update per-attacker d2_prev
         self._d2_prev[:] = d2_each

@@ -2,7 +2,7 @@
 import os, sys, numpy as np, torch
 
 # --- import your ActorCritic and RLPolicy (the eval wrapper we wrote) ---
-from rl_loop import ActorCritic
+from rl_loop_multi import ActorCritic
 import rl_infer  # must contain RLPolicy as in our latest version
 
 def _print_param_norms(model, tag):

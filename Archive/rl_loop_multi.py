@@ -597,19 +597,6 @@ class Env:
                 - center_keepout
             )
 
-        # if need_att:
-        #     # normalized squared distance to center (you already computed d2)
-        #     # d2 = ||p2-center||^2 / R^2
-
-        #     # normalized effort (you already computed a2n2)
-        #     # a2n2 = ||a2||^2 / umax^2
-
-        #     r2 = (
-        #         - self.k_att_cent * d2
-        #         - self.lA         * a2n2
-        #         - wall2
-        #     )
-
 
         r2_vec = np.zeros((self.num_attackers,), dtype=np.float32)
 
@@ -773,7 +760,7 @@ class Env:
 
             # reward only the attacker that actually hit (att_hit_idx), if any
             if att_hit_target and (att_hit_idx >= 0):
-                r2_vec[:] += self.att_target_hit_reward_att
+                r2_vec[att_hit_idx] += self.att_target_hit_reward_att
 
 
             # if done and def_hit_target: r2 += self.def_target_hit_reward_att
@@ -808,10 +795,12 @@ class Env:
         d2_true_norm = d2_threat
         # d2_belief_norm = float(np.dot(p2_geom - self.center, p2_geom - self.center)) / (self.radius**2)
 
+        rel_threat = float(np.dot(pA_list[k_threat] - p1, pA_list[k_threat] - p1)) / (self.radius**2)
+
         info = {
             "t": self.t,
-            "d2_norm": d2,                 # whatever you used for reward (belief if UKF)
-            "rel2_norm": rel2,
+            "d2_norm": d2_threat,                 # whatever you used for reward (belief if UKF)
+            "rel2_norm": rel_threat,
             "oob_def": bool(oob1),
             "oob_att": bool(oob2_any),
             "hit_target": bool(hit_target),
@@ -1339,7 +1328,7 @@ class ActorCriticDiff(nn.Module):
         prior_type = cfg.get("prior_type", "none")  # "ls", "nash", or "none"
 
         print(prior_type)
-        raise("Debug (loop multi)")
+        # raise("Debug (loop multi)")
         if prior_type == "none":
             self.layer = NoPriorLayer(cfg)
         else:

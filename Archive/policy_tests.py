@@ -10,7 +10,7 @@ import torch
 try:
     Env  # type: ignore[name-defined]
 except NameError:  # pragma: no cover
-    from rl_loop import Env  # avoids NameError when run standalone
+    from rl_loop_multi import Env  # avoids NameError when run standalone
 
 # --- small helpers ---
 def explained_variance(y_pred: np.ndarray, y_true: np.ndarray):
