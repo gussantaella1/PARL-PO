@@ -1,5 +1,5 @@
 """
-rl_loop.py
+rl_loop_diffgame.py
 ===================================
 Single-file training & evaluation where **only the defender is learned (PPO)**
 and the **attacker is a deterministic rule-based controller** that (a) drives to the
@@ -504,50 +504,46 @@ class Env:
 
         v_scale = self.radius / self.dt
 
-
+        #Defender vars
+        if True:
             
-        # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
-        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+            # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
+            wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
-        # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
-        center_keepout = 0.0
-        if self.oi_radius > 0.0:
-            r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
-            d1_m = float(np.linalg.norm(p1 - self.center))  # meters
+            # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
+            center_keepout = 0.0
+            if self.oi_radius > 0.0:
+                r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
+                d1_m = float(np.linalg.norm(p1 - self.center))  # meters
 
-            if r_keepout_m > 0.0 and d1_m < r_keepout_m:
-                gap_m = (r_keepout_m - d1_m)  # meters inside keepout
-                # normalize gap by arena radius so penalty scale is comparable across different R
-                gap = gap_m / (self.radius + 1e-9)
-                center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
+                if r_keepout_m > 0.0 and d1_m < r_keepout_m:
+                    gap_m = (r_keepout_m - d1_m)  # meters inside keepout
+                    # normalize gap by arena radius so penalty scale is comparable across different R
+                    gap = gap_m / (self.radius + 1e-9)
+                    center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
 
 
-        # defender radial velocity
-        rhat1 = (p1 - self.center)
-        rnorm = np.linalg.norm(rhat1) + 1e-9
+            # defender radial velocity
+            rhat1 = (p1 - self.center)
+            rnorm = np.linalg.norm(rhat1) + 1e-9
 
-        v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
-        a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
+            v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
+            a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
 
-        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
+            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
 
-        v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
-        a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
-        
-        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+        #Attacker vars
 
-        # ---- compute only requested reward(s) ----
-        r1 = 0.0
-        r2 = 0.0
-
-        use_security = True
+        if True:
+            v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
+            a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
+            
+            wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- termination scenariosalways uses TRUE state ----
 
 
         hit_target = False
-
-
 
         rho_att = np.linalg.norm(p2 - self.center) / self.radius
         rho_def = np.linalg.norm(p1 - self.center) / self.radius
@@ -561,6 +557,26 @@ class Env:
 
 
         hit_target = att_hit_target or def_hit_target
+
+        # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
+        collision = False
+        if self.collision_radius_m > 0.0:
+            for pA_true in pA_list:
+                if np.linalg.norm(pA_true - p1) <= self.collision_radius_m:
+                    collision = True
+                    break
+
+        oob1 = (rho1 >= self.margin)
+
+        # oob for ANY attacker
+        oob2_any = False
+        for pA_true in pA_list:
+            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
+            if rhoA_true >= self.margin:
+                oob2_any = True
+                break
+
+        done = (oob1 or oob2_any or hit_target or collision)
 
 
         # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
@@ -583,6 +599,14 @@ class Env:
 
         done = (oob1 or oob2_any or hit_target or collision)
 
+
+
+        # ---- compute only requested reward(s) ----
+        r1 = 0.0
+        r2 = 0.0
+
+        use_security = True
+
         if use_security:
 
             # build scalar g (defender maximizes, attacker minimizes)
@@ -593,16 +617,22 @@ class Env:
             # (Easiest: compute a1n2, wall1, center_keepout unconditionally when use_security.)
 
             g = (
+                #Defender terms
                 self.k_pos * d2
                 + self.alpha * delta_d2
                 - self.lD * a1n2
                 - wall1
                 - center_keepout
+
+                #Attacker terms
+                + self.lA_sec * a2n2     # NEW (pick a coefficient for security mode)
+                + wall2                  # NEW
+                + self.k_v2_sec * v2n2   # optional NEW (prevents insane ramming)
             )
 
-            g_clip = 5.0
+            # g_clip = 5.0
 
-            g = np.clip(g,-g_clip,+g_clip)
+            # g = np.clip(g,-g_clip,+g_clip)
 
             # terminal handling must also be zero-sum
             if done:
@@ -638,20 +668,6 @@ class Env:
                     - center_keepout
                 )
 
-            # if need_att:
-            #     # normalized squared distance to center (you already computed d2)
-            #     # d2 = ||p2-center||^2 / R^2
-
-            #     # normalized effort (you already computed a2n2)
-            #     # a2n2 = ||a2||^2 / umax^2
-
-            #     r2 = (
-            #         - self.k_att_cent * d2
-            #         - self.lA         * a2n2
-            #         - wall2
-            #     )
-
-
             if need_att:
 
                 dist = float(np.linalg.norm(p2 - p1))  # meters
@@ -686,21 +702,6 @@ class Env:
                         r2 -= self.wallK
                     if att_hit_target: 
                         r2 += self.att_target_hit_reward_att
-
-
-            # if done and def_hit_target: r2 += self.def_target_hit_reward_att
-
-        # if need_att and done:
-        #     # reward only if attacker ended near target
-        #     # (oi_radius_norm > 0 means you actually defined a target)
-        #     if self.oi_radius_norm > 0.0:
-        #         if att_hit_target:
-        #             r2 += float(self.beta)   # e.g. beta = 1.0 or 2.0
-        #         else:
-        #             r2 -= float(self.beta)   # optional: discourage ending without hitting
-
-
-
 
 
         # track d2_prev based on the geometry used for reward (same as your current logic)
@@ -1293,8 +1294,7 @@ class ActorCriticDiff(nn.Module):
         hidden = 128
 
         # Choose which prior layer to use
-        prior_type = cfg.get("prior_type", "none")  # "ls", "nash", or "none"
-
+        prior_type = cfg.get("prior_type", "ls")  # "ls", "nash", or "none"
         if prior_type == "ls":
             self.layer = DiffLSLayer(cfg)
         elif prior_type == "nash":
@@ -1324,6 +1324,15 @@ class ActorCriticDiff(nn.Module):
         # How strongly to trust the prior in μ = μ_res + blend * u_prior
         self.prior_blend_def = float(cfg.get("prior_blend_def", 0.5))
         self.prior_blend_att = float(cfg.get("prior_blend_att", 1.0))
+
+        # self.prior_blend_def = 0.5
+        # self.prior_blend_att = 0.5
+
+        # self.prior_blend_def = 0.1
+        # self.prior_blend_att = 0.5
+
+        self.prior_blend_def = 0.0
+        self.prior_blend_att = 0.0
 
     def dist(self, obs: torch.Tensor, who: str):
         feats, u_prior = self.layer(obs, who)
@@ -3469,28 +3478,28 @@ def train_attacker_with_distill(
     build_dyn(cfg_teacher)
 
     # --- NEW: BC pretrain attacker from rule controller ---
-    att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
-    cfg_for_bc = cfg_teacher.copy()
+    # att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
+    # cfg_for_bc = cfg_teacher.copy()
 
-    # During BC we still want an RL attacker net to exist,
-    # but labels come from the rule controller.
-    # Make sure attacker_mode is 'rl' (it already is here).
-    cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
+    # # During BC we still want an RL attacker net to exist,
+    # # but labels come from the rule controller.
+    # # Make sure attacker_mode is 'rl' (it already is here).
+    # cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
 
-    pretrain_attacker_from_rule(
-        cfg_for_bc,
-        out_path=att_bc_ckpt,
-        steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
-        total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
-        bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
-        bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
-    )
+    # pretrain_attacker_from_rule(
+    #     cfg_for_bc,
+    #     out_path=att_bc_ckpt,
+    #     steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
+    #     total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
+    #     bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
+    #     bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
+    # )
 
-    # Now train attacker with PPO starting from the BC init
-    cfg_teacher["att_init_path"] = att_bc_ckpt
+    # # Now train attacker with PPO starting from the BC init
+    # cfg_teacher["att_init_path"] = att_bc_ckpt
 
-    if extra_train_cfg is not None:
-        cfg_teacher.update(extra_train_cfg)
+    # if extra_train_cfg is not None:
+    #     cfg_teacher.update(extra_train_cfg)
 
     # IMPORTANT: read the flag AFTER updates, and default to False if absent
     DISTILL = bool(cfg_teacher.get("distill", False))
@@ -3835,4 +3844,3 @@ if __name__ == "__main__":
 
     print(f"Defender_1 teacher:  {def1_teacher_ckpt if def1_teacher_ckpt else '(skipped)'}")
     print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
-

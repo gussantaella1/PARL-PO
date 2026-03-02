@@ -1,4 +1,4 @@
-# rl_infer.py
+# rl_infer_diff.py
 
 import os
 from typing import Dict, Any, Tuple
@@ -7,15 +7,6 @@ import numpy as np
 import torch
 
 # Import the Diff-Nash network + rule-based attacker from training script
-from rl_loop import ActorCriticDiff, AttackerRuleController
-
-
-import os
-from typing import Dict, Any, Tuple
-
-import numpy as np
-import torch
-
 from rl_loop import ActorCriticDiff, AttackerRuleController
 
 
@@ -113,7 +104,7 @@ class RLPolicyDiff:
 
         miss_def = self.def_net.load_state_dict(sd_def, strict=False)
         if miss_def.missing_keys or miss_def.unexpected_keys:
-            print("[rl_infer] DEF load: missing:", miss_def.missing_keys,
+            print("[rl_infer_diff] DEF load: missing:", miss_def.missing_keys,
                 " unexpected:", miss_def.unexpected_keys)
 
         self.def_net.eval()
@@ -148,7 +139,7 @@ class RLPolicyDiff:
 
             if miss_att.missing_keys or miss_att.unexpected_keys:
                 print(
-                    "[rl_infer] ATT load: missing:",
+                    "[rl_infer_diff] ATT load: missing:",
                     miss_att.missing_keys,
                     " unexpected:",
                     miss_att.unexpected_keys,
@@ -207,5 +198,3 @@ class RLPolicyDiff:
         u = self.rule_ctrl.act(p1, v1, p2, v2)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)
     
-
-
