@@ -607,6 +607,10 @@ class Env:
 
         use_security = True
 
+
+        #Visualize what strategies 
+        # Off policy methods 
+
         if use_security:
 
             # build scalar g (defender maximizes, attacker minimizes)
@@ -616,19 +620,27 @@ class Env:
             # So ensure these are computed even if reward_mode == "att".
             # (Easiest: compute a1n2, wall1, center_keepout unconditionally when use_security.)
 
-            g = (
-                #Defender terms
-                self.k_pos * d2
-                + self.alpha * delta_d2
-                - self.lD * a1n2
-                - wall1
-                - center_keepout
+            # g = (
+            #     #Both agents: TBoth terms
+            #     self.k_pos * d2
+            #     #Defender terms
+            #     + self.alpha * delta_d2
+            #     - self.lD * a1n2
+            #     - wall1
+            #     - center_keepout
 
-                #Attacker terms
-                + self.lA_sec * a2n2     # NEW (pick a coefficient for security mode)
-                + wall2                  # NEW
-                + self.k_v2_sec * v2n2   # optional NEW (prevents insane ramming)
+            #     #Attacker terms
+            #     + self.lA * a2n2     # NEW (pick a coefficient for security mode)
+            #     + wall2                  # NEW
+            #     # + self.k_v2_sec * v2n2   # optional NEW (prevents insane ramming)
+            # )
+
+
+            g = (
+                #Both agents: TBoth terms
+                self.k_pos * d2
             )
+
 
             # g_clip = 5.0
 
@@ -637,10 +649,12 @@ class Env:
             # terminal handling must also be zero-sum
             if done:
                 # Example: encode hit_target / collision / oob into g so the sign flip is consistent
-                if collision:
-                    g -= self.collision_penalty_def
+                # if collision:
+                #     g += self.collision_penalty_def
                 if oob1:
                     g -= self.wallK
+                if oob2_any:
+                    g += self.wallK
                 if att_hit_target:
                     g -= self.def_target_hit_penalty_def
                 if def_hit_target:
@@ -653,6 +667,14 @@ class Env:
                 r1 = g
             if need_att:
                 r2 = -g
+
+            if done and collision:
+                if need_att:
+                    r1 -= self.collision_penalty_def
+                if need_def:
+                    r2 -= self.collision_penalty_def
+
+            
 
         else:
 
