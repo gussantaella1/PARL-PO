@@ -175,12 +175,11 @@ class Env:
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
 
         self.att_target_hit_radius = float(cfg.get("att_target_hit_radius", 0.0))
-        self.att_target_hit_penalty_def = float(cfg.get("att_target_hit_penalty_def", 0.0))
-        self.att_target_hit_reward_att  = float(cfg.get("att_target_hit_reward_att", 0.0))
-
         self.def_oi_safety_buffer = float(cfg.get("def_oi_safety_buffer", 0.0))
-        self.def_target_hit_penalty_def = float(cfg.get("def_target_hit_penalty_def", 0.0))
-        self.def_target_hit_reward_att  = float(cfg.get("def_target_hit_reward_att", 0.0))
+
+        self.target_hit_reward_penalty = float(cfg.get("target_hit_reward_penalty", 5.0))
+        self.collision_penalty = float(cfg.get("collision_penalty", 5.0))
+        self.wall_penalty = float(cfg.get("wall_penalty", 5.0))
 
 
         # NEW: collision termination (defender vs any attacker)
@@ -579,27 +578,6 @@ class Env:
         done = (oob1 or oob2_any or hit_target or collision)
 
 
-        # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
-        collision = False
-        if self.collision_radius_m > 0.0:
-            for pA_true in pA_list:
-                if np.linalg.norm(pA_true - p1) <= self.collision_radius_m:
-                    collision = True
-                    break
-
-        oob1 = (rho1 >= self.margin)
-
-        # oob for ANY attacker
-        oob2_any = False
-        for pA_true in pA_list:
-            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
-            if rhoA_true >= self.margin:
-                oob2_any = True
-                break
-
-        done = (oob1 or oob2_any or hit_target or collision)
-
-
 
         # ---- compute only requested reward(s) ----
         r1 = 0.0
@@ -641,11 +619,6 @@ class Env:
                 self.k_pos * d2
             )
 
-
-            # g_clip = 5.0
-
-            # g = np.clip(g,-g_clip,+g_clip)
-
             # terminal handling must also be zero-sum
             if done:
                 # Example: encode hit_target / collision / oob into g so the sign flip is consistent
@@ -654,11 +627,11 @@ class Env:
                 if oob1:
                     g -= self.wallK
                 if oob2_any:
-                    g += self.wallK
+                    g += self.wall_penalty
                 if att_hit_target:
-                    g -= self.def_target_hit_penalty_def
+                    g -= self.target_hit_reward_penalty
                 if def_hit_target:
-                    g -= self.att_target_hit_penalty_def
+                    g -= self.target_hit_reward_penalty
 
                 # If you want attacker “success” to matter, it should reduce defender g,
                 # which automatically increases attacker reward via -g.
@@ -669,10 +642,14 @@ class Env:
                 r2 = -g
 
             if done and collision:
-                if need_att:
-                    r1 -= self.collision_penalty_def
                 if need_def:
-                    r2 -= self.collision_penalty_def
+                    r1 -= self.collision_penalty
+                if need_att:
+                    r2 -= self.collision_penalty
+
+            # if done and oob1:
+            #     if need_def: 
+            #         r1 -= self.wallK
 
             
 
@@ -708,22 +685,22 @@ class Env:
             if need_def:
                 if done:
                     if collision:
-                        r1 -= self.collision_penalty_def
+                        r1 -= self.collision_penalty
                     if oob1: 
                         r1 -= self.wallK
                     if att_hit_target: 
-                        r1 -= self.def_target_hit_penalty_def
+                        r1 -= self.target_hit_reward_penalty
                     if def_hit_target: 
-                        r1 -= self.att_target_hit_penalty_def
+                        r1 -= self.target_hit_reward_penalty
 
             if need_att:
                 if done:
                     if collision:
-                        r2 -= self.collision_penalty_att
+                        r2 -= self.collision_penalty
                     if oob2_any: 
                         r2 -= self.wallK
                     if att_hit_target: 
-                        r2 += self.att_target_hit_reward_att
+                        r2 += self.target_hit_reward_penalty
 
 
         # track d2_prev based on the geometry used for reward (same as your current logic)

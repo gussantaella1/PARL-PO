@@ -60,7 +60,6 @@ COMMON: Dict[str, Any] = {
     "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
-    "wall_penalty": 3.0,
 
     # Action bounds
     "umax": 2.0,
@@ -71,16 +70,6 @@ COMMON: Dict[str, Any] = {
         [ -19.9, 0.0, 0.0,  +0.02, 0.00, 0.000], # attacker
     ], dtype=float),
     "x0_jitter": {"pos": 0.5, "vel": 0.01},
-
-    # Reward shaping (used by Env at train *and* eval)
-    "dense_coef": 0.03,   # α
-    "term_coef": 1.0,     # β
-    "step_pos_coef": 0.01,
-    "step_rel_coef": 0.005,
-    "def_center_coef": 0.05,
-    "step_vel_coef": 0.0005,
-    "effort_def": 0.01,
-    "effort_att": 0.01,
 
     # DiffNash prior (actor mean blend)
     "prior_ridge": 1e-2,
@@ -197,8 +186,17 @@ TRAIN: Dict[str, Any] = {
     # "minibatch_size": 10240,  
     # "log_every": 100,
 
+    #Long training (new)
+    "num_envs": 128,   
+    "steps_per_env": 256,   
+    "total_updates": 1000,   
+    "train_epochs": 5,
+    "minibatch_size": 4096,  
+    "log_every": 10,
+    "entropy_coef": 0.01,
 
-    #Long training
+
+    #Long training (old)
     "num_envs": 64,   
     "steps_per_env": 512,   
     "total_updates": 2000,   
@@ -222,8 +220,19 @@ TRAIN: Dict[str, Any] = {
     # "minibatch_size": 1024,  
     # "log_every": 10,
 
+    # Reward shaping (used by Env at train *and* eval)
+    "dense_coef": 0.03,   # α
+    "term_coef": 1.0,     # β
+    "step_pos_coef": 0.05,
+    # "step_rel_coef": 0.005,
+    # "def_center_coef": 0.05,
+    # "step_vel_coef": 0.0005,
+    "effort_def": 0.01,
+    "effort_att": 0.01,
+
+
     # PPO hyperparams
-    "gamma": 0.99,
+    "gamma": 0.999,
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
     "policy_lr": 3e-4,
@@ -256,6 +265,15 @@ TRAIN: Dict[str, Any] = {
 
 
 
+    # New params
+
+    "target_hit_reward_penalty": 5.0,
+    "collision_penalty": 5.0,
+    "wall_penalty": 5.0,
+
+
+
+    # Old params
 
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
     "att_target_hit_penalty_def": 3.0,     # big negative for defender
