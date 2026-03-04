@@ -3854,8 +3854,6 @@ if __name__ == "__main__":
             "def_student_ckpt": def0_student_ckpt,
         }
 
-    with runlog.stage("PHASE0_cleanup"):
-        end_phase_cleanup("Cleanup after PHASE 0")
 
     # =========================================================
     # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
@@ -3879,8 +3877,6 @@ if __name__ == "__main__":
             "att_student_ckpt": att1_student_ckpt,
         }
 
-    with runlog.stage("PHASE1_cleanup"):
-        end_phase_cleanup("Cleanup after PHASE 1")
 
     # =========================================================
     # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
@@ -3903,9 +3899,6 @@ if __name__ == "__main__":
             "def_teacher_ckpt": def1_teacher_ckpt,
             "def_student_ckpt": def1_student_ckpt,
         }
-
-    with runlog.stage("PHASE2_cleanup"):
-        end_phase_cleanup("Cleanup after PHASE 2")
 
     # =========================================================
     # Plotting (also timed)

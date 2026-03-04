@@ -188,7 +188,7 @@ TRAIN: Dict[str, Any] = {
 
     #Long training (new)
     "num_envs": 128,   
-    "steps_per_env": 256,   
+    "steps_per_env": 512,   
     "total_updates": 1000,   
     "train_epochs": 5,
     "minibatch_size": 4096,  
