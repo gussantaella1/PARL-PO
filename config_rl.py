@@ -194,15 +194,18 @@ TRAIN: Dict[str, Any] = {
     "minibatch_size": 4096,  
     "log_every": 10,
     "entropy_coef": 0.01,
+    "k_pos": 0.04, #Was 0.05
+    "gamma": 0.998, #Was 0.999
 
 
     #Long training (old)
-    "num_envs": 64,   
-    "steps_per_env": 512,   
-    "total_updates": 2000,   
-    "train_epochs": 3,
-    "minibatch_size": 8192,  
-    "log_every": 10,
+    # "num_envs": 64,   
+    # "steps_per_env": 512,   
+    # "total_updates": 2000,   
+    # "train_epochs": 3,
+    # "minibatch_size": 8192,  
+    # "log_every": 10,
+    # "entropy_coef": 0.02,
 
     #Short training
     # "num_envs": 8,          
@@ -211,6 +214,9 @@ TRAIN: Dict[str, Any] = {
     # "train_epochs": 10,
     # "minibatch_size": 1024,  
     # "log_every": 10,
+    # "entropy_coef": 0.01,
+    # "k_pos": 0.04,
+    # "gamma": 0.999,
 
     #Test training
     # "num_envs": 1,          
@@ -219,25 +225,23 @@ TRAIN: Dict[str, Any] = {
     # "train_epochs": 3,
     # "minibatch_size": 1024,  
     # "log_every": 10,
+    # "entropy_coef": 0.01,
+    # "k_pos": 0.04,  
+    # "gamma": 0.998,
 
-    # Reward shaping (used by Env at train *and* eval)
+    # Legacy eward shaping (used by Env at train *and* eval)
     "dense_coef": 0.03,   # α
     "term_coef": 1.0,     # β
     "step_pos_coef": 0.05,
-    # "step_rel_coef": 0.005,
-    # "def_center_coef": 0.05,
-    # "step_vel_coef": 0.0005,
     "effort_def": 0.01,
     "effort_att": 0.01,
 
 
     # PPO hyperparams
-    "gamma": 0.999,
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
     "policy_lr": 3e-4,
     "value_lr": 1e-3,
-    "entropy_coef": 0.02,
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
 
@@ -250,7 +254,7 @@ TRAIN: Dict[str, Any] = {
     # Training-only initial condition randomization
     # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell",  # or "fixed"
-    "train_ic_vmax": 0.05,            # max |v| component at t=0
+    "train_ic_vmax": 0.5,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
 
     "prior_type": "ls",                 #ls, nash, none
@@ -267,9 +271,9 @@ TRAIN: Dict[str, Any] = {
 
     # New params
 
-    "target_hit_reward_penalty": 5.0,
-    "collision_penalty": 5.0,
-    "wall_penalty": 5.0,
+    "target_hit_reward_penalty": 3.0,
+    "collision_penalty": 3.0,
+    "wall_penalty": 3.0,
 
 
 
@@ -316,57 +320,6 @@ TRAIN: Dict[str, Any] = {
 
 
 }
-
-#Long training config below:
-
-# ---------- TRAIN (long-run, more stable) ----------
-# TRAIN: Dict[str, Any] = {
-#     # Vectorized rollout & logging
-#     # Total samples per update = num_envs * steps_per_env
-#     # Here: 32 * 512 = 16,384 steps/update (8x your original short run)
-#     "num_envs": 32,
-#     "steps_per_env": 512,
-#     "total_updates": 1200,     # long but not crazy; ~19.7M steps
-
-#     "log_every": 10,
-
-#     # PPO hyperparams
-#     "gamma": 0.99,
-#     "gae_lambda": 0.95,
-#     "clip_eps": 0.2,
-
-#     # ↓ Smaller LRs than your short-run config (since batch is much larger)
-#     "policy_lr": 1e-4,         # was 3e-4
-#     "value_lr": 3e-4,          # was 1e-3
-
-#     "train_epochs": 10,
-#     "minibatch_size": 1024,    # 16 minibatches per update w/ 16,384 steps
-#     "entropy_coef": 0.02,
-#     "value_coef": 0.5,
-#     "max_grad_norm": 1.0,
-
-#     "lr_schedule": "linear",   # options: "none", "linear"
-#     "lr_final_factor": 0.1,    # final_lr = lr_final_factor * initial_lr
-
-#     # Anneal (training-time only)
-#     "def_center_min_anneal": 0.5,
-
-#     # Training-only initial condition randomization
-#     "train_ic_mode": "random_shell",  # or "fixed"
-#     "train_ic_vmax": 0.05,            # max |v| component at t=0
-#     "train_min_sep": 1.0,             # min defender–attacker separation (m)
-
-#     # Defender vs center behaviour
-#     "def_center_safe_radius": 0.10,   # keep-out inside 10% of R
-#     "def_center_avoid_coef":  50.0,   # penalty for entering this zone
-#     "def_center_coef":        0.0,    # no attractive tether to center
-#     "prior_blend_def":        0.0,    # disable center prior for def (RL only)
-
-#     # Terminal hit logic
-#     "att_target_hit_radius":       0.05,   # attacker within 5% of R hits target
-#     "att_target_hit_penalty_def": 10.0,    # was 5.0 → stronger slap to defender
-#     "att_target_hit_reward_att":   5.0,    # attacker reward unchanged
-# }
 
 
 

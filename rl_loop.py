@@ -21,6 +21,10 @@ import numpy as np
 import torch
 import gc
 import time
+import sys
+import platform
+from datetime import datetime, timezone
+from contextlib import contextmanager
 
 
 import torch.nn as nn
@@ -41,7 +45,109 @@ import json
 from pathlib import Path
 
 
+#Logger utils:
 
+def _utc_now():
+    return datetime.now(timezone.utc).isoformat()
+
+def _to_jsonable(x):
+    """Recursively convert common non-JSON types (numpy/torch/etc.) to JSON-safe."""
+    # basic
+    if x is None or isinstance(x, (bool, int, float, str)):
+        return x
+
+    # dict-like
+    if isinstance(x, dict):
+        return {str(k): _to_jsonable(v) for k, v in x.items()}
+
+    # list/tuple/set
+    if isinstance(x, (list, tuple, set)):
+        return [_to_jsonable(v) for v in x]
+
+    # numpy scalars/arrays
+    try:
+        import numpy as np
+        if isinstance(x, np.ndarray):
+            return x.tolist()
+        if isinstance(x, (np.integer, np.floating, np.bool_)):
+            return x.item()
+    except Exception:
+        pass
+
+    # torch tensors/devices
+    try:
+        import torch
+        if isinstance(x, torch.Tensor):
+            return {
+                "__type__": "torch.Tensor",
+                "shape": list(x.shape),
+                "dtype": str(x.dtype),
+                "device": str(x.device),
+            }
+        if isinstance(x, torch.device):
+            return str(x)
+    except Exception:
+        pass
+
+    # pathlib paths
+    try:
+        from pathlib import Path
+        if isinstance(x, Path):
+            return str(x)
+    except Exception:
+        pass
+
+    # fallback: stringify (handles callables, classes, etc.)
+    return {"__type__": type(x).__name__, "__repr__": repr(x)}
+
+class RunLogger:
+    def __init__(self, out_dir: str, filename: str = "run_manifest.json"):
+        self.out_dir = out_dir
+        self.path = os.path.join(out_dir, filename)
+
+        self.data = {
+            "created_utc": _utc_now(),
+            "out_dir": out_dir,
+            "env": {
+                "python": sys.version,
+                "platform": platform.platform(),
+            },
+            "configs": {},
+            "stages": [],   # chronological list of stage records
+        }
+        self.flush()  # create file immediately
+
+    def set_config(self, key: str, cfg_obj):
+        self.data["configs"][key] = _to_jsonable(cfg_obj)
+        self.flush()
+
+    def flush(self):
+        os.makedirs(self.out_dir, exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.data, f, indent=2, sort_keys=False)
+        os.replace(tmp, self.path)  # atomic on POSIX/most OSes
+
+    @contextmanager
+    def stage(self, name: str, **meta):
+        rec = {
+            "name": name,
+            "start_utc": _utc_now(),
+            "meta": _to_jsonable(meta),
+        }
+        t0 = time.perf_counter()
+        try:
+            yield rec  # you can mutate rec inside the with-block to add outputs
+            rec["status"] = "ok"
+        except Exception as e:
+            rec["status"] = "error"
+            rec["error"] = {"type": type(e).__name__, "repr": repr(e)}
+            raise
+        finally:
+            rec["end_utc"] = _utc_now()
+            rec["duration_s"] = float(time.perf_counter() - t0)
+            self.data["stages"].append(rec)
+            self.flush()
 
 
 # --- Single source of truth for config & dynamics ---
@@ -151,7 +257,7 @@ class Env:
         # reward params
         self.alpha = float(cfg["dense_coef"])  # Δd2 stability term
         self.beta  = float(cfg["term_coef"])   # terminal ±d2
-        self.k_pos = float(cfg.get("step_pos_coef", 0.0))
+        self.k_pos = float(cfg.get("k_pos", 0.0))
         self.k_rel = float(cfg.get("step_rel_coef", 0.0))
         self.k_cent_base = float(cfg.get("def_center_coef", 0.0))
         self.k_cent = self.k_cent_base         # may be annealed during training
@@ -3698,9 +3804,17 @@ def end_phase_cleanup(
 # =============================================================
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
 # =============================================================
+
+
+
+    # =============================================================
+# Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
+# =============================================================
 if __name__ == "__main__":
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
+
+    runlog = RunLogger(OUT_DIR, filename="run_manifest.json")
 
     cfg_distillation = config_for_train(
         attacker_mode="rl",   # attacker is RL now
@@ -3709,120 +3823,111 @@ if __name__ == "__main__":
     DISTILL = cfg_distillation["distill"]
 
 
+    cfg_training_log = config_for_train(
+        attacker_mode="train",
+        train_role="def",
+    )
+
+    runlog.set_config("training config used", cfg_training_log)
+
+    # save the exact distillation config you started with
+
+    # runlog.set_config("cfg_distillation", cfg_distillation)
+
     # =========================================================
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
     print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
-    def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+    with runlog.stage(
+        "PHASE0_train_def0",
         phase_name="def0",
         attacker_mode="rule",
-        extra_train_cfg=None,  # training vs the built-in rule-based attacker
-    )
-    end_phase_cleanup("Cleanup after PHASE 0")
+        extra_train_cfg=None,
+    ) as st:
+        def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+            phase_name="def0",
+            attacker_mode="rule",
+            extra_train_cfg=None,
+        )
+        st["outputs"] = {
+            "def_teacher_ckpt": def0_teacher_ckpt,
+            "def_student_ckpt": def0_student_ckpt,
+        }
 
-    # def0_teacher_ckpt = "Training_Policy/def0_def_teacher.pt"
-
+    with runlog.stage("PHASE0_cleanup"):
+        end_phase_cleanup("Cleanup after PHASE 0")
 
     # =========================================================
     # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
     # =========================================================
     print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
+    phase1_extra = {"def_ckpt_path": def0_teacher_ckpt}
 
-
-    att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
+    with runlog.stage(
+        "PHASE1_train_att1",
         phase_name="att1",
         attacker_mode="rl",
-        extra_train_cfg={
-            "def_ckpt_path": def0_teacher_ckpt,
-            # "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
-        },       
-    )
-    end_phase_cleanup("Cleanup after PHASE 1")
+        extra_train_cfg=phase1_extra,
+    ) as st:
+        att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
+            phase_name="att1",
+            attacker_mode="rl",
+            extra_train_cfg=phase1_extra,
+        )
+        st["outputs"] = {
+            "att_teacher_ckpt": att1_teacher_ckpt,
+            "att_student_ckpt": att1_student_ckpt,
+        }
 
-
-    # NOTE: we are *not* yet distilling the attacker here.
-    # To distill the attacker, we'd need a clear attacker-side sensor / partial
-    # observation model (UKF or otherwise). Once that's designed, we can add a
-    # distillation routine analogous to distill_from_teacher but with who='att'.
+    with runlog.stage("PHASE1_cleanup"):
+        end_phase_cleanup("Cleanup after PHASE 1")
 
     # =========================================================
     # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
     # =========================================================
     print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
+    phase2_extra = {"att_ckpt_path": att1_teacher_ckpt, "freeze_attacker": True}
 
-    def1_teacher_ckpt, def1_student_ckpt = train_defender_with_distill(
+    with runlog.stage(
+        "PHASE2_train_def1",
         phase_name="def1",
-        attacker_mode="rl",   # attacker is RL now
-        extra_train_cfg={
-            "att_ckpt_path": att1_teacher_ckpt,
-            "freeze_attacker": True,   # keep attacker₁ fixed during defender₁ training
-        },
-    )
-    end_phase_cleanup("Cleanup after PHASE 2")
+        attacker_mode="rl",
+        extra_train_cfg=phase2_extra,
+    ) as st:
+        def1_teacher_ckpt, def1_student_ckpt = train_defender_with_distill(
+            phase_name="def1",
+            attacker_mode="rl",
+            extra_train_cfg=phase2_extra,
+        )
+        st["outputs"] = {
+            "def_teacher_ckpt": def1_teacher_ckpt,
+            "def_student_ckpt": def1_student_ckpt,
+        }
 
+    with runlog.stage("PHASE2_cleanup"):
+        end_phase_cleanup("Cleanup after PHASE 2")
 
+    # =========================================================
+    # Plotting (also timed)
+    # =========================================================
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
-
-    # stage folders
     PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
     PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
     PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
     PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
-
     for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
         os.makedirs(d, exist_ok=True)
 
-    # ---- def0 ----
-    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
-    plot_training_metrics(
-        m_def0_teacher,
-        title="def0_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_DEF0,
-        save_prefix="def0_teacher",
-    )
-
-    # ---- att1 ----
-    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
-    plot_training_metrics(
-        m_att1_teacher,
-        title="att1_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_ATT1,
-        save_prefix="att1_teacher",
-    )
-
-    # ---- def1 ----
-    m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
-    plot_training_metrics(
-        m_def1_teacher,
-        title="def1_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_DEF1,
-        save_prefix="def1_teacher",
-    )
-
-    # ---- comparisons ----
-    plot_compare_phases(
-        [
-            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
-            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz")),
-        ],
-        metric="R_def_mean",
-        ylabel="Mean defender return",
-        title="Defender return across phases",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_COMP,
-        filename="compare__R_def_mean__def0_vs_def1.png",
-    )
+    # record a final summary block too
+    runlog.set_config("final_outputs", {
+        "def0_teacher_ckpt": def0_teacher_ckpt,
+        "def0_student_ckpt": def0_student_ckpt,
+        "att1_teacher_ckpt": att1_teacher_ckpt,
+        "att1_student_ckpt": att1_student_ckpt,
+        "def1_teacher_ckpt": def1_teacher_ckpt,
+        "def1_student_ckpt": def1_student_ckpt,
+        "plots_root": PLOTS_ROOT,
+    })
 
     print("Saved plots under:", PLOTS_ROOT)
     print(" -", PLOTS_DEF0)
@@ -3830,16 +3935,10 @@ if __name__ == "__main__":
     print(" -", PLOTS_DEF1)
     print(" -", PLOTS_COMP)
 
-
-
-
-
     print("\n===== ALL PHASES COMPLETE =====")
     print(f"Defender_0 teacher:  {def0_teacher_ckpt if def0_teacher_ckpt else '(skipped)'}")
     print(f"Defender_0 student:  {def0_student_ckpt if def0_student_ckpt else '(skipped)'}")
-
     print(f"Attacker_1 teacher:  {att1_teacher_ckpt if att1_teacher_ckpt else '(skipped)'}")
     print(f"Attacker_1 student:  {att1_student_ckpt if att1_student_ckpt else '(skipped)'}")
-
     print(f"Defender_1 teacher:  {def1_teacher_ckpt if def1_teacher_ckpt else '(skipped)'}")
     print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
