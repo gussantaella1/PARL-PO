@@ -219,133 +219,41 @@ def _build_security_g_1v1(
     D: int,
     center: np.ndarray,
     R: float,
-    x2_pos_prev: np.ndarray,           # numpy (D,)
-    p1n: List, p2n: List,              # pyomo expr lists
-    u1: List, u2: List,                # pyomo vars lists
+    p1n: List, p2n: List,
     cfg: Dict[str, Any],
     mcpp: MCPParams,
 ) -> Any:
-    # Use same knobs as your env step
-    k_pos = float(cfg.get("step_pos_coef", 0.0))
-    alpha = float(cfg.get("dense_coef", 0.0))
-    lD    = float(cfg.get("effort_def", 0.0))
-    lA    = float(cfg.get("effort_att", 0.0))  # optionally in attacker J
+    mcp_cfg = cfg.get("mcp", {}) or {}
 
-    wallK = float(cfg.get("wall_penalty", 0.0))
-    soft_wall = float(cfg.get("soft_wall_start", 0.7))
+    # RL-aligned k_pos
+    k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", 0.0)))
 
-    oi = cfg.get("oi", {}) or {}
-    oi_r_m = float(oi.get("r", 0.0))
-    def_keepout_buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
-    def_center_avoid_coef = float(cfg.get("def_center_avoid_coef", 0.0))
+    # RL-style d2 (normalized squared radius)
+    d2_next = sum((p2n[i] - float(center[i]))**2 for i in range(D)) / (float(R)*float(R) + 1e-12)
 
-    # d2 next (normalized squared)
-    d2_next = (sum((p2n[i] - float(center[i])) ** 2 for i in range(D))) / (float(R) * float(R) + 1e-12)
-    d2_prev = float(np.dot(x2_pos_prev - center, x2_pos_prev - center)) / (float(R) * float(R) + 1e-12)
-    delta_d2 = d2_next - d2_prev
+    g = k_pos * d2_next
 
-    # smooth wall + keepout
-    wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
-    keepout = 0.0
-    if bool(mcpp.def_use_keepout):
-        keepout = _keepout_penalty_expr(p1n, center, oi_r_m, def_keepout_buf_m, def_center_avoid_coef, mcpp.kappa)
+    # Optional smooth “constraints” (recommended for PATH stability)
+    if bool(mcp_cfg.get("include_step_walls", True)):
+        wallK = float(cfg.get("wall_penalty", 0.0))
+        soft_wall = float(cfg.get("soft_wall_start", 0.7))
+        wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
+        g = g - wall1
 
-    u1n2 = _dot_expr(u1)
-    # security g (defender wants large)
-    g = (k_pos * d2_next) + (alpha * delta_d2) - (lD * u1n2) - wall1 - keepout
+    if bool(mcp_cfg.get("include_keepout", True)) and bool(mcpp.def_use_keepout):
+        oi = cfg.get("oi", {}) or {}
+        oi_r_m = float(oi.get("r", 0.0))
+        buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
+        coef = float(cfg.get("def_center_avoid_coef", 0.0))
+        keepout = _keepout_penalty_expr(p1n, center, oi_r_m, buf_m, coef, mcpp.kappa)
+        g = g - keepout
 
-    # Optional clipping of g for stability (mostly PPO-motivated; available here too)
+    # Optional smooth clipping (keeps PATH numerics nicer)
     if mcpp.g_clip is not None and float(mcpp.g_clip) > 0:
         gc = float(mcpp.g_clip)
-        # hard clip is non-smooth; but PATH can still sometimes handle it poorly.
-        # We approximate clip with a smooth saturation: gc * tanh(g/gc)
         g = gc * pyo.tanh(g / gc)
 
-    # Attacker effort can be added in J2 (not inside g)
     return g
-
-
-def _build_default_rewards_1v1(
-    *,
-    D: int,
-    center: np.ndarray,
-    R: float,
-    x1_prev: np.ndarray,
-    x2_prev: np.ndarray,
-    p1n: List, p2n: List,
-    u1: List, u2: List,
-    cfg: Dict[str, Any],
-    mcpp: MCPParams,
-) -> Tuple[Any, Any]:
-    """
-    Returns (r_def_step, r_att_step) as smooth expressions.
-    """
-    # Shared knobs
-    alpha = float(cfg.get("dense_coef", 0.0))
-    k_pos = float(cfg.get("step_pos_coef", 0.0))
-    k_rel = float(cfg.get("step_rel_coef", 0.0))
-    lD    = float(cfg.get("effort_def", 0.0))
-    lA    = float(cfg.get("effort_att", 0.0))
-    wallK = float(cfg.get("wall_penalty", 0.0))
-    soft_wall = float(cfg.get("soft_wall_start", 0.7))
-
-    # OI keepout
-    oi = cfg.get("oi", {}) or {}
-    oi_r_m = float(oi.get("r", 0.0))
-    def_keepout_buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
-    def_center_avoid_coef = float(cfg.get("def_center_avoid_coef", 0.0))
-
-    # Distances
-    d2_next = (sum((p2n[i] - float(center[i])) ** 2 for i in range(D))) / (float(R) * float(R) + 1e-12)
-    d2_prev = float(np.dot(x2_prev[:D] - center, x2_prev[:D] - center)) / (float(R) * float(R) + 1e-12)
-    delta_d2 = d2_next - d2_prev
-
-    rel2_next = (sum((p2n[i] - p1n[i]) ** 2 for i in range(D))) / (float(R) * float(R) + 1e-12)
-
-    wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
-    wall2 = _wall_penalty_expr(p2n, center, R, soft_wall, wallK, mcpp.kappa)
-
-    keepout = 0.0
-    if bool(mcpp.def_use_keepout):
-        keepout = _keepout_penalty_expr(p1n, center, oi_r_m, def_keepout_buf_m, def_center_avoid_coef, mcpp.kappa)
-
-    u1n2 = _dot_expr(u1)
-    u2n2 = _dot_expr(u2)
-
-    # Defender reward (smooth version of your common form)
-    r_def = (alpha * delta_d2) + (k_pos * d2_next) - (lD * u1n2) - wall1 - keepout
-    if k_rel != 0.0:
-        # In your code you sometimes used -k_rel * rel2; choose sign by cfg convention
-        r_def = r_def - (k_rel * rel2_next)
-
-    # Attacker reward variants
-    if mcpp.att_reward_style == "symmetric":
-        # r_att = -alpha*delta_d2 - k_pos*d2 + k_rel*rel2 - lA*||u2||^2 - wall2
-        r_att = (-alpha * delta_d2) - (k_pos * d2_next) - (lA * u2n2) - wall2
-        if k_rel != 0.0:
-            r_att = r_att + (k_rel * rel2_next)
-
-    else:
-        # "progress_close": mimic your newer attacker shaping:
-        # progress = d2_prev - d2_next (positive if moving inward)
-        # close_pen = softplus(1 - dist/min_sep)^2
-        att = cfg.get("att_reward", {}) or {}
-        att_rule = cfg.get("att_rule", {}) or {}
-        k_prog = float(att.get("k_prog", 2.0))
-        k_close = float(att.get("k_close", 2.0))
-        min_sep = float(att.get("min_sep", att_rule.get("min_sep", 3.0)))
-
-        # progress (inward)
-        progress = (d2_prev - d2_next)
-
-        # smooth close penalty
-        dist = pyo.sqrt(sum((p2n[i] - p1n[i]) ** 2 for i in range(D)) + 1e-12)
-        x = dist / (float(min_sep) + 1e-12)
-        close_pen = _smooth_hinge_sq(1.0 - x, mcpp.kappa)
-
-        r_att = (k_prog * progress) - (k_close * close_pen) - (lA * u2n2) - wall2
-
-    return r_def, r_att
 
 
 # ============================================================
@@ -412,33 +320,32 @@ def solve_one_step_mcp_1v1(
     p2n = [x2n(i) for i in range(D)]
 
     # Build objectives
-    if mcpp.mode == "security":
-        g = _build_security_g_1v1(
-            D=D, center=center, R=R,
-            x2_pos_prev=x2[:D].copy(),
-            p1n=p1n, p2n=p2n,
-            u1=[m.u1[i] for i in range(D)],
-            u2=[m.u2[i] for i in range(D)],
-            cfg=cfg, mcpp=mcpp,
-        )
-        # defender minimizes -g ; attacker minimizes +g (+ optional effort)
-        lA = float(cfg.get("effort_att", 0.0))
-        u2n2 = _dot_expr([m.u2[i] for i in range(D)])
-        J1 = -g
-        J2 = +g + (lA * u2n2)
+    g = _build_security_g_1v1(
+        D=D, center=center, R=R,
+        x2_pos_prev=x2[:D].copy(),
+        p1n=p1n, p2n=p2n,
+        u1=[m.u1[i] for i in range(D)],
+        u2=[m.u2[i] for i in range(D)],
+        cfg=cfg, mcpp=mcpp,
+    )
+    # defender minimizes -g ; attacker minimizes +g (+ optional effort)
+    lA = float(cfg.get("effort_att", 0.0))
+    u2n2 = _dot_expr([m.u2[i] for i in range(D)])
+    J1 = -g
+    J2 = +g
 
-    else:
-        r_def, r_att = _build_default_rewards_1v1(
-            D=D, center=center, R=R,
-            x1_prev=x1, x2_prev=x2,
-            p1n=p1n, p2n=p2n,
-            u1=[m.u1[i] for i in range(D)],
-            u2=[m.u2[i] for i in range(D)],
-            cfg=cfg, mcpp=mcpp
-        )
-        J1 = -r_def
-        J2 = -r_att
-        g = None  # not used
+    def _dot_expr(v_list: List):
+        return sum(v_list[i] * v_list[i] for i in range(len(v_list)))
+    
+    u1n2 = _dot_expr([m.u1[i] for i in range(D)])   # = ||u1||^2
+    u2n2 = _dot_expr([m.u2[i] for i in range(D)])   # = ||u2||^2
+
+    umax2 = float(umax) * float(umax) + 1e-12
+    reg = float(cfg.get("mcp", {}).get("reg_u", 0.0))
+    reg = 0.01
+
+    J1 = -g + reg * (u1n2 / umax2)
+    J2 = +g + reg * (u2n2 / umax2)
 
     m.J1 = pyo.Expression(expr=J1)
     m.J2 = pyo.Expression(expr=J2)
@@ -618,35 +525,32 @@ def solve_one_step_mcp_1v2_team(
     else:
         d2_threat_prev = d2a_prev
 
-    alpha = float(cfg.get("dense_coef", 0.0))
-    k_pos = float(cfg.get("step_pos_coef", 0.0))
-    lD    = float(cfg.get("effort_def", 0.0))
-    lA    = float(cfg.get("effort_att", 0.0))
-    wallK = float(cfg.get("wall_penalty", 0.0))
-    soft_wall = float(cfg.get("soft_wall_start", 0.7))
+    #Build security strategy on 1v2 game
+    k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", 0.0)))
+    g = k_pos * d2_threat_next
 
-    oi = cfg.get("oi", {}) or {}
-    oi_r_m = float(oi.get("r", 0.0))
-    def_keepout_buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
-    def_center_avoid_coef = float(cfg.get("def_center_avoid_coef", 0.0))
+    # optional smooth stabilizers
+    mcp_cfg = cfg.get("mcp", {}) or {}
+    if bool(mcp_cfg.get("include_step_walls", True)):
+        wallK = float(cfg.get("wall_penalty", 0.0))
+        soft_wall = float(cfg.get("soft_wall_start", 0.7))
+        wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
+        g = g - wall1
 
-    delta = d2_threat_next - float(d2_threat_prev)
+    if bool(mcp_cfg.get("include_keepout", True)) and bool(mcpp.def_use_keepout):
+        oi = cfg.get("oi", {}) or {}
+        oi_r_m = float(oi.get("r", 0.0))
+        buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
+        coef = float(cfg.get("def_center_avoid_coef", 0.0))
+        keepout = _keepout_penalty_expr(p1n, center, oi_r_m, buf_m, coef, mcpp.kappa)
+        g = g - keepout
 
-    wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
-    keepout = 0.0
-    if bool(mcpp.def_use_keepout):
-        keepout = _keepout_penalty_expr(p1n, center, oi_r_m, def_keepout_buf_m, def_center_avoid_coef, mcpp.kappa)
-
-    u1n2 = _dot_expr([m.u1[i] for i in range(D)])
-    u2n2 = _dot_expr([m.u2[j] for j in range(2 * D)])
-
-    g = (k_pos * d2_threat_next) + (alpha * delta) - (lD * u1n2) - wall1 - keepout
     if mcpp.g_clip is not None and float(mcpp.g_clip) > 0:
         gc = float(mcpp.g_clip)
         g = gc * pyo.tanh(g / gc)
 
     J1 = -g
-    J2 = +g + (lA * u2n2)
+    J2 = +g   # strict zero-sum
 
     m.J1 = pyo.Expression(expr=J1)
     m.J2 = pyo.Expression(expr=J2)

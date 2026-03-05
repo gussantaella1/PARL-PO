@@ -468,3 +468,13 @@ def build_dyn(cfg: Dict[str, Any]):
         raise ValueError(f"Unknown dynamics='{cfg['dynamics']}'")
 
 
+
+# cfg["paper_baseline"] = {
+#   "objective": "ppo_oi_minmax",
+#   "ppo_obj": {
+#     "threat_mode": "idx0",
+#     "include_step_walls": False,
+#     "include_keepout": False,
+#     "include_effort_def": False,
+#   }
+# }

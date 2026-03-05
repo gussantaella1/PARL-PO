@@ -1,4 +1,7 @@
 # paper_baseline_runner.py
+# Paper: Multiple to one orbital pursuit: https://ieeexplore.ieee.org/document/10700692
+
+
 # ============================================================
 # Baseline rollout runners for:
 #   (1) "paper" objectives (as in the Chinese paper):
@@ -133,55 +136,52 @@ def _baseline_objective_mode(cfg: Dict[str, Any]) -> str:
 
 @dataclass
 class PPOObjectiveParams:
-    # Core shaping (defender-centric)
-    alpha: float = 1.0          # progress weight on (d2_next - d2_now)
-    k_pos: float = 1.0          # weight on d2_next (keep threat far from OI)
-    lD: float = 0.1             # defender effort weight on ||uD||^2
-    wallK: float = 10.0         # wall penalty weight
-    soft_wall: float = 0.7      # start penalizing beyond this rho
-    margin: float = 1.0         # terminate if rho >= margin (kept for rollout termination)
+    # Core security meaning: defender wants attacker far from OI
+    k_pos: float = 1.0
 
-    # Defender keepout around OI (meters)
+    # Optional extras (turn on/off to match RL exactly)
+    include_step_walls: bool = False
+    include_keepout: bool = False
+    include_effort_def: bool = False
+    lD: float = 0.0
+
+    # Wall / keepout params (only used if enabled)
+    wallK: float = 10.0
+    soft_wall: float = 0.7
+    margin: float = 1.0
+
     oi_radius_m: float = 0.0
     def_keepout_buffer_m: float = 0.0
     def_center_avoid_coef: float = 0.0
 
-    # Threat selection among attackers
-    threat_mode: str = "closest_to_center"  # or "idx0"
-
-
-def _ppo_obj_params_from_cfg(cfg: Dict[str, Any]) -> PPOObjectiveParams:
-    p = PPOObjectiveParams()
-    d = (cfg.get("paper_baseline", {}) or {}).get("ppo_obj", {}) or {}
-    for k, v in d.items():
-        if hasattr(p, k):
-            setattr(p, k, v)
-    p.threat_mode = (p.threat_mode or "closest_to_center").lower()
-    return p
-
+    # Threat selection
+    threat_mode: str = "idx0"   # "idx0" matches your Env which uses attacker[0]
 
 def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PPOObjectiveParams:
-    """
-    Convenience: pull defaults from your existing PPO-style cfg keys if present.
-    """
     oi = cfg.get("oi", {}) or {}
-    if "r" in oi:
-        p.oi_radius_m = float(oi.get("r", p.oi_radius_m))
+    p.oi_radius_m = float(oi.get("r", p.oi_radius_m))
 
-    # these names match what you used in Env
     p.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", p.def_keepout_buffer_m))
     p.def_center_avoid_coef = float(cfg.get("def_center_avoid_coef", p.def_center_avoid_coef))
+
     p.wallK = float(cfg.get("wall_penalty", p.wallK))
     p.soft_wall = float(cfg.get("soft_wall_start", p.soft_wall))
     p.margin = float(cfg.get("arena_terminate_margin", p.margin))
 
-    # match reward knobs if present
-    p.alpha = float(cfg.get("dense_coef", p.alpha))
-    p.k_pos = float(cfg.get("step_pos_coef", p.k_pos))
+    # IMPORTANT: in your RL code you use cfg["k_pos"] (sometimes step_pos_coef elsewhere)
+    p.k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", p.k_pos)))
+
+    # effort only if you want it in baseline g
     p.lD = float(cfg.get("effort_def", p.lD))
 
-    return p
+    pb = cfg.get("paper_baseline", {}) or {}
+    obj = (pb.get("ppo_obj", {}) or {})
+    p.include_step_walls = bool(obj.get("include_step_walls", p.include_step_walls))
+    p.include_keepout    = bool(obj.get("include_keepout", p.include_keepout))
+    p.include_effort_def = bool(obj.get("include_effort_def", p.include_effort_def))
+    p.threat_mode        = (obj.get("threat_mode", p.threat_mode) or p.threat_mode).lower()
 
+    return p
 
 # ============================================================
 # Dynamics adapter (matches your RL runners)
@@ -866,56 +866,47 @@ def _ppo_security_value_g(
     center: np.ndarray,
     R: float,
     params: PPOObjectiveParams,
+    *,
+    lookahead: int = 1,   # set >1 if you want “paper-style” foresight
 ) -> float:
-    """
-    Scalar security payoff g (defender maximizes, attackers minimize).
-
-    g encourages:
-      - keeping the closest attacker far from OI: +k_pos * d2_next
-      - discouraging attacker inward progress:   +alpha * (d2_next - d2_now)
-    and penalizes:
-      - defender effort: -lD * ||uD||^2
-      - wall: -wall(pD_next)
-      - defender keepout around OI: -keepout(pD_next)
-
-    This is intentionally "PPO-aligned" in meaning, not identical term-by-term.
-    """
     D = int(xD.size // 2)
     eps = 1e-12
 
-    # current positions
-    pA_now = [np.asarray(x[:D], float) for x in xA_list]
-    ith = _pick_threat_attacker(pA_now, center, params.threat_mode)
-    d2_now = float(np.dot(pA_now[ith] - center, pA_now[ith] - center)) / (R * R + eps)
-
-    # one-step prediction
-    xD_1, xA_1 = _predict_positions(
+    # --- predict forward (default 1-step; you can set lookahead=params.tau if you want) ---
+    xD_pred, xA_pred = _predict_positions(
         xE=xD, xP=xA_list,
         uE=uD, uP=uA_list,
-        k0=k, n_steps=1,
+        k0=k, n_steps=max(1, int(lookahead)),
         step_plant_single=step_plant_single,
     )
-    pA_next = [np.asarray(x[:D], float) for x in xA_1]
-    pD_next = np.asarray(xD_1[:D], float)
 
-    ith_next = _pick_threat_attacker(pA_next, center, params.threat_mode)
-    d2_next = float(np.dot(pA_next[ith_next] - center, pA_next[ith_next] - center)) / (R * R + eps)
+    pD = np.asarray(xD_pred[:D], float)
+    pA = [np.asarray(x[:D], float) for x in xA_pred]
 
-    # attacker "progress": positive means moved outward; negative means moved inward
-    prog = d2_next - d2_now
+    # --- threat selection: idx0 matches your RL Env (primary attacker only) ---
+    ith = _pick_threat_attacker(pA, center, params.threat_mode)
 
-    # penalties
-    uD_n2 = float(np.dot(uD, uD))
-    wallD = _wall_penalty(pD_next, center, R, params.soft_wall, params.wallK)
-    keepout = _def_keepout_penalty(pD_next, center, params.oi_radius_m, params.def_keepout_buffer_m, params.def_center_avoid_coef)
+    # d2 (normalized squared dist to center)
+    d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
 
-    g = (
-        + float(params.k_pos) * d2_next
-        + float(params.alpha) * prog
-        - float(params.lD) * uD_n2
-        - wallD
-        - keepout
-    )
+    # --- RL-aligned security payoff ---
+    g = float(params.k_pos) * d2
+
+    # Optional shaping (only include if you also include it in RL g)
+    if params.include_effort_def and float(params.lD) != 0.0:
+        g -= float(params.lD) * float(np.dot(uD, uD))
+
+    if params.include_step_walls:
+        g -= _wall_penalty(pD, center, R, params.soft_wall, params.wallK)
+
+    if params.include_keepout:
+        g -= _def_keepout_penalty(
+            p_def=pD, center=center,
+            oi_r=params.oi_radius_m,
+            buf=params.def_keepout_buffer_m,
+            coef=params.def_center_avoid_coef
+        )
+
     return float(g)
 
 
