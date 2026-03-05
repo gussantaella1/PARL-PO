@@ -719,10 +719,13 @@ class Env:
             #     # + self.k_v2_sec * v2n2   # optional NEW (prevents insane ramming)
             # )
 
+            k_time = 0.001
+
 
             g = (
                 #Both agents: TBoth terms
                 self.k_pos * d2
+                + k_time
             )
 
             # terminal handling must also be zero-sum
@@ -742,16 +745,15 @@ class Env:
                 # If you want attacker “success” to matter, it should reduce defender g,
                 # which automatically increases attacker reward via -g.
 
-            if need_def:
-                r1 = g
-            if need_att:
-                r2 = -g
+            shared_termination = 0.0
 
             if done and collision:
-                if need_def:
-                    r1 -= self.collision_penalty
-                if need_att:
-                    r2 -= self.collision_penalty
+                shared_termination -= self.collision_penalty
+
+            if need_def:
+                r1 = g - shared_termination
+            if need_att:
+                r2 = -g - shared_termination
 
             # if done and oob1:
             #     if need_def: 
@@ -3583,22 +3585,22 @@ def train_attacker_with_distill(
     build_dyn(cfg_teacher)
 
     # --- NEW: BC pretrain attacker from rule controller ---
-    # att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
-    # cfg_for_bc = cfg_teacher.copy()
+    att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
+    cfg_for_bc = cfg_teacher.copy()
 
-    # # During BC we still want an RL attacker net to exist,
-    # # but labels come from the rule controller.
-    # # Make sure attacker_mode is 'rl' (it already is here).
-    # cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
+    # During BC we still want an RL attacker net to exist,
+    # but labels come from the rule controller.
+    # Make sure attacker_mode is 'rl' (it already is here).
+    cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
 
-    # pretrain_attacker_from_rule(
-    #     cfg_for_bc,
-    #     out_path=att_bc_ckpt,
-    #     steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
-    #     total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
-    #     bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
-    #     bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
-    # )
+    pretrain_attacker_from_rule(
+        cfg_for_bc,
+        out_path=att_bc_ckpt,
+        steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
+        total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
+        bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
+        bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
+    )
 
     # # Now train attacker with PPO starting from the BC init
     # cfg_teacher["att_init_path"] = att_bc_ckpt
@@ -3882,7 +3884,9 @@ if __name__ == "__main__":
     # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
     # =========================================================
     print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
-    phase2_extra = {"att_ckpt_path": att1_teacher_ckpt, "freeze_attacker": True}
+    phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
+                    "def_ckpt_path": def0_teacher_ckpt,
+                    }
 
     with runlog.stage(
         "PHASE2_train_def1",
@@ -3901,7 +3905,7 @@ if __name__ == "__main__":
         }
 
     # =========================================================
-    # Plotting (also timed)
+    # Plotting 
     # =========================================================
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
     PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
@@ -3910,6 +3914,58 @@ if __name__ == "__main__":
     PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
     for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
         os.makedirs(d, exist_ok=True)
+
+        # ---- def0 ----
+    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
+    plot_training_metrics(
+        m_def0_teacher,
+        title="def0_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF0,
+        save_prefix="def0_teacher",
+    )
+
+    # ---- att1 ----
+    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
+    plot_training_metrics(
+        m_att1_teacher,
+        title="att1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_ATT1,
+        save_prefix="att1_teacher",
+    )
+
+    # ---- def1 ----
+    m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
+    plot_training_metrics(
+        m_def1_teacher,
+        title="def1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF1,
+        save_prefix="def1_teacher",
+    )
+
+    # ---- comparisons ----
+    plot_compare_phases(
+        [
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz")),
+        ],
+        metric="R_def_mean",
+        ylabel="Mean defender return",
+        title="Defender return across phases",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_COMP,
+        filename="compare__R_def_mean__def0_vs_def1.png",
+    )
 
     # record a final summary block too
     runlog.set_config("final_outputs", {

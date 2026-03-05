@@ -190,7 +190,7 @@ TRAIN: Dict[str, Any] = {
     "num_envs": 128,   
     "steps_per_env": 512,   
     "total_updates": 1000,   
-    "train_epochs": 5,
+    "train_epochs": 3,
     "minibatch_size": 4096,  
     "log_every": 10,
     "entropy_coef": 0.01,
@@ -271,7 +271,7 @@ TRAIN: Dict[str, Any] = {
 
     # New params
 
-    "target_hit_reward_penalty": 3.0,
+    "target_hit_reward_penalty": 3.5,
     "collision_penalty": 3.0,
     "wall_penalty": 3.0,
 
