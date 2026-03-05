@@ -1,5 +1,5 @@
 """
-rl_loop_diffgame.py
+rl_loop.py
 ===================================
 Single-file training & evaluation where **only the defender is learned (PPO)**
 and the **attacker is a deterministic rule-based controller** that (a) drives to the
@@ -725,7 +725,7 @@ class Env:
             g = (
                 #Both agents: TBoth terms
                 self.k_pos * d2
-                + k_time
+                # + k_time
             )
 
             # terminal handling must also be zero-sum
