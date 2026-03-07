@@ -255,22 +255,13 @@ class Env:
 
 
         # reward params
-        self.alpha = float(cfg["dense_coef"])  # Δd2 stability term
-        self.beta  = float(cfg["term_coef"])   # terminal ±d2
-        self.k_pos = float(cfg.get("k_pos", 0.0))
-        self.k_rel = float(cfg.get("step_rel_coef", 0.0))
-        self.k_cent_base = float(cfg.get("def_center_coef", 0.0))
-        self.k_cent = self.k_cent_base         # may be annealed during training
-        self.k_vel = float(cfg.get("step_vel_coef", 0.0))
+        self.k_pos = float(cfg.get("k_pos"))
+
         self.lD    = float(cfg["effort_def"])
         self.lA    = float(cfg["effort_att"])
         self.wallK = float(cfg["wall_penalty"])
-        self.soft_wall = float(cfg.get("soft_wall_start", 0.7))
+        self.soft_wall = float(cfg.get("soft_wall_start"))
         self.margin = float(cfg["arena_terminate_margin"])  # 1.0 = at radius
-
-        # NEW: defender center keep-out (normalized radius wrt arena R)
-        self.def_center_safe_radius = float(cfg.get("def_center_safe_radius", 0.05))
-        self.def_center_avoid_coef  = float(cfg.get("def_center_avoid_coef", 10.0))
 
         # NEW: attacker "hit object" termination around center (normalized wrt arena R)
 
@@ -280,25 +271,24 @@ class Env:
         self.oi_radius = float(oi.get("r", 0.0))
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
 
-        self.att_target_hit_radius = float(cfg.get("att_target_hit_radius", 0.0))
-        self.def_oi_safety_buffer = float(cfg.get("def_oi_safety_buffer", 0.0))
 
-        self.target_hit_reward_penalty = float(cfg.get("target_hit_reward_penalty", 5.0))
-        self.collision_penalty = float(cfg.get("collision_penalty", 5.0))
-        self.wall_penalty = float(cfg.get("wall_penalty", 5.0))
+        self.hit_buffer_def = float(cfg.get("hit_buffer_def"))
+        self.hit_buffer_att = float(cfg.get("hit_buffer_att"))
+
+        self.target_hit_reward_penalty = float(cfg.get("target_hit_reward_penalty"))
+        self.collision_penalty = float(cfg.get("collision_penalty"))
+        self.wall_penalty = float(cfg.get("wall_penalty"))
 
 
         # NEW: collision termination (defender vs any attacker)
-        self.collision_radius_m    = float(cfg.get("collision_radius_m", 0.2))  # meters; 0 disables
-        self.collision_penalty_def = float(cfg.get("collision_penalty_def", 0.0))
-        self.collision_penalty_att = float(cfg.get("collision_penalty_att", 0.0))
+        self.collision_radius_m    = float(cfg.get("collision_radius_m"))  # meters; 0 disables
 
 
         # ---- UKF / measurement model knobs ----
         self.use_ukf          = bool(cfg.get("use_ukf", False))
         self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
-        self.meas_innov_coef  = float(cfg.get("meas_innov_coef", 0.0))  # weight on innovation^2
-        self.meas_cov_coef    = float(cfg.get("meas_cov_coef", 0.0))    # weight on trace(P_pos)
+        self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
+        self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
 
         if self.use_ukf and self.D != 3:
             raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
@@ -364,12 +354,15 @@ class Env:
         self.k_att_wall     = float(att.get("k_wall", self.wallK))
         self.att_wall_power = float(att.get("wall_power", 4.0))
 
+        # --- Opponent-domain randomization (used when training attacker) ---
+        self.opp_domain = "def0"  # default
+        mix = cfg.get("opp_mix", {}) or {}
+        self.opp_resample = str(mix.get("resample", "episode"))
+        self.weak_scale = float(mix.get("weak_scale", 0.2))
+        self.weak_noise_std = float(mix.get("weak_noise_std", 0.0))
 
-        self.hit_buffer_def = float(self.def_oi_safety_buffer)
-        self.hit_buffer_att = float(self.att_target_hit_radius)
-
-
-
+    def set_opp_domain(self, mode: str):
+        self.opp_domain = str(mode)
 
     def reset(self) -> np.ndarray:
         self.t = 0
@@ -405,8 +398,15 @@ class Env:
                 r = (r_min**3 + (r_max**3 - r_min**3) * u) ** (1.0 / 3.0)
                 return self.center + r * d
 
-            r_def_min, r_def_max = 0.0, 0.5 * R
-            r_att_min, r_att_max = 0.4 * R, 0.95 * R
+            # r_def_min, r_def_max = 0.0, 0.5 * R
+            # r_att_min, r_att_max = 0.4 * R, 0.95 * R
+
+            r_def_min = float(self.cfg.get("r_def_min")) * R  
+            r_def_max = float(self.cfg.get("r_def_max")) * R
+
+            r_att_min = float(self.cfg.get("r_att_min")) * R
+            r_att_max = float(self.cfg.get("r_att_max")) * R 
+
 
             # defender
             p1 = sample_in_ball(r_def_min, r_def_max)
@@ -519,7 +519,18 @@ class Env:
         need_att = reward_mode in ("att", "both")
 
         # Defender action
-        a1 = np.clip(np.asarray(a1_env, float).reshape(self.D,), self.u_lo, self.u_hi)
+        a1_in = np.asarray(a1_env, float).reshape(self.D,)
+
+        # --- apply domain transform to defender action ---
+        if self.opp_domain == "none":
+            a1_in[:] = 0.0
+        elif self.opp_domain == "weak":
+            a1_in = self.weak_scale * a1_in
+            if self.weak_noise_std > 0:
+                a1_in = a1_in + np.random.normal(0.0, self.weak_noise_std, size=(self.D,))
+        # else: "def0" => no change
+
+        a1 = np.clip(a1_in, self.u_lo, self.u_hi)
 
         # Attacker actions => force (Na, D)
         aA = np.asarray(aA_env, float)
@@ -601,8 +612,6 @@ class Env:
         wall1 = 0.0
         wall2 = 0.0
         center_keepout = 0.0
-        vrad1 = 0.0
-        k_vrad = self.k_vel * 3.0
 
         rho1 = np.linalg.norm(p1 - self.center)/ self.radius
         rho2 = np.linalg.norm(p2 - self.center) / self.radius
@@ -610,44 +619,29 @@ class Env:
         v_scale = self.radius / self.dt
 
         #Defender vars
-        if True:
-            
-            # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
-            wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+        #             
+        # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
+        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
 
-            # defender keep-out (METERS): keep defender outside (oi_radius + buffer)
-            center_keepout = 0.0
-            if self.oi_radius > 0.0:
-                r_keepout_m = self.oi_radius + self.def_keepout_buffer_m
-                d1_m = float(np.linalg.norm(p1 - self.center))  # meters
+        # defender radial velocity
+        rhat1 = (p1 - self.center)
+        rnorm = np.linalg.norm(rhat1) + 1e-9
 
-                if r_keepout_m > 0.0 and d1_m < r_keepout_m:
-                    gap_m = (r_keepout_m - d1_m)  # meters inside keepout
-                    # normalize gap by arena radius so penalty scale is comparable across different R
-                    gap = gap_m / (self.radius + 1e-9)
-                    center_keepout = self.def_center_avoid_coef * (gap_m * gap_m)
+        v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
+        a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
 
-
-            # defender radial velocity
-            rhat1 = (p1 - self.center)
-            rnorm = np.linalg.norm(rhat1) + 1e-9
-
-            v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
-            a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
-
-            vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
+        vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
 
         #Attacker vars
 
-        if True:
-            v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
-            a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
-            
-            wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+        v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
+        a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
+        
+        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- termination scenariosalways uses TRUE state ----
 
-
+        # 1) Hitting target
         hit_target = False
 
         rho_att = np.linalg.norm(p2 - self.center) / self.radius
@@ -663,7 +657,7 @@ class Env:
 
         hit_target = att_hit_target or def_hit_target
 
-        # collision: defender within collision_radius_m of ANY attacker (TRUE distance)
+        # 2) collision: defender within collision_radius_m of ANY attacker (TRUE distance)
         collision = False
         if self.collision_radius_m > 0.0:
             for pA_true in pA_list:
@@ -673,6 +667,8 @@ class Env:
 
         oob1 = (rho1 >= self.margin)
 
+        # 3) Exiting the arena
+
         # oob for ANY attacker
         oob2_any = False
         for pA_true in pA_list:
@@ -680,6 +676,13 @@ class Env:
             if rhoA_true >= self.margin:
                 oob2_any = True
                 break
+
+        if self.opp_domain == "none":
+            # do NOT let defender OOB / defender-hit / collisions terminate training
+            oob1 = False
+            def_hit_target = False
+            collision = False
+            hit_target = att_hit_target  # only attacker matters
 
         done = (oob1 or oob2_any or hit_target or collision)
 
@@ -697,30 +700,7 @@ class Env:
 
         if use_security:
 
-            # build scalar g (defender maximizes, attacker minimizes)
-            # d2 and delta_d2 already computed above.
-            # a1n2, wall1, center_keepout already computed under need_def, but
-            # for security we must compute them regardless (since g depends on them).
-            # So ensure these are computed even if reward_mode == "att".
-            # (Easiest: compute a1n2, wall1, center_keepout unconditionally when use_security.)
-
-            # g = (
-            #     #Both agents: TBoth terms
-            #     self.k_pos * d2
-            #     #Defender terms
-            #     + self.alpha * delta_d2
-            #     - self.lD * a1n2
-            #     - wall1
-            #     - center_keepout
-
-            #     #Attacker terms
-            #     + self.lA * a2n2     # NEW (pick a coefficient for security mode)
-            #     + wall2                  # NEW
-            #     # + self.k_v2_sec * v2n2   # optional NEW (prevents insane ramming)
-            # )
-
             k_time = 0.001
-
 
             g = (
                 #Both agents: TBoth terms
@@ -900,7 +880,13 @@ class Env:
 
         # Defender
         x1  = np.concatenate([p1, v1])
-        x1n = self.Ad @ x1 + self.Bd @ a1
+
+        if self.opp_domain == "none":
+            # freeze defender in place for "no defender" domain
+            x1n = x1
+        else:
+            x1n = self.Ad @ x1 + self.Bd @ a1
+
         p1n, v1n = x1n[:D], x1n[D:]
 
         # Ensure aA is (Na, D)
@@ -960,6 +946,12 @@ class VecEnv:
     def __init__(self, make_env: Callable[[], Env], num_envs: int):
         self.envs: List[Env] = [make_env() for _ in range(num_envs)]
         self.num_envs = num_envs
+
+
+        # NEW: pick opponent domain per env (only matters in attacker-training)
+        for e in self.envs:
+            e.set_opp_domain(_sample_opp_domain(e.cfg))
+
         o = [e.reset() for e in self.envs]
         self.obs = np.stack(o, axis=0)
 
@@ -974,6 +966,9 @@ class VecEnv:
         for i, e in enumerate(self.envs):
             o, R1, R2, d, inf = e.step(a1_env[i], aA_env[i], reward_mode=reward_mode)
             if d:
+                # NEW: resample opponent domain at episode boundary
+                if e.opp_resample == "episode":
+                    e.set_opp_domain(_sample_opp_domain(e.cfg))
                 o = e.reset()
             obs_next.append(o)
             r1.append(R1); r2.append(R2); done.append(d); info.append(inf)
@@ -1253,109 +1248,6 @@ class DiffLSLayer(nn.Module):
         return feats, u_prior
 
 
-class DiffNashLayer(nn.Module):
-    """
-    One-step Nash prior via an external IPOPT-based game solver.
-
-    - Reconstructs (x1, x2) = [p1, v1], [p2, v2] from the observation.
-    - Calls an external 'Nash game solver' (IPOPT-based) that returns (u1*, u2*).
-    - Returns u1* as prior if who='def', u2* if who='att'.
-
-    Notes:
-    - This layer *does not* backprop through the IPOPT solver; u_prior is treated
-      as a fixed, non-differentiable prior. Gradients only flow through the
-      learned residual policy on top of u_prior.
-    - The actual game definition (costs, constraints) is inside the external
-      solver you provide (e.g. nash_ipopt_solver.solve_nash_ipopt).
-    """
-
-    def __init__(self, cfg: Dict[str, Any]):
-        super().__init__()
-        self.D = int(cfg["D"])
-        self.dt = float(cfg["dt"])
-
-        # Dynamics, center, etc., same geometry as DiffLS
-        self.register_buffer(
-            "Ad",
-            torch.as_tensor(np.asarray(cfg["dyn"]["Ad"], np.float32), dtype=torch.float32)
-        )
-        self.register_buffer(
-            "Bd",
-            torch.as_tensor(np.asarray(cfg["dyn"]["Bd"], np.float32), dtype=torch.float32)
-        )
-
-        ar = cfg["arena"]
-        c = np.array(
-            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
-            dtype=np.float32
-        )[: self.D]
-        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
-
-        # Where to find the IPOPT game solver
-        # Example expected structure in cfg:
-        # cfg["nash_solver"] = {
-        #     "module": "nash_ipopt_solver",
-        #     "fn":     "solve_nash_ipopt",
-        #     "params": {...}   # optional dict passed to solver
-        # }
-        solver_cfg = cfg.get("nash_solver", {})
-        module_name = solver_cfg.get("module", "nash_ipopt_solver")
-        fn_name     = solver_cfg.get("fn", "solve_nash_ipopt")
-        self.solver_params = solver_cfg.get("params", {})
-
-        mod = importlib.import_module(module_name)
-        self.nash_solve = getattr(mod, fn_name)
-
-    def forward(self, obs: torch.Tensor, who: str):
-        """
-        obs:  [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
-        who:  'def' or 'att'
-        """
-        B, D = obs.shape[0], self.D
-        device = obs.device
-        dtype  = obs.dtype
-
-        center = self.center.to(dtype=dtype, device=device)
-
-        # Decompose obs into pieces
-        p1c = obs[:, 0:D]          # defender pos (centered)
-        p2c = obs[:, D:2*D]        # attacker pos (centered)
-        v1  = obs[:, 3*D:4*D]
-        v2  = obs[:, 4*D:5*D]
-
-        # Recover absolute positions
-        p1 = p1c + center          # [B, D]
-        p2 = p2c + center          # [B, D]
-
-        # Construct state vectors x1, x2 = [p, v]
-        x1 = torch.cat([p1, v1], dim=-1)   # [B, 2D]
-        x2 = torch.cat([p2, v2], dim=-1)   # [B, 2D]
-
-        # We will call the IPOPT solver in numpy-space (no grads)
-        x1_np = x1.detach().cpu().numpy()
-        x2_np = x2.detach().cpu().numpy()
-
-        u1_list = []
-        u2_list = []
-
-        # Call solver for each batch element
-        for i in range(B):
-            u1_i, u2_i = self.nash_solve(x1_np[i], x2_np[i], self.solver_params)
-            # Expect u1_i, u2_i to be numpy arrays of shape (D,)
-            u1_list.append(np.asarray(u1_i, dtype=np.float32))
-            u2_list.append(np.asarray(u2_i, dtype=np.float32))
-
-        u1_np = np.stack(u1_list, axis=0)   # [B, D]
-        u2_np = np.stack(u2_list, axis=0)   # [B, D]
-
-        u1_prior = torch.as_tensor(u1_np, device=device, dtype=dtype)
-        u2_prior = torch.as_tensor(u2_np, device=device, dtype=dtype)
-        u_prior  = u1_prior if who == "def" else u2_prior
-
-        # As in DiffLS, the "features" are [p1c, p2c, v1, v2]
-        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # [B, 4D]
-        return feats, u_prior
-    
 
 class NoPriorLayer(nn.Module):
     """
@@ -1404,8 +1296,6 @@ class ActorCriticDiff(nn.Module):
         prior_type = cfg.get("prior_type", "ls")  # "ls", "nash", or "none"
         if prior_type == "ls":
             self.layer = DiffLSLayer(cfg)
-        elif prior_type == "nash":
-            self.layer = DiffNashLayer(cfg)
         elif prior_type == "none":
             self.layer = NoPriorLayer(cfg)
         else:
@@ -1429,8 +1319,8 @@ class ActorCriticDiff(nn.Module):
         )
 
         # How strongly to trust the prior in μ = μ_res + blend * u_prior
-        self.prior_blend_def = float(cfg.get("prior_blend_def", 0.5))
-        self.prior_blend_att = float(cfg.get("prior_blend_att", 1.0))
+        # self.prior_blend_def = float(cfg.get("prior_blend_def"))
+        # self.prior_blend_att = float(cfg.get("prior_blend_att"))
 
         # self.prior_blend_def = 0.5
         # self.prior_blend_att = 0.5
@@ -2122,10 +2012,10 @@ def distill_from_teacher(
     # -----------------------
     # Hyperparams
     # -----------------------
-    num_envs      = int(cfg.get("num_envs", 8))
-    steps_per_env = int(cfg.get("steps_per_env", 256))
-    total_updates = int(cfg.get("total_updates", 300))
-    log_every     = int(cfg.get("log_every", 10))
+    num_envs      = int(cfg.get("num_envs"))
+    steps_per_env = int(cfg.get("steps_per_env"))
+    total_updates = int(cfg.get("total_updates"))
+    log_every     = int(cfg.get("log_every"))
 
     # DAgger schedule (prob of executing TEACHER)
     beta0       = float(cfg.get("distill_beta0", 1.0))
@@ -2477,7 +2367,7 @@ def pretrain_attacker_from_rule(
     def make_env():
         return Env(cfg)
 
-    num_envs = int(cfg.get("num_envs", 8))
+    num_envs = int(cfg.get("num_envs"))
     vec = VecEnv(make_env, num_envs)
     obs_dim = vec.obs.shape[1]
     act_dim = int(cfg["D"])
@@ -2578,7 +2468,18 @@ def pretrain_attacker_from_rule(
     return out_path
 
 
-
+def _sample_opp_domain(cfg: Dict[str, Any]) -> str:
+    mix = cfg.get("opp_mix", None)
+    if not mix:
+        return "def0"
+    modes = list(mix.get("modes", ["def0"]))
+    probs = mix.get("probs", None)
+    if probs is None:
+        # uniform
+        return np.random.choice(modes)
+    probs = np.asarray(probs, float)
+    probs = probs / (probs.sum() + 1e-12)
+    return str(np.random.choice(modes, p=probs))
 
 # =============================================================
 # Training & Evaluation
@@ -2612,10 +2513,10 @@ def train(cfg: Dict[str, Any]):
     def make_env():
         return Env(cfg)
 
-    num_envs = int(cfg.get("num_envs", 8))
-    steps_per_env = int(cfg.get("steps_per_env", 256))
-    total_updates = int(cfg.get("total_updates", 300))
-    log_every = int(cfg.get("log_every", 10))
+    num_envs = int(cfg.get("num_envs"))
+    steps_per_env = int(cfg.get("steps_per_env"))
+    total_updates = int(cfg.get("total_updates"))
+    log_every = int(cfg.get("log_every"))
 
     vec = VecEnv(make_env, num_envs)
     obs_dim = vec.obs.shape[1]
@@ -2662,17 +2563,17 @@ def train(cfg: Dict[str, Any]):
     # =========================================================
     # NEW: Freeze verification snapshots (opponents must not move)
     # =========================================================
-    verify_freeze = bool(cfg.get("verify_freeze", True))
-    freeze_tol = float(cfg.get("freeze_tol", 0.0))  # set 0.0 for exact; or 1e-12 if you’re paranoid
+    verify_freeze = bool(cfg.get("verify_freeze"))
+    freeze_tol = float(cfg.get("freeze_tol"))  # set 0.0 for exact; or 1e-12 if you’re paranoid
 
     snap_def = None
     snap_att = None
 
-    if verify_freeze and cfg.get("freeze_defender", False):
+    if verify_freeze and cfg.get("freeze_defender"):
         # defender is frozen opponent in attacker-training
         snap_def = snapshot_state_dict(ppo.def_net)
 
-    if verify_freeze and cfg.get("freeze_attacker", False) and (ppo.att_net is not None):
+    if verify_freeze and cfg.get("freeze_attacker") and (ppo.att_net is not None):
         # attacker is frozen opponent in defender-training
         snap_att = snapshot_state_dict(ppo.att_net)
 
@@ -2702,8 +2603,6 @@ def train(cfg: Dict[str, Any]):
 
 
     # Optional anneal of defender center tether
-    def_center_base = cfg.get("def_center_coef", 0.0)
-    min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
 
     for upd in range(1, total_updates + 1):
         term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
@@ -2724,13 +2623,7 @@ def train(cfg: Dict[str, Any]):
                 for g, base in zip(ppo.att_opt.param_groups, ppo.att_base_lrs):
                     g["lr"] = base * scale
         # ------------------------------------------------
-
-        # Linear anneal multiplier from 1.0 → min_anneal for k_cent
-        center_frac = upd / max(1, total_updates)
-        k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
-        for e in vec.envs:
-            e.k_cent = def_center_base * k_cent_mul
-
+        
         # Buffers
         bufD = RolloutBuffer(obs_dim, act_dim, num_envs, steps_per_env, device)
         rule_att = (cfg.get("attacker_mode", "rule") == "rule")
@@ -3110,43 +3003,6 @@ def _as_1d(x):
         # if it's a column vector or similar, flatten
         x = x.reshape(-1)
     return x.astype(float)
-
-
-def _smooth_series(y, method="none", param=0.2):
-    """
-    Smooth a 1D series.
-
-    method:
-      - "none": no smoothing
-      - "ema": exponential moving average with alpha=param (0<alpha<=1)
-      - "ma":  moving average with window=int(param)
-    """
-    y = _as_1d(y)
-    if method is None or method == "none":
-        return y
-
-    if method == "ema":
-        alpha = float(param)
-        if not (0.0 < alpha <= 1.0):
-            raise ValueError("EMA alpha must be in (0, 1].")
-        out = np.empty_like(y)
-        out[0] = y[0]
-        for i in range(1, len(y)):
-            out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
-        return out
-
-    if method == "ma":
-        win = int(param)
-        if win <= 1:
-            return y
-        # pad at left so length stays the same
-        pad = win - 1
-        ypad = np.pad(y, (pad, 0), mode="edge")
-        kernel = np.ones(win, dtype=float) / win
-        return np.convolve(ypad, kernel, mode="valid")
-
-    raise ValueError(f"Unknown smoothing method: {method!r}")
-
 
 def plot_training_metrics(
     metrics: dict,
@@ -3602,11 +3458,11 @@ def train_attacker_with_distill(
         bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
     )
 
-    # # Now train attacker with PPO starting from the BC init
-    # cfg_teacher["att_init_path"] = att_bc_ckpt
+    # Now train attacker with PPO starting from the BC init
+    cfg_teacher["att_init_path"] = att_bc_ckpt
 
-    # if extra_train_cfg is not None:
-    #     cfg_teacher.update(extra_train_cfg)
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
 
     # IMPORTANT: read the flag AFTER updates, and default to False if absent
     DISTILL = bool(cfg_teacher.get("distill", False))
@@ -3856,12 +3712,26 @@ if __name__ == "__main__":
             "def_student_ckpt": def0_student_ckpt,
         }
 
+    def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
+
 
     # =========================================================
     # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
     # =========================================================
     print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
-    phase1_extra = {"def_ckpt_path": def0_teacher_ckpt}
+    phase1_extra = {
+        "def_ckpt_path": def0_teacher_ckpt,
+        "freeze_defender": True,
+
+        # NEW:
+        "opp_mix": {
+            "modes": ["none", "def0", "weak"],
+            "probs": [0.0, 1.0, 0.0],     # must sum to 1
+            "resample": "episode",           # "episode" or "never"
+            "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
+            "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+        },
+    }
 
     with runlog.stage(
         "PHASE1_train_att1",

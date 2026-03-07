@@ -71,11 +71,6 @@ COMMON: Dict[str, Any] = {
     ], dtype=float),
     "x0_jitter": {"pos": 0.5, "vel": 0.01},
 
-    # DiffNash prior (actor mean blend)
-    "prior_ridge": 1e-2,
-    "prior_blend_def": 0.5,
-    "prior_blend_att": 1.0,
-
     # Attacker control selection
     #   "rule" => deterministic controller
     #   "rl"   => learned attacker (if your training loop supports it)
@@ -177,25 +172,42 @@ TRAIN: Dict[str, Any] = {
     "freeze_tol": 0.0,
 
     # Vectorized rollout & logging
-    #Ultra long training: 
 
-    # "num_envs": 128,   
-    # "steps_per_env": 1024,    
-    # "total_updates": 3000,   
-    # "train_epochs": 10,
-    # "minibatch_size": 10240,  
-    # "log_every": 100,
+    #Current config
 
-    #Long training (new)
     "num_envs": 128,   
     "steps_per_env": 512,   
     "total_updates": 1000,   
-    "train_epochs": 3,
+    "train_epochs": 5,
     "minibatch_size": 4096,  
     "log_every": 10,
-    "entropy_coef": 0.01,
-    "k_pos": 0.04, #Was 0.05
+    "entropy_coef": 0.02,
+    "k_pos": 0.05, #Was 0.05
     "gamma": 0.998, #Was 0.999
+
+
+
+
+    # #Long training (new)
+    # "num_envs": 128,   
+    # "steps_per_env": 512,   
+    # "total_updates": 1000,   
+    # "train_epochs": 3,
+    # "minibatch_size": 4096,  
+    # "log_every": 10,
+    # "entropy_coef": 0.01,
+    # "k_pos": 0.04, #Was 0.05
+    # "gamma": 0.998, #Was 0.999
+
+    # #Amy Zhang email config
+    # "num_envs": 128,   #Was 64 
+    # "steps_per_env": 256, #Was 512  
+    # "total_updates": 1000,   #Was 2000
+    # "train_epochs": 5, #Was 3
+    # "minibatch_size": 4096,  #Was 8192
+    # "entropy_coef": 0.01,
+    # "k_pos": 0.05,
+    # "gamma": 0.998, #Was 0.999
 
 
     #Long training (old)
@@ -229,15 +241,20 @@ TRAIN: Dict[str, Any] = {
     # "k_pos": 0.04,  
     # "gamma": 0.998,
 
-    # Legacy eward shaping (used by Env at train *and* eval)
-    "dense_coef": 0.03,   # α
-    "term_coef": 1.0,     # β
-    "step_pos_coef": 0.05,
-    "effort_def": 0.01,
-    "effort_att": 0.01,
+    #Arena start positions config (relative to radius of arena)
+    # "r_def_min": 0.0, #Default: 0.0
+    # "r_def_max": 0.85, # Default: 0.5
 
+    # "r_att_min": 0.0, #Default 0.4
+    # "r_att_max": 0.95, #Default: 0.95
 
-    # PPO hyperparams
+    "r_def_min": 0.0, #Default: 0.0
+    "r_def_max": 0.5, # Default: 0.5
+
+    "r_att_min": 0.4, #Default 0.4
+    "r_att_max": 0.95, #Default: 0.95
+
+    # Other PPO hyperparams
     "gae_lambda": 0.95,
     "clip_eps": 0.2,
     "policy_lr": 3e-4,
@@ -245,6 +262,25 @@ TRAIN: Dict[str, Any] = {
     "value_coef": 0.5,
     "max_grad_norm": 1.0,
 
+    # Termination rewards/penalties 
+
+    # "target_hit_reward_penalty": 4.0,
+    # "collision_penalty": 2.0,
+    # "wall_penalty": 2.0,
+
+    "target_hit_reward_penalty": 5.0,
+    "collision_penalty": 5.0,
+    "wall_penalty": 5.0,
+
+    "hit_buffer_att": 0.0,
+
+    "hit_buffer_def": 0.0,
+
+    # Legacy reward shaping (used by Env at train *and* eval)
+    "effort_def": 0.01,
+    "effort_att": 0.01,
+
+    #Learning schedule
     "lr_schedule": "linear",   # options: "none", "linear"
     "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
 
@@ -261,42 +297,8 @@ TRAIN: Dict[str, Any] = {
     "prior_blend_att":        0.0,    # (optional) disable center prior for def
     "prior_blend_def":        0.0,    # (optional) disable center prior for def
 
-    # "prior_blend_def":        0.25,    # (optional) disable center prior for def
-
-    "def_center_safe_radius": 0.3,   # e.g. keep-out inside 10% of R
-    "def_center_avoid_coef":  0.0,   # crank this up if defender still dips in
-    "def_center_coef":        0.0,    # no attractive center tether
-
-
-
-    # New params
-
-    "target_hit_reward_penalty": 3.5,
-    "collision_penalty": 3.0,
-    "wall_penalty": 3.0,
-
-
-
-    # Old params
-
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
-    "att_target_hit_penalty_def": 3.0,     # big negative for defender
-    "att_target_hit_reward_att": 5.0,       # matching positive for attacker
-
-    # "def_target_hit_radius": 0.2,          # attacker within 5% of R hits object
-    "def_target_hit_penalty_def": 5.0,     # big negative for defender
-    "def_target_hit_reward_att": 0.0,       # matching positive for attacker
-
-    "def_keepout_buffer_m": 1.5,        # meters (keepout buffer around object) - Reward function
-    "def_oi_safety_buffer": 0.25,       #extra percentage - Termination
-
-
-
-    #For collision penalties on both agents
-
     "collision_radius_m": 0.2,            # meters
-    "collision_penalty_def": 3.0,         # penalty applied to defender on collision
-    "collision_penalty_att": 3.0,         # penalty applied to attacker(s) on collision
 
 
     #Learning stat tracking
