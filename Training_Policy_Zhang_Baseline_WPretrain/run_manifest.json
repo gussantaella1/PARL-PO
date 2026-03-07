@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-03-07T05:38:00.405867+00:00",
+  "created_utc": "2026-03-07T06:12:52.735785+00:00",
   "out_dir": "Training_Policy",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
@@ -142,13 +142,13 @@
       "verify_freeze": true,
       "freeze_tol": 0.0,
       "num_envs": 128,
-      "steps_per_env": 512,
+      "steps_per_env": 256,
       "total_updates": 1000,
       "train_epochs": 5,
       "minibatch_size": 4096,
       "log_every": 10,
-      "entropy_coef": 0.02,
-      "k_pos": 0.05,
+      "entropy_coef": 0.01,
+      "k_pos": 0.04,
       "gamma": 0.998,
       "r_def_min": 0.0,
       "r_def_max": 0.5,
@@ -164,7 +164,7 @@
       "collision_penalty": 5.0,
       "wall_penalty": 5.0,
       "hit_buffer_att": 0.0,
-      "hit_buffer_def": 0.0,
+      "hit_buffer_def": 0.25,
       "effort_def": 0.01,
       "effort_att": 0.01,
       "lr_schedule": "linear",
@@ -192,19 +192,71 @@
       "lambda_intent": 1.0,
       "reward_mode_for_step": "def",
       "train_role": "def"
+    },
+    "final_outputs": {
+      "def0_teacher_ckpt": "Training_Policy/def0_teacher.pt",
+      "def0_student_ckpt": null,
+      "att1_teacher_ckpt": "Training_Policy/att1_teacher.pt",
+      "att1_student_ckpt": null,
+      "def1_teacher_ckpt": "Training_Policy/def1_teacher.pt",
+      "def1_student_ckpt": null,
+      "plots_root": "Training_Policy/Plots"
     }
   },
   "stages": [
     {
       "name": "PHASE0_train_def0",
-      "start_utc": "2026-03-07T05:38:00.415584+00:00",
+      "start_utc": "2026-03-07T06:12:52.737457+00:00",
       "meta": {
         "phase_name": "def0",
         "attacker_mode": "rule",
         "extra_train_cfg": null
       },
-      "end_utc": "2026-03-07T05:39:04.255979+00:00",
-      "duration_s": 63.84039917700284
+      "outputs": {
+        "def_teacher_ckpt": "Training_Policy/def0_teacher.pt",
+        "def_student_ckpt": null
+      },
+      "status": "ok",
+      "end_utc": "2026-03-07T06:38:25.250692+00:00",
+      "duration_s": 1532.513232147001
+    },
+    {
+      "name": "PHASE1_train_att1",
+      "start_utc": "2026-03-07T06:38:25.251004+00:00",
+      "meta": {
+        "phase_name": "att1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "def_ckpt_path": "Training_Policy/def0_teacher.pt",
+          "freeze_defender": true
+        }
+      },
+      "outputs": {
+        "att_teacher_ckpt": "Training_Policy/att1_teacher.pt",
+        "att_student_ckpt": null
+      },
+      "status": "ok",
+      "end_utc": "2026-03-07T07:02:50.774642+00:00",
+      "duration_s": 1465.5236394520034
+    },
+    {
+      "name": "PHASE2_train_def1",
+      "start_utc": "2026-03-07T07:02:50.774962+00:00",
+      "meta": {
+        "phase_name": "def1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "att_ckpt_path": "Training_Policy/att1_teacher.pt",
+          "def_ckpt_path": "Training_Policy/def0_teacher.pt"
+        }
+      },
+      "outputs": {
+        "def_teacher_ckpt": "Training_Policy/def1_teacher.pt",
+        "def_student_ckpt": null
+      },
+      "status": "ok",
+      "end_utc": "2026-03-07T07:23:10.599277+00:00",
+      "duration_s": 1219.8243156690005
     }
   ]
 }

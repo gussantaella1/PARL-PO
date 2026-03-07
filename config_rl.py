@@ -174,18 +174,15 @@ TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
 
     #Current config
-
-    "num_envs": 128,   
-    "steps_per_env": 512,   
-    "total_updates": 1000,   
-    "train_epochs": 5,
-    "minibatch_size": 4096,  
+    "num_envs": 128,   #Was 64 
+    "steps_per_env": 256, #Was 512  
+    "total_updates": 1000,   #Was 2000
+    "train_epochs": 5, #Was 3
+    "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
-    "entropy_coef": 0.02,
-    "k_pos": 0.05, #Was 0.05
+    "entropy_coef": 0.01,
+    "k_pos": 0.04,
     "gamma": 0.998, #Was 0.999
-
-
 
 
     # #Long training (new)
@@ -206,7 +203,7 @@ TRAIN: Dict[str, Any] = {
     # "train_epochs": 5, #Was 3
     # "minibatch_size": 4096,  #Was 8192
     # "entropy_coef": 0.01,
-    # "k_pos": 0.05,
+    # "k_pos": 0.04,
     # "gamma": 0.998, #Was 0.999
 
 
@@ -274,7 +271,7 @@ TRAIN: Dict[str, Any] = {
 
     "hit_buffer_att": 0.0,
 
-    "hit_buffer_def": 0.0,
+    "hit_buffer_def": 0.25,
 
     # Legacy reward shaping (used by Env at train *and* eval)
     "effort_def": 0.01,

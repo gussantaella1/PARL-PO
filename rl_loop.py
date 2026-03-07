@@ -2603,6 +2603,8 @@ def train(cfg: Dict[str, Any]):
 
 
     # Optional anneal of defender center tether
+    def_center_base = cfg.get("def_center_coef", 0.0)
+    min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
 
     for upd in range(1, total_updates + 1):
         term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
@@ -2623,7 +2625,13 @@ def train(cfg: Dict[str, Any]):
                 for g, base in zip(ppo.att_opt.param_groups, ppo.att_base_lrs):
                     g["lr"] = base * scale
         # ------------------------------------------------
-        
+
+        # Linear anneal multiplier from 1.0 → min_anneal for k_cent
+        center_frac = upd / max(1, total_updates)
+        k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
+        for e in vec.envs:
+            e.k_cent = def_center_base * k_cent_mul
+
         # Buffers
         bufD = RolloutBuffer(obs_dim, act_dim, num_envs, steps_per_env, device)
         rule_att = (cfg.get("attacker_mode", "rule") == "rule")
@@ -3724,13 +3732,13 @@ if __name__ == "__main__":
         "freeze_defender": True,
 
         # NEW:
-        "opp_mix": {
-            "modes": ["none", "def0", "weak"],
-            "probs": [0.0, 1.0, 0.0],     # must sum to 1
-            "resample": "episode",           # "episode" or "never"
-            "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
-            "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-        },
+        # "opp_mix": {
+        #     "modes": ["none", "def0", "weak"],
+        #     "probs": [0.0, 1.0, 0.0],     # must sum to 1
+        #     "resample": "episode",           # "episode" or "never"
+        #     "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
+        #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+        # },
     }
 
     with runlog.stage(
