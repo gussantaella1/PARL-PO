@@ -174,15 +174,19 @@ TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
 
     #Current config
-    "num_envs": 128,   #Was 64 
-    "steps_per_env": 256, #Was 512  
-    "total_updates": 1000,   #Was 2000
+    "num_envs": 256,   #Was 64 
+    "steps_per_env": 512, #Was 512  
+    "total_updates": 2000,   #Was 2000
     "train_epochs": 5, #Was 3
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
     "entropy_coef": 0.01,
-    "k_pos": 0.04,
-    "gamma": 0.998, #Was 0.999
+    "k_pos": 0.05,
+    "gamma": 0.999, #Was 0.999
+    "target_hit_reward_penalty": 10.0,
+    "collision_penalty": 6.0,
+    "wall_penalty": 3.0,
+
 
 
     # #Long training (new)
@@ -205,6 +209,10 @@ TRAIN: Dict[str, Any] = {
     # "entropy_coef": 0.01,
     # "k_pos": 0.04,
     # "gamma": 0.998, #Was 0.999
+    # "target_hit_reward_penalty": 5.0,
+    # "collision_penalty": 5.0,
+    # "wall_penalty": 5.0,
+
 
 
     #Long training (old)
@@ -237,6 +245,9 @@ TRAIN: Dict[str, Any] = {
     # "entropy_coef": 0.01,
     # "k_pos": 0.04,  
     # "gamma": 0.998,
+    # "target_hit_reward_penalty": 5.0,
+    # "collision_penalty": 5.0,
+    # "wall_penalty": 5.0,
 
     #Arena start positions config (relative to radius of arena)
     # "r_def_min": 0.0, #Default: 0.0
@@ -264,10 +275,6 @@ TRAIN: Dict[str, Any] = {
     # "target_hit_reward_penalty": 4.0,
     # "collision_penalty": 2.0,
     # "wall_penalty": 2.0,
-
-    "target_hit_reward_penalty": 5.0,
-    "collision_penalty": 5.0,
-    "wall_penalty": 5.0,
 
     "hit_buffer_att": 0.0,
 

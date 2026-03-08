@@ -728,7 +728,7 @@ class Env:
             shared_termination = 0.0
 
             if done and collision:
-                shared_termination -= self.collision_penalty
+                shared_termination += self.collision_penalty
 
             if need_def:
                 r1 = g - shared_termination
@@ -3236,13 +3236,20 @@ def plot_compare_phases(
             return np.convolve(ypad, kernel, mode="valid")
         raise ValueError(f"Unknown smoothing method: {method!r}")
 
-    for label, path in labeled_paths:
+    for item in labeled_paths:
+        if len(item) == 2:
+            label, path = item
+            metric_key = metric
+        else:
+            label, path, metric_key = item
+
         m = load_npz_metrics(path)
-        if metric not in m:
-            print(f"[plot_compare_phases] skipping {label}: missing key {metric!r}")
+        if metric_key not in m:
+            print(f"[plot_compare_phases] skipping {label}: missing key {metric_key!r}")
             continue
-        x = _as_1d(m["update"]) if "update" in m else np.arange(len(m[metric]))
-        y = _smooth_series(m[metric], method=smooth, param=smooth_param)
+
+        x = _as_1d(m["update"]) if "update" in m else np.arange(len(m[metric_key]))
+        y = _smooth_series(m[metric_key], method=smooth, param=smooth_param)
         ax.plot(x, y, label=label)
 
     ax.set_xlabel("Update")
@@ -3449,25 +3456,28 @@ def train_attacker_with_distill(
     build_dyn(cfg_teacher)
 
     # --- NEW: BC pretrain attacker from rule controller ---
-    att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
-    cfg_for_bc = cfg_teacher.copy()
+    # att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
+    # cfg_for_bc = cfg_teacher.copy()
 
-    # During BC we still want an RL attacker net to exist,
-    # but labels come from the rule controller.
-    # Make sure attacker_mode is 'rl' (it already is here).
-    cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
+    # # During BC we still want an RL attacker net to exist,
+    # # but labels come from the rule controller.
+    # # Make sure attacker_mode is 'rl' (it already is here).
+    # cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
 
-    pretrain_attacker_from_rule(
-        cfg_for_bc,
-        out_path=att_bc_ckpt,
-        steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
-        total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
-        bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
-        bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
-    )
+    # pretrain_attacker_from_rule(
+    #     cfg_for_bc,
+    #     out_path=att_bc_ckpt,
+    #     steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
+    #     total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
+    #     bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
+    #     bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
+    # )
 
-    # Now train attacker with PPO starting from the BC init
-    cfg_teacher["att_init_path"] = att_bc_ckpt
+    # # Now train attacker with PPO starting from the BC init
+    # cfg_teacher["att_init_path"] = att_bc_ckpt
+
+
+
 
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)
@@ -3680,6 +3690,14 @@ if __name__ == "__main__":
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
 
+    PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
+    PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
+    PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
+    PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
+    PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
+    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
+        os.makedirs(d, exist_ok=True)
+
     runlog = RunLogger(OUT_DIR, filename="run_manifest.json")
 
     cfg_distillation = config_for_train(
@@ -3720,7 +3738,19 @@ if __name__ == "__main__":
             "def_student_ckpt": def0_student_ckpt,
         }
 
-    def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
+    # def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
+
+    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
+    plot_training_metrics(
+        m_def0_teacher,
+        title="def0_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_DEF0,
+        save_prefix="def0_teacher",
+    )
+
 
 
     # =========================================================
@@ -3732,13 +3762,13 @@ if __name__ == "__main__":
         "freeze_defender": True,
 
         # NEW:
-        # "opp_mix": {
-        #     "modes": ["none", "def0", "weak"],
-        #     "probs": [0.0, 1.0, 0.0],     # must sum to 1
-        #     "resample": "episode",           # "episode" or "never"
-        #     "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
-        #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-        # },
+        "opp_mix": {
+            "modes": ["none", "def0", "weak"],
+            "probs": [0.2, 8.0, 0.0],     # must sum to 1
+            "resample": "episode",           # "episode" or "never"
+            "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
+            "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+        },
     }
 
     with runlog.stage(
@@ -3756,6 +3786,17 @@ if __name__ == "__main__":
             "att_teacher_ckpt": att1_teacher_ckpt,
             "att_student_ckpt": att1_student_ckpt,
         }
+
+    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
+    plot_training_metrics(
+        m_att1_teacher,
+        title="att1_teacher",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_ATT1,
+        save_prefix="att1_teacher",
+    )
 
 
     # =========================================================
@@ -3782,41 +3823,6 @@ if __name__ == "__main__":
             "def_student_ckpt": def1_student_ckpt,
         }
 
-    # =========================================================
-    # Plotting 
-    # =========================================================
-    PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
-    PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
-    PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
-    PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
-    PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
-    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
-        os.makedirs(d, exist_ok=True)
-
-        # ---- def0 ----
-    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
-    plot_training_metrics(
-        m_def0_teacher,
-        title="def0_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_DEF0,
-        save_prefix="def0_teacher",
-    )
-
-    # ---- att1 ----
-    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
-    plot_training_metrics(
-        m_att1_teacher,
-        title="att1_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_ATT1,
-        save_prefix="att1_teacher",
-    )
-
     # ---- def1 ----
     m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
     plot_training_metrics(
@@ -3829,13 +3835,16 @@ if __name__ == "__main__":
         save_prefix="def1_teacher",
     )
 
-    # ---- comparisons ----
+    # =========================================================
+    # Multi phase Plotting 
+    # =========================================================
+
     plot_compare_phases(
         [
-            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz")),
-            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz")),
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
         ],
-        metric="R_def_mean",
+        metric=None,
         ylabel="Mean defender return",
         title="Defender return across phases",
         smooth="ema",
@@ -3844,6 +3853,23 @@ if __name__ == "__main__":
         out_dir=PLOTS_COMP,
         filename="compare__R_def_mean__def0_vs_def1.png",
     )
+
+    plot_compare_phases(
+        [
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
+            ("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean"),
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
+        ],
+        metric=None,
+        ylabel="Mean return",
+        title="Return across phases",
+        smooth="ema",
+        smooth_param=0.2,
+        show=False,
+        out_dir=PLOTS_COMP,
+        filename="compare__R_mean__def0_vs_def1_vs_att1.png",
+    )
+
 
     # record a final summary block too
     runlog.set_config("final_outputs", {
