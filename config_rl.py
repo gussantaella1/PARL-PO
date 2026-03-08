@@ -161,6 +161,9 @@ COMMON = _merge(COMMON,VIZ)
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
 
+    "save_best_ckpt": True,
+    "save_last_ckpt": True,
+
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
@@ -186,6 +189,7 @@ TRAIN: Dict[str, Any] = {
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 6.0,
     "wall_penalty": 3.0,
+    "fuel_depletion_penalty": 6.0,
 
 
 
@@ -236,18 +240,37 @@ TRAIN: Dict[str, Any] = {
     # "gamma": 0.999,
 
     #Test training
-    # "num_envs": 1,          
-    # "steps_per_env": 256,    
-    # "total_updates": 100, 
-    # "train_epochs": 3,
-    # "minibatch_size": 1024,  
-    # "log_every": 10,
-    # "entropy_coef": 0.01,
-    # "k_pos": 0.04,  
-    # "gamma": 0.998,
-    # "target_hit_reward_penalty": 5.0,
-    # "collision_penalty": 5.0,
-    # "wall_penalty": 5.0,
+    "num_envs": 1,          
+    "steps_per_env": 256,    
+    "total_updates": 100, 
+    "train_epochs": 3,
+    "minibatch_size": 1024,  
+    "log_every": 10,
+    "entropy_coef": 0.01,
+    "k_pos": 0.04,  
+    "gamma": 0.998,
+    "target_hit_reward_penalty": 5.0,
+    "collision_penalty": 5.0,
+    "wall_penalty": 5.0,
+
+    "fuel": {
+        "enable": False,
+        "def": {
+            "m0": 500.0,
+            "m_dry": 400.0,
+            "Tmax": 2.0,
+            "Isp": 220.0,
+        },
+        "att": {
+            "m0": 500.0,
+            "m_dry": 400.0,
+            "Tmax": 2.0,
+            "Isp": 220.0,
+        },
+    },
+
+    "k_eff_def": 0.01,
+    "k_eff_att": 0.01,
 
     #Arena start positions config (relative to radius of arena)
     # "r_def_min": 0.0, #Default: 0.0
@@ -286,7 +309,7 @@ TRAIN: Dict[str, Any] = {
 
     #Learning schedule
     "lr_schedule": "linear",   # options: "none", "linear"
-    "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
+    "lr_final_factor": 0.2,  # final_lr = lr_final_factor * initial_lr
 
     # Anneal (training-time only)
     "def_center_min_anneal": 0.5,

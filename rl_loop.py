@@ -26,15 +26,13 @@ import platform
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
-
+import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
 
 # from __future__ import annotations
 
-import math
-import random
 from dataclasses import dataclass
 
 
@@ -279,6 +277,8 @@ class Env:
         self.collision_penalty = float(cfg.get("collision_penalty"))
         self.wall_penalty = float(cfg.get("wall_penalty"))
 
+        self.fuel_depletion_penalty = float(cfg.get("fuel_depletion_penalty"))
+
 
         # NEW: collision termination (defender vs any attacker)
         self.collision_radius_m    = float(cfg.get("collision_radius_m"))  # meters; 0 disables
@@ -325,6 +325,10 @@ class Env:
             self._ukf_init_pos_std = float(ukf_cfg.get("init_pos_std", pos_std0))
             self._ukf_init_vel_std = float(ukf_cfg.get("init_vel_std", vel_std0))
 
+        if self.use_fuel:
+            self.k_eff_def = float(cfg.get("k_eff_def"))
+            self.k_eff_att = float(cfg.get("k_eff_att"))
+
 
         # Training-only initial-condition randomization
         # Defaults to "fixed" if keys are absent (e.g., eval config)
@@ -360,6 +364,36 @@ class Env:
         self.opp_resample = str(mix.get("resample", "episode"))
         self.weak_scale = float(mix.get("weak_scale", 0.2))
         self.weak_noise_std = float(mix.get("weak_noise_std", 0.0))
+
+
+
+        fuel = cfg.get("fuel", {})
+        self.use_fuel = bool(fuel.get("enable", False))
+
+        if self.use_fuel:
+            fdef = fuel.get("def", {})
+            fatt = fuel.get("att", {})
+
+            self.g0 = 9.80665  # m/s^2
+
+            self.m0_def   = float(fdef.get("m0", 1.0))
+            self.mdry_def = float(fdef.get("m_dry", 1.0))
+            self.Tmax_def = float(fdef.get("Tmax", 0.0))
+            self.Isp_def  = float(fdef.get("Isp", 0.0))
+
+            self.m0_att   = float(fatt.get("m0", 1.0))
+            self.mdry_att = float(fatt.get("m_dry", 1.0))
+            self.Tmax_att = float(fatt.get("Tmax", 0.0))
+            self.Isp_att  = float(fatt.get("Isp", 0.0))
+
+            if self.m0_def < self.mdry_def:
+                raise ValueError("fuel.def: m0 must be >= m_dry")
+            if self.m0_att < self.mdry_att:
+                raise ValueError("fuel.att: m0 must be >= m_dry")
+            if self.Tmax_def <= 0.0 or self.Isp_def <= 0.0:
+                raise ValueError("fuel.def: Tmax and Isp must be > 0")
+            if self.Tmax_att <= 0.0 or self.Isp_att <= 0.0:
+                raise ValueError("fuel.att: Tmax and Isp must be > 0")
 
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
@@ -506,6 +540,10 @@ class Env:
         d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
         self._d2_prev = d2_raw / (self.radius**2)
 
+        if self.use_fuel:
+            self.m_def = self.m0_def
+            self.m_att = np.full((self.num_attackers,), self.m0_att, dtype=float)
+
         return self._obs()
 
 
@@ -518,34 +556,70 @@ class Env:
         need_def = reward_mode in ("def", "both")
         need_att = reward_mode in ("att", "both")
 
-        # Defender action
-        a1_in = np.asarray(a1_env, float).reshape(self.D,)
+        # Defender commanded action
+        a1_cmd = np.asarray(a1_env, float).reshape(self.D,)
 
-        # --- apply domain transform to defender action ---
         if self.opp_domain == "none":
-            a1_in[:] = 0.0
+            a1_cmd[:] = 0.0
         elif self.opp_domain == "weak":
-            a1_in = self.weak_scale * a1_in
+            a1_cmd = self.weak_scale * a1_cmd
             if self.weak_noise_std > 0:
-                a1_in = a1_in + np.random.normal(0.0, self.weak_noise_std, size=(self.D,))
-        # else: "def0" => no change
+                a1_cmd = a1_cmd + np.random.normal(0.0, self.weak_noise_std, size=(self.D,))
 
-        a1 = np.clip(a1_in, self.u_lo, self.u_hi)
+        a1_cmd = np.clip(a1_cmd, self.u_lo, self.u_hi)
 
-        # Attacker actions => force (Na, D)
-        aA = np.asarray(aA_env, float)
-        if aA.ndim == 1:
-            aA = aA.reshape(1, self.D)
+        # Attacker commanded actions
+        aA_cmd = np.asarray(aA_env, float)
+        if aA_cmd.ndim == 1:
+            aA_cmd = aA_cmd.reshape(1, self.D)
         else:
-            aA = aA.reshape(self.num_attackers, self.D)
-        aA = np.clip(aA, self.u_lo, self.u_hi)
+            aA_cmd = aA_cmd.reshape(self.num_attackers, self.D)
+        aA_cmd = np.clip(aA_cmd, self.u_lo, self.u_hi)
 
-        # For convenience in reward calc we reference the "primary" attacker as index 0
-        a2 = aA[0]
+        # -------------------------------------------------
+        # Convert commanded actions into realized dynamics
+        # -------------------------------------------------
+        fuel_depleted_def = False
+        fuel_depleted_att = False
 
+        if self.use_fuel:
+            a1_real, self.m_def, fuel_depleted_def, thrust_def, mdot_def = self._apply_propulsion(
+                a_cmd=a1_cmd,
+                m=self.m_def,
+                m_dry=self.mdry_def,
+                Tmax=self.Tmax_def,
+                Isp=self.Isp_def,
+            )
 
-        # propagate true state
-        self.state = self._plant_step(self.state, a1, aA)
+            aA_real = np.zeros_like(aA_cmd, dtype=float)
+            thrust_att_all = np.zeros((self.num_attackers,), dtype=float)
+            mdot_att_all = np.zeros((self.num_attackers,), dtype=float)
+
+            for k in range(self.num_attackers):
+                aA_real[k], self.m_att[k], fuel_k, thrust_k, mdot_k = self._apply_propulsion(
+                    a_cmd=aA_cmd[k],
+                    m=self.m_att[k],
+                    m_dry=self.mdry_att,
+                    Tmax=self.Tmax_att,
+                    Isp=self.Isp_att,
+                )
+                thrust_att_all[k] = thrust_k
+                mdot_att_all[k] = mdot_k
+                fuel_depleted_att = fuel_depleted_att or fuel_k
+        else:
+            a1_real = a1_cmd
+            aA_real = aA_cmd
+            thrust_def = 0.0
+            mdot_def = 0.0
+            thrust_att_all = np.zeros((self.num_attackers,), dtype=float)
+            mdot_att_all = np.zeros((self.num_attackers,), dtype=float)
+
+        # primary attacker convenience
+        a2_cmd = aA_cmd[0]
+        a2_real = aA_real[0]
+
+        # propagate true state using REALIZED accelerations
+        self.state = self._plant_step(self.state, a1_real, aA_real)
         self.t += 1
 
         # Unpack new state
@@ -628,15 +702,15 @@ class Env:
         rnorm = np.linalg.norm(rhat1) + 1e-9
 
         v1n2 = float(np.dot(v1, v1)) / (v_scale**2)
-        a1n2 = float(np.dot(a1, a1)) / (self.u_hi**2)
+        a1n2 = float(np.dot(a1_cmd, a1_cmd)) / (self.u_hi**2)
 
         vrad1 = float(np.dot(v1, rhat1 / rnorm)) / v_scale  # dimensionless
 
         #Attacker vars
 
         v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
-        a2n2 = float(np.dot(a2, a2)) / (self.u_hi**2)
-        
+        a2n2 = float(np.dot(a2_cmd, a2_cmd)) / (self.u_hi**2)
+
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
 
         # ---- termination scenariosalways uses TRUE state ----
@@ -684,7 +758,12 @@ class Env:
             collision = False
             hit_target = att_hit_target  # only attacker matters
 
+        # 4) Fuel logic (optional)
+
         done = (oob1 or oob2_any or hit_target or collision)
+
+        if self.use_fuel == True:
+            done = done or fuel_depleted_att or fuel_depleted_def          
 
 
 
@@ -708,6 +787,11 @@ class Env:
                 # + k_time
             )
 
+            if self.use_fuel:
+                eff_def = thrust_def / (self.Tmax_def + 1e-9)
+                eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
+                g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
+
             # terminal handling must also be zero-sum
             if done:
                 # Example: encode hit_target / collision / oob into g so the sign flip is consistent
@@ -721,6 +805,15 @@ class Env:
                     g -= self.target_hit_reward_penalty
                 if def_hit_target:
                     g -= self.target_hit_reward_penalty
+
+                if self.use_fuel:
+                    if fuel_depleted_def:
+                        g -= self.fuel_depletion_penalty
+                    if fuel_depleted_att:
+                        g += self.fuel_depletion_penalty
+
+
+
 
                 # If you want attacker “success” to matter, it should reduce defender g,
                 # which automatically increases attacker reward via -g.
@@ -821,6 +914,21 @@ class Env:
             info["meas_innov_sq"] = meas_innov_sq
             info["ukf_trPpos"] = meas_trPpos
 
+        if self.use_fuel:
+            fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
+            fuel_frac_att = (self.m_att[0] - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
+
+            info["fuel_frac_def"] = float(np.clip(fuel_frac_def, 0.0, 1.0))
+            info["fuel_frac_att"] = float(np.clip(fuel_frac_att, 0.0, 1.0))
+            info["fuel_used_def"] = 1.0 - info["fuel_frac_def"]
+            info["fuel_used_att"] = 1.0 - info["fuel_frac_att"]
+
+            # optional, nice to have
+            info["thrust_def"] = float(thrust_def)
+            info["thrust_att"] = float(thrust_att_all[0])
+            info["mdot_def"] = float(mdot_def)
+            info["mdot_att"] = float(mdot_att_all[0])
+
         return self._obs(), float(r1), float(r2), bool(done), info
 
 
@@ -859,6 +967,15 @@ class Env:
         # attacker vels
         for vA in vA_obs:
             parts.append(vA)
+
+        # Defender and attacker fuel:
+
+        if self.use_fuel:
+            fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
+            fuel_frac_att = (self.m_att[0] - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
+
+            parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
+            parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
         obs = np.concatenate(parts).astype(np.float32)
         return obs
@@ -935,7 +1052,49 @@ class Env:
             vA_list.append(vA)
 
         return p1, v1, pA_list, vA_list
+    
+    def _apply_propulsion(
+        self,
+        a_cmd: np.ndarray,
+        m: float,
+        m_dry: float,
+        Tmax: float,
+        Isp: float,
+    ):
+        """
+        Convert commanded acceleration into realized acceleration using
+        thrust saturation and propellant consumption.
 
+        a_cmd : commanded acceleration [m/s^2]
+        m     : current mass [kg]
+        Tmax  : max thrust magnitude [N]
+        Isp   : specific impulse [s]
+        """
+        a_cmd = np.asarray(a_cmd, dtype=float)
+
+        if m <= m_dry + 1e-9:
+            return np.zeros_like(a_cmd), m_dry, True, 0.0, 0.0
+
+        # Required thrust to realize the commanded acceleration
+        F_req = m * a_cmd
+        F_req_norm = np.linalg.norm(F_req)
+
+        # Saturate by max available thrust
+        if F_req_norm > Tmax:
+            F = F_req * (Tmax / (F_req_norm + 1e-9))
+        else:
+            F = F_req
+
+        # Realized acceleration
+        a_real = F / max(m, 1e-9)
+
+        # Rocket equation mass flow
+        thrust_norm = np.linalg.norm(F)
+        mdot = thrust_norm / (Isp * self.g0)   # kg/s
+        m_next = max(m_dry, m - mdot * self.dt)
+        fuel_depleted = (m_next <= m_dry + 1e-9)
+
+        return a_real, m_next, fuel_depleted, thrust_norm, mdot
 
 
 
@@ -1214,75 +1373,187 @@ class AttackerRuleController:
 # DiffLS Layer & Actor-Critic
 # =============================================================
 class DiffLSLayer(nn.Module):
-    def __init__(self, cfg):
+    """
+    Analytic one-step ridge prior using the SAME discrete dynamics as the env:
+
+        x_{k+1} = Ad x_k + Bd u_k
+
+    For each agent, define position selector P so that:
+        p_{k+1} = P Ad x + P Bd u = E + F u
+
+    Then solve:
+        min_u ||E + F u||^2 + ridge * ||u||^2
+
+    which gives:
+        u* = -(F^T F + ridge I)^(-1) F^T E
+
+    Observation format assumed (single-attacker case):
+        obs = [p1c, p2c, rel, v1, v2]                 if fuel disabled
+        obs = [p1c, p2c, rel, v1, v2, f_def, f_att]   if fuel enabled
+
+    where:
+        p1c = p1 - center
+        p2c = p2 - center
+    """
+    def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         self.D = int(cfg["D"])
         self.ridge = float(cfg.get("prior_ridge", 1e-2))
+        self.use_fuel = bool(cfg.get("fuel", {}).get("enable", False))
+        self.num_attackers = int(cfg.get("num_attackers", 1))
 
-        # robust dt fetch (adjust if your config uses a different key)
-        self.dt = float(cfg.get("dt", cfg.get("h", cfg.get("dyn", {}).get("dt", 1.0))))
+        if self.num_attackers != 1:
+            raise NotImplementedError(
+                "DiffLSLayer currently supports only num_attackers=1."
+            )
 
-    def forward(self, obs: torch.Tensor, who: str):
-        B, D = obs.shape[0], self.D
-        dt = self.dt
+        Ad = np.asarray(cfg["dyn"]["Ad"], dtype=np.float32)
+        Bd = np.asarray(cfg["dyn"]["Bd"], dtype=np.float32)
 
-        # obs = [p1c, p2c, rel, v1, v2]  (5D dims total; 15 when D=3)
+        if Ad.shape != (2 * self.D, 2 * self.D):
+            raise ValueError(
+                f"Expected Ad shape {(2*self.D, 2*self.D)}, got {Ad.shape}"
+            )
+        if Bd.shape != (2 * self.D, self.D):
+            raise ValueError(
+                f"Expected Bd shape {(2*self.D, self.D)}, got {Bd.shape}"
+            )
+
+        self.register_buffer("Ad", torch.tensor(Ad, dtype=torch.float32))
+        self.register_buffer("Bd", torch.tensor(Bd, dtype=torch.float32))
+
+        # Position selector P: x = [p, v] -> P x = p
+        P = np.hstack([
+            np.eye(self.D, dtype=np.float32),
+            np.zeros((self.D, self.D), dtype=np.float32),
+        ])
+        self.register_buffer("P", torch.tensor(P, dtype=torch.float32))
+
+        # F = P Bd
+        F = P @ Bd                                # (D, D)
+        M = F.T @ F + self.ridge * np.eye(self.D, dtype=np.float32)
+
+        self.register_buffer("F", torch.tensor(F, dtype=torch.float32))
+        self.register_buffer("K", torch.tensor(np.linalg.solve(M, F.T), dtype=torch.float32))
+        # K shape: (D, D), so u* = -K E
+
+        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0)
+
+    def _split_obs(self, obs: torch.Tensor):
+        """
+        Single-attacker observation parser.
+
+        Returns:
+            p1c, p2c, rel, v1, v2, fdef, fatt
+        where fdef/fatt are None if fuel is disabled.
+        """
+        D = self.D
+        expected = 5 * D + (2 if self.use_fuel else 0)
+        if obs.shape[-1] != expected:
+            raise ValueError(
+                f"Expected obs dim {expected}, got {obs.shape[-1]}. "
+                f"Check prior layer vs env observation layout."
+            )
+
         p1c = obs[:, 0:D]
         p2c = obs[:, D:2*D]
+        rel = obs[:, 2*D:3*D]
         v1  = obs[:, 3*D:4*D]
         v2  = obs[:, 4*D:5*D]
 
-        # one-step position error to center (in centered coordinates)
-        e1 = p1c + dt * v1   # (B, D)
-        e2 = p2c + dt * v2   # (B, D)
+        if self.use_fuel:
+            fdef = obs[:, 5*D:5*D+1]
+            fatt = obs[:, 5*D+1:5*D+2]
+        else:
+            fdef = None
+            fatt = None
 
-        alpha = 0.5 * (dt * dt)
-        k = alpha / (alpha * alpha + self.ridge)  # scalar
+        return p1c, p2c, rel, v1, v2, fdef, fatt
 
-        u_def_prior = -k * e1
-        u_att_prior = -k * e2
+    def _one_step_prior(self, p_c: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        """
+        Build x = [p_centered, v], then solve one-step ridge prior
+        using the actual discrete dynamics.
+        """
+        x = torch.cat([p_c, v], dim=-1)           # (B, 2D)
+        E = x @ self.Ad.T @ self.P.T              # (B, D), same as P Ad x
+        u = -(E @ self.K.T)                       # (B, D)
+        return u
+
+    def forward(self, obs: torch.Tensor, who: str):
+        p1c, p2c, rel, v1, v2, fdef, fatt = self._split_obs(obs)
+
+        u_def_prior = self._one_step_prior(p1c, v1)
+        u_att_prior = self._one_step_prior(p2c, v2)
         u_prior = u_def_prior if who == "def" else u_att_prior
 
-        # IMPORTANT: feats must be 4D = 12 when D=3
-        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
-        return feats, u_prior
+        if self.use_fuel:
+            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt], dim=-1)
+        else:
+            feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
 
+        return feats, u_prior
 
 
 class NoPriorLayer(nn.Module):
     """
     No analytic prior: just repackage the observation into features
     and return u_prior = 0.
+
+    Observation format assumed (single-attacker case):
+        obs = [p1c, p2c, rel, v1, v2]                 if fuel disabled
+        obs = [p1c, p2c, rel, v1, v2, f_def, f_att]   if fuel enabled
     """
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         self.D = int(cfg["D"])
-        ar = cfg["arena"]
-        c = np.array(
-            [ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)],
-            dtype=np.float32
-        )[: self.D]
-        self.register_buffer("center", torch.tensor(c, dtype=torch.float32))
+        self.use_fuel = bool(cfg.get("fuel", {}).get("enable", False))
+        self.num_attackers = int(cfg.get("num_attackers", 1))
 
-    def forward(self, obs: torch.Tensor, who: str):
-        """
-        obs: [B, 5*D] = [p1-center, p2-center, (p2-p1), v1, v2]
-        Return:
-          feats: [B, 4*D] = [p1c, p2c, v1, v2]
-          u_prior: [B, D] = 0
-        """
-        B, D = obs.shape[0], self.D
-        device, dtype = obs.device, obs.dtype
+        if self.num_attackers != 1:
+            raise NotImplementedError(
+                "NoPriorLayer currently supports only num_attackers=1."
+            )
+
+        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0)
+
+    def _split_obs(self, obs: torch.Tensor):
+        D = self.D
+        expected = 5 * D + (2 if self.use_fuel else 0)
+        if obs.shape[-1] != expected:
+            raise ValueError(
+                f"Expected obs dim {expected}, got {obs.shape[-1]}. "
+                f"Check prior layer vs env observation layout."
+            )
 
         p1c = obs[:, 0:D]
         p2c = obs[:, D:2*D]
+        rel = obs[:, 2*D:3*D]
         v1  = obs[:, 3*D:4*D]
         v2  = obs[:, 4*D:5*D]
 
-        feats = torch.cat([p1c, p2c, v1, v2], dim=-1)  # (B, 4D)
+        if self.use_fuel:
+            fdef = obs[:, 5*D:5*D+1]
+            fatt = obs[:, 5*D+1:5*D+2]
+        else:
+            fdef = None
+            fatt = None
+
+        return p1c, p2c, rel, v1, v2, fdef, fatt
+
+    def forward(self, obs: torch.Tensor, who: str):
+        B, D = obs.shape[0], self.D
+        device, dtype = obs.device, obs.dtype
+
+        p1c, p2c, rel, v1, v2, fdef, fatt = self._split_obs(obs)
+
+        if self.use_fuel:
+            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt], dim=-1)
+        else:
+            feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
+
         u_prior = torch.zeros((B, D), device=device, dtype=dtype)
         return feats, u_prior
-
 
 
 
@@ -1304,8 +1575,10 @@ class ActorCriticDiff(nn.Module):
             )
 
         # Policy (residual over prior)
+        feat_dim = self.layer.feature_dim
+
         self.pi = nn.Sequential(
-            nn.Linear(4 * cfg["D"], hidden), nn.Tanh(),
+            nn.Linear(feat_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
         self.mu_res = nn.Linear(hidden, act_dim)
@@ -1558,27 +1831,30 @@ class PPO:
 # =============================================================
 
 def build_full_obs_from_envs(vec: VecEnv, device: str) -> torch.Tensor:
-    """
-    Build 'full-state' observations for the teacher from each Env in vec.envs:
-      o_full = [p1 - c, p2 - c, (p2 - p1), v1, v2]
-    using TRUE p2, v2 (not UKF belief).
-    Shape: [num_envs, 5*D]
-    """
     obs_list = []
     for e in vec.envs:
-        # NEW
         p1, v1, pA_list, vA_list = e._unpack(e.state)
         p2 = pA_list[0]
         v2 = vA_list[0]
-        center = e.center
-        p1c = p1 - center
-        p2c = p2 - center
-        rel = p2 - p1
+        c = e.center
 
-        obs_full = np.concatenate([p1c, p2c, rel, v1, v2]).astype(np.float32)
-        obs_list.append(obs_full)
-    obs_full_np = np.stack(obs_list, axis=0)
-    return torch.as_tensor(obs_full_np, dtype=torch.float32, device=device)
+        parts = [
+            p1 - c,
+            p2 - c,
+            p2 - p1,
+            v1,
+            v2,
+        ]
+
+        if e.use_fuel:
+            fdef = (e.m_def - e.mdry_def) / (e.m0_def - e.mdry_def + 1e-9)
+            fatt = (e.m_att[0] - e.mdry_att) / (e.m0_att - e.mdry_att + 1e-9)
+            parts.append(np.array([np.clip(fdef, 0.0, 1.0)], dtype=np.float32))
+            parts.append(np.array([np.clip(fatt, 0.0, 1.0)], dtype=np.float32))
+
+        obs_list.append(np.concatenate(parts).astype(np.float32))
+
+    return torch.as_tensor(np.stack(obs_list, axis=0), dtype=torch.float32, device=device)
 
 
 #Distillation helpers. 
@@ -1978,12 +2254,6 @@ import torch.nn as nn
 
 #     return student, metrics_last
 
-from typing import Dict, Any, List, Optional, Tuple
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
 
 def distill_from_teacher(
     cfg: Dict[str, Any],
@@ -2051,6 +2321,9 @@ def distill_from_teacher(
 
     vec = VecEnv(make_env, num_envs)
     obs_dim = vec.obs.shape[1]
+
+    expected_obs_dim = 5 * cfg["D"] + (2 if cfg.get("fuel", {}).get("enable", False) else 0)
+    assert obs_dim == expected_obs_dim, f"obs_dim={obs_dim}, expected={expected_obs_dim}"
     act_dim = int(cfg["D"])
 
     # -----------------------
@@ -2237,7 +2510,7 @@ def distill_from_teacher(
             a2_env = np.stack(acts_att, axis=0)
 
             # Step env
-            o2_np, _, done, trunc, _ = vec.step(
+            o2_np, _, _, done, infos = vec.step(
                 a1_exec.detach().cpu().numpy(),
                 a2_env,
             )
@@ -2481,6 +2754,22 @@ def _sample_opp_domain(cfg: Dict[str, Any]) -> str:
     probs = probs / (probs.sum() + 1e-12)
     return str(np.random.choice(modes, p=probs))
 
+def _cpu_state_dict(m: torch.nn.Module) -> dict:
+    return {k: v.detach().cpu() for k, v in m.state_dict().items()}
+
+def _save_role_checkpoint(ppo, train_role: str, path: str):
+    if train_role == "def":
+        net = ppo.def_net
+    elif train_role == "att":
+        net = ppo.att_net
+        if net is None:
+            raise RuntimeError("Tried to save attacker checkpoint, but ppo.att_net is None.")
+    else:
+        raise ValueError(f"Unknown train_role={train_role!r}")
+
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    torch.save(_cpu_state_dict(net), path)
+
 # =============================================================
 # Training & Evaluation
 # =============================================================
@@ -2501,14 +2790,29 @@ def train(cfg: Dict[str, Any]):
         # Optional: show model graphs once (often noisy / can break with custom ops)
         # writer.add_text("notes", "PPO Diffgame run", 0)
 
-
-
     train_role = cfg.get("train_role", "def")  # <-- NEW
 
     if train_role == "def":
         reward_mode = "def"
     elif train_role == "att":
         reward_mode = "att"
+
+    # -------------------------
+    # Checkpoint saving config
+    # -------------------------
+    save_best_ckpt = bool(cfg.get("save_best_ckpt", True))
+    save_last_ckpt = bool(cfg.get("save_last_ckpt", True))
+    checkpoint_dir = cfg.get("checkpoint_dir", None)
+    checkpoint_prefix = cfg.get("checkpoint_prefix", f"{train_role}_teacher")
+
+    tracked_metric_name = "R_def_mean" if train_role == "def" else "R_att_mean"
+    best_metric = -float("inf")
+    best_update = None
+    best_ckpt_path = None
+    last_ckpt_path = None
+
+    if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
 
     def make_env():
         return Env(cfg)
@@ -2600,6 +2904,18 @@ def train(cfg: Dict[str, Any]):
         "lr_vf": [],
     }
 
+    if cfg.get("fuel", {}).get("enable", False):
+        metrics["fuel_used_def_mean"] = []
+        metrics["fuel_used_att_mean"] = []
+        metrics["fuel_frac_def_mean"] = []
+        metrics["fuel_frac_att_mean"] = []
+
+        # optional
+        metrics["thrust_def_mean"] = []
+        metrics["thrust_att_mean"] = []
+        metrics["mdot_def_mean"] = []
+        metrics["mdot_att_mean"] = []
+
 
 
     # Optional anneal of defender center tether
@@ -2652,6 +2968,18 @@ def train(cfg: Dict[str, Any]):
         meas_innov_acc = 0.0
         trP_acc = 0.0
         info_count = 0
+
+        if cfg.get("fuel", {}).get("enable", False):
+            fuel_used_def_acc = 0.0
+            fuel_used_att_acc = 0.0
+            fuel_frac_def_acc = 0.0
+            fuel_frac_att_acc = 0.0
+
+            thrust_def_acc = 0.0
+            thrust_att_acc = 0.0
+            mdot_def_acc = 0.0
+            mdot_att_acc = 0.0
+            fuel_info_count = 0
 
         for _ in range(steps_per_env):
             with torch.no_grad():
@@ -2728,6 +3056,20 @@ def train(cfg: Dict[str, Any]):
                 if inf.get("hit_target", False): term_counts["hit_target"] += 1
                 if inf.get("collision", False): term_counts["collision"] += 1
 
+                if cfg.get("fuel", {}).get("enable", False):
+                    if "fuel_used_def" in inf:
+                        fuel_used_def_acc += inf["fuel_used_def"]
+                        fuel_used_att_acc += inf["fuel_used_att"]
+                        fuel_frac_def_acc += inf["fuel_frac_def"]
+                        fuel_frac_att_acc += inf["fuel_frac_att"]
+
+                        thrust_def_acc += inf.get("thrust_def", 0.0)
+                        thrust_att_acc += inf.get("thrust_att", 0.0)
+                        mdot_def_acc += inf.get("mdot_def", 0.0)
+                        mdot_att_acc += inf.get("mdot_att", 0.0)
+
+                        fuel_info_count += 1
+
 
             global_env_step += num_envs
 
@@ -2783,6 +3125,22 @@ def train(cfg: Dict[str, Any]):
         if upd % log_every == 0:
             R_def_mean = ep_ret_def.mean()
             R_att_mean = ep_ret_att.mean()
+
+            tracked_metric_value = R_def_mean if train_role == "def" else R_att_mean
+
+            if save_best_ckpt and checkpoint_dir is not None:
+                if tracked_metric_value > best_metric:
+                    best_metric = float(tracked_metric_value)
+                    best_update = int(upd)
+                    best_ckpt_path = os.path.join(
+                        checkpoint_dir,
+                        f"{checkpoint_prefix}__best.pt"
+                    )
+                    _save_role_checkpoint(ppo, train_role, best_ckpt_path)
+                    print(
+                        f"[checkpoint] new best {tracked_metric_name}={best_metric:+.3f} "
+                        f"at update {best_update} -> {best_ckpt_path}"
+                    )
 
             # means over all steps collected this update
             if info_count > 0:
@@ -2845,6 +3203,34 @@ def train(cfg: Dict[str, Any]):
             lr_pi = ppo.def_opt.param_groups[0]["lr"]
             lr_vf = ppo.def_opt.param_groups[-1]["lr"]
 
+            if cfg.get("fuel", {}).get("enable", False):
+                if fuel_info_count > 0:
+                    fuel_used_def_mean = fuel_used_def_acc / fuel_info_count
+                    fuel_used_att_mean = fuel_used_att_acc / fuel_info_count
+                    fuel_frac_def_mean = fuel_frac_def_acc / fuel_info_count
+                    fuel_frac_att_mean = fuel_frac_att_acc / fuel_info_count
+
+                    thrust_def_mean = thrust_def_acc / fuel_info_count
+                    thrust_att_mean = thrust_att_acc / fuel_info_count
+                    mdot_def_mean = mdot_def_acc / fuel_info_count
+                    mdot_att_mean = mdot_att_acc / fuel_info_count
+                else:
+                    fuel_used_def_mean = fuel_used_att_mean = 0.0
+                    fuel_frac_def_mean = fuel_frac_att_mean = 0.0
+                    thrust_def_mean = thrust_att_mean = 0.0
+                    mdot_def_mean = mdot_att_mean = 0.0
+
+                metrics["fuel_used_def_mean"].append(fuel_used_def_mean)
+                metrics["fuel_used_att_mean"].append(fuel_used_att_mean)
+                metrics["fuel_frac_def_mean"].append(fuel_frac_def_mean)
+                metrics["fuel_frac_att_mean"].append(fuel_frac_att_mean)
+
+                metrics["thrust_def_mean"].append(thrust_def_mean)
+                metrics["thrust_att_mean"].append(thrust_att_mean)
+                metrics["mdot_def_mean"].append(mdot_def_mean)
+                metrics["mdot_att_mean"].append(mdot_att_mean)
+
+
             # ---- store in metrics ----
             metrics["update"].append(upd)
             metrics["R_def_mean"].append(R_def_mean)
@@ -2868,6 +3254,12 @@ def train(cfg: Dict[str, Any]):
             if cfg.get("use_ukf", False):
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
+
+            if cfg.get("fuel", {}).get("enable", False):
+                print(
+                    f"   fuel used: def={fuel_used_def_mean:.3f}, att={fuel_used_att_mean:.3f}   "
+                    f"fuel remaining: def={fuel_frac_def_mean:.3f}, att={fuel_frac_att_mean:.3f}"
+                )
 
             
             if writer is not None:
@@ -2909,6 +3301,18 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("act/def_abs_mean", a1.abs().mean().item(), global_env_step)
                 writer.add_scalar("act/def_abs_max",  a1.abs().max().item(),  global_env_step)
 
+                if cfg.get("fuel", {}).get("enable", False):
+                    writer.add_scalar("fuel/used_def_mean", fuel_used_def_mean, gs)
+                    writer.add_scalar("fuel/used_att_mean", fuel_used_att_mean, gs)
+                    writer.add_scalar("fuel/remaining_def_mean", fuel_frac_def_mean, gs)
+                    writer.add_scalar("fuel/remaining_att_mean", fuel_frac_att_mean, gs)
+
+                    writer.add_scalar("fuel/thrust_def_mean", thrust_def_mean, gs)
+                    writer.add_scalar("fuel/thrust_att_mean", thrust_att_mean, gs)
+                    writer.add_scalar("fuel/mdot_def_mean", mdot_def_mean, gs)
+                    writer.add_scalar("fuel/mdot_att_mean", mdot_att_mean, gs)
+
+
 
 
 
@@ -2933,8 +3337,24 @@ def train(cfg: Dict[str, Any]):
         writer.flush()
         writer.close()
 
+    if save_last_ckpt and checkpoint_dir is not None:
+        last_ckpt_path = os.path.join(
+            checkpoint_dir,
+            f"{checkpoint_prefix}.pt"
+        )
+        _save_role_checkpoint(ppo, train_role, last_ckpt_path)
+        print(f"[checkpoint] saved last checkpoint -> {last_ckpt_path}")
+
+    ckpt_info = {
+        "tracked_metric_name": tracked_metric_name,
+        "best_metric": best_metric,
+        "best_update": best_update,
+        "best_ckpt_path": best_ckpt_path,
+        "last_ckpt_path": last_ckpt_path,
+    }
+
     print("Training finished.")
-    return ppo, metrics
+    return ppo, metrics, ckpt_info
 
 
 def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
@@ -3161,6 +3581,29 @@ def plot_training_metrics(
         ax.legend()
         figs.append(("ukf_stats", fig))
 
+    # 6) Fuel utilization:
+
+    fuel_keys = [k for k in [
+        "fuel_used_def_mean",
+        "fuel_used_att_mean",
+        "fuel_frac_def_mean",
+        "fuel_frac_att_mean",
+    ] if k in metrics and len(np.asarray(metrics[k]).reshape(-1)) == len(x)]
+
+    if fuel_keys:
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "fuel_used_def_mean", "Defender fuel used frac")
+        _plot_if(ax, "fuel_used_att_mean", "Attacker fuel used frac")
+        _plot_if(ax, "fuel_frac_def_mean", "Defender fuel remaining frac")
+        _plot_if(ax, "fuel_frac_att_mean", "Attacker fuel remaining frac")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("Fraction")
+        ax.set_title(f"{title} — Fuel" if title else "Fuel")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("fuel", fig))
+
     if not figs:
         raise ValueError("None of the expected keys were present; nothing to plot.")
 
@@ -3344,12 +3787,19 @@ def train_defender_with_distill(
         print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
         print(f"[{phase_name.upper()}] distill={DISTILL}")
 
-        ppo_def, metrics_def = train(cfg_teacher)
+        cfg_teacher["checkpoint_dir"] = OUT_DIR
+        cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
+
+        ppo_def, metrics_def, ckpt_info = train(cfg_teacher)
 
         # --- Save defender teacher checkpoint ---
-        def_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_teacher.pt")
-        torch.save(ppo_def.def_net.state_dict(), def_teacher_ckpt)
-        print(f"[{phase_name.upper()} TEACHER] Saved defender teacher to {def_teacher_ckpt}")
+        def_teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
+        print(f"[{phase_name.upper()} TEACHER] Using defender checkpoint: {def_teacher_ckpt}")
+        print(
+            f"[{phase_name.upper()} TEACHER] "
+            f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
+            f"at update {ckpt_info['best_update']}"
+        )
 
         # --- Save teacher metrics ---
         metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
@@ -3423,7 +3873,6 @@ def train_defender_with_distill(
     # del env
     # gc.collect()
     # torch.cuda.empty_cache()
-
     return def_teacher_ckpt, student_out
 
 def train_attacker_with_distill(
@@ -3492,12 +3941,21 @@ def train_attacker_with_distill(
     print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
     print(f"[{phase_name.upper()}] distill={DISTILL}")
 
-    ppo_att, metrics_att = train(cfg_teacher)
+    # cfg_teacher["save_best_ckpt"] = True
+    # cfg_teacher["save_last_ckpt"] = True
+    cfg_teacher["checkpoint_dir"] = OUT_DIR
+    cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
+
+    ppo_att, metrics_att, ckpt_info = train(cfg_teacher)
 
     # --- Save attacker teacher checkpoint ---
-    att_teacher_ckpt = os.path.join(OUT_DIR, f"{phase_name}_teacher.pt")
-    torch.save(ppo_att.att_net.state_dict(), att_teacher_ckpt)
-    print(f"[{phase_name.upper()} TEACHER] Saved attacker teacher to {att_teacher_ckpt}")
+    att_teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
+    print(f"[{phase_name.upper()} TEACHER] Using attacker checkpoint: {att_teacher_ckpt}")
+    print(
+        f"[{phase_name.upper()} TEACHER] "
+        f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
+        f"at update {ckpt_info['best_update']}"
+    )
 
     # --- Save teacher metrics ---
     metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
@@ -3572,6 +4030,151 @@ def train_attacker_with_distill(
     # torch.cuda.empty_cache()
 
     return att_teacher_ckpt, student_out
+
+def train_with_distill(
+    phase_name: str,
+    attacker_mode: str,
+    train_role: str,
+    extra_train_cfg: Dict[str, Any] | None = None,
+):
+    """
+    Unified wrapper for:
+      - teacher training (full-state)
+      - optional UKF student distillation
+
+    Replaces both:
+      - train_defender_with_distill(...)
+      - train_attacker_with_distill(...)
+
+    Args:
+        phase_name: label used for checkpoints / metrics filenames
+        attacker_mode: "rule" or "rl"
+        train_role: "def" or "att"
+        extra_train_cfg: optional overrides merged into both teacher and student cfgs
+
+    Returns
+    -------
+    teacher_ckpt : str
+        Path to best teacher checkpoint (or last if best missing)
+    student_ckpt : str | None
+        Path to distilled student checkpoint if distill=True, else None
+    """
+    if train_role not in ("def", "att"):
+        raise ValueError(f"train_role must be 'def' or 'att', got {train_role!r}")
+
+    role_upper = "DEFENDER" if train_role == "def" else "ATTACKER"
+    role_lower = "defender" if train_role == "def" else "attacker"
+
+    # =========================================================
+    # TEACHER (full-state)
+    # =========================================================
+    cfg_teacher = config_for_train(
+        attacker_mode=attacker_mode,
+        train_role=train_role,
+    )
+    cfg_teacher["use_ukf"] = False  # teacher is always full-state
+
+    if extra_train_cfg is not None:
+        cfg_teacher.update(extra_train_cfg)
+
+    DISTILL = bool(cfg_teacher.get("distill", False))
+
+    build_dyn(cfg_teacher)
+
+    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError(
+            f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available."
+        )
+
+    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
+    print(f"[{phase_name.upper()}] train_role={train_role}  distill={DISTILL}")
+
+    cfg_teacher["checkpoint_dir"] = OUT_DIR
+    cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
+
+    ppo_teacher, metrics_teacher, ckpt_info = train(cfg_teacher)
+
+    teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
+    print(f"[{phase_name.upper()} TEACHER] Using {role_lower} checkpoint: {teacher_ckpt}")
+    print(
+        f"[{phase_name.upper()} TEACHER] "
+        f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
+        f"at update {ckpt_info['best_update']}"
+    )
+
+    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
+    np.savez(metrics_path, **metrics_teacher)
+    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
+
+    try:
+        del ppo_teacher, metrics_teacher
+    except Exception:
+        pass
+
+    # =========================================================
+    # STUDENT (UKF) via distillation
+    # =========================================================
+    student_out = None
+
+    if DISTILL:
+        cfg_student = config_for_train(
+            attacker_mode=attacker_mode,
+            train_role=train_role,
+        )
+        cfg_student["use_ukf"] = True
+        cfg_student["seed"] = cfg_teacher["seed"] + 1
+
+        if extra_train_cfg is not None:
+            cfg_student.update(extra_train_cfg)
+
+        build_dyn(cfg_student)
+
+        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available."
+            )
+
+        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+
+        student_out = os.path.join(OUT_DIR, f"{phase_name}_ukf_student.pt")
+
+        # NOTE:
+        # distill_from_teacher() is currently defender-centric internally.
+        # This unified wrapper preserves your current behavior, but if you want
+        # truly symmetric attacker distillation, distill_from_teacher() itself
+        # should be generalized later.
+        student, metrics_student = distill_from_teacher(
+            cfg_student,
+            teacher_ckpt,
+            out_path=student_out,
+        )
+
+        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
+
+        distill_metrics_path = os.path.join(
+            OUT_DIR, f"distill_metrics_{phase_name}_student.npz"
+        )
+        np.savez(distill_metrics_path, **metrics_student)
+        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
+
+        try:
+            del student, metrics_student
+        except Exception:
+            pass
+
+    meta = {
+        "train_role": train_role,
+        "teacher_ckpt": teacher_ckpt,
+        "teacher_best_metric_name": ckpt_info["tracked_metric_name"],
+        "teacher_best_metric": ckpt_info["best_metric"],
+        "teacher_best_update": ckpt_info["best_update"],
+        "teacher_best_ckpt_path": ckpt_info["best_ckpt_path"],
+        "teacher_last_ckpt_path": ckpt_info["last_ckpt_path"],
+        "student_ckpt": student_out,
+        "distill_enabled": DISTILL,
+    }
+
+    return teacher_ckpt, student_out, meta
 
 
 
@@ -3728,15 +4331,13 @@ if __name__ == "__main__":
         attacker_mode="rule",
         extra_train_cfg=None,
     ) as st:
-        def0_teacher_ckpt, def0_student_ckpt = train_defender_with_distill(
+        def0_teacher_ckpt, def0_student_ckpt, def0_meta = train_with_distill(
             phase_name="def0",
             attacker_mode="rule",
+            train_role="def",
             extra_train_cfg=None,
         )
-        st["outputs"] = {
-            "def_teacher_ckpt": def0_teacher_ckpt,
-            "def_student_ckpt": def0_student_ckpt,
-        }
+        st["outputs"] = def0_meta
 
     # def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
 
@@ -3777,15 +4378,13 @@ if __name__ == "__main__":
         attacker_mode="rl",
         extra_train_cfg=phase1_extra,
     ) as st:
-        att1_teacher_ckpt, att1_student_ckpt = train_attacker_with_distill(
+        att1_teacher_ckpt, att1_student_ckpt, att1_meta = train_with_distill(
             phase_name="att1",
             attacker_mode="rl",
+            train_role="att",
             extra_train_cfg=phase1_extra,
         )
-        st["outputs"] = {
-            "att_teacher_ckpt": att1_teacher_ckpt,
-            "att_student_ckpt": att1_student_ckpt,
-        }
+        st["outputs"] = att1_meta
 
     m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
     plot_training_metrics(
@@ -3813,15 +4412,13 @@ if __name__ == "__main__":
         attacker_mode="rl",
         extra_train_cfg=phase2_extra,
     ) as st:
-        def1_teacher_ckpt, def1_student_ckpt = train_defender_with_distill(
+        def1_teacher_ckpt, def1_student_ckpt, def1_meta = train_with_distill(
             phase_name="def1",
             attacker_mode="rl",
+            train_role="def",
             extra_train_cfg=phase2_extra,
         )
-        st["outputs"] = {
-            "def_teacher_ckpt": def1_teacher_ckpt,
-            "def_student_ckpt": def1_student_ckpt,
-        }
+        st["outputs"] = def1_meta
 
     # ---- def1 ----
     m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
@@ -3873,12 +4470,9 @@ if __name__ == "__main__":
 
     # record a final summary block too
     runlog.set_config("final_outputs", {
-        "def0_teacher_ckpt": def0_teacher_ckpt,
-        "def0_student_ckpt": def0_student_ckpt,
-        "att1_teacher_ckpt": att1_teacher_ckpt,
-        "att1_student_ckpt": att1_student_ckpt,
-        "def1_teacher_ckpt": def1_teacher_ckpt,
-        "def1_student_ckpt": def1_student_ckpt,
+        "def0": def0_meta,
+        "att1": att1_meta,
+        "def1": def1_meta,
         "plots_root": PLOTS_ROOT,
     })
 
