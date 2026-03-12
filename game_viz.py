@@ -24,7 +24,8 @@ __all__ = [
     "add_triad_legend",
     "animate_rollout_3d", "interactive_rollout_3d",
     "plot_rollout_thrust_u",
-    "plot_rollout_center_distance"
+    "plot_rollout_center_distance",
+    "plot_rollout_relative_distance"
 ]
 
 
@@ -1942,4 +1943,186 @@ def plot_rollout_center_distance(
     fig.tight_layout()
     if show:
         plt.show()
+    return fig, ax
+
+def plot_rollout_relative_distance(
+    frames_dict,
+    cfg=None,
+    agents=(1, 2),
+    rollout_idx: int | None = None,
+    dt: float | None = None,
+    title: str | None = None,
+    show: bool = True,
+    show_collision_radius: bool = True,
+):
+    """
+    Plot relative distance ||p_i - p_j|| over rollout time for two agents.
+
+    Parameters
+    ----------
+    frames_dict : dict
+        Rollout dictionary containing executed trajectories.
+    cfg : dict | None
+        Config dictionary. Used to infer dt and collision radius.
+    agents : tuple[int, int]
+        Pair of agent indices to compare, e.g. (1, 2).
+    rollout_idx : int | None
+        If frames_dict stores multiple rollouts, select one.
+    dt : float | None
+        Optional timestep override. If None, tries cfg["dt"].
+    title : str | None
+        Plot title.
+    show : bool
+        Whether to call plt.show().
+    show_collision_radius : bool
+        Whether to draw cfg["collision_radius_m"] as a horizontal line.
+
+    Returns
+    -------
+    fig, ax
+    """
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    if len(agents) != 2:
+        raise ValueError(f"'agents' must contain exactly two agent indices, got {agents}")
+
+    a_i, a_j = int(agents[0]), int(agents[1])
+
+    def _maybe_pick_rollout(obj):
+        if rollout_idx is None:
+            return obj
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            try:
+                return obj[rollout_idx]
+            except Exception:
+                return obj
+        return obj
+
+    def _as_xyz(seq):
+        """
+        Coerce list/array of positions to shape (T,3) float array.
+        Accepts (T,2) and pads z=0.
+        """
+        if seq is None:
+            return None
+        X = np.asarray(seq, dtype=float)
+        if X.ndim != 2 or X.shape[0] < 1:
+            return None
+        if X.shape[1] == 2:
+            z = np.zeros((X.shape[0], 1), dtype=float)
+            return np.hstack([X, z])
+        if X.shape[1] >= 3:
+            return X[:, :3]
+        return None
+
+    def _infer_dt():
+        if dt is not None:
+            return float(dt)
+        if cfg is None:
+            return None
+        for path in (("dt",), ("dyn", "dt"), ("sim", "dt")):
+            try:
+                val = cfg
+                for p in path:
+                    val = val[p]
+                return float(val)
+            except Exception:
+                pass
+        return None
+
+    # --------- get exec trajectories for each agent ----------
+    exec_all = None
+    if "exec_xyz_all" in frames_dict and frames_dict["exec_xyz_all"] is not None:
+        exec_all = _maybe_pick_rollout(frames_dict["exec_xyz_all"])
+    elif "exec_all" in frames_dict and frames_dict["exec_all"] is not None:
+        exec_all = _maybe_pick_rollout(frames_dict["exec_all"])
+
+    def _get_exec_for_agent(a1_indexed: int):
+        a0 = a1_indexed - 1
+
+        # Preferred: N-agent container
+        if isinstance(exec_all, (list, tuple)) and 0 <= a0 < len(exec_all):
+            return _as_xyz(_maybe_pick_rollout(exec_all[a0]))
+
+        # Legacy: exec1_xyz, exec2_xyz, ...
+        for k in (f"exec{a1_indexed}_xyz", f"exec{a1_indexed}_xy"):
+            if k in frames_dict and frames_dict[k] is not None:
+                return _as_xyz(_maybe_pick_rollout(frames_dict[k]))
+
+        # Extra fallbacks
+        for k in (f"exec{a1_indexed}", f"x{a1_indexed}_xyz", f"x{a1_indexed}_xy"):
+            if k in frames_dict and frames_dict[k] is not None:
+                return _as_xyz(_maybe_pick_rollout(frames_dict[k]))
+
+        return None
+
+    Xi = _get_exec_for_agent(a_i)
+    Xj = _get_exec_for_agent(a_j)
+
+    if Xi is None:
+        maybe = [k for k in frames_dict.keys() if f"{a_i}" in k and any(s in k.lower() for s in ("exec", "x"))]
+        raise KeyError(
+            f"Could not find executed trajectory for agent {a_i}.\n"
+            f"Tried exec_xyz_all and legacy exec{a_i}_xyz/exec{a_i}_xy.\n"
+            f"Nearby keys: {maybe}"
+        )
+
+    if Xj is None:
+        maybe = [k for k in frames_dict.keys() if f"{a_j}" in k and any(s in k.lower() for s in ("exec", "x"))]
+        raise KeyError(
+            f"Could not find executed trajectory for agent {a_j}.\n"
+            f"Tried exec_xyz_all and legacy exec{a_j}_xyz/exec{a_j}_xy.\n"
+            f"Nearby keys: {maybe}"
+        )
+
+    # Align lengths
+    T = min(Xi.shape[0], Xj.shape[0])
+    if T < 1:
+        raise ValueError("No rollout samples found (T < 1).")
+
+    Xi = Xi[:T]
+    Xj = Xj[:T]
+
+    # --------- relative distance ----------
+    rel_dist = np.linalg.norm(Xi - Xj, axis=1)
+
+    # --------- time axis ----------
+    _dt = _infer_dt()
+    if _dt is None:
+        t = np.arange(T)
+        xlab = "step"
+    else:
+        t = _dt * np.arange(T)
+        xlab = "time [s]"
+
+    # --------- plot ----------
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.plot(t, rel_dist, label=f"||p{a_i} - p{a_j}||")
+
+    if show_collision_radius and cfg is not None:
+        collision_radius = float(cfg.get("collision_radius_m", 0.0))
+        if collision_radius > 0.0:
+            ax.axhline(
+                collision_radius,
+                linestyle="--",
+                linewidth=1.5,
+                alpha=0.85,
+                label=f"collision radius = {collision_radius:g} m",
+            )
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("relative distance [m]")
+    ax.grid(True, alpha=0.35)
+
+    if title is None:
+        title = f"Relative distance between agent {a_i} and agent {a_j}"
+
+    ax.set_title(title)
+    ax.legend()
+    fig.tight_layout()
+
+    if show:
+        plt.show()
+
     return fig, ax

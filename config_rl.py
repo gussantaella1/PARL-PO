@@ -132,6 +132,22 @@ KF_COMMON: Dict[str, Any] = {
     "reward_from_belief": True,   # NEW: toggle
 
     "belief_clip_factor": 2.0,
+
+    "fuel": {
+        "enable": False,
+        "def": {
+            "m0": 500.0,
+            "m_dry": 400.0,
+            "Tmax": 2.0,
+            "Isp": 220.0,
+        },
+        "att": {
+            "m0": 500.0,
+            "m_dry": 400.0,
+            "Tmax": 2.0,
+            "Isp": 220.0,
+        },
+    },
 }
 
 # ---------- Visualizer config ----------
@@ -177,19 +193,19 @@ TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
 
     #Current config
-    "num_envs": 256,   #Was 64 
+    "num_envs": 256,   #Was 256
     "steps_per_env": 512, #Was 512  
-    "total_updates": 2000,   #Was 2000
-    "train_epochs": 5, #Was 3
+    "total_updates": 1000,   #Was 2000
+    "train_epochs": 3, #Was 3
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
     "entropy_coef": 0.01,
     "k_pos": 0.05,
-    "gamma": 0.999, #Was 0.999
+    "gamma": 0.992, #Was 0.995
     "target_hit_reward_penalty": 10.0,
-    "collision_penalty": 6.0,
-    "wall_penalty": 3.0,
-    "fuel_depletion_penalty": 6.0,
+    "collision_penalty": 5.0,
+    "wall_penalty": 5.0,
+    "fuel_depletion_penalty": 5.0,
 
 
 
@@ -240,35 +256,23 @@ TRAIN: Dict[str, Any] = {
     # "gamma": 0.999,
 
     #Test training
-    "num_envs": 1,          
-    "steps_per_env": 256,    
-    "total_updates": 100, 
-    "train_epochs": 3,
-    "minibatch_size": 1024,  
-    "log_every": 10,
-    "entropy_coef": 0.01,
-    "k_pos": 0.04,  
-    "gamma": 0.998,
-    "target_hit_reward_penalty": 5.0,
-    "collision_penalty": 5.0,
-    "wall_penalty": 5.0,
+    # "num_envs": 1,          
+    # "steps_per_env": 256,    
+    # "total_updates": 100, 
+    # "train_epochs": 3,
+    # "minibatch_size": 1024,  
+    # "log_every": 10,
+    # "entropy_coef": 0.01,
+    # "k_pos": 0.04,  
+    # "gamma": 0.998,
+    # "target_hit_reward_penalty": 5.0,
+    # "collision_penalty": 5.0,
+    # "wall_penalty": 5.0,
 
-    "fuel": {
-        "enable": False,
-        "def": {
-            "m0": 500.0,
-            "m_dry": 400.0,
-            "Tmax": 2.0,
-            "Isp": 220.0,
-        },
-        "att": {
-            "m0": 500.0,
-            "m_dry": 400.0,
-            "Tmax": 2.0,
-            "Isp": 220.0,
-        },
-    },
+    "record_ic_history": True,
+    "max_ic_history": 300000,
 
+    #Effort penalties (Fuel setting)
     "k_eff_def": 0.01,
     "k_eff_att": 0.01,
 
@@ -280,10 +284,12 @@ TRAIN: Dict[str, Any] = {
     # "r_att_max": 0.95, #Default: 0.95
 
     "r_def_min": 0.0, #Default: 0.0
-    "r_def_max": 0.5, # Default: 0.5
+    "r_def_max": 0.8, # Default: 0.5
 
-    "r_att_min": 0.4, #Default 0.4
+    "r_att_min": 0.3, #Default 0.4
     "r_att_max": 0.95, #Default: 0.95
+
+    "percent_advantage_defender": 0.75, 
 
     # Other PPO hyperparams
     "gae_lambda": 0.95,
@@ -300,8 +306,7 @@ TRAIN: Dict[str, Any] = {
     # "wall_penalty": 2.0,
 
     "hit_buffer_att": 0.0,
-
-    "hit_buffer_def": 0.25,
+    "hit_buffer_def": 0.0,
 
     # Legacy reward shaping (used by Env at train *and* eval)
     "effort_def": 0.01,
@@ -309,14 +314,14 @@ TRAIN: Dict[str, Any] = {
 
     #Learning schedule
     "lr_schedule": "linear",   # options: "none", "linear"
-    "lr_final_factor": 0.2,  # final_lr = lr_final_factor * initial_lr
+    "lr_final_factor": 0.1,  # final_lr = lr_final_factor * initial_lr
 
     # Anneal (training-time only)
     "def_center_min_anneal": 0.5,
 
     # Training-only initial condition randomization
     # (env uses this; eval config will default back to "fixed")
-    "train_ic_mode": "random_shell",  # or "fixed"
+    "train_ic_mode": "random_shell_advantage",  # or "fixed"
     "train_ic_vmax": 0.5,            # max |v| component at t=0
     "train_min_sep": 1.0,             # min defender–attacker separation (m)
 
@@ -325,7 +330,7 @@ TRAIN: Dict[str, Any] = {
     "prior_blend_def":        0.0,    # (optional) disable center prior for def
 
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
-    "collision_radius_m": 0.2,            # meters
+    "collision_radius_m": 0.8,            # meters
 
 
     #Learning stat tracking
@@ -370,7 +375,10 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
       - steps_per_env = T
       - total_updates = 0
     """
+
     cfg = _dcopy(COMMON)
+    cfg = _merge(COMMON,TRAIN)
+    
     # Safe rollout defaults
     cfg["x0_jitter"] = {"pos": 0.0, "vel": 0.0}
     cfg["num_envs"] = 1

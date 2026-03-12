@@ -30,6 +30,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import copy
 
 # from __future__ import annotations
 
@@ -290,12 +291,22 @@ class Env:
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
 
+        #Fuel config
+        fuel = cfg.get("fuel", {})
+        self.use_fuel = bool(fuel.get("enable"))
+
         if self.use_ukf and self.D != 3:
             raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
 
         self.ukf = None
         self._latest_meas_innov = 0.0
         self._latest_meas_trP   = 0.0
+
+        self.record_ic_history = bool(cfg.get("record_ic_history", False))
+        self.max_ic_history = int(cfg.get("max_ic_history", 200000))
+
+        self.ic_history_def = []
+        self.ic_history_att = []
 
         if self.use_ukf:
             ukf_cfg = cfg.get("ukf", {})
@@ -429,7 +440,7 @@ class Env:
                 d = np.random.normal(size=(self.D,))
                 d /= (np.linalg.norm(d) + 1e-9)
                 u = np.random.rand()
-                r = (r_min**3 + (r_max**3 - r_min**3) * u) ** (1.0 / 3.0)
+                r = (r_min**3 + (r_max**3 - r_min**3) * u) ** (1.0 / self.D)
                 return self.center + r * d
 
             # r_def_min, r_def_max = 0.0, 0.5 * R
@@ -468,10 +479,137 @@ class Env:
                 x0[idx, 0:self.D]        = pA[k]
                 x0[idx, self.D:2*self.D] = vA[k]
 
+        elif mode == "random_shell_advantage":
+            R = self.radius
+            v_max = self.train_ic_vmax
+            min_sep = self.train_min_sep
+
+            def sample_in_shell(r_min, r_max):
+                if r_max < r_min:
+                    raise ValueError(f"Invalid shell: r_min={r_min} > r_max={r_max}")
+
+                d = np.random.normal(size=(self.D,))
+                d /= (np.linalg.norm(d) + 1e-9)
+
+                # correct for generic dimension D
+                u = np.random.rand()
+                r = (r_min**self.D + (r_max**self.D - r_min**self.D) * u) ** (1.0 / self.D)
+                return self.center + r * d
+
+            # Recommended: margin in METERS, based on OI radius.
+            oi_r = float(self.cfg.get("oi", {}).get("r"))
+
+            percent_advantage_defender = self.cfg.get("percent_advantage_defender", 0.75)
+            radial_margin = float(percent_advantage_defender*np.pi*2*oi_r) 
+
+            r_def_min = float(self.cfg.get("r_def_min")) * R
+            r_def_max = float(self.cfg.get("r_def_max")) * R
+
+            r_att_min = float(self.cfg.get("r_att_min")) * R
+            r_att_max = float(self.cfg.get("r_att_max")) * R
+
+            r_att_min = max(r_att_min, radial_margin)
+
+            if radial_margin < 0.0:
+                raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
+
+            if r_def_min > r_def_max:
+                raise ValueError(f"Invalid defender shell: [{r_def_min}, {r_def_max}]")
+            if r_att_min > r_att_max:
+                raise ValueError(f"Invalid attacker shell: [{r_att_min}, {r_att_max}]")
+
+            # Quick feasibility sanity check
+            if r_def_min > (r_att_max - radial_margin):
+                raise ValueError(
+                    "Infeasible radial shells: defender cannot be at least "
+                    f"{radial_margin:.3f} m closer to center than attacker. "
+                    f"Got r_def_min={r_def_min:.3f}, r_att_max={r_att_max:.3f}."
+                )
+
+            placed = False
+
+            # Outer loop: resample whole scene until all constraints are satisfied
+            for _scene_try in range(2000):
+                # -------------------------------------------------
+                # 1) Sample all attackers first
+                # -------------------------------------------------
+                pA = []
+                vA = []
+                rA = []
+
+                attackers_ok = True
+                for k in range(Na):
+                    found_att = False
+                    for _ in range(1000):
+                        pk = sample_in_shell(r_att_min, r_att_max)
+                        rk = np.linalg.norm(pk - self.center)
+
+                        # enforce attacker-attacker min separation
+                        if any(np.linalg.norm(pk - pj) < min_sep for pj in pA):
+                            continue
+
+                        pA.append(pk)
+                        rA.append(rk)
+                        vA.append(np.random.uniform(-v_max, v_max, size=(self.D,)))
+                        found_att = True
+                        break
+
+                    if not found_att:
+                        attackers_ok = False
+                        break
+
+                if not attackers_ok:
+                    continue
+
+                # -------------------------------------------------
+                # 2) Defender must be closer than EVERY attacker
+                #    by at least radial_margin
+                # -------------------------------------------------
+                r_att_nearest = min(rA)
+                r_def_max_eff = min(r_def_max, r_att_nearest - radial_margin)
+
+                if r_def_max_eff < r_def_min:
+                    continue
+
+                found_def = False
+                for _ in range(1000):
+                    p1 = sample_in_shell(r_def_min, r_def_max_eff)
+
+                    # enforce defender-attacker Euclidean min separation too
+                    if any(np.linalg.norm(p1 - pk) < min_sep for pk in pA):
+                        continue
+
+                    found_def = True
+                    break
+
+                if not found_def:
+                    continue
+
+                v1 = np.random.uniform(-v_max, v_max, size=(self.D,))
+                placed = True
+                break
+
+            if not placed:
+                raise RuntimeError(
+                    "random_shell: could not sample a feasible initial condition after many attempts. "
+                    "Try relaxing r_def_max, increasing r_att_min/r_att_max, reducing min_sep, "
+                    "or reducing percent_advantage_defender."
+                )
+
+            x0 = np.zeros_like(self._x0)
+            x0[0, 0:self.D]        = p1
+            x0[0, self.D:2*self.D] = v1
+
+            for k in range(Na):
+                idx = 1 + k
+                x0[idx, 0:self.D]        = pA[k]
+                x0[idx, self.D:2*self.D] = vA[k]
+
         else:
             raise ValueError(f"Unknown train_ic_mode='{mode}'")
 
         # ---- flatten to state (all agents) ----
+        self._record_ic_scene(x0)
         self.state = x0.reshape(-1)
 
         # With multi-attacker _unpack, we get lists:
@@ -739,11 +877,12 @@ class Env:
                     collision = True
                     break
 
-        oob1 = (rho1 >= self.margin)
+
 
         # 3) Exiting the arena
 
         # oob for ANY attacker
+        oob1 = (rho1 >= self.margin)
         oob2_any = False
         for pA_true in pA_list:
             rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
@@ -788,40 +927,42 @@ class Env:
             )
 
             if self.use_fuel:
-                eff_def = thrust_def / (self.Tmax_def + 1e-9)
-                eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
-                g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
+                # eff_def = thrust_def / (self.Tmax_def + 1e-9)
+                # eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
+                # g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
+                burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
+                burn_frac_att = (mdot_att_all[0] * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
+                g += - self.k_eff_def * burn_frac_def + self.k_eff_att * burn_frac_att
 
-            # terminal handling must also be zero-sum
+            # terminal handling must also be zero-sum. Colissions make it symmetrical
+
+            shared_termination = 0.0
+
             if done:
                 # Example: encode hit_target / collision / oob into g so the sign flip is consistent
                 # if collision:
                 #     g += self.collision_penalty_def
-                if oob1:
+                if att_hit_target or def_hit_target:
+                    g -= self.target_hit_reward_penalty
+                elif collision:
+                    shared_termination += self.collision_penalty
+                elif oob1:
                     g -= self.wallK
-                if oob2_any:
+                elif oob2_any:
                     g += self.wall_penalty
-                if att_hit_target:
-                    g -= self.target_hit_reward_penalty
-                if def_hit_target:
-                    g -= self.target_hit_reward_penalty
 
-                if self.use_fuel:
+                elif self.use_fuel:
                     if fuel_depleted_def:
                         g -= self.fuel_depletion_penalty
                     if fuel_depleted_att:
                         g += self.fuel_depletion_penalty
 
-
-
-
                 # If you want attacker “success” to matter, it should reduce defender g,
                 # which automatically increases attacker reward via -g.
 
-            shared_termination = 0.0
 
-            if done and collision:
-                shared_termination += self.collision_penalty
+            # if done and collision:
+            #     shared_termination += self.collision_penalty
 
             if need_def:
                 r1 = g - shared_termination
@@ -1095,6 +1236,53 @@ class Env:
         fuel_depleted = (m_next <= m_dry + 1e-9)
 
         return a_real, m_next, fuel_depleted, thrust_norm, mdot
+    
+    def _record_ic_scene(self, x0: np.ndarray):
+        """
+        Record initial positions actually used at reset().
+        Stores positions only, not velocities.
+        """
+        if not self.record_ic_history:
+            return
+
+        x0 = np.asarray(x0, dtype=np.float32)
+
+        # defender
+        self.ic_history_def.append(x0[0, 0:self.D].copy())
+
+        # attackers
+        for k in range(self.num_attackers):
+            idx = 1 + k
+            self.ic_history_att.append(x0[idx, 0:self.D].copy())
+
+        # keep memory bounded
+        if len(self.ic_history_def) > self.max_ic_history:
+            extra = len(self.ic_history_def) - self.max_ic_history
+            self.ic_history_def = self.ic_history_def[extra:]
+
+        if len(self.ic_history_att) > self.max_ic_history * self.num_attackers:
+            extra = len(self.ic_history_att) - self.max_ic_history * self.num_attackers
+            self.ic_history_att = self.ic_history_att[extra:]
+
+
+    def get_ic_history_arrays(self):
+        """
+        Returns
+        -------
+        def_pos : (Ndef, D)
+        att_pos : (Natt, D)
+        """
+        if len(self.ic_history_def) == 0:
+            def_pos = np.zeros((0, self.D), dtype=np.float32)
+        else:
+            def_pos = np.stack(self.ic_history_def, axis=0).astype(np.float32)
+
+        if len(self.ic_history_att) == 0:
+            att_pos = np.zeros((0, self.D), dtype=np.float32)
+        else:
+            att_pos = np.stack(self.ic_history_att, axis=0).astype(np.float32)
+
+        return def_pos, att_pos
 
 
 
@@ -1135,7 +1323,30 @@ class VecEnv:
         return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
 
 
+def collect_ic_history_from_vecenv(vec: VecEnv):
+    """
+    Aggregate initial-condition history from all sub-envs.
 
+    Returns
+    -------
+    def_pos : (N, D)
+    att_pos : (M, D)
+    """
+    def_all = []
+    att_all = []
+
+    for e in vec.envs:
+        d, a = e.get_ic_history_arrays()
+        if d.shape[0] > 0:
+            def_all.append(d)
+        if a.shape[0] > 0:
+            att_all.append(a)
+
+    D = vec.envs[0].D
+    def_pos = np.concatenate(def_all, axis=0) if len(def_all) > 0 else np.zeros((0, D), dtype=np.float32)
+    att_pos = np.concatenate(att_all, axis=0) if len(att_all) > 0 else np.zeros((0, D), dtype=np.float32)
+
+    return def_pos, att_pos
 
 
 
@@ -2746,11 +2957,18 @@ def _sample_opp_domain(cfg: Dict[str, Any]) -> str:
     if not mix:
         return "def0"
     modes = list(mix.get("modes", ["def0"]))
-    probs = mix.get("probs", None)
+    probs = mix.get("probs")
     if probs is None:
         # uniform
         return np.random.choice(modes)
     probs = np.asarray(probs, float)
+
+    total = probs.sum()
+    if not np.isclose(total, 1.0, atol=1e-8):
+        raise ValueError(
+            f"opp_mix['probs'] must sum to 1.0, got sum={total:.12f} and probs={probs.tolist()}"
+        )
+
     probs = probs / (probs.sum() + 1e-12)
     return str(np.random.choice(modes, p=probs))
 
@@ -3257,8 +3475,12 @@ def train(cfg: Dict[str, Any]):
 
             if cfg.get("fuel", {}).get("enable", False):
                 print(
-                    f"   fuel used: def={fuel_used_def_mean:.3f}, att={fuel_used_att_mean:.3f}   "
-                    f"fuel remaining: def={fuel_frac_def_mean:.3f}, att={fuel_frac_att_mean:.3f}"
+                    f"   fuel used: def={fuel_used_def_mean:.6f}, att={fuel_used_att_mean:.6f}   "
+                    f"fuel remaining: def={fuel_frac_def_mean:.6f}, att={fuel_frac_att_mean:.6f}"
+                )
+                print(
+                    f"   thrust mean: def={thrust_def_mean:.6e}, att={thrust_att_mean:.6e}   "
+                    f"mdot mean: def={mdot_def_mean:.6e}, att={mdot_att_mean:.6e}"
                 )
 
             
@@ -3314,7 +3536,16 @@ def train(cfg: Dict[str, Any]):
 
 
 
-
+    ic_used_path = None
+    if cfg.get("record_ic_history", False) and checkpoint_dir is not None:
+        def_used, att_used = collect_ic_history_from_vecenv(vec)
+        ic_used_path = os.path.join(checkpoint_dir, f"ic_samples_{checkpoint_prefix}.npz")
+        np.savez(
+            ic_used_path,
+            def_pos=def_used,
+            att_pos=att_used,
+        )
+        print(f"[ic] saved actual training IC samples -> {ic_used_path}")
 
             
             
@@ -3351,6 +3582,8 @@ def train(cfg: Dict[str, Any]):
         "best_update": best_update,
         "best_ckpt_path": best_ckpt_path,
         "last_ckpt_path": last_ckpt_path,
+        "ic_used_path": ic_used_path,
+
     }
 
     print("Training finished.")
@@ -3420,17 +3653,6 @@ def load_npz_metrics(path: str) -> dict:
     for k in data.files:
         metrics[k] = data[k]
     return metrics
-
-
-def _as_1d(x):
-    """Best-effort convert to 1D float array (for plotting)."""
-    x = np.asarray(x)
-    if x.ndim == 0:
-        return x.reshape(1).astype(float)
-    if x.ndim > 1:
-        # if it's a column vector or similar, flatten
-        x = x.reshape(-1)
-    return x.astype(float)
 
 def plot_training_metrics(
     metrics: dict,
@@ -3717,6 +3939,124 @@ def plot_compare_phases(
 
     return fig, saved_path
 
+def _draw_circle(ax, radius, center_xy=(0.0, 0.0), **kwargs):
+    th = np.linspace(0.0, 2.0 * np.pi, 400)
+    x = center_xy[0] + radius * np.cos(th)
+    y = center_xy[1] + radius * np.sin(th)
+    ax.plot(x, y, **kwargs)
+
+
+def _plot_ic_projection(
+    ax,
+    def_pos: np.ndarray,
+    att_pos: np.ndarray,
+    dims=(0, 1),
+    title="",
+    arena_r=None,
+    oi_r=None,
+    center=None,
+    alpha_def=0.15,
+    alpha_att=0.15,
+    s=4,
+):
+    i, j = dims
+    center = np.zeros(3, dtype=float) if center is None else np.asarray(center, dtype=float)
+
+    if def_pos.shape[0] > 0:
+        ax.scatter(
+            def_pos[:, i], def_pos[:, j],
+            s=s, alpha=alpha_def, label="Defender starts"
+        )
+
+    if att_pos.shape[0] > 0:
+        ax.scatter(
+            att_pos[:, i], att_pos[:, j],
+            s=s, alpha=alpha_att, label="Attacker starts"
+        )
+
+    # arena / OI circles only make geometric sense in centered projections
+    if arena_r is not None:
+        _draw_circle(ax, arena_r, center_xy=(center[i], center[j]), linestyle="--", linewidth=1.0)
+    if oi_r is not None and oi_r > 0.0:
+        _draw_circle(ax, oi_r, center_xy=(center[i], center[j]), linestyle="-", linewidth=1.0)
+
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(True)
+    ax.set_title(title)
+    ax.legend()
+
+
+def plot_ic_samples(
+    def_pos: np.ndarray,
+    att_pos: np.ndarray,
+    cfg: Dict[str, Any],
+    title: str = "",
+    out_path: str | None = None,
+    show: bool = False,
+    close: bool = True,
+):
+    """
+    Plot IC samples in XY and, if D=3, also XZ projection.
+    """
+    D = int(cfg["D"])
+    ar = cfg["arena"]
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)],
+        dtype=float,
+    )[:D]
+    arena_r = float(ar["r"])
+    oi_r = float(cfg.get("oi", {}).get("r", 0.0))
+
+    if D == 2:
+        fig, ax = plt.subplots(1, 1, figsize=(7, 7))
+        _plot_ic_projection(
+            ax,
+            def_pos,
+            att_pos,
+            dims=(0, 1),
+            title=title or "IC samples (XY)",
+            arena_r=arena_r,
+            oi_r=oi_r,
+            center=np.pad(center, (0, 1)),
+        )
+    else:
+        fig, axes = plt.subplots(1, 2, figsize=(13, 6))
+
+        _plot_ic_projection(
+            axes[0],
+            def_pos,
+            att_pos,
+            dims=(0, 1),
+            title=(title + " — XY") if title else "IC samples — XY",
+            arena_r=arena_r,
+            oi_r=oi_r,
+            center=center,
+        )
+        _plot_ic_projection(
+            axes[1],
+            def_pos,
+            att_pos,
+            dims=(0, 2),
+            title=(title + " — XZ") if title else "IC samples — XZ",
+            arena_r=arena_r,
+            oi_r=oi_r,
+            center=center,
+        )
+
+    fig.tight_layout()
+
+    if out_path is not None:
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        fig.savefig(out_path, dpi=200, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    if close:
+        plt.close(fig)
+
+    return fig
+
 def make_tb_writer(cfg: dict, run_name: str | None = None):
     """
     Creates a TensorBoard SummaryWriter under:
@@ -3743,293 +4083,86 @@ def make_tb_writer(cfg: dict, run_name: str | None = None):
     print(f"[tb] logging to: {logdir}")
     return writer, logdir
 
+def sample_ic_support(
+    cfg: Dict[str, Any],
+    n_scenes: int = 20000,
+    seed: int = 123,
+):
+    """
+    Approximate the feasible initial-condition support by repeatedly
+    calling Env.reset() on a fresh env.
+
+    Returns
+    -------
+    def_pos : (n_scenes, D)
+    att_pos : (n_scenes * num_attackers, D)
+    """
+    cfg_probe = copy.deepcopy(cfg)
+    cfg_probe["record_ic_history"] = False  # do not accumulate in the probe env
+
+    build_dyn(cfg_probe)
+    set_seed(seed)
+
+    env = Env(cfg_probe)
+
+    def_all = []
+    att_all = []
+
+    for _ in range(n_scenes):
+        env.reset()
+        p1, v1, pA_list, vA_list = env._unpack(env.state)
+
+        def_all.append(np.asarray(p1, dtype=np.float32).copy())
+        for pA in pA_list:
+            att_all.append(np.asarray(pA, dtype=np.float32).copy())
+
+    def_pos = np.stack(def_all, axis=0).astype(np.float32)
+    att_pos = np.stack(att_all, axis=0).astype(np.float32)
+
+    return def_pos, att_pos
+
+def plot_ic_support_from_cfg(
+    cfg: Dict[str, Any],
+    n_scenes: int = 20000,
+    seed: int = 123,
+    title: str = "Feasible initial-condition support",
+    out_path: str | None = None,
+    show: bool = False,
+):
+    def_pos, att_pos = sample_ic_support(cfg, n_scenes=n_scenes, seed=seed)
+    return plot_ic_samples(
+        def_pos,
+        att_pos,
+        cfg,
+        title=title,
+        out_path=out_path,
+        show=show,
+    )
+
+
+def plot_ic_used_from_npz(
+    npz_path: str,
+    cfg: Dict[str, Any],
+    title: str = "Initial conditions actually used during training",
+    out_path: str | None = None,
+    show: bool = False,
+):
+    data = np.load(npz_path)
+    def_pos = data["def_pos"]
+    att_pos = data["att_pos"]
+    return plot_ic_samples(
+        def_pos,
+        att_pos,
+        cfg,
+        title=title,
+        out_path=out_path,
+        show=show,
+    )
+
 
     # ---------------------------------------------------------
     # Helper: train defender teacher + distill to UKF student
     # ---------------------------------------------------------
-def train_defender_with_distill(
-    phase_name: str,
-    attacker_mode: str,
-    extra_train_cfg: Dict[str, Any] | None = None,
-):
-    """
-    Always trains a full-state TEACHER defender.
-    If cfg_teacher["distill"] == True, then runs a UKF STUDENT distillation phase.
-    If False, skips distillation and returns student_ckpt=None.
-    """
-
-    # -------- TEACHER (full-state) --------
-
-    cfg_teacher = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="def",
-        )
-    
-    BUILD_TEACHER = True
-    DISTILL = bool(cfg_teacher.get("distill", False))
-
-    if BUILD_TEACHER: 
-        cfg_teacher = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="def",
-        )
-        cfg_teacher["use_ukf"] = False  # teacher is full-state
-
-        if extra_train_cfg is not None:
-            cfg_teacher.update(extra_train_cfg)
-
-        # IMPORTANT: read the flag AFTER updates, and default to False if absent
-
-        build_dyn(cfg_teacher)
-
-        if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
-        print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-        print(f"[{phase_name.upper()}] distill={DISTILL}")
-
-        cfg_teacher["checkpoint_dir"] = OUT_DIR
-        cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
-
-        ppo_def, metrics_def, ckpt_info = train(cfg_teacher)
-
-        # --- Save defender teacher checkpoint ---
-        def_teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
-        print(f"[{phase_name.upper()} TEACHER] Using defender checkpoint: {def_teacher_ckpt}")
-        print(
-            f"[{phase_name.upper()} TEACHER] "
-            f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
-            f"at update {ckpt_info['best_update']}"
-        )
-
-        # --- Save teacher metrics ---
-        metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
-        np.savez(metrics_path, **metrics_def)
-        print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
-
-    # --- Optional: evaluate teacher (full-state) ---
-    # cfg_eval = config_for_eval(
-    #     attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
-    #     umax=cfg_teacher["umax"],
-    #     T=cfg_teacher["T"],
-    # )
-    # cfg_eval["use_ukf"] = False
-    # build_dyn(cfg_eval)
-    # trajs = evaluate(ppo_def, cfg_eval, episodes=2)
-
-    # ar = cfg_eval["arena"]
-    # D = cfg_eval["D"]
-    # center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
-    # R = float(ar["r"])
-    # m = rollout_metrics(trajs[0]["states"], center, R)
-    # print(
-    #     f"[{phase_name.upper()} TEACHER metrics] "
-    #     f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
-    # )
-
-    try:
-        del ppo_def, metrics_def
-    except: pass
-
-    # def_teacher_ckpt = "Training_Policy/def0_def_teacher.pt"
-
-    # -------- STUDENT (UKF) via distillation (optional) --------
-    student_out = None
-    if DISTILL:
-        cfg_student = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="def",
-        )
-
-        cfg_student["use_ukf"] = True
-        cfg_student["seed"] = cfg_teacher["seed"] + 1
-
-        # If you want the student to inherit any relevant training knobs, do it here:
-        # (e.g., same attacker opponent checkpoint/freeze settings)
-        if extra_train_cfg is not None:
-            cfg_student.update(extra_train_cfg)
-
-        build_dyn(cfg_student)
-
-        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
-        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
-
-        student_out = os.path.join(OUT_DIR, f"{phase_name}_ukf_student.pt")
-        student, metrics_student = distill_from_teacher(
-            cfg_student, def_teacher_ckpt, out_path=student_out,
-        )
-        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
-
-        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
-        np.savez(distill_metrics_path, **metrics_student)
-        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
-
-        try:
-            del student, metrics_student
-        except: pass
-
-    #Clearing cache
-    # del ppo_def
-    # del env
-    # gc.collect()
-    # torch.cuda.empty_cache()
-    return def_teacher_ckpt, student_out
-
-def train_attacker_with_distill(
-    phase_name: str,
-    attacker_mode: str,
-    extra_train_cfg: Dict[str, Any] | None = None,
-):
-    """
-    Wrapper that (1) optionally rule-pretrains the attacker, then (2) trains with PPO (teacher),
-    then (3) distills (student). Adjust the distill part to match your pipeline.
-
-    Args:
-        phase_name: label for logging/checkpoints
-        attacker_mode: e.g. "rl"
-        extra_train_cfg: overrides merged into cfg_teacher
-        do_rule_pretrain: if True, call pretrain_attacker_from_rule before PPO
-        rule_pretrain_kwargs: forwarded into pretrain_attacker_from_rule(...)
-    """
-    # -------- TEACHER (full-state) --------
-    cfg_teacher = config_for_train(
-        attacker_mode=attacker_mode,
-        train_role="att",
-    )
-    cfg_teacher["use_ukf"] = False  # teacher is full-state
-    cfg_teacher["def_ckpt_path"] = def0_teacher_ckpt   # load defender₀ as opponent
-    cfg_teacher["freeze_defender"] = True              # keep defender fixed
-
-    DISTILL = bool(cfg_teacher.get("distill", False))
-
-    build_dyn(cfg_teacher)
-
-    # --- NEW: BC pretrain attacker from rule controller ---
-    # att_bc_ckpt = os.path.join(OUT_DIR, "att1_bc_init.pt")
-    # cfg_for_bc = cfg_teacher.copy()
-
-    # # During BC we still want an RL attacker net to exist,
-    # # but labels come from the rule controller.
-    # # Make sure attacker_mode is 'rl' (it already is here).
-    # cfg_for_bc["seed"] = cfg_teacher["seed"] + 123  # any offset you want
-
-    # pretrain_attacker_from_rule(
-    #     cfg_for_bc,
-    #     out_path=att_bc_ckpt,
-    #     steps_per_env=int(cfg_for_bc.get("steps_per_env", 256)),
-    #     total_updates=int(cfg_for_bc.get("att_bc_updates", 200)),
-    #     bc_epochs=int(cfg_for_bc.get("att_bc_epochs", 4)),
-    #     bc_mb_size=int(cfg_for_bc.get("att_bc_mb_size", 2048)),
-    # )
-
-    # # Now train attacker with PPO starting from the BC init
-    # cfg_teacher["att_init_path"] = att_bc_ckpt
-
-
-
-
-    if extra_train_cfg is not None:
-        cfg_teacher.update(extra_train_cfg)
-
-    # IMPORTANT: read the flag AFTER updates, and default to False if absent
-    DISTILL = bool(cfg_teacher.get("distill", False))
-
-    # build_dyn(cfg_teacher)
-
-    if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
-    print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-    print(f"[{phase_name.upper()}] distill={DISTILL}")
-
-    # cfg_teacher["save_best_ckpt"] = True
-    # cfg_teacher["save_last_ckpt"] = True
-    cfg_teacher["checkpoint_dir"] = OUT_DIR
-    cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
-
-    ppo_att, metrics_att, ckpt_info = train(cfg_teacher)
-
-    # --- Save attacker teacher checkpoint ---
-    att_teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
-    print(f"[{phase_name.upper()} TEACHER] Using attacker checkpoint: {att_teacher_ckpt}")
-    print(
-        f"[{phase_name.upper()} TEACHER] "
-        f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
-        f"at update {ckpt_info['best_update']}"
-    )
-
-    # --- Save teacher metrics ---
-    metrics_path = os.path.join(OUT_DIR, f"train_metrics_{phase_name}_teacher.npz")
-    np.savez(metrics_path, **metrics_att)
-    print(f"[{phase_name.upper()} TEACHER] Saved metrics to {metrics_path}")
-
-    # --- Optional: evaluate teacher (full-state) ---
-    # cfg_eval = config_for_eval(
-    #     attacker_mode=cfg_teacher.get("attacker_mode", attacker_mode),
-    #     umax=cfg_teacher["umax"],
-    #     T=cfg_teacher["T"],
-    # )
-    # cfg_eval["use_ukf"] = False
-    # build_dyn(cfg_eval)
-    # trajs = evaluate(ppo_att, cfg_eval, episodes=2)
-
-    # ar = cfg_eval["arena"]
-    # D = cfg_eval["D"]
-    # center = np.array([ar["cx"], ar["cy"], (ar["cz"] if D == 3 else 0.0)], dtype=float)[:D]
-    # R = float(ar["r"])
-    # m = rollout_metrics(trajs[0]["states"], center, R)
-    # print(
-    #     f"[{phase_name.upper()} TEACHER metrics] "
-    #     f"d2_T={m['d2_norm'][-1]:.3f}  d1_med={np.median(m['d1_norm']):.3f}  rel2_med={np.median(m['rel2_norm']):.3f}"
-    # )
-
-    try:
-        del ppo_att, metrics_att
-    except: pass
-
-    # -------- STUDENT (UKF) via distillation (optional) --------
-    student_out = None
-
-    if DISTILL:
-        cfg_student = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role="att",
-        )
-
-        cfg_student["use_ukf"] = True
-        cfg_student["seed"] = cfg_teacher["seed"] + 1
-
-        # If you want the student to inherit any relevant training knobs, do it here:
-        # (e.g., same attacker opponent checkpoint/freeze settings)
-        if extra_train_cfg is not None:
-            cfg_student.update(extra_train_cfg)
-
-        build_dyn(cfg_student)
-
-        if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
-        print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
-
-        student_out = os.path.join(OUT_DIR, f"{phase_name}_ukf_student.pt")
-        student, metrics_student = distill_from_teacher(
-            cfg_student, att_teacher_ckpt, out_path=student_out,
-        )
-        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
-
-        distill_metrics_path = os.path.join(OUT_DIR, f"distill_metrics_{phase_name}_student.npz")
-        np.savez(distill_metrics_path, **metrics_student)
-        print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
-
-        try:
-            del student, metrics_student
-        except: pass
-
-    #Clearing cache
-    # del ppo_def
-    # del env
-    # gc.collect()
-    # torch.cuda.empty_cache()
-
-    return att_teacher_ckpt, student_out
 
 def train_with_distill(
     phase_name: str,
@@ -4077,6 +4210,11 @@ def train_with_distill(
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)
 
+    if cfg_teacher["train_ic_mode"] == "random_shell_advantage":
+        if train_role == "att": 
+            cfg_teacher["r_att_min"] = 0.0
+            cfg_teacher["train_ic_mode"] = "random_shell"
+
     DISTILL = bool(cfg_teacher.get("distill", False))
 
     build_dyn(cfg_teacher)
@@ -4094,7 +4232,9 @@ def train_with_distill(
 
     ppo_teacher, metrics_teacher, ckpt_info = train(cfg_teacher)
 
-    teacher_ckpt = ckpt_info["best_ckpt_path"] or ckpt_info["last_ckpt_path"]
+    teacher_ckpt = ckpt_info["last_ckpt_path"]
+    teacher_ckpt_best = ckpt_info["best_ckpt_path"]
+
     print(f"[{phase_name.upper()} TEACHER] Using {role_lower} checkpoint: {teacher_ckpt}")
     print(
         f"[{phase_name.upper()} TEACHER] "
@@ -4175,7 +4315,6 @@ def train_with_distill(
     }
 
     return teacher_ckpt, student_out, meta
-
 
 
 # =============================================================
@@ -4290,6 +4429,15 @@ def end_phase_cleanup(
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
 # =============================================================
 if __name__ == "__main__":
+
+    do_phase_0 = True
+    do_phase_1 = True
+    do_phase_2 = True
+
+    def0_teacher_ckpt = "Training_Policy_0.990/def0_teacher.pt"
+    att1_teacher_ckpt = "Training_Policy/att1_teacher.pt"
+ 
+
     OUT_DIR = "Training_Policy"
     os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -4312,7 +4460,7 @@ if __name__ == "__main__":
 
     cfg_training_log = config_for_train(
         attacker_mode="train",
-        train_role="def",
+        train_role="rl",
     )
 
     runlog.set_config("training config used", cfg_training_log)
@@ -4324,149 +4472,216 @@ if __name__ == "__main__":
     # =========================================================
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
-    print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
-    with runlog.stage(
-        "PHASE0_train_def0",
-        phase_name="def0",
-        attacker_mode="rule",
-        extra_train_cfg=None,
-    ) as st:
-        def0_teacher_ckpt, def0_student_ckpt, def0_meta = train_with_distill(
+    if do_phase_0 is True:
+        print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
+        with runlog.stage(
+            "PHASE0_train_def0",
             phase_name="def0",
             attacker_mode="rule",
-            train_role="def",
             extra_train_cfg=None,
+        ) as st:
+            def0_teacher_ckpt, def0_student_ckpt, def0_meta = train_with_distill(
+                phase_name="def0",
+                attacker_mode="rule",
+                train_role="def",
+                extra_train_cfg=None,
+            )
+            st["outputs"] = def0_meta
+
+        # def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
+
+        m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
+        plot_training_metrics(
+            m_def0_teacher,
+            title="def0_teacher",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_DEF0,
+            save_prefix="def0_teacher",
         )
-        st["outputs"] = def0_meta
 
-    # def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
+        plot_ic_support_from_cfg(
+            cfg_training_log,
+            n_scenes=30000,
+            seed=123,
+            title="def0 feasible IC support",
+            out_path=os.path.join(PLOTS_DEF0, "def0_ic_support.png"),
+            show=False,
+        )
 
-    m_def0_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"))
-    plot_training_metrics(
-        m_def0_teacher,
-        title="def0_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_DEF0,
-        save_prefix="def0_teacher",
-    )
-
+        plot_ic_used_from_npz(
+            os.path.join(OUT_DIR, "ic_samples_def0_teacher.npz"),
+            cfg_training_log,
+            title="def0 ICs actually used during training",
+            out_path=os.path.join(PLOTS_DEF0, "def0_ic_used.png"),
+            show=False,
+        )
 
 
     # =========================================================
     # PHASE 1: Attacker₁ vs fixed Defender₀ (teacher only, for now)
     # =========================================================
-    print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
-    phase1_extra = {
-        "def_ckpt_path": def0_teacher_ckpt,
-        "freeze_defender": True,
+    if do_phase_1 is True:
 
-        # NEW:
-        "opp_mix": {
-            "modes": ["none", "def0", "weak"],
-            "probs": [0.2, 8.0, 0.0],     # must sum to 1
-            "resample": "episode",           # "episode" or "never"
-            "weak_scale": 0.15,              # 0.0 -> basically none, 1.0 -> full def0
-            "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-        },
-    }
+        print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
+        phase1_extra = {
+            "def_ckpt_path": def0_teacher_ckpt,
+            "freeze_defender": True,
 
-    with runlog.stage(
-        "PHASE1_train_att1",
-        phase_name="att1",
-        attacker_mode="rl",
-        extra_train_cfg=phase1_extra,
-    ) as st:
-        att1_teacher_ckpt, att1_student_ckpt, att1_meta = train_with_distill(
+            # NEW:
+            "opp_mix": {
+                "modes": ["none", "def0", "weak"],
+                "probs": [0.1, 0.8, 0.1],     # must sum to 1
+                "resample": "episode",           # "episode" or "never"
+                "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
+                "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+            },
+        }
+
+        with runlog.stage(
+            "PHASE1_train_att1",
             phase_name="att1",
             attacker_mode="rl",
-            train_role="att",
             extra_train_cfg=phase1_extra,
-        )
-        st["outputs"] = att1_meta
+        ) as st:
+            att1_teacher_ckpt, att1_student_ckpt, att1_meta = train_with_distill(
+                phase_name="att1",
+                attacker_mode="rl",
+                train_role="att",
+                extra_train_cfg=phase1_extra,
+            )
+            st["outputs"] = att1_meta
 
-    m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
-    plot_training_metrics(
-        m_att1_teacher,
-        title="att1_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_ATT1,
-        save_prefix="att1_teacher",
-    )
+        m_att1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"))
+        plot_training_metrics(
+            m_att1_teacher,
+            title="att1_teacher",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_ATT1,
+            save_prefix="att1_teacher",
+        )
+
+        plot_ic_support_from_cfg(
+            cfg_training_log,
+            n_scenes=30000,
+            seed=123,
+            title="att1 feasible IC support",
+            out_path=os.path.join(PLOTS_ATT1, "att1_ic_support.png"),
+            show=False,
+        )
+
+        plot_ic_used_from_npz(
+            os.path.join(OUT_DIR, "ic_samples_att1_teacher.npz"),
+            cfg_training_log,
+            title="att1 ICs actually used during training",
+            out_path=os.path.join(PLOTS_ATT1, "att1_ic_used.png"),
+            show=False,
+        )
 
 
     # =========================================================
     # PHASE 2: Defender₁ vs frozen Attacker₁ (teacher + distill)
     # =========================================================
-    print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
-    phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
-                    "def_ckpt_path": def0_teacher_ckpt,
-                    }
+    if do_phase_2 is True:
 
-    with runlog.stage(
-        "PHASE2_train_def1",
-        phase_name="def1",
-        attacker_mode="rl",
-        extra_train_cfg=phase2_extra,
-    ) as st:
-        def1_teacher_ckpt, def1_student_ckpt, def1_meta = train_with_distill(
+        print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
+        phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
+                        "def_ckpt_path": def0_teacher_ckpt,
+                        "freeze_attacker": True,
+                        }
+
+        with runlog.stage(
+            "PHASE2_train_def1",
             phase_name="def1",
             attacker_mode="rl",
-            train_role="def",
             extra_train_cfg=phase2_extra,
-        )
-        st["outputs"] = def1_meta
+        ) as st:
+            def1_teacher_ckpt, def1_student_ckpt, def1_meta = train_with_distill(
+                phase_name="def1",
+                attacker_mode="rl",
+                train_role="def",
+                extra_train_cfg=phase2_extra,
+            )
+            st["outputs"] = def1_meta
 
-    # ---- def1 ----
-    m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
-    plot_training_metrics(
-        m_def1_teacher,
-        title="def1_teacher",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_DEF1,
-        save_prefix="def1_teacher",
-    )
+        # ---- def1 ----
+        m_def1_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"))
+        plot_training_metrics(
+            m_def1_teacher,
+            title="def1_teacher",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_DEF1,
+            save_prefix="def1_teacher",
+        )
+
+        plot_ic_support_from_cfg(
+            cfg_training_log,
+            n_scenes=30000,
+            seed=123,
+            title="def1 feasible IC support",
+            out_path=os.path.join(PLOTS_DEF1, "def1_ic_support.png"),
+            show=False,
+        )
+
+        plot_ic_used_from_npz(
+            os.path.join(OUT_DIR, "ic_samples_def1_teacher.npz"),
+            cfg_training_log,
+            title="def1 ICs actually used during training",
+            out_path=os.path.join(PLOTS_DEF1, "def1_ic_used.png"),
+            show=False,
+        )
 
     # =========================================================
     # Multi phase Plotting 
     # =========================================================
+    if do_phase_0 or do_phase_2:
+        plot_compare_phases(
+            [
+                ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
+                ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
+            ],
+            metric=None,
+            ylabel="Mean defender return",
+            title="Defender return across phases",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_COMP,
+            filename="compare__R_def_mean__def0_vs_def1.png",
+        )
 
-    plot_compare_phases(
-        [
-            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
-            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
-        ],
-        metric=None,
-        ylabel="Mean defender return",
-        title="Defender return across phases",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_COMP,
-        filename="compare__R_def_mean__def0_vs_def1.png",
-    )
+    if do_phase_0 or do_phase_1 or do_phase_2:
+        plot_compare_phases(
+            [
+                ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
+                ("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean"),
+                ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
+            ],
+            metric=None,
+            ylabel="Mean return",
+            title="Return across phases",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_COMP,
+            filename="compare__R_mean__def0_vs_def1_vs_att1.png",
+        )
 
-    plot_compare_phases(
-        [
-            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
-            ("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean"),
-            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
-        ],
-        metric=None,
-        ylabel="Mean return",
-        title="Return across phases",
-        smooth="ema",
-        smooth_param=0.2,
-        show=False,
-        out_dir=PLOTS_COMP,
-        filename="compare__R_mean__def0_vs_def1_vs_att1.png",
-    )
+    if not do_phase_0:
+        def0_meta = None
+    
+    if not do_phase_1:
+        att1_meta = None
 
+    if not do_phase_2:
+        def1_meta = None
+
+        
 
     # record a final summary block too
     runlog.set_config("final_outputs", {
@@ -4483,9 +4698,21 @@ if __name__ == "__main__":
     print(" -", PLOTS_COMP)
 
     print("\n===== ALL PHASES COMPLETE =====")
-    print(f"Defender_0 teacher:  {def0_teacher_ckpt if def0_teacher_ckpt else '(skipped)'}")
-    print(f"Defender_0 student:  {def0_student_ckpt if def0_student_ckpt else '(skipped)'}")
-    print(f"Attacker_1 teacher:  {att1_teacher_ckpt if att1_teacher_ckpt else '(skipped)'}")
-    print(f"Attacker_1 student:  {att1_student_ckpt if att1_student_ckpt else '(skipped)'}")
-    print(f"Defender_1 teacher:  {def1_teacher_ckpt if def1_teacher_ckpt else '(skipped)'}")
-    print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
+    if do_phase_0:
+        print(f"Defender_0 teacher:  {def0_teacher_ckpt if def0_teacher_ckpt else '(skipped)'}")
+        print(f"Defender_0 student:  {def0_student_ckpt if def0_student_ckpt else '(skipped)'}")
+    else:
+        print("Defender_0 training skipped")
+
+
+    if do_phase_1:
+        print(f"Attacker_1 teacher:  {att1_teacher_ckpt if att1_teacher_ckpt else '(skipped)'}")
+        print(f"Attacker_1 student:  {att1_student_ckpt if att1_student_ckpt else '(skipped)'}")
+    else:
+        print("Attacker_1 training skipped")
+    
+    if do_phase_2:
+        print(f"Defender_1 teacher:  {def1_teacher_ckpt if def1_teacher_ckpt else '(skipped)'}")
+        print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
+    else:
+        print("Defender_1 training skipped")

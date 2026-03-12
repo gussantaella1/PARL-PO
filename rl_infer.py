@@ -1,194 +1,295 @@
-# rl_infer_diff.py
+#rl_infer.py
 
+from __future__ import annotations
+
+import copy
 import os
-from typing import Dict, Any, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
-# Import the Diff-Nash network + rule-based attacker from training script
+from config_rl import build_dyn
 from rl_loop import ActorCriticDiff, AttackerRuleController
 
 
 class RLPolicyDiff:
     """
-    Inference wrapper for Diff-Nash policies.
+    Inference wrapper for policies trained with the new rl_loop.py.
 
-    - Defender is always RL (ActorCriticDiff loaded from ppo_def.pt).
-    - Attacker can be:
-        * "rl"   -> RL attacker (ppo_att.pt required)
-        * "rule" -> rule-based attacker (AttackerRuleController; no ppo_att.pt)
+    Supports:
+      - Defender: always RL (ActorCriticDiff)
+      - Attacker:
+          * "rl"   -> ActorCriticDiff loaded from checkpoint
+          * "rule" -> AttackerRuleController (no attacker checkpoint required)
 
-    Exposes:
-      - verify_ckpt_compat() -> (obs_dim_def, obs_dim_att)
-      - act_def_obs(obs, deterministic=True)
-      - act_att_obs(obs, deterministic=True)
+    Expected single-attacker observation format:
+      if fuel disabled:
+          obs = [p1-center, p2-center, (p2-p1), v1, v2]                in R^{5D}
+      if fuel enabled:
+          obs = [p1-center, p2-center, (p2-p1), v1, v2, fuel_def, fuel_att]
+                                                                     in R^{5D+2}
 
-    Where obs is expected to be:
-        obs = [p1 - center, p2 - center, (p2 - p1), v1, v2]  in R^{5D}.
+    Notes
+    -----
+    - This wrapper currently assumes num_attackers == 1.
+    - If deterministic=True, actions are produced from the policy mean.
+    - If deterministic=False, actions are sampled from the policy.
     """
 
-    def __init__(self,
-                 cfg: Dict[str, Any],
-                 device: str = "cpu",
-                 def_ckpt: str | None = None,
-                 att_ckpt: str | None = None):
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        device: str = "cpu",
+        def_ckpt: Optional[str] = None,
+        att_ckpt: Optional[str] = None,
+    ):
+        self.cfg = copy.deepcopy(cfg)
 
-        self.cfg = cfg
-        self.device = device
-        self.D = int(cfg["D"])
+        if device == "cuda" and not torch.cuda.is_available():
+            print("[rl_infer_diff] CUDA requested but not available; falling back to CPU.")
+            device = "cpu"
+        self.device = torch.device(device)
+
+        # Build discrete dynamics for new DiffLSLayer
+        build_dyn(self.cfg)
+
+        self.D = int(self.cfg["D"])
         self.act_dim = self.D
-        self.umax = float(cfg.get("umax", 5e-4))
-        self.attacker_mode = cfg.get("attacker_mode", "rl")  # "rl" or "rule"
-        self.use_mean_at_eval = bool(cfg.get("rl_eval_deterministic", True))
+        self.umax = float(self.cfg.get("umax", 5e-4))
+        self.num_attackers = int(self.cfg.get("num_attackers", 1))
+        if self.num_attackers != 1:
+            raise NotImplementedError(
+                "RLPolicyDiff currently supports only num_attackers == 1."
+            )
 
-        # ---- Arena center (for reconstructing p1, p2 from obs) ----
-        ar = cfg.get("arena", {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0})
-        if ar.get("type", "sphere") == "sphere":
-            self.center = np.array(
-                [
-                    ar.get("cx", 0.0),
-                    ar.get("cy", 0.0),
-                    (ar.get("cz", 0.0) if self.D == 3 else 0.0),
-                ],
-                dtype=np.float32,
-            )[: self.D]
+        raw_attacker_mode = str(self.cfg.get("attacker_mode", "rl")).lower()
+        if raw_attacker_mode in ("rl", "train"):
+            self.attacker_mode = "rl"
+        elif raw_attacker_mode == "rule":
+            self.attacker_mode = "rule"
         else:
-            cx = float(ar.get("cx", 0.0))
-            cy = float(ar.get("cy", 0.0))
-            cz = float(ar.get("cz", 0.0)) if self.D == 3 else 0.0
-            self.center = np.array([cx, cy, cz], dtype=np.float32)[: self.D]
+            raise ValueError(
+                f"Unsupported attacker_mode={raw_attacker_mode!r}; expected 'rl' or 'rule'."
+            )
 
-        def _pick(cfg, keys, default):
-            for k in keys:
-                v = cfg.get(k, None)
-                if v:
-                    return v
-            return default
-        
-        def _strip_ignored_keys(sd: dict) -> dict:
-            # handle wrapped {"state_dict": ...} already outside
-            IGNORE = {
-                "layer.center",
-                # if you ever see these again, add them too:
-                # "layer.Ad", "layer.Bd", "layer.P",
-            }
+        self.use_mean_at_eval = bool(self.cfg.get("rl_eval_deterministic", True))
+        self.use_fuel = bool(self.cfg.get("fuel", {}).get("enable"))
+        self.obs_extra = 2 if self.use_fuel else 0
 
-            # also handle possible DataParallel "module." prefix
-            for k in list(sd.keys()):
-                k_noprefix = k[len("module."):] if k.startswith("module.") else k
-                if k_noprefix in IGNORE:
-                    sd.pop(k, None)
-            return sd
+        self.obs_dim_def = 5 * self.D + self.obs_extra
+        self.obs_dim_att = 5 * self.D + self.obs_extra
 
+        # ---- Arena center (for reconstructing p1, p2 from obs in rule mode) ----
+        ar = self.cfg.get("arena", {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0})
+        self.center = np.array(
+            [
+                float(ar.get("cx", 0.0)),
+                float(ar.get("cy", 0.0)),
+                (float(ar.get("cz", 0.0)) if self.D == 3 else 0.0),
+            ],
+            dtype=np.float32,
+        )[: self.D]
 
-
-        # ==================== DEFENDER (RL) ====================
-        self.def_ckpt = def_ckpt or _pick(
-            cfg,
-            ["def_ckpt_path", "def_ckpt", "def_policy_path", "defender_ckpt_path", "defender_ckpt", "ckpt_def"],
+        # ==================== DEFENDER (always RL) ====================
+        self.def_ckpt = def_ckpt or self._pick(
+            self.cfg,
+            [
+                "def_ckpt_path",
+                "def_ckpt",
+                "def_policy_path",
+                "defender_ckpt_path",
+                "defender_ckpt",
+                "ckpt_def",
+            ],
             "ppo_def.pt",
         )
-        
         if not os.path.exists(self.def_ckpt):
-            raise FileNotFoundError(self.def_ckpt)
+            raise FileNotFoundError(f"Defender checkpoint not found: {self.def_ckpt}")
 
-        # Diff-Nash training uses obs_dim = 5 * D
-        self.obs_dim_def = 5 * self.D
-        self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, cfg).to(self.device)
-
-        sd_def = torch.load(self.def_ckpt, map_location=self.device)
-        if isinstance(sd_def, dict) and "state_dict" in sd_def:
-            sd_def = sd_def["state_dict"]
-        sd_def = _strip_ignored_keys(sd_def)
-
-        miss_def = self.def_net.load_state_dict(sd_def, strict=False)
-        if miss_def.missing_keys or miss_def.unexpected_keys:
-            print("[rl_infer_diff] DEF load: missing:", miss_def.missing_keys,
-                " unexpected:", miss_def.unexpected_keys)
-
+        self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, self.cfg).to(self.device)
+        self._load_net_checkpoint(self.def_net, self.def_ckpt, name="DEF")
         self.def_net.eval()
+        for p in self.def_net.parameters():
+            p.requires_grad_(False)
 
-        # ==================== ATTACKER: RL or RULE ====================
-
+        # ==================== ATTACKER (RL or RULE) ====================
         self.att_net = None
         self.rule_ctrl = None
 
         if self.attacker_mode == "rl":
-            # RL attacker – ppo_att.pt required
-
-            self.att_ckpt = att_ckpt or _pick(
-                cfg,
-                ["att_ckpt_path", "att_ckpt", "att_policy_path", "attacker_ckpt_path", "attacker_ckpt", "ckpt_att"],
+            self.att_ckpt = att_ckpt or self._pick(
+                self.cfg,
+                [
+                    "att_ckpt_path",
+                    "att_ckpt",
+                    "att_policy_path",
+                    "attacker_ckpt_path",
+                    "attacker_ckpt",
+                    "ckpt_att",
+                ],
                 "ppo_att.pt",
             )
-
             if not os.path.exists(self.att_ckpt):
-                raise FileNotFoundError(self.att_ckpt)
+                raise FileNotFoundError(f"Attacker checkpoint not found: {self.att_ckpt}")
 
-            self.obs_dim_att = 5 * self.D
-            self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, cfg).to(self.device)
-
-            sd_att = torch.load(self.att_ckpt, map_location=self.device)
-            if isinstance(sd_att, dict) and "state_dict" in sd_att:
-                sd_att = sd_att["state_dict"]
-            sd_att = _strip_ignored_keys(sd_att)
-
-            miss_att = self.att_net.load_state_dict(sd_att, strict=False)
-
-
-            if miss_att.missing_keys or miss_att.unexpected_keys:
-                print(
-                    "[rl_infer_diff] ATT load: missing:",
-                    miss_att.missing_keys,
-                    " unexpected:",
-                    miss_att.unexpected_keys,
-                )
+            self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, self.cfg).to(self.device)
+            self._load_net_checkpoint(self.att_net, self.att_ckpt, name="ATT")
             self.att_net.eval()
+            for p in self.att_net.parameters():
+                p.requires_grad_(False)
         else:
-            # Rule-based attacker – no ppo_att required
-            self.obs_dim_att = 5 * self.D
-            self.rule_ctrl = AttackerRuleController(cfg)
+            self.rule_ctrl = AttackerRuleController(self.cfg)
 
     # ------------------------------------------------------------------
-    #  Public helpers
+    # Internal helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _pick(cfg: Dict[str, Any], keys, default):
+        for k in keys:
+            v = cfg.get(k, None)
+            if v:
+                return v
+        return default
+
+    @staticmethod
+    def _strip_ignored_keys(sd: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """
+        Strip keys that may appear in older checkpoints or wrappers and
+        should not block loading.
+        """
+        ignore_exact = {
+            "layer.center",  # old NoPriorLayer buffer
+        }
+
+        out = {}
+        for k, v in sd.items():
+            k_noprefix = k[len("module."):] if k.startswith("module.") else k
+            if k_noprefix in ignore_exact:
+                continue
+            out[k_noprefix] = v
+        return out
+
+    def _extract_state_dict(self, payload: Any) -> Dict[str, torch.Tensor]:
+        """
+        Accept:
+          - raw state_dict
+          - {"state_dict": ...}
+          - {"model": ...}
+          - {"policy": ...}
+          - {"net": ...}
+          - {"def_net": ...}
+          - {"att_net": ...}
+          - {"actor_critic": ...}
+        """
+        if not isinstance(payload, dict):
+            raise RuntimeError("Checkpoint payload is not a dict; unsupported format.")
+
+        # Raw state_dict case
+        if all(isinstance(k, str) for k in payload.keys()):
+            if any(isinstance(v, torch.Tensor) for v in payload.values()):
+                return payload
+
+        for key in ["state_dict", "model", "policy", "net", "def_net", "att_net", "actor_critic"]:
+            if key in payload and isinstance(payload[key], dict):
+                return payload[key]
+
+        # Wrapped PPO save with prefixes like def_net.xxx / att_net.xxx
+        if any(k.startswith("def_net.") for k in payload.keys()):
+            return {k[len("def_net."):]: v for k, v in payload.items() if k.startswith("def_net.")}
+        if any(k.startswith("att_net.") for k in payload.keys()):
+            return {k[len("att_net."):]: v for k, v in payload.items() if k.startswith("att_net.")}
+
+        raise RuntimeError("Could not extract state_dict from checkpoint payload.")
+
+    def _load_net_checkpoint(self, model: torch.nn.Module, ckpt_path: str, name: str = "NET") -> None:
+        payload = torch.load(ckpt_path, map_location=self.device)
+        sd = self._extract_state_dict(payload)
+        sd = self._strip_ignored_keys(sd)
+
+        miss = model.load_state_dict(sd, strict=False)
+        if miss.missing_keys or miss.unexpected_keys:
+            print(
+                f"[rl_infer_diff] {name} load: "
+                f"missing={miss.missing_keys} unexpected={miss.unexpected_keys}"
+            )
+
+    def _validate_obs(self, obs: np.ndarray, who: str) -> np.ndarray:
+        obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
+        expected = self.obs_dim_def if who == "def" else self.obs_dim_att
+        if obs_np.shape[0] != expected:
+            raise ValueError(
+                f"Observation size mismatch for {who}: got {obs_np.shape[0]}, expected {expected}. "
+                f"{'Fuel is enabled, so expected 5D+2.' if self.use_fuel else 'Fuel is disabled, so expected 5D.'}"
+            )
+        return obs_np
+
+    def _resolve_deterministic(self, deterministic: Optional[bool]) -> bool:
+        if deterministic is None:
+            return self.use_mean_at_eval
+        return bool(deterministic)
+
+    def _act_one_obs(
+        self,
+        net: ActorCriticDiff,
+        obs: np.ndarray,
+        who: str,
+        deterministic: Optional[bool],
+    ) -> np.ndarray:
+        obs_np = self._validate_obs(obs, who=who)
+        deterministic = self._resolve_deterministic(deterministic)
+
+        o = torch.as_tensor(obs_np[None, :], dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            if deterministic:
+                dist = net.dist(o, who=who)
+                u_raw = dist.mean
+                a_env = torch.tanh(u_raw) * self.umax
+            else:
+                a_env, _, _ = net.act(o, who=who, act_scale=self.umax)
+
+        a = a_env.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        return np.clip(a, -self.umax, +self.umax)
+
+    # ------------------------------------------------------------------
+    # Public helpers
     # ------------------------------------------------------------------
     def verify_ckpt_compat(self) -> Tuple[int, int]:
         """
-        For runner sanity-check; the runner expects (5*D, 5*D).
+        Returns expected obs dims for defender and attacker.
         """
         return self.obs_dim_def, self.obs_dim_att
 
-    # ---- Core one-step for obs-level policies ----
-    def _act_one_obs(self, net: ActorCriticDiff, obs: np.ndarray, who: str, deterministic: bool):
-        obs_np = np.asarray(obs, dtype=np.float32)
-        o = torch.as_tensor(obs_np[None, :], dtype=torch.float32, device=self.device)
-        with torch.no_grad():
-            # ActorCriticDiff.act already does Normal + tanh + scaling
-            a_env, _, _ = net.act(o, who=who, act_scale=self.umax)
-        a = a_env.squeeze(0).detach().cpu().numpy()
-        return np.clip(a, -self.umax, +self.umax)
-
-    # ---- Defender: always RL ----
-    def act_def_obs(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray:
+    def act_def_obs(self, obs: np.ndarray, deterministic: Optional[bool] = None) -> np.ndarray:
+        """
+        Defender action from observation.
+        """
         return self._act_one_obs(self.def_net, obs, who="def", deterministic=deterministic)
 
-    # ---- Attacker: RL or rule-based ----
-    def act_att_obs(self, obs: np.ndarray, deterministic: bool = True) -> np.ndarray:
-        obs_np = np.asarray(obs, dtype=np.float32)
+    def act_att_obs(self, obs: np.ndarray, deterministic: Optional[bool] = None) -> np.ndarray:
+        """
+        Attacker action from observation.
+
+        - RL mode: uses attacker network.
+        - Rule mode: reconstructs (p1, p2, v1, v2) from obs and applies rule controller.
+        """
+        obs_np = self._validate_obs(obs, who="att")
 
         if self.attacker_mode == "rl":
             if self.att_net is None:
                 raise RuntimeError("attacker_mode='rl' but attacker net is not initialized.")
             return self._act_one_obs(self.att_net, obs_np, who="att", deterministic=deterministic)
 
-        # Rule-based attacker: reconstruct (p1, v1, p2, v2) from obs = [p1-c, p2-c, rel, v1, v2]
+        if self.rule_ctrl is None:
+            raise RuntimeError("attacker_mode='rule' but rule controller is not initialized.")
+
         D = self.D
         c = self.center
 
+        # obs = [p1c, p2c, rel, v1, v2, (optional fuel_def, fuel_att)]
         p1c = obs_np[0:D]
         p2c = obs_np[D : 2 * D]
-        # rel = obs_np[2*D : 3*D]  # (p2 - p1), not needed explicitly
         v1 = obs_np[3 * D : 4 * D]
         v2 = obs_np[4 * D : 5 * D]
 
@@ -197,4 +298,3 @@ class RLPolicyDiff:
 
         u = self.rule_ctrl.act(p1, v1, p2, v2)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)
-    
