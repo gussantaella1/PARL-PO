@@ -204,7 +204,7 @@ TRAIN: Dict[str, Any] = {
     "gamma": 0.992, #Was 0.995
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 5.0,
-    "wall_penalty": 5.0,
+    "wall_penalty": 2.5,
     "fuel_depletion_penalty": 5.0,
 
 
@@ -330,7 +330,7 @@ TRAIN: Dict[str, Any] = {
     "prior_blend_def":        0.0,    # (optional) disable center prior for def
 
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
-    "collision_radius_m": 0.8,            # meters
+    "collision_radius_m": 0.75,            # meters
 
 
     #Learning stat tracking

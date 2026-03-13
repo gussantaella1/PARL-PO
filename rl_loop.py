@@ -4210,14 +4210,20 @@ def train_with_distill(
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)
 
-    if cfg_teacher["train_ic_mode"] == "random_shell_advantage":
-        if train_role == "att": 
-            cfg_teacher["r_att_min"] = 0.0
-            cfg_teacher["train_ic_mode"] = "random_shell"
+    # if cfg_teacher["train_ic_mode"] == "random_shell_advantage":
+    #     if train_role == "att": 
+    #         cfg_teacher["r_att_min"] = 0.0
+    #         cfg_teacher["train_ic_mode"] = "random_shell"
 
     DISTILL = bool(cfg_teacher.get("distill", False))
 
     build_dyn(cfg_teacher)
+
+    # dynamics_config = cfg_teacher["dyn"]
+    # print(dynamics_config["Ad"])
+    # print(dynamics_config["Bd"])
+
+    # raise("Debug")
 
     if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
         raise RuntimeError(
@@ -4430,11 +4436,11 @@ def end_phase_cleanup(
 # =============================================================
 if __name__ == "__main__":
 
-    do_phase_0 = True
+    do_phase_0 = False
     do_phase_1 = True
     do_phase_2 = True
 
-    def0_teacher_ckpt = "Training_Policy_0.990/def0_teacher.pt"
+    def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
     att1_teacher_ckpt = "Training_Policy/att1_teacher.pt"
  
 
@@ -4469,6 +4475,11 @@ if __name__ == "__main__":
 
     # runlog.set_config("cfg_distillation", cfg_distillation)
 
+    phase0_extra = {
+        "gamma": 0.990,
+        "hit_buffer_def": 0.25,
+    }
+
     # =========================================================
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
@@ -4478,13 +4489,13 @@ if __name__ == "__main__":
             "PHASE0_train_def0",
             phase_name="def0",
             attacker_mode="rule",
-            extra_train_cfg=None,
+            extra_train_cfg=phase0_extra,
         ) as st:
             def0_teacher_ckpt, def0_student_ckpt, def0_meta = train_with_distill(
                 phase_name="def0",
                 attacker_mode="rule",
                 train_role="def",
-                extra_train_cfg=None,
+                extra_train_cfg=phase0_extra,
             )
             st["outputs"] = def0_meta
 
@@ -4528,15 +4539,16 @@ if __name__ == "__main__":
         phase1_extra = {
             "def_ckpt_path": def0_teacher_ckpt,
             "freeze_defender": True,
-
+            "train_ic_mode": "random_shell",
+            "r_att_min": 0.0,
             # NEW:
-            "opp_mix": {
-                "modes": ["none", "def0", "weak"],
-                "probs": [0.1, 0.8, 0.1],     # must sum to 1
-                "resample": "episode",           # "episode" or "never"
-                "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
-                "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-            },
+            # "opp_mix": {
+            #     "modes": ["none", "def0", "weak"],
+            #     "probs": [0.1, 0.8, 0.1],     # must sum to 1
+            #     "resample": "episode",           # "episode" or "never"
+            #     "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
+            #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+            # },
         }
 
         with runlog.stage(
