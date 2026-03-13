@@ -4475,16 +4475,17 @@ if __name__ == "__main__":
 
     # runlog.set_config("cfg_distillation", cfg_distillation)
 
-    phase0_extra = {
-        "gamma": 0.990,
-        "hit_buffer_def": 0.25,
-    }
 
     # =========================================================
     # PHASE 0: Defender₀ vs rule-based attacker (teacher + distill)
     # =========================================================
     if do_phase_0 is True:
         print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
+
+        phase0_extra = {
+            "gamma": 0.990,
+            "hit_buffer_def": 0.25,
+        }
         with runlog.stage(
             "PHASE0_train_def0",
             phase_name="def0",
@@ -4541,10 +4542,12 @@ if __name__ == "__main__":
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
             "r_att_min": 0.0,
+            "gamma": 0.993,
+
             # NEW:
             # "opp_mix": {
             #     "modes": ["none", "def0", "weak"],
-            #     "probs": [0.1, 0.8, 0.1],     # must sum to 1
+            #     "probs": [0.05, 0.9, 0.05],     # must sum to 1
             #     "resample": "episode",           # "episode" or "never"
             #     "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
             #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
@@ -4603,6 +4606,7 @@ if __name__ == "__main__":
         phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
                         "def_ckpt_path": def0_teacher_ckpt,
                         "freeze_attacker": True,
+                        "gamma": 0.991,
                         }
 
         with runlog.stage(
