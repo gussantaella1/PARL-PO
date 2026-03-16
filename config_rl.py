@@ -183,7 +183,7 @@ TRAIN: Dict[str, Any] = {
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
-    "distill": False, #Does policy distillation, True or False
+    "distill": True, #Does policy distillation, True or False
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,

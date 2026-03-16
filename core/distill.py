@@ -11,6 +11,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from core.utils import set_seed
+from config_rl import build_dyn
+from core.models import ActorCriticDiff
+from core.controllers import AttackerRuleController
+from core.env import Env
+
+
+
 # Assumes these already exist in your codebase:
 # - Env
 # - ActorCriticDiff
@@ -120,6 +128,23 @@ class PartialObsStudentPolicy(nn.Module):
         a_env = torch.tanh(u_raw) * self.act_scale
         return a_env, zhat_t, hidden
 
+    def forward_chunk(
+        self,
+        xhat_rel_seq: torch.Tensor,  # (B, T, xhat_dim)
+        sigma_seq: torch.Tensor,     # (B, T, sigma_dim)
+        u_prev_seq: torch.Tensor,    # (B, T, act_dim)
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+    ):
+        enc_in = torch.cat([xhat_rel_seq, sigma_seq, u_prev_seq], dim=-1)
+        enc_out, hidden = self.encoder(enc_in, hidden)
+        zhat_seq = self.z_head(enc_out)
+
+        pol_in = torch.cat([xhat_rel_seq, zhat_seq], dim=-1)
+        h = self.policy(pol_in)
+        u_raw = self.mu_raw(h)
+        a_env = torch.tanh(u_raw) * self.act_scale
+        return a_env, zhat_seq, hidden
+
 
 # =========================================================
 # Episode container + chunking
@@ -145,6 +170,24 @@ def _iter_tbptt_chunks(ep: DAggerEpisode, chunk_len: int):
             ep.u_teacher[t0:t1],
             ep.z_teacher[t0:t1],
         )
+
+
+def _future_window_tensor(rel_seq: torch.Tensor, lookahead_H: int) -> torch.Tensor:
+    """
+    Build per-timestep future windows from a realized relative-state trajectory.
+    Output shape: (T, H+1, rel_dim), padded with the terminal state.
+    """
+    T, rel_dim = rel_seq.shape
+    future = torch.empty((T, lookahead_H + 1, rel_dim), dtype=rel_seq.dtype, device=rel_seq.device)
+    last = rel_seq[-1]
+
+    for t in range(T):
+        max_len = min(lookahead_H + 1, T - t)
+        future[t, :max_len] = rel_seq[t : t + max_len]
+        if max_len < (lookahead_H + 1):
+            future[t, max_len:] = last
+
+    return future
 
 
 # =========================================================
@@ -264,42 +307,36 @@ def _sim_intent_from_future_rel_traj(future_rel: np.ndarray, latent_dim: int) ->
     return z
 
 
-def _load_attacker_policy_if_needed(
-    cfg: Dict[str, Any],
+def _load_policy_if_needed(
+    ckpt_path: Optional[str],
     obs_dim: int,
     act_dim: int,
+    cfg: Dict[str, Any],
     device: torch.device,
+    missing_msg: str,
 ):
-    attacker_mode = str(cfg.get("attacker_mode", "rule")).lower()
-    if attacker_mode == "rule":
-        return None
+    if ckpt_path is None:
+        raise RuntimeError(missing_msg)
 
-    att_ckpt = (
-        cfg.get("att_ckpt_path")
-        or cfg.get("att_ckpt")
-        or cfg.get("att_policy_path")
-        or cfg.get("attacker_ckpt_path")
-    )
-    if att_ckpt is None:
-        raise RuntimeError("attacker_mode='rl' but no attacker checkpoint path was provided.")
-
-    payload = torch.load(att_ckpt, map_location=device)
-    att_sd = _extract_state_dict(
+    payload = torch.load(ckpt_path, map_location=device)
+    sd = _extract_state_dict(
         payload,
-        ["policy_state_dict", "state_dict", "model", "net", "att_net", "actor_critic"],
+        ["policy_state_dict", "state_dict", "model", "net", "def_net", "att_net", "actor_critic"],
     )
-    if att_sd is None:
+    if sd is None:
         if isinstance(payload, dict) and any(k.startswith("att_net.") for k in payload.keys()):
-            att_sd = {k[len("att_net."):]: v for k, v in payload.items() if k.startswith("att_net.")}
+            sd = {k[len("att_net."):]: v for k, v in payload.items() if k.startswith("att_net.")}
+        elif isinstance(payload, dict) and any(k.startswith("def_net.") for k in payload.keys()):
+            sd = {k[len("def_net."):]: v for k, v in payload.items() if k.startswith("def_net.")}
         else:
-            raise RuntimeError(f"Could not parse attacker checkpoint: {att_ckpt}")
+            raise RuntimeError(f"Could not parse policy checkpoint: {ckpt_path}")
 
-    attacker = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
-    attacker.load_state_dict(att_sd, strict=False)
-    attacker.eval()
-    for p in attacker.parameters():
+    policy = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    policy.load_state_dict(sd, strict=False)
+    policy.eval()
+    for p in policy.parameters():
         p.requires_grad_(False)
-    return attacker
+    return policy
 
 
 # =========================================================
@@ -376,23 +413,30 @@ def _ukf_student_features_from_env(env, u_prev: np.ndarray) -> Tuple[np.ndarray,
 # Opponent + teacher rollout helpers
 # =========================================================
 
-def _teacher_def_action_env(teacher_policy, full_obs: np.ndarray, device: torch.device, act_scale: float) -> np.ndarray:
+def _teacher_action_env(
+    teacher_policy,
+    full_obs: np.ndarray,
+    device: torch.device,
+    act_scale: float,
+    distill_role: str,
+) -> np.ndarray:
     o = torch.as_tensor(full_obs[None, :], dtype=torch.float32, device=device)
     with torch.no_grad():
-        dist = teacher_policy.dist(o, who="def")
+        dist = teacher_policy.dist(o, who=distill_role)
         a_env = torch.tanh(dist.mean) * act_scale
     return a_env[0].detach().cpu().numpy().astype(np.float32)
 
 
-def _attacker_action_env(
+def _opponent_action_env(
     env,
+    distill_role: str,
     attacker_mode: str,
     rule_ctrl,
-    attacker_policy,
+    opponent_policy,
     device: torch.device,
     act_scale: float,
 ) -> np.ndarray:
-    if attacker_mode == "rule":
+    if distill_role == "def" and attacker_mode == "rule":
         p1, v1, pA_list, vA_list = env._unpack(env.state)
         p2 = pA_list[0]
         v2 = vA_list[0]
@@ -401,51 +445,10 @@ def _attacker_action_env(
     full_obs = _full_obs_from_env(env)
     o = torch.as_tensor(full_obs[None, :], dtype=torch.float32, device=device)
     with torch.no_grad():
-        dist = attacker_policy.dist(o, who="att")
+        who = "att" if distill_role == "def" else "def"
+        dist = opponent_policy.dist(o, who=who)
         a_env = torch.tanh(dist.mean) * act_scale
     return a_env[0].detach().cpu().numpy().astype(np.float32)
-
-
-def _teacher_future_rel_traj(
-    env,
-    teacher_policy,
-    attacker_mode: str,
-    rule_ctrl,
-    attacker_policy,
-    lookahead_H: int,
-    device: torch.device,
-    act_scale: float,
-) -> np.ndarray:
-    """
-    Roll a cloned env forward under teacher defender + current attacker model
-    to produce the privileged future relative trajectory label.
-    """
-    sim = copy.deepcopy(env)
-    rel_seq = []
-
-    for _ in range(lookahead_H + 1):
-        rel_seq.append(_true_relative_state_from_env(sim))
-
-        full_obs = _full_obs_from_env(sim)
-        a_def = _teacher_def_action_env(teacher_policy, full_obs, device, act_scale)
-        a_att = _attacker_action_env(
-            sim,
-            attacker_mode=attacker_mode,
-            rule_ctrl=rule_ctrl,
-            attacker_policy=attacker_policy,
-            device=device,
-            act_scale=act_scale,
-        )
-
-        _, _, _, done, _ = sim.step(a_def, a_att, reward_mode="both")
-        if done:
-            break
-
-    # pad if episode terminated early
-    while len(rel_seq) < (lookahead_H + 1):
-        rel_seq.append(rel_seq[-1].copy())
-
-    return np.stack(rel_seq, axis=0).astype(np.float32)
 
 
 # =========================================================
@@ -492,6 +495,9 @@ def distill_from_teacher(
     D = int(cfg["D"])
     act_dim = D
     obs_dim = 5 * D + (2 if cfg.get("fuel", {}).get("enable", False) else 0)
+    distill_role = str(cfg.get("train_role", "def")).lower()
+    if distill_role not in {"def", "att"}:
+        raise ValueError(f"Unsupported train_role for distillation: {distill_role!r}")
 
     # DAgger / TBPTT hyperparams
     episodes_per_iter = int(cfg.get("episodes_per_iter", 8))
@@ -530,8 +536,33 @@ def distill_from_teacher(
 
     # Opponent during distillation
     attacker_mode = str(cfg.get("attacker_mode", "rule")).lower()
-    rule_ctrl = AttackerRuleController(cfg) if attacker_mode == "rule" else None
-    attacker_policy = _load_attacker_policy_if_needed(cfg, obs_dim, act_dim, device) if attacker_mode == "rl" else None
+    rule_ctrl = AttackerRuleController(cfg) if (distill_role == "def" and attacker_mode == "rule") else None
+    if distill_role == "def" and attacker_mode == "rule":
+        opponent_policy = None
+    elif distill_role == "def":
+        opponent_policy = _load_policy_if_needed(
+            cfg.get("att_ckpt_path")
+            or cfg.get("att_ckpt")
+            or cfg.get("att_policy_path")
+            or cfg.get("attacker_ckpt_path"),
+            obs_dim,
+            act_dim,
+            cfg,
+            device,
+            "Defender distillation with attacker_mode='rl' requires an attacker checkpoint path.",
+        )
+    else:
+        opponent_policy = _load_policy_if_needed(
+            cfg.get("def_ckpt_path")
+            or cfg.get("def_ckpt")
+            or cfg.get("def_policy_path")
+            or cfg.get("defender_ckpt_path"),
+            obs_dim,
+            act_dim,
+            cfg,
+            device,
+            "Attacker distillation requires a defender checkpoint path for the frozen opponent.",
+        )
 
     # Student
     student = PartialObsStudentPolicy(
@@ -566,6 +597,7 @@ def distill_from_teacher(
 
     print("=== Paper-style distillation: full-state teacher -> UKF partial-observable student ===")
     print(f"teacher_ckpt={teacher_ckpt_path}")
+    print(f"distill_role={distill_role}")
     print(f"attacker_mode={attacker_mode}")
     print(f"lookahead_H={lookahead_H}, latent_dim={latent_dim}, tbptt_chunk_len={tbptt_chunk_len}")
     print(f"intent_source={'teacher_encoder' if teacher_intent is not None else 'sim_fallback'}")
@@ -579,7 +611,7 @@ def distill_from_teacher(
         # -------------------------------------------------
         for _ in range(episodes_per_iter):
             env = Env(cfg)
-            obs = env.reset()
+            env.reset()
 
             hidden = student.init_hidden(batch_size=1, device=device)
             u_prev_exec = np.zeros((act_dim,), dtype=np.float32)
@@ -588,40 +620,22 @@ def distill_from_teacher(
             sigma_hist = []
             uprev_hist = []
             uteach_hist = []
-            zteach_hist = []
+            rel_hist = []
 
             for _t in range(max_steps):
                 # student inputs from UKF / filter belief
                 xhat_rel_np, sigma_np, u_prev_np = _ukf_student_features_from_env(env, u_prev_exec)
+                rel_true_np = _true_relative_state_from_env(env)
 
                 # teacher labels from full state + privileged future
                 full_obs_np = _full_obs_from_env(env)
-                u_teacher_np = _teacher_def_action_env(
+                u_teacher_np = _teacher_action_env(
                     teacher_policy=teacher_policy,
                     full_obs=full_obs_np,
                     device=device,
                     act_scale=act_scale,
+                    distill_role=distill_role,
                 )
-
-                future_rel_np = _teacher_future_rel_traj(
-                    env=env,
-                    teacher_policy=teacher_policy,
-                    attacker_mode=attacker_mode,
-                    rule_ctrl=rule_ctrl,
-                    attacker_policy=attacker_policy,
-                    lookahead_H=lookahead_H,
-                    device=device,
-                    act_scale=act_scale,
-                )
-
-                if teacher_intent is not None:
-                    with torch.no_grad():
-                        future_rel_t = torch.as_tensor(
-                            future_rel_np[None, :, :], dtype=torch.float32, device=device
-                        )
-                        z_teacher_np = teacher_intent(future_rel_t)[0].detach().cpu().numpy().astype(np.float32)
-                else:
-                    z_teacher_np = _sim_intent_from_future_rel_traj(future_rel_np, latent_dim=latent_dim)
 
                 # student prediction
                 xhat_t = torch.as_tensor(xhat_rel_np[None, :], dtype=torch.float32, device=device)
@@ -634,21 +648,27 @@ def distill_from_teacher(
 
                 # DAgger execution mixture
                 use_teacher = (random.random() < beta_exec)
-                a_def_exec = u_teacher_np if use_teacher else a_student_np
+                a_exec = u_teacher_np if use_teacher else a_student_np
 
                 # attacker/opponent action
-                a_att_exec = _attacker_action_env(
+                a_opp_exec = _opponent_action_env(
                     env=env,
+                    distill_role=distill_role,
                     attacker_mode=attacker_mode,
                     rule_ctrl=rule_ctrl,
-                    attacker_policy=attacker_policy,
+                    opponent_policy=opponent_policy,
                     device=device,
                     act_scale=act_scale,
                 )
 
+                if distill_role == "def":
+                    a1_env, aA_env = a_exec, a_opp_exec
+                else:
+                    a1_env, aA_env = a_opp_exec, a_exec
+
                 _, _, _, done, _ = env.step(
-                    a1_env=a_def_exec,
-                    aA_env=a_att_exec,
+                    a1_env=a1_env,
+                    aA_env=aA_env,
                     reward_mode="both",
                 )
 
@@ -657,19 +677,34 @@ def distill_from_teacher(
                 sigma_hist.append(sigma_np.copy())
                 uprev_hist.append(u_prev_np.copy())
                 uteach_hist.append(u_teacher_np.copy())
-                zteach_hist.append(z_teacher_np.copy())
+                rel_hist.append(rel_true_np.copy())
 
-                u_prev_exec = a_def_exec.copy()
+                u_prev_exec = a_exec.copy()
 
                 if done:
                     break
+
+            rel_hist_t = torch.as_tensor(np.stack(rel_hist), dtype=torch.float32, device=device)
+            future_rel_t = _future_window_tensor(rel_hist_t, lookahead_H)
+            if teacher_intent is not None:
+                with torch.no_grad():
+                    z_teacher_t = teacher_intent(future_rel_t)
+            else:
+                z_teacher_np = np.stack(
+                    [
+                        _sim_intent_from_future_rel_traj(future_rel_t[k].detach().cpu().numpy(), latent_dim=latent_dim)
+                        for k in range(future_rel_t.shape[0])
+                    ],
+                    axis=0,
+                )
+                z_teacher_t = torch.as_tensor(z_teacher_np, dtype=torch.float32, device=device)
 
             ep = DAggerEpisode(
                 xhat_rel=torch.as_tensor(np.stack(xhat_hist), dtype=torch.float32, device=device),
                 sigma=torch.as_tensor(np.stack(sigma_hist), dtype=torch.float32, device=device),
                 u_prev=torch.as_tensor(np.stack(uprev_hist), dtype=torch.float32, device=device),
                 u_teacher=torch.as_tensor(np.stack(uteach_hist), dtype=torch.float32, device=device),
-                z_teacher=torch.as_tensor(np.stack(zteach_hist), dtype=torch.float32, device=device),
+                z_teacher=z_teacher_t,
             )
             new_eps.append(ep)
 
@@ -696,22 +731,14 @@ def distill_from_teacher(
                 else:
                     hidden = hidden.detach()
 
-                pred_actions = []
-                pred_latents = []
-
-                Tchunk = xhat_seq.shape[0]
-                for k in range(Tchunk):
-                    a_pred, z_pred, hidden = student.step(
-                        xhat_seq[k].unsqueeze(0),
-                        sigma_seq[k].unsqueeze(0),
-                        uprev_seq[k].unsqueeze(0),
-                        hidden,
-                    )
-                    pred_actions.append(a_pred)
-                    pred_latents.append(z_pred)
-
-                pred_actions = torch.cat(pred_actions, dim=0)
-                pred_latents = torch.cat(pred_latents, dim=0)
+                pred_actions, pred_latents, hidden = student.forward_chunk(
+                    xhat_seq.unsqueeze(0),
+                    sigma_seq.unsqueeze(0),
+                    uprev_seq.unsqueeze(0),
+                    hidden,
+                )
+                pred_actions = pred_actions.squeeze(0)
+                pred_latents = pred_latents.squeeze(0)
 
                 loss_act = act_loss_fn(pred_actions, uteach_seq)
                 loss_z   = z_loss_fn(pred_latents, zteach_seq)

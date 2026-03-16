@@ -42,9 +42,13 @@ if __name__ == "__main__":
     do_phase_0 = True
     do_phase_1 = True
     do_phase_2 = True
+    do_phase_3 = True
+    do_phase_4 = True
 
     def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
     att1_teacher_ckpt = "Training_Policy/att1_teacher.pt"
+    def1_teacher_ckpt = "Training_Policy/def1_teacher.pt"
+    att2_teacher_ckpt = "Training_Policy/att2_teacher.pt"
  
 
     OUT_DIR = "Training_Policy"
@@ -54,8 +58,10 @@ if __name__ == "__main__":
     PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
     PLOTS_ATT1 = os.path.join(PLOTS_ROOT, "att1")
     PLOTS_DEF1 = os.path.join(PLOTS_ROOT, "def1")
+    PLOTS_ATT2 = os.path.join(PLOTS_ROOT, "att2")
+    PLOTS_DEF2 = os.path.join(PLOTS_ROOT, "def2")
     PLOTS_COMP = os.path.join(PLOTS_ROOT, "comparisons")
-    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_COMP]:
+    for d in [PLOTS_DEF0, PLOTS_ATT1, PLOTS_DEF1, PLOTS_ATT2, PLOTS_DEF2, PLOTS_COMP]:
         os.makedirs(d, exist_ok=True)
 
     runlog = RunLogger(OUT_DIR, filename="run_manifest.json")
@@ -263,14 +269,138 @@ if __name__ == "__main__":
         )
 
     # =========================================================
+    # PHASE 3: Attacker_2 vs frozen Defender_1 (teacher + distill)
+    # =========================================================
+    if do_phase_3 is True:
+
+        print("\n===== PHASE 3: Train ATTACKER_2 vs frozen DEFENDER_1 =====")
+        phase3_extra = {
+            "def_ckpt_path": def1_teacher_ckpt,
+            "freeze_defender": True,
+            "train_ic_mode": "random_shell",
+            "r_att_min": 0.0,
+            "gamma": 0.991,
+        }
+
+        with runlog.stage(
+            "PHASE3_train_att2",
+            phase_name="att2",
+            attacker_mode="rl",
+            extra_train_cfg=phase3_extra,
+        ) as st:
+            att2_teacher_ckpt, att2_student_ckpt, att2_meta = train_with_distill(
+                out_dir=OUT_DIR,
+                phase_name="att2",
+                attacker_mode="rl",
+                train_role="att",
+                extra_train_cfg=phase3_extra,
+            )
+            st["outputs"] = att2_meta
+
+        m_att2_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_att2_teacher.npz"))
+        plot_training_metrics(
+            m_att2_teacher,
+            title="att2_teacher",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_ATT2,
+            save_prefix="att2_teacher",
+        )
+
+        plot_ic_support_from_cfg(
+            cfg_training_log,
+            n_scenes=30000,
+            seed=123,
+            title="att2 feasible IC support",
+            out_path=os.path.join(PLOTS_ATT2, "att2_ic_support.png"),
+            show=False,
+        )
+
+        plot_ic_used_from_npz(
+            os.path.join(OUT_DIR, "ic_samples_att2_teacher.npz"),
+            cfg_training_log,
+            title="att2 ICs actually used during training",
+            out_path=os.path.join(PLOTS_ATT2, "att2_ic_used.png"),
+            show=False,
+        )
+
+    # =========================================================
+    # PHASE 4: Defender_2 vs frozen Attacker_2 (teacher + distill)
+    # =========================================================
+    if do_phase_4 is True:
+
+        print("\n===== PHASE 4: Train DEFENDER_2 vs frozen ATTACKER_2 =====")
+        phase4_extra = {
+            "att_ckpt_path": att2_teacher_ckpt,
+            "def_ckpt_path": def1_teacher_ckpt,
+            "freeze_attacker": True,
+            "gamma": 0.991,
+        }
+
+        with runlog.stage(
+            "PHASE4_train_def2",
+            phase_name="def2",
+            attacker_mode="rl",
+            extra_train_cfg=phase4_extra,
+        ) as st:
+            def2_teacher_ckpt, def2_student_ckpt, def2_meta = train_with_distill(
+                out_dir=OUT_DIR,
+                phase_name="def2",
+                attacker_mode="rl",
+                train_role="def",
+                extra_train_cfg=phase4_extra,
+            )
+            st["outputs"] = def2_meta
+
+        m_def2_teacher = load_npz_metrics(os.path.join(OUT_DIR, "train_metrics_def2_teacher.npz"))
+        plot_training_metrics(
+            m_def2_teacher,
+            title="def2_teacher",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_DEF2,
+            save_prefix="def2_teacher",
+        )
+
+        plot_ic_support_from_cfg(
+            cfg_training_log,
+            n_scenes=30000,
+            seed=123,
+            title="def2 feasible IC support",
+            out_path=os.path.join(PLOTS_DEF2, "def2_ic_support.png"),
+            show=False,
+        )
+
+        plot_ic_used_from_npz(
+            os.path.join(OUT_DIR, "ic_samples_def2_teacher.npz"),
+            cfg_training_log,
+            title="def2 ICs actually used during training",
+            out_path=os.path.join(PLOTS_DEF2, "def2_ic_used.png"),
+            show=False,
+        )
+
+    # =========================================================
     # Multi phase Plotting 
     # =========================================================
-    if do_phase_0 or do_phase_2:
+    defender_phase_metrics = []
+    if do_phase_0:
+        defender_phase_metrics.append(
+            ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean")
+        )
+    if do_phase_2:
+        defender_phase_metrics.append(
+            ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean")
+        )
+    if do_phase_4:
+        defender_phase_metrics.append(
+            ("def2_teacher", os.path.join(OUT_DIR, "train_metrics_def2_teacher.npz"), "R_def_mean")
+        )
+
+    if len(defender_phase_metrics) >= 2:
         plot_compare_phases(
-            [
-                ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
-                ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
-            ],
+            defender_phase_metrics,
             metric=None,
             ylabel="Mean defender return",
             title="Defender return across phases",
@@ -278,16 +408,47 @@ if __name__ == "__main__":
             smooth_param=0.2,
             show=False,
             out_dir=PLOTS_COMP,
-            filename="compare__R_def_mean__def0_vs_def1.png",
+            filename="compare__R_def_mean__def0_vs_def1_vs_def2.png",
         )
 
-    if do_phase_0 or do_phase_1 or do_phase_2:
+    attacker_phase_metrics = []
+    if do_phase_1:
+        attacker_phase_metrics.append(
+            ("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean")
+        )
+    if do_phase_3:
+        attacker_phase_metrics.append(
+            ("att2_teacher", os.path.join(OUT_DIR, "train_metrics_att2_teacher.npz"), "R_att_mean")
+        )
+
+    if len(attacker_phase_metrics) >= 2:
         plot_compare_phases(
-            [
-                ("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"),
-                ("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean"),
-                ("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"),
-            ],
+            attacker_phase_metrics,
+            metric=None,
+            ylabel="Mean attacker return",
+            title="Attacker return across phases",
+            smooth="ema",
+            smooth_param=0.2,
+            show=False,
+            out_dir=PLOTS_COMP,
+            filename="compare__R_att_mean__att1_vs_att2.png",
+        )
+
+    all_phase_metrics = []
+    if do_phase_0:
+        all_phase_metrics.append(("def0_teacher", os.path.join(OUT_DIR, "train_metrics_def0_teacher.npz"), "R_def_mean"))
+    if do_phase_1:
+        all_phase_metrics.append(("att1_teacher", os.path.join(OUT_DIR, "train_metrics_att1_teacher.npz"), "R_att_mean"))
+    if do_phase_2:
+        all_phase_metrics.append(("def1_teacher", os.path.join(OUT_DIR, "train_metrics_def1_teacher.npz"), "R_def_mean"))
+    if do_phase_3:
+        all_phase_metrics.append(("att2_teacher", os.path.join(OUT_DIR, "train_metrics_att2_teacher.npz"), "R_att_mean"))
+    if do_phase_4:
+        all_phase_metrics.append(("def2_teacher", os.path.join(OUT_DIR, "train_metrics_def2_teacher.npz"), "R_def_mean"))
+
+    if len(all_phase_metrics) >= 2:
+        plot_compare_phases(
+            all_phase_metrics,
             metric=None,
             ylabel="Mean return",
             title="Return across phases",
@@ -295,7 +456,7 @@ if __name__ == "__main__":
             smooth_param=0.2,
             show=False,
             out_dir=PLOTS_COMP,
-            filename="compare__R_mean__def0_vs_def1_vs_att1.png",
+            filename="compare__R_mean__def0_vs_att1_vs_def1_vs_att2_vs_def2.png",
         )
 
     if not do_phase_0:
@@ -306,6 +467,12 @@ if __name__ == "__main__":
 
     if not do_phase_2:
         def1_meta = None
+    
+    if not do_phase_3:
+        att2_meta = None
+
+    if not do_phase_4:
+        def2_meta = None
 
         
 
@@ -314,6 +481,8 @@ if __name__ == "__main__":
         "def0": def0_meta,
         "att1": att1_meta,
         "def1": def1_meta,
+        "att2": att2_meta,
+        "def2": def2_meta,
         "plots_root": PLOTS_ROOT,
     })
 
@@ -321,6 +490,8 @@ if __name__ == "__main__":
     print(" -", PLOTS_DEF0)
     print(" -", PLOTS_ATT1)
     print(" -", PLOTS_DEF1)
+    print(" -", PLOTS_ATT2)
+    print(" -", PLOTS_DEF2)
     print(" -", PLOTS_COMP)
 
     print("\n===== ALL PHASES COMPLETE =====")
@@ -342,3 +513,15 @@ if __name__ == "__main__":
         print(f"Defender_1 student:  {def1_student_ckpt if def1_student_ckpt else '(skipped)'}")
     else:
         print("Defender_1 training skipped")
+
+    if do_phase_3:
+        print(f"Attacker_2 teacher:  {att2_teacher_ckpt if att2_teacher_ckpt else '(skipped)'}")
+        print(f"Attacker_2 student:  {att2_student_ckpt if att2_student_ckpt else '(skipped)'}")
+    else:
+        print("Attacker_2 training skipped")
+
+    if do_phase_4:
+        print(f"Defender_2 teacher:  {def2_teacher_ckpt if def2_teacher_ckpt else '(skipped)'}")
+        print(f"Defender_2 student:  {def2_student_ckpt if def2_student_ckpt else '(skipped)'}")
+    else:
+        print("Defender_2 training skipped")
