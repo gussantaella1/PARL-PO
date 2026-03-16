@@ -200,7 +200,10 @@ TRAIN: Dict[str, Any] = {
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
     "entropy_coef": 0.01,
-    "k_pos": 0.05,
+
+    "k_pos": 0.3, #Was 0.05
+    "k_dock": 0.5,
+
     "gamma": 0.992, #Was 0.995
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 10.0,
@@ -208,7 +211,8 @@ TRAIN: Dict[str, Any] = {
     "fuel_depletion_penalty": 5.0,
     "collision_radius_m": 0.25,            # meters
 
-
+    # "k_pos": 0.05, #Was 0.05
+    # "k_dock": 0.5,
 
 
     # #Long training (new)
@@ -258,18 +262,19 @@ TRAIN: Dict[str, Any] = {
     # "gamma": 0.999,
 
     #Test training
-    # "num_envs": 1,          
-    # "steps_per_env": 256,    
-    # "total_updates": 100, 
-    # "train_epochs": 3,
-    # "minibatch_size": 1024,  
-    # "log_every": 10,
-    # "entropy_coef": 0.01,
-    # "k_pos": 0.04,  
-    # "gamma": 0.998,
-    # "target_hit_reward_penalty": 5.0,
-    # "collision_penalty": 5.0,
-    # "wall_penalty": 5.0,
+    "num_envs": 1,          
+    "steps_per_env": 256,    
+    "total_updates": 100, 
+    "train_epochs": 3,
+    "minibatch_size": 1024,  
+    "log_every": 10,
+    "entropy_coef": 0.01,
+    "k_pos": 0.04,  
+    "k_dock": 0.5,
+    "gamma": 0.998,
+    "target_hit_reward_penalty": 5.0,
+    "collision_penalty": 5.0,
+    "wall_penalty": 5.0,
 
     "record_ic_history": True,
     "max_ic_history": 300000,

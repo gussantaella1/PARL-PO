@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-03-16T14:34:40.478436+00:00",
+  "created_utc": "2026-03-16T20:59:07.389013+00:00",
   "out_dir": "Training_Policy",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
@@ -158,18 +158,19 @@
       "att_ckpt_path": null,
       "verify_freeze": true,
       "freeze_tol": 0.0,
-      "num_envs": 256,
-      "steps_per_env": 512,
-      "total_updates": 1000,
+      "num_envs": 1,
+      "steps_per_env": 256,
+      "total_updates": 100,
       "train_epochs": 3,
-      "minibatch_size": 4096,
+      "minibatch_size": 1024,
       "log_every": 10,
       "entropy_coef": 0.01,
-      "k_pos": 0.05,
-      "gamma": 0.992,
-      "target_hit_reward_penalty": 10.0,
-      "collision_penalty": 10.0,
-      "wall_penalty": 2.5,
+      "k_pos": 0.04,
+      "k_dock": 0.5,
+      "gamma": 0.998,
+      "target_hit_reward_penalty": 5.0,
+      "collision_penalty": 5.0,
+      "wall_penalty": 5.0,
       "fuel_depletion_penalty": 5.0,
       "collision_radius_m": 0.25,
       "record_ic_history": true,
@@ -217,13 +218,23 @@
       "train_role": "rl"
     },
     "final_outputs": {
-      "def0": null,
+      "def0": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": -85.83366184051685,
+        "teacher_best_update": 10,
+        "teacher_best_ckpt_path": "Training_Policy/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false
+      },
       "att1": {
         "train_role": "att",
         "teacher_ckpt": "Training_Policy/att1_teacher.pt",
         "teacher_best_metric_name": "R_att_mean",
-        "teacher_best_metric": 152.43433660197644,
-        "teacher_best_update": 430,
+        "teacher_best_metric": 153.06936269906657,
+        "teacher_best_update": 20,
         "teacher_best_ckpt_path": "Training_Policy/att1_teacher__best.pt",
         "teacher_last_ckpt_path": "Training_Policy/att1_teacher.pt",
         "student_ckpt": null,
@@ -233,8 +244,8 @@
         "train_role": "def",
         "teacher_ckpt": "Training_Policy/def1_teacher.pt",
         "teacher_best_metric_name": "R_def_mean",
-        "teacher_best_metric": 64.826030067434,
-        "teacher_best_update": 1000,
+        "teacher_best_metric": -77.68270339466514,
+        "teacher_best_update": 20,
         "teacher_best_ckpt_path": "Training_Policy/def1_teacher__best.pt",
         "teacher_last_ckpt_path": "Training_Policy/def1_teacher.pt",
         "student_ckpt": null,
@@ -245,8 +256,34 @@
   },
   "stages": [
     {
+      "name": "PHASE0_train_def0",
+      "start_utc": "2026-03-16T20:59:07.396344+00:00",
+      "meta": {
+        "phase_name": "def0",
+        "attacker_mode": "rule",
+        "extra_train_cfg": {
+          "gamma": 0.99,
+          "hit_buffer_def": 0.25
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": -85.83366184051685,
+        "teacher_best_update": 10,
+        "teacher_best_ckpt_path": "Training_Policy/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false
+      },
+      "status": "ok",
+      "end_utc": "2026-03-16T20:59:23.291001+00:00",
+      "duration_s": 15.894658982986584
+    },
+    {
       "name": "PHASE1_train_att1",
-      "start_utc": "2026-03-16T14:34:40.487318+00:00",
+      "start_utc": "2026-03-16T20:59:25.512341+00:00",
       "meta": {
         "phase_name": "att1",
         "attacker_mode": "rl",
@@ -262,20 +299,20 @@
         "train_role": "att",
         "teacher_ckpt": "Training_Policy/att1_teacher.pt",
         "teacher_best_metric_name": "R_att_mean",
-        "teacher_best_metric": 152.43433660197644,
-        "teacher_best_update": 430,
+        "teacher_best_metric": 153.06936269906657,
+        "teacher_best_update": 20,
         "teacher_best_ckpt_path": "Training_Policy/att1_teacher__best.pt",
         "teacher_last_ckpt_path": "Training_Policy/att1_teacher.pt",
         "student_ckpt": null,
         "distill_enabled": false
       },
       "status": "ok",
-      "end_utc": "2026-03-16T15:53:46.909906+00:00",
-      "duration_s": 4746.422590753064
+      "end_utc": "2026-03-16T20:59:44.753369+00:00",
+      "duration_s": 19.241029147990048
     },
     {
       "name": "PHASE2_train_def1",
-      "start_utc": "2026-03-16T15:55:27.080383+00:00",
+      "start_utc": "2026-03-16T20:59:47.060184+00:00",
       "meta": {
         "phase_name": "def1",
         "attacker_mode": "rl",
@@ -290,16 +327,16 @@
         "train_role": "def",
         "teacher_ckpt": "Training_Policy/def1_teacher.pt",
         "teacher_best_metric_name": "R_def_mean",
-        "teacher_best_metric": 64.826030067434,
-        "teacher_best_update": 1000,
+        "teacher_best_metric": -77.68270339466514,
+        "teacher_best_update": 20,
         "teacher_best_ckpt_path": "Training_Policy/def1_teacher__best.pt",
         "teacher_last_ckpt_path": "Training_Policy/def1_teacher.pt",
         "student_ckpt": null,
         "distill_enabled": false
       },
       "status": "ok",
-      "end_utc": "2026-03-16T17:16:34.619276+00:00",
-      "duration_s": 4867.538890202995
+      "end_utc": "2026-03-16T21:00:05.902514+00:00",
+      "duration_s": 18.84232377796434
     }
   ]
 }
