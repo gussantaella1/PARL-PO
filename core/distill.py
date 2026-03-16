@@ -185,8 +185,8 @@ def _load_teacher_bundle(
       - one privileged intent encoder state dict under one of:
           ["intent_encoder_state_dict", "teacher_intent_encoder_state_dict", "privileged_encoder_state_dict"]
 
-    If the latter is missing, we fail loudly because then the paper-style latent supervision
-    is not actually available.
+    If the intent encoder is missing, we can optionally fall back to handcrafted
+    simulation-derived intent labels (cfg["allow_sim_intent_fallback"]=True).
     """
     payload = torch.load(ckpt_path, map_location=device)
 
@@ -210,11 +210,13 @@ def _load_teacher_bundle(
                 intent_sd = payload[k]
                 break
 
-    if intent_sd is None:
+    allow_sim_intent_fallback = bool(cfg.get("allow_sim_intent_fallback", True))
+
+    if intent_sd is None and not allow_sim_intent_fallback:
         raise RuntimeError(
             "This checkpoint does not contain a privileged teacher intent encoder. "
-            "Your current teacher checkpoints are therefore not sufficient for a paper-faithful "
-            "teacher->student distillation. Save E* alongside the teacher policy first."
+            "Either save E* alongside the teacher policy checkpoint or set "
+            "cfg['allow_sim_intent_fallback']=True to use simulation-derived intent labels."
         )
 
     teacher_policy = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
@@ -223,14 +225,43 @@ def _load_teacher_bundle(
     for p in teacher_policy.parameters():
         p.requires_grad_(False)
 
-    traj_dim = (lookahead_H + 1) * rel_dim
-    teacher_intent = PrivilegedFutureIntentEncoder(traj_dim=traj_dim, latent_dim=latent_dim).to(device)
-    teacher_intent.load_state_dict(intent_sd, strict=True)
-    teacher_intent.eval()
-    for p in teacher_intent.parameters():
-        p.requires_grad_(False)
+    teacher_intent = None
+    if intent_sd is not None:
+        traj_dim = (lookahead_H + 1) * rel_dim
+        teacher_intent = PrivilegedFutureIntentEncoder(traj_dim=traj_dim, latent_dim=latent_dim).to(device)
+        teacher_intent.load_state_dict(intent_sd, strict=True)
+        teacher_intent.eval()
+        for p in teacher_intent.parameters():
+            p.requires_grad_(False)
 
     return teacher_policy, teacher_intent
+
+
+def _sim_intent_from_future_rel_traj(future_rel: np.ndarray, latent_dim: int) -> np.ndarray:
+    """
+    Handcrafted intent fallback from a simulated future relative trajectory.
+    This is not paper-faithful E*, but it uses the same privileged rollout signal.
+    """
+    rel = np.asarray(future_rel, dtype=np.float32)
+    pos = rel[:, : rel.shape[1] // 2]
+    vel = rel[:, rel.shape[1] // 2 :]
+    dist = np.linalg.norm(pos, axis=1)
+
+    feats = [
+        pos[0],
+        vel[0],
+        pos[-1],
+        vel[-1],
+        pos[-1] - pos[0],
+        np.array([np.min(dist), np.argmin(dist) / max(1, len(dist) - 1)], dtype=np.float32),
+        np.array([dist[-1] - dist[0]], dtype=np.float32),
+    ]
+    flat = np.concatenate([f.reshape(-1) for f in feats]).astype(np.float32)
+
+    z = np.zeros((latent_dim,), dtype=np.float32)
+    n = min(latent_dim, flat.shape[0])
+    z[:n] = flat[:n]
+    return z
 
 
 def _load_attacker_policy_if_needed(
@@ -440,11 +471,10 @@ def distill_from_teacher(
           (2) latent intent imitation
 
     Important:
-      This function assumes the teacher checkpoint contains BOTH:
-        - teacher policy weights
-        - privileged teacher intent encoder weights
-      If your current checkpoint only stores ActorCriticDiff weights, this function
-      will fail by design, because then the paper-style latent supervision is unavailable.
+      Preferred: teacher checkpoint contains BOTH policy and privileged intent encoder E*.
+      Optional fallback: if E* is missing and cfg["allow_sim_intent_fallback"] is True,
+      we synthesize intent labels from mini simulation rollouts of teacher+attacker.
+      This preserves the rollout logic but is less paper-faithful than learned E*.
     """
     cfg = copy.deepcopy(cfg)
 
@@ -538,6 +568,7 @@ def distill_from_teacher(
     print(f"teacher_ckpt={teacher_ckpt_path}")
     print(f"attacker_mode={attacker_mode}")
     print(f"lookahead_H={lookahead_H}, latent_dim={latent_dim}, tbptt_chunk_len={tbptt_chunk_len}")
+    print(f"intent_source={'teacher_encoder' if teacher_intent is not None else 'sim_fallback'}")
 
     for it in range(iters):
         beta_exec = beta_at(it)
@@ -583,11 +614,14 @@ def distill_from_teacher(
                     act_scale=act_scale,
                 )
 
-                with torch.no_grad():
-                    future_rel_t = torch.as_tensor(
-                        future_rel_np[None, :, :], dtype=torch.float32, device=device
-                    )
-                    z_teacher_np = teacher_intent(future_rel_t)[0].detach().cpu().numpy().astype(np.float32)
+                if teacher_intent is not None:
+                    with torch.no_grad():
+                        future_rel_t = torch.as_tensor(
+                            future_rel_np[None, :, :], dtype=torch.float32, device=device
+                        )
+                        z_teacher_np = teacher_intent(future_rel_t)[0].detach().cpu().numpy().astype(np.float32)
+                else:
+                    z_teacher_np = _sim_intent_from_future_rel_traj(future_rel_np, latent_dim=latent_dim)
 
                 # student prediction
                 xhat_t = torch.as_tensor(xhat_rel_np[None, :], dtype=torch.float32, device=device)
