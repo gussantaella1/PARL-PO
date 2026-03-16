@@ -4492,7 +4492,7 @@ def end_phase_cleanup(
 # =============================================================
 if __name__ == "__main__":
 
-    do_phase_0 = True
+    do_phase_0 = False
     do_phase_1 = True
     do_phase_2 = True
 
@@ -4602,13 +4602,13 @@ if __name__ == "__main__":
             # "gamma": 0.994, #Aggressive, but can be confused
 
             # NEW:
-            "opp_mix": {
-                "modes": ["none", "def0", "weak"],
-                "probs": [0.05, 0.95, 0.00],     # must sum to 1
-                "resample": "episode",           # "episode" or "never"
-                "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
-                "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-            },
+            # "opp_mix": {
+            #     "modes": ["none", "def0", "weak"],
+            #     "probs": [0.05, 0.95, 0.00],     # must sum to 1
+            #     "resample": "episode",           # "episode" or "never"
+            #     "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
+            #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+            # },
         }
 
         with runlog.stage(
