@@ -203,9 +203,11 @@ TRAIN: Dict[str, Any] = {
     "k_pos": 0.05,
     "gamma": 0.992, #Was 0.995
     "target_hit_reward_penalty": 10.0,
-    "collision_penalty": 5.0,
+    "collision_penalty": 10.0,
     "wall_penalty": 2.5,
     "fuel_depletion_penalty": 5.0,
+    "collision_radius_m": 0.25,            # meters
+
 
 
 
@@ -289,7 +291,7 @@ TRAIN: Dict[str, Any] = {
     "r_att_min": 0.3, #Default 0.4
     "r_att_max": 0.95, #Default: 0.95
 
-    "percent_advantage_defender": 0.75, 
+    "percent_advantage_defender": 1.0, 
 
     # Other PPO hyperparams
     "gae_lambda": 0.95,
@@ -323,15 +325,13 @@ TRAIN: Dict[str, Any] = {
     # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell_advantage",  # or "fixed"
     "train_ic_vmax": 0.5,            # max |v| component at t=0
-    "train_min_sep": 1.0,             # min defender–attacker separation (m)
+    "train_min_sep": 2.0,             # min defender–attacker separation (m)
 
     "prior_type": "ls",                 #ls, nash, none
     "prior_blend_att":        0.0,    # (optional) disable center prior for def
     "prior_blend_def":        0.0,    # (optional) disable center prior for def
 
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
-    "collision_radius_m": 0.75,            # meters
-
 
     #Learning stat tracking
     "use_tensorboard": True,

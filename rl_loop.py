@@ -910,7 +910,8 @@ class Env:
         r1 = 0.0
         r2 = 0.0
 
-        use_security = True
+        use_security = False
+        use_zero_sum = True
 
 
         #Visualize what strategies 
@@ -947,7 +948,7 @@ class Env:
                 elif collision:
                     shared_termination += self.collision_penalty
                 elif oob1:
-                    g -= self.wallK
+                    g -= self.wall_penalty
                 elif oob2_any:
                     g += self.wall_penalty
 
@@ -968,6 +969,61 @@ class Env:
                 r1 = g - shared_termination
             if need_att:
                 r2 = -g - shared_termination
+
+            # if done and oob1:
+            #     if need_def: 
+            #         r1 -= self.wallK
+
+        elif use_zero_sum:
+
+            k_time = 0.001
+
+            g = (
+                #Both agents: TBoth terms
+                self.k_pos * d2
+                - (self.k_pos/1.5) * rel2
+                # + k_time
+            )
+
+            if self.use_fuel:
+                # eff_def = thrust_def / (self.Tmax_def + 1e-9)
+                # eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
+                # g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
+                burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
+                burn_frac_att = (mdot_att_all[0] * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
+                g += - self.k_eff_def * burn_frac_def + self.k_eff_att * burn_frac_att
+
+
+            if done:
+                # Example: encode hit_target / collision / oob into g so the sign flip is consistent
+                # if collision:
+                #     g += self.collision_penalty_def
+                if att_hit_target or def_hit_target:
+                    g -= self.target_hit_reward_penalty
+                elif collision:
+                    g += self.collision_penalty
+                elif oob1:
+                    g -= self.wall_penalty
+                elif oob2_any:
+                    g += self.wall_penalty
+
+                elif self.use_fuel:
+                    if fuel_depleted_def:
+                        g -= self.fuel_depletion_penalty
+                    if fuel_depleted_att:
+                        g += self.fuel_depletion_penalty
+
+                # If you want attacker “success” to matter, it should reduce defender g,
+                # which automatically increases attacker reward via -g.
+
+
+            # if done and collision:
+            #     shared_termination += self.collision_penalty
+
+            if need_def:
+                r1 = g 
+            if need_att:
+                r2 = -g
 
             # if done and oob1:
             #     if need_def: 
@@ -4436,7 +4492,7 @@ def end_phase_cleanup(
 # =============================================================
 if __name__ == "__main__":
 
-    do_phase_0 = False
+    do_phase_0 = True
     do_phase_1 = True
     do_phase_2 = True
 
@@ -4542,16 +4598,17 @@ if __name__ == "__main__":
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
             "r_att_min": 0.0,
-            "gamma": 0.993,
+            "gamma": 0.991,
+            # "gamma": 0.994, #Aggressive, but can be confused
 
             # NEW:
-            # "opp_mix": {
-            #     "modes": ["none", "def0", "weak"],
-            #     "probs": [0.05, 0.9, 0.05],     # must sum to 1
-            #     "resample": "episode",           # "episode" or "never"
-            #     "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
-            #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
-            # },
+            "opp_mix": {
+                "modes": ["none", "def0", "weak"],
+                "probs": [0.05, 0.95, 0.00],     # must sum to 1
+                "resample": "episode",           # "episode" or "never"
+                "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
+                "weak_noise_std": 0.00,          # optional additive Gaussian in action space
+            },
         }
 
         with runlog.stage(
@@ -4606,6 +4663,9 @@ if __name__ == "__main__":
         phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
                         "def_ckpt_path": def0_teacher_ckpt,
                         "freeze_attacker": True,
+                        # "gamma": 0.993,
+                        # "gamma": 0.990, # Performed poorly against .994 attacker, good against .990 
+                        # "gamma": 0.994, # Performed poorly against .994 attacker
                         "gamma": 0.991,
                         }
 
