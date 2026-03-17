@@ -1,6 +1,6 @@
 # mcp_baseline_runner.py
 """
-MCP baseline runner for your PPO pursuit-evasion game.
+MCP baseline runner for the current PPO zero-sum pursuit-evasion game.
 
 Each sim step k:
   - Build a single big Mixed Complementarity Problem (MCP) capturing the KKT
@@ -12,32 +12,33 @@ Supports:
   - 1v1: defender vs attacker
   - 1v2: defender vs attacker TEAM (attacker controls are concatenated as one player)
 
-Cost modes:
-  - "security": zero-sum saddle using a scalar security value g
-      defender maximizes g  <=> minimizes J1 = -g
-      attacker minimizes g  <=> minimizes J2 = +g (+ optional effort)
-  - "default": general-sum Nash using per-agent PPO-ish rewards (smooth versions)
-      J1 = -r_def_step
-      J2 = -r_att_step
+Objective mode:
+  - "zero_sum" / "security": solver-safe relaxation of the env's current one-step
+    zero-sum reward
+      g = k_pos * d2 - k_dock * dock_gap - lD * ||uD||^2 + lA * ||uA||^2
+    where dock_gap is smoothed for PATH.
 
 Config (optional):
   cfg["mcp"] = {
-      "mode": "security" or "default",
+      "mode": "zero_sum" or "security",
       "solver": "path",
       "tee": False,
       "kappa": 40.0,                # softplus sharpness
       "g_clip": None or float,      # optional clipping of g BEFORE mapping to J
-      "att_reward_style": "progress_close" or "symmetric",
+      "reg_u": 0.01,                # small quadratic regularizer for PATH
       "def_use_keepout": True,
       "include_terminal_in_mcp": False,  # keep False (terminal logic is non-smooth)
+      "include_step_walls": False,  # optional smooth stabilizers, not in env g
+      "include_keepout": False,     # optional smooth stabilizers, not in env g
       "softmin_tau": 30.0,          # only relevant for 1v2 threat smoothmin
-      "threat_mode": "idx0" or "softmin",# for 1v2 security threat selection
+      "threat_mode": "idx0" or "softmin",# for 1v2 threat selection
   }
 
 Notes:
   - Terminal penalties (collision/oob/hit) are NOT embedded in the MCP objective by default,
-    because they are discontinuous and will destabilize PATH.
-  - Rollout termination is still computed after stepping the plant (as in your env).
+    because they are discontinuous and destabilize PATH.
+  - Rollout termination is computed exactly after each applied step using the same event order
+    as core/env.py.
 """
 
 from __future__ import annotations
@@ -67,7 +68,7 @@ else:
 
 @dataclass
 class MCPParams:
-    mode: str = "security"               # "security" or "default"
+    mode: str = "zero_sum"               # "zero_sum" or "security"
     solver: str = "path"                 # "path" (recommended)
     tee: bool = False
 
@@ -79,8 +80,8 @@ class MCPParams:
     # optional clipping of g before mapping to J (helps PPO; optional here)
     g_clip: Optional[float] = None
 
-    # which attacker reward shape to mimic in default mode
-    att_reward_style: str = "progress_close"  # "progress_close" or "symmetric"
+    # small stabilizing regularizer
+    reg_u: float = 0.01
 
     # keepout term
     def_use_keepout: bool = True
@@ -95,9 +96,10 @@ def _mcp_params_from_cfg(cfg: Dict[str, Any]) -> MCPParams:
     for k, v in d.items():
         if hasattr(p, k):
             setattr(p, k, v)
-    p.mode = (p.mode or "security").lower()
+    p.mode = (p.mode or "zero_sum").lower()
+    if p.mode == "default":
+        p.mode = "zero_sum"
     p.solver = (p.solver or "path").lower()
-    p.att_reward_style = (p.att_reward_style or "progress_close").lower()
     p.threat_mode = (p.threat_mode or "idx0").lower()
     return p
 
@@ -152,6 +154,75 @@ def _dot_expr(v_list: List):
     return sum(v_list[i] * v_list[i] for i in range(len(v_list)))
 
 
+def _ensure_step_mats(cfg: Dict[str, Any]) -> None:
+    dyn = cfg.get("dyn", {}) if isinstance(cfg.get("dyn", {}), dict) else {}
+    if dyn.get("Ad", None) is None or dyn.get("Bd", None) is None:
+        from config_rl import build_dyn
+
+        build_dyn(cfg)
+
+
+def _terminal_info_numpy(
+    *,
+    p_def: np.ndarray,
+    p_att_list: List[np.ndarray],
+    center: np.ndarray,
+    cfg: Dict[str, Any],
+    primary_idx: int = 0,
+) -> Dict[str, Any]:
+    R = float(cfg.get("arena", {}).get("r", 30.0))
+    eps = 1e-12
+    margin = float(cfg.get("arena_terminate_margin", 1.0))
+    oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
+    oi_r_norm = oi_r / (R + eps) if R > 0.0 else 0.0
+    hit_buffer_def = float(cfg.get("hit_buffer_def", 0.0))
+    hit_buffer_att = float(cfg.get("hit_buffer_att", 0.0))
+    collision_radius_m = float(cfg.get("collision_radius_m", 0.0))
+
+    rho_def = float(np.linalg.norm(p_def - center) / (R + eps))
+    rho_att = float(np.linalg.norm(p_att_list[primary_idx] - center) / (R + eps))
+
+    thresh_def = (1.0 + hit_buffer_def) * oi_r_norm
+    thresh_att = (1.0 + hit_buffer_att) * oi_r_norm
+
+    att_hit_target = (oi_r_norm > 0.0) and (rho_att <= thresh_att)
+    def_hit_target = (oi_r_norm > 0.0) and (rho_def <= thresh_def)
+    hit_target = bool(att_hit_target or def_hit_target)
+
+    collision = False
+    if collision_radius_m > 0.0:
+        for p_att in p_att_list:
+            if float(np.linalg.norm(p_att - p_def)) <= collision_radius_m:
+                collision = True
+                break
+
+    oob_def = bool(rho_def >= margin)
+    oob_att = any(float(np.linalg.norm(p_att - center) / (R + eps)) >= margin for p_att in p_att_list)
+    done = bool(collision or hit_target or oob_def or oob_att)
+
+    g_term = 0.0
+    if done:
+        if collision:
+            g_term += float(cfg.get("collision_penalty", 0.0))
+        elif att_hit_target or def_hit_target:
+            g_term -= float(cfg.get("target_hit_reward_penalty", 0.0))
+        elif oob_def:
+            g_term -= float(cfg.get("wall_penalty", 0.0))
+        elif oob_att:
+            g_term += float(cfg.get("wall_penalty", 0.0))
+
+    return {
+        "done": bool(done),
+        "collision": bool(collision),
+        "att_hit_target": bool(att_hit_target),
+        "def_hit_target": bool(def_hit_target),
+        "oob_def": bool(oob_def),
+        "oob_att": bool(oob_att),
+        "terminal_g": float(g_term),
+        "primary_idx": int(primary_idx),
+    }
+
+
 # ============================================================
 # Dynamics helpers: step matrices for HCW/LTV
 # ============================================================
@@ -167,6 +238,7 @@ def _extract_step_mats(cfg: Dict[str, Any], k: int, D: int) -> Tuple[np.ndarray,
     Handles the common case where matrices are 6x6,6x3 but D==2
     by selecting planar indices [0,1,3,4] and control cols [0,1].
     """
+    _ensure_step_mats(cfg)
     dyn = cfg.get("dyn", {}) if isinstance(cfg.get("dyn", {}), dict) else {}
     Ad = dyn.get("Ad", None)
     Bd = dyn.get("Bd", None)
@@ -211,36 +283,51 @@ def _step_lti(x: np.ndarray, u: np.ndarray, Ad: np.ndarray, Bd: np.ndarray) -> n
 
 
 # ============================================================
-# PPO-aligned cost builders (smooth)
+# PPO-aligned cost builders (solver-safe smoothing around the env zero-sum g)
 # ============================================================
 
-def _build_security_g_1v1(
+def _build_zero_sum_g_1v1(
     *,
     D: int,
     center: np.ndarray,
     R: float,
     p1n: List, p2n: List,
+    u1: List,
+    u2: List,
     cfg: Dict[str, Any],
     mcpp: MCPParams,
 ) -> Any:
     mcp_cfg = cfg.get("mcp", {}) or {}
-
-    # RL-aligned k_pos
     k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", 0.0)))
+    k_dock = float(cfg.get("k_dock", 0.0))
+    lD = float(cfg.get("effort_def", 0.0))
+    lA = float(cfg.get("effort_att", 0.0))
+    collision_radius_m = float(cfg.get("collision_radius_m", 0.0))
+    umax = float(cfg.get("umax", 1.0))
 
-    # RL-style d2 (normalized squared radius)
     d2_next = sum((p2n[i] - float(center[i]))**2 for i in range(D)) / (float(R)*float(R) + 1e-12)
+    rel_dist = pyo.sqrt(sum((p2n[i] - p1n[i]) ** 2 for i in range(D)) + 1e-12)
+    dock_gap = _softplus_expr(rel_dist - collision_radius_m, mcpp.kappa) / (float(R) + 1e-12)
 
-    g = k_pos * d2_next
+    umax2 = float(umax) * float(umax) + 1e-12
+    u1n2 = _dot_expr(u1) / umax2
+    u2n2 = _dot_expr(u2) / umax2
 
-    # Optional smooth “constraints” (recommended for PATH stability)
-    if bool(mcp_cfg.get("include_step_walls", True)):
+    g = (
+        k_pos * d2_next
+        - k_dock * dock_gap
+        - lD * u1n2
+        + lA * u2n2
+    )
+
+    # Optional smooth stabilizers. Off by default to mirror env g.
+    if bool(mcp_cfg.get("include_step_walls", False)):
         wallK = float(cfg.get("wall_penalty", 0.0))
-        soft_wall = float(cfg.get("soft_wall_start", 0.7))
+        soft_wall = float(cfg.get("soft_wall_start", 0.5))
         wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
         g = g - wall1
 
-    if bool(mcp_cfg.get("include_keepout", True)) and bool(mcpp.def_use_keepout):
+    if bool(mcp_cfg.get("include_keepout", False)) and bool(mcpp.def_use_keepout):
         oi = cfg.get("oi", {}) or {}
         oi_r_m = float(oi.get("r", 0.0))
         buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -320,29 +407,27 @@ def solve_one_step_mcp_1v1(
     p2n = [x2n(i) for i in range(D)]
 
     # Build objectives
-    g = _build_security_g_1v1(
+    if mcpp.mode not in ("zero_sum", "security"):
+        raise ValueError(f"Unsupported MCP mode={mcpp.mode!r}; use 'zero_sum' or 'security'.")
+    if mcpp.include_terminal_in_mcp:
+        raise NotImplementedError(
+            "include_terminal_in_mcp is not implemented for the PATH-based zero-sum MCP. "
+            "Terminal events are applied exactly after each rollout step instead."
+        )
+
+    g = _build_zero_sum_g_1v1(
         D=D, center=center, R=R,
-        x2_pos_prev=x2[:D].copy(),
         p1n=p1n, p2n=p2n,
         u1=[m.u1[i] for i in range(D)],
         u2=[m.u2[i] for i in range(D)],
         cfg=cfg, mcpp=mcpp,
     )
-    # defender minimizes -g ; attacker minimizes +g (+ optional effort)
-    lA = float(cfg.get("effort_att", 0.0))
-    u2n2 = _dot_expr([m.u2[i] for i in range(D)])
-    J1 = -g
-    J2 = +g
 
-    def _dot_expr(v_list: List):
-        return sum(v_list[i] * v_list[i] for i in range(len(v_list)))
-    
     u1n2 = _dot_expr([m.u1[i] for i in range(D)])   # = ||u1||^2
     u2n2 = _dot_expr([m.u2[i] for i in range(D)])   # = ||u2||^2
 
     umax2 = float(umax) * float(umax) + 1e-12
-    reg = float(cfg.get("mcp", {}).get("reg_u", 0.0))
-    reg = 0.01
+    reg = float(cfg.get("mcp", {}).get("reg_u", mcpp.reg_u))
 
     J1 = -g + reg * (u1n2 / umax2)
     J2 = +g + reg * (u2n2 / umax2)
@@ -501,43 +586,60 @@ def solve_one_step_mcp_1v2_team(
     p2an = [x2an(i) for i in range(D)]
     p2bn = [x2bn(i) for i in range(D)]
 
-    if mcpp.mode != "security":
-        raise ValueError("solve_one_step_mcp_1v2_team currently supports mode='security' only.")
+    if mcpp.mode not in ("zero_sum", "security"):
+        raise ValueError(
+            f"Unsupported MCP mode={mcpp.mode!r}; use 'zero_sum' or 'security'."
+        )
+    if mcpp.include_terminal_in_mcp:
+        raise NotImplementedError(
+            "include_terminal_in_mcp is not implemented for the PATH-based zero-sum MCP. "
+            "Terminal events are applied exactly after each rollout step instead."
+        )
 
-    # Threat selection for g: idx0 (use attacker0) or smoothmin over attackers
+    # Threat selection for g: idx0 (primary attacker) or smoothmin over attackers.
     d2a_next = (sum((p2an[i] - float(center[i])) ** 2 for i in range(D))) / (float(R) * float(R) + 1e-12)
     d2b_next = (sum((p2bn[i] - float(center[i])) ** 2 for i in range(D))) / (float(R) * float(R) + 1e-12)
+    rela_next = pyo.sqrt(sum((p2an[i] - p1n[i]) ** 2 for i in range(D)) + 1e-12)
+    relb_next = pyo.sqrt(sum((p2bn[i] - p1n[i]) ** 2 for i in range(D)) + 1e-12)
+
+    collision_radius_m = float(cfg.get("collision_radius_m", 0.0))
+    dock_gap_a = _softplus_expr(rela_next - collision_radius_m, mcpp.kappa) / (float(R) + 1e-12)
+    dock_gap_b = _softplus_expr(relb_next - collision_radius_m, mcpp.kappa) / (float(R) + 1e-12)
 
     if mcpp.threat_mode == "softmin":
         d2_threat_next = _softmin_expr([d2a_next, d2b_next], tau=mcpp.softmin_tau)
-        # softmin returns something like min, good.
+        dock_gap = _softmin_expr([dock_gap_a, dock_gap_b], tau=mcpp.softmin_tau)
     else:
         d2_threat_next = d2a_next  # idx0
+        dock_gap = dock_gap_a
 
-    # d2_prev threat uses current true positions
-    d2a_prev = float(np.dot(x2a[:D] - center, x2a[:D] - center)) / (float(R) * float(R) + 1e-12)
-    d2b_prev = float(np.dot(x2b[:D] - center, x2b[:D] - center)) / (float(R) * float(R) + 1e-12)
-    if mcpp.threat_mode == "softmin":
-        # smoothmin over constants is just numeric
-        # use the same formula in numpy:
-        tau = float(mcpp.softmin_tau)
-        d2_threat_prev = -(1.0 / tau) * np.log(np.exp(-tau * d2a_prev) + np.exp(-tau * d2b_prev))
-    else:
-        d2_threat_prev = d2a_prev
-
-    #Build security strategy on 1v2 game
     k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", 0.0)))
-    g = k_pos * d2_threat_next
+    k_dock = float(cfg.get("k_dock", 0.0))
+    lD = float(cfg.get("effort_def", 0.0))
+    lA = float(cfg.get("effort_att", 0.0))
+    umax2 = float(umax) * float(umax) + 1e-12
+    u1n2 = _dot_expr([m.u1[i] for i in range(D)]) / umax2
+    u2n2 = (
+        _dot_expr([u2a_i(i) for i in range(D)]) / umax2
+        + _dot_expr([u2b_i(i) for i in range(D)]) / umax2
+    ) / 2.0
 
-    # optional smooth stabilizers
+    g = (
+        k_pos * d2_threat_next
+        - k_dock * dock_gap
+        - lD * u1n2
+        + lA * u2n2
+    )
+
+    # Optional smooth stabilizers. Off by default to mirror env g.
     mcp_cfg = cfg.get("mcp", {}) or {}
-    if bool(mcp_cfg.get("include_step_walls", True)):
+    if bool(mcp_cfg.get("include_step_walls", False)):
         wallK = float(cfg.get("wall_penalty", 0.0))
-        soft_wall = float(cfg.get("soft_wall_start", 0.7))
+        soft_wall = float(cfg.get("soft_wall_start", 0.5))
         wall1 = _wall_penalty_expr(p1n, center, R, soft_wall, wallK, mcpp.kappa)
         g = g - wall1
 
-    if bool(mcp_cfg.get("include_keepout", True)) and bool(mcpp.def_use_keepout):
+    if bool(mcp_cfg.get("include_keepout", False)) and bool(mcpp.def_use_keepout):
         oi = cfg.get("oi", {}) or {}
         oi_r_m = float(oi.get("r", 0.0))
         buf_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -549,8 +651,9 @@ def solve_one_step_mcp_1v2_team(
         gc = float(mcpp.g_clip)
         g = gc * pyo.tanh(g / gc)
 
-    J1 = -g
-    J2 = +g   # strict zero-sum
+    reg = float(cfg.get("mcp", {}).get("reg_u", mcpp.reg_u))
+    J1 = -g + reg * u1n2
+    J2 = +g + reg * u2n2
 
     m.J1 = pyo.Expression(expr=J1)
     m.J2 = pyo.Expression(expr=J2)
@@ -635,6 +738,7 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
     1 defender vs 1 attacker MCP baseline rollout.
     Returns dict compatible with your animator keys.
     """
+    _ensure_step_mats(cfg)
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx = 2 * D
     T_horizon = int(cfg.get("T", 1))
@@ -670,6 +774,8 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
     u_cmd_norm_1, u_cmd_norm_2 = [], []
 
     dbg_hist = []
+    terminal_hist = []
+    stopped_early = False
 
     # t=0
     exec_xyz1.append(_p3(x1[:D], D))
@@ -702,6 +808,15 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
         x1 = _step_lti(x1, u1, Ad, Bd)
         x2 = _step_lti(x2, u2, Ad, Bd)
 
+        term_dbg = _terminal_info_numpy(
+            p_def=np.asarray(x1[:D], float),
+            p_att_list=[np.asarray(x2[:D], float)],
+            center=center,
+            cfg=cfg,
+            primary_idx=0,
+        )
+        terminal_hist.append(term_dbg)
+
         # update warm start
         u1_prev = u1.copy()
         u2_prev = u2.copy()
@@ -722,6 +837,10 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
         exec_xyz2.append(_p3(x2[:D], D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
+        if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
+            stopped_early = True
+            break
+
     out = {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
         "plan_att1": plan_att1, "plan_att2": plan_att2,
@@ -735,6 +854,8 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
 
         "mcp_dbg_hist": dbg_hist,
         "mcp_params": _mcp_params_from_cfg(cfg).__dict__,
+        "terminal_hist": terminal_hist,
+        "stopped_early": bool(stopped_early),
     }
     return out
 
@@ -752,6 +873,7 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
     1 defender vs 2 attackers, treated as a single attacker TEAM (2D decision variables).
     Solves a 2-player MCP (defender vs team).
     """
+    _ensure_step_mats(cfg)
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx = 2 * D
     T_horizon = int(cfg.get("T", 1))
@@ -761,6 +883,15 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
         steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
     if turn_len is None:
         turn_len = 1
+
+    ar = cfg.get("arena", {}) or {}
+    ar.setdefault("type", "sphere")
+    ar.setdefault("cx", 0.0); ar.setdefault("cy", 0.0); ar.setdefault("cz", 0.0)
+    ar.setdefault("r", 30.0)
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)],
+        dtype=np.float32,
+    )[:D]
 
     # init
     x0 = np.asarray(cfg["x0"], dtype=np.float32)
@@ -780,6 +911,8 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
     u_cmd_norm_1, u_cmd_norm_2, u_cmd_norm_3 = [], [], []
 
     dbg_hist = []
+    terminal_hist = []
+    stopped_early = False
 
     # t=0
     exec_xyz1.append(_p3(x1[:D], D))
@@ -817,6 +950,15 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
         x2a = _step_lti(x2a, u2a, Ad, Bd)
         x2b = _step_lti(x2b, u2b, Ad, Bd)
 
+        term_dbg = _terminal_info_numpy(
+            p_def=np.asarray(x1[:D], float),
+            p_att_list=[np.asarray(x2a[:D], float), np.asarray(x2b[:D], float)],
+            center=center,
+            cfg=cfg,
+            primary_idx=0,
+        )
+        terminal_hist.append(term_dbg)
+
         # update warm start
         u1_prev = u1.copy()
         u2_prev = np.stack([u2a.copy(), u2b.copy()], axis=0)
@@ -838,6 +980,10 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
         exec_xyz2.append(_p3(x2a[:D], D))
         exec_xyz3.append(_p3(x2b[:D], D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
+
+        if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
+            stopped_early = True
+            break
 
     out = {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
@@ -867,6 +1013,8 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
 
         "mcp_dbg_hist": dbg_hist,
         "mcp_params": _mcp_params_from_cfg(cfg).__dict__,
+        "terminal_hist": terminal_hist,
+        "stopped_early": bool(stopped_early),
     }
     return out
 

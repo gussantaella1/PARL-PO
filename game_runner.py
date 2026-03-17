@@ -182,6 +182,14 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
         return obs
 
+    def build_student_sigma_feat():
+        if use_ukf and (ukf12 is not None):
+            P = np.asarray(ukf12.P, dtype=np.float32)
+            P_rel = P[: 2 * D, : 2 * D]
+            iu = np.triu_indices(2 * D)
+            return P_rel[iu].astype(np.float32)
+        return None
+
     # -------------------- policy wrapper --------------------
     pol = RLPolicyDiff(cfg, device=cfg.get("device", "cpu"))
     din_def, din_att = pol.verify_ckpt_compat()
@@ -458,14 +466,21 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
         obs_def = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
         obs_att = build_train_obs(x1, x2, m_def, m_att)
+        sigma_feat = build_student_sigma_feat()
 
         u1_cmd = np.clip(
-            np.asarray(pol.act_def_obs(obs_def, deterministic=deterministic), dtype=np.float32),
+            np.asarray(
+                pol.act_def_obs(obs_def, deterministic=deterministic, sigma_feat=sigma_feat),
+                dtype=np.float32,
+            ),
             -umax,
             +umax,
         )
         u2_cmd = np.clip(
-            np.asarray(pol.act_att_obs(obs_att, deterministic=deterministic), dtype=np.float32),
+            np.asarray(
+                pol.act_att_obs(obs_att, deterministic=deterministic, sigma_feat=sigma_feat),
+                dtype=np.float32,
+            ),
             -umax,
             +umax,
         )
@@ -528,7 +543,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 return p
 
             if ukf12 is not None:
-                ukf12.predict(dt, u=_to3_u(u2_real), u_cov=None)
+                ukf12.predict(dt, u=_u3(u2_real), u_cov=None)
                 if take:
                     p_obs = _to3_pos(x1)
                     p_tgt = _to3_pos(x2)
@@ -544,7 +559,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 est_hist["est12_xyz"].append(ukf12.x[:3].copy())
 
             if ukf21 is not None:
-                ukf21.predict(dt, u=_to3_u(u1_real), u_cov=None)
+                ukf21.predict(dt, u=_u3(u1_real), u_cov=None)
                 if take:
                     p_obs = _to3_pos(x2)
                     p_tgt = _to3_pos(x1)

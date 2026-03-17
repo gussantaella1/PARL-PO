@@ -1,20 +1,27 @@
 # rl_infer_1v2.py
 
 import os
-from typing import Dict, Any, Tuple
+import pickle
+from typing import Any, Dict, Tuple
 
 import numpy as np
 import torch
 
-# Import the Diff-Nash network + rule-based attacker from training script
-from rl_loop import ActorCriticDiff, AttackerRuleController
+from core.controllers import AttackerRuleController
+from rl_loop_1v2 import ActorCriticDiff
 
 
-import os
-from typing import Dict, Any, Tuple
-
-
-from rl_loop_1v2 import ActorCriticDiff, AttackerRuleController
+def _load_checkpoint_payload(path: str, map_location, label: str):
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        print(
+            f"[rl_infer_1v2] {label}: legacy checkpoint format detected; "
+            "retrying torch.load(..., weights_only=False)."
+        )
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 
 
@@ -91,7 +98,7 @@ class RLPolicy_Multi:
             raise FileNotFoundError(self.def_ckpt)
 
         self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, cfg).to(self.device)
-        sd_def = torch.load(self.def_ckpt, map_location=self.device)
+        sd_def = _load_checkpoint_payload(self.def_ckpt, map_location=self.device, label="DEF")
         if isinstance(sd_def, dict) and "state_dict" in sd_def:
             sd_def = sd_def["state_dict"]
         sd_def = _strip_ignored_keys(sd_def)
@@ -116,7 +123,7 @@ class RLPolicy_Multi:
                 raise FileNotFoundError(self.att_ckpt)
 
             self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, cfg).to(self.device)
-            sd_att = torch.load(self.att_ckpt, map_location=self.device)
+            sd_att = _load_checkpoint_payload(self.att_ckpt, map_location=self.device, label="ATT")
             if isinstance(sd_att, dict) and "state_dict" in sd_att:
                 sd_att = sd_att["state_dict"]
             sd_att = _strip_ignored_keys(sd_att)
@@ -219,4 +226,3 @@ class RLPolicy_Multi:
         u = self.rule_ctrl.act(p1, v1, pk, vk)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)
     
-

@@ -4,13 +4,29 @@ from __future__ import annotations
 
 import copy
 import os
+import pickle
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 from config_rl import build_dyn
-from rl_loop import ActorCriticDiff, AttackerRuleController
+from core.controllers import AttackerRuleController
+from core.distill import PartialObsStudentPolicy
+from core.models import ActorCriticDiff
+
+
+def _load_checkpoint_payload(path: str, map_location, label: str):
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        print(
+            f"[rl_infer_diff] {label}: legacy checkpoint format detected; "
+            "retrying torch.load(..., weights_only=False)."
+        )
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 
 class RLPolicyDiff:
@@ -79,6 +95,8 @@ class RLPolicyDiff:
 
         self.obs_dim_def = 5 * self.D + self.obs_extra
         self.obs_dim_att = 5 * self.D + self.obs_extra
+        self.student_xhat_dim = 2 * self.D
+        self.student_sigma_dim = (2 * self.D) * (2 * self.D + 1) // 2
 
         # ---- Arena center (for reconstructing p1, p2 from obs in rule mode) ----
         ar = self.cfg.get("arena", {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0})
@@ -107,8 +125,18 @@ class RLPolicyDiff:
         if not os.path.exists(self.def_ckpt):
             raise FileNotFoundError(f"Defender checkpoint not found: {self.def_ckpt}")
 
-        self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, self.cfg).to(self.device)
-        self._load_net_checkpoint(self.def_net, self.def_ckpt, name="DEF")
+        def_payload = _load_checkpoint_payload(self.def_ckpt, map_location=self.device, label="DEF")
+        self.def_is_student = self._extract_student_state_dict(def_payload) is not None
+        if self.def_is_student:
+            self.def_net = self._build_student_model(def_payload).to(self.device)
+            self._load_student_checkpoint(self.def_net, def_payload, name="DEF")
+            self.def_hidden = self.def_net.init_hidden(batch_size=1, device=self.device)
+            self.def_u_prev = np.zeros((self.act_dim,), dtype=np.float32)
+        else:
+            self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, self.cfg).to(self.device)
+            self._load_net_checkpoint_from_payload(self.def_net, def_payload, name="DEF")
+            self.def_hidden = None
+            self.def_u_prev = None
         self.def_net.eval()
         for p in self.def_net.parameters():
             p.requires_grad_(False)
@@ -116,6 +144,9 @@ class RLPolicyDiff:
         # ==================== ATTACKER (RL or RULE) ====================
         self.att_net = None
         self.rule_ctrl = None
+        self.att_is_student = False
+        self.att_hidden = None
+        self.att_u_prev = None
 
         if self.attacker_mode == "rl":
             self.att_ckpt = att_ckpt or self._pick(
@@ -133,8 +164,16 @@ class RLPolicyDiff:
             if not os.path.exists(self.att_ckpt):
                 raise FileNotFoundError(f"Attacker checkpoint not found: {self.att_ckpt}")
 
-            self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, self.cfg).to(self.device)
-            self._load_net_checkpoint(self.att_net, self.att_ckpt, name="ATT")
+            att_payload = _load_checkpoint_payload(self.att_ckpt, map_location=self.device, label="ATT")
+            self.att_is_student = self._extract_student_state_dict(att_payload) is not None
+            if self.att_is_student:
+                self.att_net = self._build_student_model(att_payload).to(self.device)
+                self._load_student_checkpoint(self.att_net, att_payload, name="ATT")
+                self.att_hidden = self.att_net.init_hidden(batch_size=1, device=self.device)
+                self.att_u_prev = np.zeros((self.act_dim,), dtype=np.float32)
+            else:
+                self.att_net = ActorCriticDiff(self.obs_dim_att, self.act_dim, self.cfg).to(self.device)
+                self._load_net_checkpoint_from_payload(self.att_net, att_payload, name="ATT")
             self.att_net.eval()
             for p in self.att_net.parameters():
                 p.requires_grad_(False)
@@ -202,8 +241,31 @@ class RLPolicyDiff:
 
         raise RuntimeError("Could not extract state_dict from checkpoint payload.")
 
-    def _load_net_checkpoint(self, model: torch.nn.Module, ckpt_path: str, name: str = "NET") -> None:
-        payload = torch.load(ckpt_path, map_location=self.device)
+    @staticmethod
+    def _extract_student_state_dict(payload: Any) -> Optional[Dict[str, torch.Tensor]]:
+        if isinstance(payload, dict) and isinstance(payload.get("student_state_dict"), dict):
+            return payload["student_state_dict"]
+        return None
+
+    def _build_student_model(self, payload: Any) -> PartialObsStudentPolicy:
+        meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
+        payload_cfg = payload.get("cfg", {}) if isinstance(payload, dict) else {}
+        latent_dim = int(meta.get("latent_dim", payload_cfg.get("distill_latent_dim", 8)))
+        return PartialObsStudentPolicy(
+            xhat_dim=self.student_xhat_dim,
+            sigma_dim=self.student_sigma_dim,
+            act_dim=self.act_dim,
+            latent_dim=latent_dim,
+            lstm_hidden=256,
+            act_scale=self.umax,
+        )
+
+    def _load_net_checkpoint_from_payload(
+        self,
+        model: torch.nn.Module,
+        payload: Any,
+        name: str = "NET",
+    ) -> None:
         sd = self._extract_state_dict(payload)
         sd = self._strip_ignored_keys(sd)
 
@@ -211,6 +273,23 @@ class RLPolicyDiff:
         if miss.missing_keys or miss.unexpected_keys:
             print(
                 f"[rl_infer_diff] {name} load: "
+                f"missing={miss.missing_keys} unexpected={miss.unexpected_keys}"
+            )
+
+    def _load_student_checkpoint(
+        self,
+        model: PartialObsStudentPolicy,
+        payload: Any,
+        name: str = "STUDENT",
+    ) -> None:
+        sd = self._extract_student_state_dict(payload)
+        if sd is None:
+            raise RuntimeError(f"{name} checkpoint is not a recognized student checkpoint.")
+
+        miss = model.load_state_dict(sd, strict=False)
+        if miss.missing_keys or miss.unexpected_keys:
+            print(
+                f"[rl_infer_diff] {name} student load: "
                 f"missing={miss.missing_keys} unexpected={miss.unexpected_keys}"
             )
 
@@ -229,9 +308,52 @@ class RLPolicyDiff:
             return self.use_mean_at_eval
         return bool(deterministic)
 
+    def _student_features(
+        self,
+        obs: np.ndarray,
+        sigma_feat: Optional[np.ndarray],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
+        rel = obs_np[2 * self.D : 3 * self.D]
+        v1 = obs_np[3 * self.D : 4 * self.D]
+        v2 = obs_np[4 * self.D : 5 * self.D]
+        xhat_rel = np.concatenate([rel, v2 - v1]).astype(np.float32)
+
+        if sigma_feat is None:
+            sigma_np = np.zeros((self.student_sigma_dim,), dtype=np.float32)
+        else:
+            sigma_np = np.asarray(sigma_feat, dtype=np.float32).reshape(-1)
+            if sigma_np.shape[0] != self.student_sigma_dim:
+                raise ValueError(
+                    f"sigma_feat has dim {sigma_np.shape[0]}, expected {self.student_sigma_dim}."
+                )
+
+        return xhat_rel, sigma_np
+
+    def _act_one_student(
+        self,
+        model: PartialObsStudentPolicy,
+        obs: np.ndarray,
+        sigma_feat: Optional[np.ndarray],
+        hidden: Tuple[torch.Tensor, torch.Tensor],
+        u_prev: np.ndarray,
+    ) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor], np.ndarray]:
+        xhat_rel, sigma_np = self._student_features(obs, sigma_feat)
+
+        xhat_t = torch.as_tensor(xhat_rel[None, :], dtype=torch.float32, device=self.device)
+        sigma_t = torch.as_tensor(sigma_np[None, :], dtype=torch.float32, device=self.device)
+        uprev_t = torch.as_tensor(u_prev[None, :], dtype=torch.float32, device=self.device)
+
+        with torch.no_grad():
+            a_env, _, hidden = model.step(xhat_t, sigma_t, uprev_t, hidden)
+
+        a = a_env.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        a = np.clip(a, -self.umax, +self.umax)
+        return a, hidden, a.copy()
+
     def _act_one_obs(
         self,
-        net: ActorCriticDiff,
+        net: torch.nn.Module,
         obs: np.ndarray,
         who: str,
         deterministic: Optional[bool],
@@ -261,13 +383,32 @@ class RLPolicyDiff:
         """
         return self.obs_dim_def, self.obs_dim_att
 
-    def act_def_obs(self, obs: np.ndarray, deterministic: Optional[bool] = None) -> np.ndarray:
+    def act_def_obs(
+        self,
+        obs: np.ndarray,
+        deterministic: Optional[bool] = None,
+        sigma_feat: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """
         Defender action from observation.
         """
+        if self.def_is_student:
+            a, self.def_hidden, self.def_u_prev = self._act_one_student(
+                self.def_net,
+                obs,
+                sigma_feat,
+                self.def_hidden,
+                self.def_u_prev,
+            )
+            return a
         return self._act_one_obs(self.def_net, obs, who="def", deterministic=deterministic)
 
-    def act_att_obs(self, obs: np.ndarray, deterministic: Optional[bool] = None) -> np.ndarray:
+    def act_att_obs(
+        self,
+        obs: np.ndarray,
+        deterministic: Optional[bool] = None,
+        sigma_feat: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
         """
         Attacker action from observation.
 
@@ -279,6 +420,15 @@ class RLPolicyDiff:
         if self.attacker_mode == "rl":
             if self.att_net is None:
                 raise RuntimeError("attacker_mode='rl' but attacker net is not initialized.")
+            if self.att_is_student:
+                a, self.att_hidden, self.att_u_prev = self._act_one_student(
+                    self.att_net,
+                    obs_np,
+                    sigma_feat,
+                    self.att_hidden,
+                    self.att_u_prev,
+                )
+                return a
             return self._act_one_obs(self.att_net, obs_np, who="att", deterministic=deterministic)
 
         if self.rule_ctrl is None:

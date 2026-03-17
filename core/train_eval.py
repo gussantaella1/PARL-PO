@@ -758,7 +758,7 @@ def train_with_distill(
         pass
 
     # =========================================================
-    # STUDENT (UKF) via distillation
+    # STUDENT (UKF-observation) via distillation into ActorCriticDiff
     # =========================================================
     student_out = None
 
@@ -784,11 +784,6 @@ def train_with_distill(
 
         student_out = os.path.join(out_dir, f"{phase_name}_ukf_student.pt")
 
-        # NOTE:
-        # distill_from_teacher() is currently defender-centric internally.
-        # This unified wrapper preserves your current behavior, but if you want
-        # truly symmetric attacker distillation, distill_from_teacher() itself
-        # should be generalized later.
         student, metrics_student = distill_from_teacher(
             cfg_student,
             teacher_ckpt,
@@ -900,4 +895,3 @@ def rollout_metrics(states: np.ndarray, center: np.ndarray, R: float):
     d2_delta = np.diff(d2, prepend=d2[:1])
 
     return {"d1_norm": d1, "d2_norm": d2, "rel2_norm": rel2, "d2_delta": d2_delta}
-

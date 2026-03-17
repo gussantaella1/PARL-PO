@@ -8,9 +8,9 @@
 #         - paper_ne  : ARS best-response on (Je, Jpi)
 #         - minmax    : zero-sum security (maximin) on a scalar g derived from the paper
 #
-#   (2) "ppo_oi_minmax" objectives (match your PPO intent):
-#         - attackers try to reach the object of interest (OI) at the arena center
-#         - defender tries to keep them away (security/maximin)
+#   (2) "ppo_zero_sum" objectives (match the current PPO env zero-sum g):
+#         g = k_pos * d2 - k_dock * dock_gap - lD * ||uD||^2 + lA * ||uA||^2
+#         plus the same terminal events/order used in core/env.py
 #
 # Output dict keys are styled to match your RL rollout runners:
 #   exec1_xyz/exec2_xyz/(exec3_xyz), plan_hist*, u_cmd_all, u_cmd_norm_all, etc.
@@ -121,41 +121,56 @@ def _baseline_objective_mode(cfg: Dict[str, Any]) -> str:
     """
     Outer objective switch:
       - "paper"          : replicate the paper’s pursuit-evasion objectives
-      - "ppo_oi_minmax"  : match PPO meaning (attackers -> OI; defender fends off)
+      - "ppo_zero_sum"   : match the current PPO zero-sum env reward
     """
     d = cfg.get("paper_baseline", {}) or {}
     mode = (d.get("objective") or "paper").lower()
-    if mode not in ("paper", "ppo_oi_minmax"):
+    if mode in ("ppo_oi_minmax", "zero_sum"):
+        mode = "ppo_zero_sum"
+    if mode not in ("paper", "ppo_zero_sum"):
         mode = "paper"
     return mode
 
 
 # ============================================================
-# PPO-like OI objective bundle (for security / maximin)
+# PPO zero-sum objective bundle (for security / maximin)
 # ============================================================
 
 @dataclass
 class PPOObjectiveParams:
-    # Core security meaning: defender wants attacker far from OI
+    # Core zero-sum step reward used in core/env.py
     k_pos: float = 1.0
+    k_dock: float = 0.0
+    lD: float = 0.0
+    lA: float = 0.0
+    collision_radius_m: float = 0.0
 
-    # Optional extras (turn on/off to match RL exactly)
+    # Optional extras (off by default; not part of the default PPO g)
     include_step_walls: bool = False
     include_keepout: bool = False
-    include_effort_def: bool = False
-    lD: float = 0.0
+    include_terminal: bool = True
+    lookahead: int = 1
 
-    # Wall / keepout params (only used if enabled)
+    # Step-shaping stabilizers / terminal params
     wallK: float = 10.0
+    wall_penalty: float = 0.0
+    collision_penalty: float = 0.0
+    target_hit_reward_penalty: float = 0.0
     soft_wall: float = 0.7
     margin: float = 1.0
 
     oi_radius_m: float = 0.0
     def_keepout_buffer_m: float = 0.0
     def_center_avoid_coef: float = 0.0
+    hit_buffer_def: float = 0.0
+    hit_buffer_att: float = 0.0
 
     # Threat selection
-    threat_mode: str = "idx0"   # "idx0" matches your Env which uses attacker[0]
+    threat_mode: str = "idx0"   # "idx0" matches core/env.py
+
+
+def _ppo_obj_params_from_cfg(cfg: Dict[str, Any]) -> PPOObjectiveParams:
+    return PPOObjectiveParams()
 
 def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PPOObjectiveParams:
     oi = cfg.get("oi", {}) or {}
@@ -165,20 +180,29 @@ def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PP
     p.def_center_avoid_coef = float(cfg.get("def_center_avoid_coef", p.def_center_avoid_coef))
 
     p.wallK = float(cfg.get("wall_penalty", p.wallK))
+    p.wall_penalty = float(cfg.get("wall_penalty", p.wall_penalty))
+    p.collision_penalty = float(cfg.get("collision_penalty", p.collision_penalty))
+    p.target_hit_reward_penalty = float(
+        cfg.get("target_hit_reward_penalty", p.target_hit_reward_penalty)
+    )
     p.soft_wall = float(cfg.get("soft_wall_start", p.soft_wall))
     p.margin = float(cfg.get("arena_terminate_margin", p.margin))
 
-    # IMPORTANT: in your RL code you use cfg["k_pos"] (sometimes step_pos_coef elsewhere)
+    # Match the current zero-sum env reward.
     p.k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", p.k_pos)))
-
-    # effort only if you want it in baseline g
+    p.k_dock = float(cfg.get("k_dock", p.k_dock))
     p.lD = float(cfg.get("effort_def", p.lD))
+    p.lA = float(cfg.get("effort_att", p.lA))
+    p.collision_radius_m = float(cfg.get("collision_radius_m", p.collision_radius_m))
+    p.hit_buffer_def = float(cfg.get("hit_buffer_def", p.hit_buffer_def))
+    p.hit_buffer_att = float(cfg.get("hit_buffer_att", p.hit_buffer_att))
 
     pb = cfg.get("paper_baseline", {}) or {}
-    obj = (pb.get("ppo_obj", {}) or {})
+    obj = (pb.get("zero_sum", {}) or pb.get("ppo_obj", {}) or {})
     p.include_step_walls = bool(obj.get("include_step_walls", p.include_step_walls))
     p.include_keepout    = bool(obj.get("include_keepout", p.include_keepout))
-    p.include_effort_def = bool(obj.get("include_effort_def", p.include_effort_def))
+    p.include_terminal   = bool(obj.get("include_terminal", p.include_terminal))
+    p.lookahead          = int(obj.get("lookahead", p.lookahead))
     p.threat_mode        = (obj.get("threat_mode", p.threat_mode) or p.threat_mode).lower()
 
     return p
@@ -850,10 +874,71 @@ def _def_keepout_penalty(p_def: np.ndarray, center: np.ndarray, oi_r: float, buf
 
 
 def _pick_threat_attacker(pA_list: List[np.ndarray], center: np.ndarray, mode: str) -> int:
-    if (mode or "closest_to_center") == "idx0":
+    mode = (mode or "idx0").lower()
+    if mode in ("idx0", "primary", "first"):
         return 0
     d2 = [float(np.dot(p - center, p - center)) for p in pA_list]
     return int(np.argmin(d2))
+
+
+def _ppo_terminal_adjustment(
+    pD: np.ndarray,
+    pA_list: List[np.ndarray],
+    center: np.ndarray,
+    R: float,
+    params: PPOObjectiveParams,
+    primary_idx: int,
+) -> Tuple[float, Dict[str, Any]]:
+    eps = 1e-12
+    oi_r_norm = float(params.oi_radius_m) / (float(R) + eps) if R > 0.0 else 0.0
+
+    rho_def = float(np.linalg.norm(pD - center) / (float(R) + eps))
+    rho_att = float(np.linalg.norm(pA_list[primary_idx] - center) / (float(R) + eps))
+
+    thresh_def = (1.0 + float(params.hit_buffer_def)) * oi_r_norm
+    thresh_att = (1.0 + float(params.hit_buffer_att)) * oi_r_norm
+
+    att_hit_target = (oi_r_norm > 0.0) and (rho_att <= thresh_att)
+    def_hit_target = (oi_r_norm > 0.0) and (rho_def <= thresh_def)
+    hit_target = bool(att_hit_target or def_hit_target)
+
+    collision = False
+    if float(params.collision_radius_m) > 0.0:
+        for pA in pA_list:
+            if float(np.linalg.norm(pA - pD)) <= float(params.collision_radius_m):
+                collision = True
+                break
+
+    oob_def = bool(rho_def >= float(params.margin))
+    oob_att = any(
+        float(np.linalg.norm(pA - center) / (float(R) + eps)) >= float(params.margin)
+        for pA in pA_list
+    )
+
+    done = bool(collision or hit_target or oob_def or oob_att)
+
+    g_term = 0.0
+    if done:
+        if collision:
+            g_term += float(params.collision_penalty)
+        elif att_hit_target or def_hit_target:
+            g_term -= float(params.target_hit_reward_penalty)
+        elif oob_def:
+            g_term -= float(params.wall_penalty)
+        elif oob_att:
+            g_term += float(params.wall_penalty)
+
+    info = {
+        "done": done,
+        "collision": bool(collision),
+        "att_hit_target": bool(att_hit_target),
+        "def_hit_target": bool(def_hit_target),
+        "oob_def": bool(oob_def),
+        "oob_att": bool(oob_att),
+        "terminal_g": float(g_term),
+        "primary_idx": int(primary_idx),
+    }
+    return float(g_term), info
 
 
 def _ppo_security_value_g(
@@ -866,35 +951,48 @@ def _ppo_security_value_g(
     center: np.ndarray,
     R: float,
     params: PPOObjectiveParams,
-    *,
-    lookahead: int = 1,   # set >1 if you want “paper-style” foresight
+    umax: float,
 ) -> float:
     D = int(xD.size // 2)
     eps = 1e-12
 
-    # --- predict forward (default 1-step; you can set lookahead=params.tau if you want) ---
+    # core/env.py is one-step. Keep optional lookahead for experimentation, default 1.
+    lookahead = max(1, int(params.lookahead))
     xD_pred, xA_pred = _predict_positions(
         xE=xD, xP=xA_list,
         uE=uD, uP=uA_list,
-        k0=k, n_steps=max(1, int(lookahead)),
+        k0=k, n_steps=lookahead,
         step_plant_single=step_plant_single,
     )
 
     pD = np.asarray(xD_pred[:D], float)
     pA = [np.asarray(x[:D], float) for x in xA_pred]
 
-    # --- threat selection: idx0 matches your RL Env (primary attacker only) ---
+    # idx0 matches core/env.py; other modes are exploratory overrides.
     ith = _pick_threat_attacker(pA, center, params.threat_mode)
 
-    # d2 (normalized squared dist to center)
     d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
+    dist_rel = float(np.linalg.norm(pA[ith] - pD))
+    dock_gap = max(0.0, dist_rel - float(params.collision_radius_m)) / (float(R) + eps)
 
-    # --- RL-aligned security payoff ---
-    g = float(params.k_pos) * d2
+    uD = np.asarray(uD, float).reshape(-1)
+    umax2 = float(umax) * float(umax) + eps
+    aD_n2 = float(np.dot(uD, uD)) / umax2
+    aA_n2 = float(
+        np.mean([
+            float(np.dot(np.asarray(uA, float).reshape(-1), np.asarray(uA, float).reshape(-1))) / umax2
+            for uA in uA_list
+        ])
+    )
 
-    # Optional shaping (only include if you also include it in RL g)
-    if params.include_effort_def and float(params.lD) != 0.0:
-        g -= float(params.lD) * float(np.dot(uD, uD))
+    g = (
+        float(params.k_pos) * d2
+        - float(params.k_dock) * dock_gap
+        - float(params.lD) * aD_n2
+        + float(params.lA) * aA_n2
+    )
+
+    # Optional smooth stabilizers. These are not part of the default PPO g.
 
     if params.include_step_walls:
         g -= _wall_penalty(pD, center, R, params.soft_wall, params.wallK)
@@ -906,6 +1004,17 @@ def _ppo_security_value_g(
             buf=params.def_keepout_buffer_m,
             coef=params.def_center_avoid_coef
         )
+
+    if params.include_terminal:
+        g_term, _ = _ppo_terminal_adjustment(
+            pD=pD,
+            pA_list=pA,
+            center=center,
+            R=R,
+            params=params,
+            primary_idx=0,
+        )
+        g += g_term
 
     return float(g)
 
@@ -962,7 +1071,7 @@ def _solve_one_step_minmax_team_ppo_oi(
                 xD=xD, xA_list=xA_list,
                 uD=uD, uA_list=uA,
                 k=k, step_plant_single=step_plant_single,
-                center=center, R=R, params=ppo_params
+                center=center, R=R, params=ppo_params, umax=umax
             )
             if (best is None) or (g < best - paper_params.ne_tol):
                 best = g
@@ -978,7 +1087,7 @@ def _solve_one_step_minmax_team_ppo_oi(
                 xD=xD, xA_list=xA_list,
                 uD=uD, uA_list=uA,
                 k=k, step_plant_single=step_plant_single,
-                center=center, R=R, params=ppo_params
+                center=center, R=R, params=ppo_params, umax=umax
             )
             if (best is None) or (g > best + paper_params.ne_tol):
                 best = g
@@ -1020,11 +1129,11 @@ def _solve_one_step_minmax_team_ppo_oi(
         xD=xD, xA_list=xA_list,
         uD=uD_star, uA_list=uA_star,
         k=k, step_plant_single=step_plant_single,
-        center=center, R=R, params=ppo_params
+        center=center, R=R, params=ppo_params, umax=umax
     )
 
     dbg = {
-        "objective": "ppo_oi_minmax",
+        "objective": "ppo_zero_sum",
         "ars_iters": int(it_used),
         "g_star": float(g_star),
         "idx_def": int(idx_d),
@@ -1074,7 +1183,7 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
       - Agent 2 (exec2) = "pursuer slot" (your attacker slot)
 
     Objective switch:
-      cfg["paper_baseline"]["objective"] in {"paper","ppo_oi_minmax"}
+      cfg["paper_baseline"]["objective"] in {"paper","ppo_zero_sum"}
 
     Paper submode:
       cfg["paper"]["game_mode"] in {"paper_ne","minmax"}
@@ -1095,7 +1204,7 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     step_plant_single, center, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     R = float(cfg.get("arena", {}).get("r", 30.0))
 
-    # PPO-OI objective params (only used if obj_mode == "ppo_oi_minmax")
+    # PPO zero-sum objective params (only used if obj_mode == "ppo_zero_sum")
     ppo_obj = _populate_ppo_obj_from_cfg(cfg, _ppo_obj_params_from_cfg(cfg))
 
     # initial states
@@ -1122,10 +1231,12 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     # debug logs
     it_hist: List[int] = []
     g_star_hist: List[float] = []
+    terminal_hist: List[Dict[str, Any]] = []
+    stopped_early = False
 
     # t=0
-    exec_xyz1.append(_p3(xE, D))
-    exec_xyz2.append(_p3(xP, D))
+    exec_xyz1.append(_p3(xE[:D], D))
+    exec_xyz2.append(_p3(xP[:D], D))
     exec_att1.append({"R": _identity_R(), "phi": 0.0}); phi_hist1.append(0.0)
     exec_att2.append({"R": _identity_R(), "phi": 0.0}); phi_hist2.append(0.0)
     fov_axis_hist.append(None); fov_seen_mask.append(False)
@@ -1144,9 +1255,9 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
             uP = uP_list[0]
 
         else:
-            # PPO-style OI security game:
-            # - defender (xE) maximizes g
-            # - attacker (xP) minimizes g
+            # PPO-style zero-sum game:
+            # - defender maximizes g
+            # - attacker minimizes g
             uD, uA_list, dbg = _solve_one_step_minmax_team_ppo_oi(
                 xD=xE, xA_list=[xP],
                 uD_prev=uE_prev, uA_prev=uP_prev,
@@ -1174,6 +1285,16 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
         xE = step_plant_single(xE, uE, k)
         xP = step_plant_single(xP, uP, k)
 
+        _, term_dbg = _ppo_terminal_adjustment(
+            pD=np.asarray(xE[:D], float),
+            pA_list=[np.asarray(xP[:D], float)],
+            center=center,
+            R=R,
+            params=ppo_obj,
+            primary_idx=0,
+        )
+        terminal_hist.append(term_dbg)
+
         # update neighborhood centers
         uE_prev = uE
         uP_prev = [uP]
@@ -1194,6 +1315,10 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
         exec_xyz2.append(_p3(xP, D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
+        if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
+            stopped_early = True
+            break
+
     out = {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
         "plan_att1": plan_att1, "plan_att2": plan_att2,
@@ -1211,6 +1336,8 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
         "baseline_objective": obj_mode,
         "iters_hist": it_hist,
         "g_star_hist": g_star_hist,
+        "terminal_hist": terminal_hist,
+        "stopped_early": bool(stopped_early),
     }
     return out
 
@@ -1228,7 +1355,7 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
       - Agents 2&3      = "pursuer slots" (your attacker slots)
 
     Objective switch:
-      cfg["paper_baseline"]["objective"] in {"paper","ppo_oi_minmax"}
+      cfg["paper_baseline"]["objective"] in {"paper","ppo_zero_sum"}
 
     Paper submode:
       cfg["paper"]["game_mode"] in {"paper_ne","minmax"}
@@ -1274,11 +1401,13 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
 
     it_hist: List[int] = []
     g_star_hist: List[float] = []
+    terminal_hist: List[Dict[str, Any]] = []
+    stopped_early = False
 
     # t=0
-    exec_xyz1.append(_p3(xE, D))
-    exec_xyz2.append(_p3(xP0, D))
-    exec_xyz3.append(_p3(xP1, D))
+    exec_xyz1.append(_p3(xE[:D], D))
+    exec_xyz2.append(_p3(xP0[:D], D))
+    exec_xyz3.append(_p3(xP1[:D], D))
     I = _identity_R()
     exec_att1.append({"R": I, "phi": 0.0}); phi_hist1.append(0.0)
     exec_att2.append({"R": I, "phi": 0.0}); phi_hist2.append(0.0)
@@ -1330,6 +1459,16 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
         xP0 = step_plant_single(xP0, uP0, k)
         xP1 = step_plant_single(xP1, uP1, k)
 
+        _, term_dbg = _ppo_terminal_adjustment(
+            pD=np.asarray(xE[:D], float),
+            pA_list=[np.asarray(xP0[:D], float), np.asarray(xP1[:D], float)],
+            center=center,
+            R=R,
+            params=ppo_obj,
+            primary_idx=0,
+        )
+        terminal_hist.append(term_dbg)
+
         # update neighborhood centers
         uE_prev = uE
         uP_prev = [uP0, uP1]
@@ -1351,6 +1490,10 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
         exec_xyz2.append(_p3(xP0, D))
         exec_xyz3.append(_p3(xP1, D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
+
+        if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
+            stopped_early = True
+            break
 
     out = {
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
@@ -1384,6 +1527,8 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
         "baseline_objective": obj_mode,
         "iters_hist": it_hist,
         "g_star_hist": g_star_hist,
+        "terminal_hist": terminal_hist,
+        "stopped_early": bool(stopped_early),
     }
     return out
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+import pickle
 import random
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,19 @@ from core.models import ActorCriticDiff
 from core.controllers import AttackerRuleController
 from core.env import Env
 
+
+
+def _load_checkpoint_payload(path: str, map_location, label: str):
+    try:
+        return torch.load(path, map_location=map_location)
+    except pickle.UnpicklingError as exc:
+        if "Weights only load failed" not in str(exc):
+            raise
+        print(
+            f"[distill] {label}: legacy checkpoint format detected; "
+            "retrying torch.load(..., weights_only=False)."
+        )
+        return torch.load(path, map_location=map_location, weights_only=False)
 
 
 # Assumes these already exist in your codebase:
@@ -231,7 +245,7 @@ def _load_teacher_bundle(
     If the intent encoder is missing, we can optionally fall back to handcrafted
     simulation-derived intent labels (cfg["allow_sim_intent_fallback"]=True).
     """
-    payload = torch.load(ckpt_path, map_location=device)
+    payload = _load_checkpoint_payload(ckpt_path, map_location=device, label="teacher")
 
     policy_sd = _extract_state_dict(
         payload,
@@ -318,7 +332,7 @@ def _load_policy_if_needed(
     if ckpt_path is None:
         raise RuntimeError(missing_msg)
 
-    payload = torch.load(ckpt_path, map_location=device)
+    payload = _load_checkpoint_payload(ckpt_path, map_location=device, label="opponent")
     sd = _extract_state_dict(
         payload,
         ["policy_state_dict", "state_dict", "model", "net", "def_net", "att_net", "actor_critic"],
@@ -461,27 +475,24 @@ def distill_from_teacher(
     out_path: str = "ppo_def_ukf_distilled.pt",
 ):
     """
-    Paper-style teacher -> partially-observable student distillation.
+    Distill a full-state teacher into an ActorCriticDiff student that consumes the
+    same observation interface as PPO, but under cfg["use_ukf"]=True.
 
-    What this implements:
-      - fully-observable teacher action labels from the true state
-      - privileged teacher latent labels z_t from FUTURE relative trajectory
-      - partially-observable student with recurrent encoder over
-          (xhat_rel_t, Sigma_t, u_{t-1})
-      - DAgger rollout collection
-      - supervised losses on BOTH:
-          (1) action imitation
-          (2) latent intent imitation
+    The student architecture intentionally matches fully-observable PPO so that:
+      - checkpoints are plain ActorCriticDiff state_dicts
+      - inference stays on the same code path as teacher checkpoints
+      - defender/attacker evaluation remains apples-to-apples
 
-    Important:
-      Preferred: teacher checkpoint contains BOTH policy and privileged intent encoder E*.
-      Optional fallback: if E* is missing and cfg["allow_sim_intent_fallback"] is True,
-      we synthesize intent labels from mini simulation rollouts of teacher+attacker.
-      This preserves the rollout logic but is less paper-faithful than learned E*.
+    Distillation target:
+      - teacher mean action from the true full-state observation
+
+    Student input:
+      - env._obs() under use_ukf=True, i.e. the observation stream already produced
+        by the environment / filter stack
     """
     cfg = copy.deepcopy(cfg)
 
-    # Student must be partial-observable
+    # Student observes the partial-observation stream produced by Env._obs().
     cfg["use_ukf"] = True
 
     # Ensure dynamics exist
@@ -499,39 +510,30 @@ def distill_from_teacher(
     if distill_role not in {"def", "att"}:
         raise ValueError(f"Unsupported train_role for distillation: {distill_role!r}")
 
-    # DAgger / TBPTT hyperparams
+    # DAgger hyperparams
     episodes_per_iter = int(cfg.get("episodes_per_iter", 8))
     max_steps         = int(cfg.get("max_steps", cfg.get("T", 300)))
     iters             = int(cfg.get("iters", 100))
-    lookahead_H       = int(cfg.get("lookahead_H", 15))
-    tbptt_chunk_len   = int(cfg.get("tbptt_chunk_len", 40))
 
     beta_start = float(cfg.get("dagger_beta_start", 1.0))
     beta_end   = float(cfg.get("dagger_beta_end", 0.0))
     beta_decay = int(cfg.get("dagger_decay_iters", 50))
 
-    latent_dim       = int(cfg.get("distill_latent_dim", 8))
-    lambda_intent    = float(cfg.get("lambda_intent", 1.0))
     student_lr       = float(cfg.get("distill_lr", cfg.get("policy_lr", 3e-4)))
     grad_clip_norm   = float(cfg.get("max_grad_norm", 1.0))
     max_dataset_eps  = int(cfg.get("max_dataset_episodes", 512))
     log_every        = int(cfg.get("log_every", 10))
 
-    # Student feature sizes
-    xhat_dim = 2 * D
-    sigma_dim = (2 * D) * (2 * D + 1) // 2
-    rel_dim = 2 * D
-
     # Teacher bundle
-    teacher_policy, teacher_intent = _load_teacher_bundle(
+    teacher_policy, _teacher_intent = _load_teacher_bundle(
         ckpt_path=teacher_ckpt_path,
         obs_dim=obs_dim,
         act_dim=act_dim,
         cfg=cfg,
         device=device,
-        lookahead_H=lookahead_H,
-        rel_dim=rel_dim,
-        latent_dim=latent_dim,
+        lookahead_H=1,
+        rel_dim=2 * D,
+        latent_dim=int(cfg.get("distill_latent_dim", 8)),
     )
 
     # Opponent during distillation
@@ -564,19 +566,11 @@ def distill_from_teacher(
             "Attacker distillation requires a defender checkpoint path for the frozen opponent.",
         )
 
-    # Student
-    student = PartialObsStudentPolicy(
-        xhat_dim=xhat_dim,
-        sigma_dim=sigma_dim,
-        act_dim=act_dim,
-        latent_dim=latent_dim,
-        lstm_hidden=256,
-        act_scale=act_scale,
-    ).to(device)
+    # Student uses the exact PPO policy class.
+    student = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
 
     optimizer = optim.Adam(student.parameters(), lr=student_lr)
     act_loss_fn = nn.MSELoss()
-    z_loss_fn   = nn.MSELoss()
 
     def beta_at(iter_idx: int) -> float:
         if beta_decay <= 0:
@@ -584,49 +578,34 @@ def distill_from_teacher(
         alpha = min(1.0, max(0.0, iter_idx / float(beta_decay)))
         return float((1.0 - alpha) * beta_start + alpha * beta_end)
 
-    dataset: List[DAggerEpisode] = []
+    dataset: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
     metrics = {
         "iter": [],
         "dagger_beta": [],
         "loss": [],
         "loss_action": [],
-        "loss_intent": [],
         "dataset_episodes": [],
     }
 
-    print("=== Paper-style distillation: full-state teacher -> UKF partial-observable student ===")
+    print("=== Distillation: full-state teacher -> UKF-observation ActorCriticDiff student ===")
     print(f"teacher_ckpt={teacher_ckpt_path}")
     print(f"distill_role={distill_role}")
     print(f"attacker_mode={attacker_mode}")
-    print(f"lookahead_H={lookahead_H}, latent_dim={latent_dim}, tbptt_chunk_len={tbptt_chunk_len}")
-    print(f"intent_source={'teacher_encoder' if teacher_intent is not None else 'sim_fallback'}")
+    print(f"student_arch=ActorCriticDiff  obs_dim={obs_dim}  act_dim={act_dim}")
 
     for it in range(iters):
         beta_exec = beta_at(it)
-        new_eps: List[DAggerEpisode] = []
+        new_eps: List[Tuple[torch.Tensor, torch.Tensor]] = []
 
         # -------------------------------------------------
         # 1) DAgger collection
         # -------------------------------------------------
         for _ in range(episodes_per_iter):
             env = Env(cfg)
-            env.reset()
-
-            hidden = student.init_hidden(batch_size=1, device=device)
-            u_prev_exec = np.zeros((act_dim,), dtype=np.float32)
-
-            xhat_hist = []
-            sigma_hist = []
-            uprev_hist = []
-            uteach_hist = []
-            rel_hist = []
+            obs_student = env.reset()
 
             for _t in range(max_steps):
-                # student inputs from UKF / filter belief
-                xhat_rel_np, sigma_np, u_prev_np = _ukf_student_features_from_env(env, u_prev_exec)
-                rel_true_np = _true_relative_state_from_env(env)
-
                 # teacher labels from full state + privileged future
                 full_obs_np = _full_obs_from_env(env)
                 u_teacher_np = _teacher_action_env(
@@ -637,13 +616,12 @@ def distill_from_teacher(
                     distill_role=distill_role,
                 )
 
-                # student prediction
-                xhat_t = torch.as_tensor(xhat_rel_np[None, :], dtype=torch.float32, device=device)
-                sigma_t = torch.as_tensor(sigma_np[None, :], dtype=torch.float32, device=device)
-                uprev_t = torch.as_tensor(u_prev_np[None, :], dtype=torch.float32, device=device)
-
                 with torch.no_grad():
-                    a_student_t, zhat_t, hidden = student.step(xhat_t, sigma_t, uprev_t, hidden)
+                    o_student_t = torch.as_tensor(
+                        obs_student[None, :], dtype=torch.float32, device=device
+                    )
+                    dist_student = student.dist(o_student_t, who=distill_role)
+                    a_student_t = torch.tanh(dist_student.mean) * act_scale
                     a_student_np = a_student_t[0].detach().cpu().numpy().astype(np.float32)
 
                 # DAgger execution mixture
@@ -666,47 +644,23 @@ def distill_from_teacher(
                 else:
                     a1_env, aA_env = a_opp_exec, a_exec
 
-                _, _, _, done, _ = env.step(
+                obs_next, _, _, done, _ = env.step(
                     a1_env=a1_env,
                     aA_env=aA_env,
                     reward_mode="both",
                 )
 
                 # store supervised sample
-                xhat_hist.append(xhat_rel_np.copy())
-                sigma_hist.append(sigma_np.copy())
-                uprev_hist.append(u_prev_np.copy())
-                uteach_hist.append(u_teacher_np.copy())
-                rel_hist.append(rel_true_np.copy())
-
-                u_prev_exec = a_exec.copy()
+                new_eps.append(
+                    (
+                        torch.as_tensor(obs_student.copy(), dtype=torch.float32, device=device),
+                        torch.as_tensor(u_teacher_np.copy(), dtype=torch.float32, device=device),
+                    )
+                )
+                obs_student = obs_next
 
                 if done:
                     break
-
-            rel_hist_t = torch.as_tensor(np.stack(rel_hist), dtype=torch.float32, device=device)
-            future_rel_t = _future_window_tensor(rel_hist_t, lookahead_H)
-            if teacher_intent is not None:
-                with torch.no_grad():
-                    z_teacher_t = teacher_intent(future_rel_t)
-            else:
-                z_teacher_np = np.stack(
-                    [
-                        _sim_intent_from_future_rel_traj(future_rel_t[k].detach().cpu().numpy(), latent_dim=latent_dim)
-                        for k in range(future_rel_t.shape[0])
-                    ],
-                    axis=0,
-                )
-                z_teacher_t = torch.as_tensor(z_teacher_np, dtype=torch.float32, device=device)
-
-            ep = DAggerEpisode(
-                xhat_rel=torch.as_tensor(np.stack(xhat_hist), dtype=torch.float32, device=device),
-                sigma=torch.as_tensor(np.stack(sigma_hist), dtype=torch.float32, device=device),
-                u_prev=torch.as_tensor(np.stack(uprev_hist), dtype=torch.float32, device=device),
-                u_teacher=torch.as_tensor(np.stack(uteach_hist), dtype=torch.float32, device=device),
-                z_teacher=z_teacher_t,
-            )
-            new_eps.append(ep)
 
         dataset.extend(new_eps)
         if len(dataset) > max_dataset_eps:
@@ -719,30 +673,24 @@ def distill_from_teacher(
 
         total_loss = 0.0
         total_act  = 0.0
-        total_z    = 0.0
-        n_chunks   = 0
+        n_batches  = 0
 
-        for ep in dataset:
-            hidden = student.init_hidden(batch_size=1, device=device)
+        if dataset:
+            batch_size = int(cfg.get("distill_batch_size", min(512, max(32, len(dataset)))))
+            order = torch.randperm(len(dataset), device=device)
+            obs_all = torch.stack([x for x, _ in dataset], dim=0)
+            act_all = torch.stack([u for _, u in dataset], dim=0)
 
-            for xhat_seq, sigma_seq, uprev_seq, uteach_seq, zteach_seq in _iter_tbptt_chunks(ep, tbptt_chunk_len):
-                if isinstance(hidden, tuple):
-                    hidden = tuple(h.detach() for h in hidden)
-                else:
-                    hidden = hidden.detach()
+            for start in range(0, len(dataset), batch_size):
+                idx = order[start : start + batch_size]
+                obs_batch = obs_all[idx]
+                act_batch = act_all[idx]
 
-                pred_actions, pred_latents, hidden = student.forward_chunk(
-                    xhat_seq.unsqueeze(0),
-                    sigma_seq.unsqueeze(0),
-                    uprev_seq.unsqueeze(0),
-                    hidden,
-                )
-                pred_actions = pred_actions.squeeze(0)
-                pred_latents = pred_latents.squeeze(0)
+                dist = student.dist(obs_batch, who=distill_role)
+                pred_actions = torch.tanh(dist.mean) * act_scale
 
-                loss_act = act_loss_fn(pred_actions, uteach_seq)
-                loss_z   = z_loss_fn(pred_latents, zteach_seq)
-                loss = loss_act + lambda_intent * loss_z
+                loss_act = act_loss_fn(pred_actions, act_batch)
+                loss = loss_act
 
                 optimizer.zero_grad(set_to_none=True)
                 loss.backward()
@@ -750,49 +698,31 @@ def distill_from_teacher(
                 optimizer.step()
 
                 total_loss += float(loss.detach().cpu())
-                total_act  += float(loss_act.detach().cpu())
-                total_z    += float(loss_z.detach().cpu())
-                n_chunks   += 1
+                total_act += float(loss_act.detach().cpu())
+                n_batches += 1
 
         # -------------------------------------------------
         # 3) Logging
         # -------------------------------------------------
         if (it % log_every == 0) or (it == iters - 1):
-            mean_loss = total_loss / max(1, n_chunks)
-            mean_act  = total_act / max(1, n_chunks)
-            mean_z    = total_z / max(1, n_chunks)
+            mean_loss = total_loss / max(1, n_batches)
+            mean_act  = total_act / max(1, n_batches)
 
             print(
                 f"[distill {it:04d}] beta={beta_exec:.3f}  "
-                f"loss={mean_loss:.3e}  action={mean_act:.3e}  latent={mean_z:.3e}  "
-                f"dataset_eps={len(dataset)}"
+                f"loss={mean_loss:.3e}  action={mean_act:.3e}  "
+                f"dataset_samples={len(dataset)}"
             )
 
             metrics["iter"].append(float(it))
             metrics["dagger_beta"].append(float(beta_exec))
             metrics["loss"].append(mean_loss)
             metrics["loss_action"].append(mean_act)
-            metrics["loss_intent"].append(mean_z)
             metrics["dataset_episodes"].append(float(len(dataset)))
 
-    # Save a richer student checkpoint
+    # Save a plain ActorCriticDiff checkpoint so inference uses the same path as PPO.
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    torch.save(
-        {
-            "student_state_dict": student.state_dict(),
-            "cfg": cfg,
-            "meta": {
-                "type": "paper_style_partial_obs_student",
-                "uses_ukf": True,
-                "latent_dim": latent_dim,
-                "lookahead_H": lookahead_H,
-                "tbptt_chunk_len": tbptt_chunk_len,
-                "teacher_ckpt_path": teacher_ckpt_path,
-            },
-            "metrics": metrics,
-        },
-        out_path,
-    )
+    torch.save(student.state_dict(), out_path)
     print(f"[distill] saved student checkpoint -> {out_path}")
 
     return student, metrics
