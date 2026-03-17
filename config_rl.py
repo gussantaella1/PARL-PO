@@ -110,6 +110,11 @@ COMMON: Dict[str, Any] = {
         "alpha": 0.18,
         "edgecolor": "k"        
     },
+
+    "mcp": {
+        "solver": "path",
+        "executable": "/home/gs34433/Research/path_5/ampl/pathampl",       
+    },
 }
 
 # ---------- Kalman / measurement subconfig ----------
