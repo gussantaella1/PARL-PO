@@ -144,12 +144,14 @@ class PPOObjectiveParams:
     lD: float = 0.0
     lA: float = 0.0
     collision_radius_m: float = 0.0
+    gamma: float = 1.0
 
     # Optional extras (off by default; not part of the default PPO g)
     include_step_walls: bool = False
     include_keepout: bool = False
     include_terminal: bool = True
     lookahead: int = 1
+    objective_mode: str = "discounted_sum"
 
     # Step-shaping stabilizers / terminal params
     wallK: float = 10.0
@@ -193,6 +195,7 @@ def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PP
     p.k_dock = float(cfg.get("k_dock", p.k_dock))
     p.lD = float(cfg.get("effort_def", p.lD))
     p.lA = float(cfg.get("effort_att", p.lA))
+    p.gamma = float(cfg.get("gamma", p.gamma))
     p.collision_radius_m = float(cfg.get("collision_radius_m", p.collision_radius_m))
     p.hit_buffer_def = float(cfg.get("hit_buffer_def", p.hit_buffer_def))
     p.hit_buffer_att = float(cfg.get("hit_buffer_att", p.hit_buffer_att))
@@ -203,6 +206,7 @@ def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PP
     p.include_keepout    = bool(obj.get("include_keepout", p.include_keepout))
     p.include_terminal   = bool(obj.get("include_terminal", p.include_terminal))
     p.lookahead          = int(obj.get("lookahead", p.lookahead))
+    p.objective_mode     = (obj.get("objective_mode", p.objective_mode) or p.objective_mode).lower()
     p.threat_mode        = (obj.get("threat_mode", p.threat_mode) or p.threat_mode).lower()
 
     return p
@@ -956,57 +960,85 @@ def _ppo_security_value_g(
     D = int(xD.size // 2)
     eps = 1e-12
 
-    # core/env.py is one-step. Keep optional lookahead for experimentation, default 1.
-    lookahead = max(1, int(params.lookahead))
-    xD_pred, xA_pred = _predict_positions(
-        xE=xD, xP=xA_list,
-        uE=uD, uP=uA_list,
-        k0=k, n_steps=lookahead,
-        step_plant_single=step_plant_single,
-    )
+    def _ppo_step_reward_g(pD: np.ndarray, pA: List[np.ndarray]) -> float:
+        ith = _pick_threat_attacker(pA, center, params.threat_mode)
+        d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
+        dist_rel = float(np.linalg.norm(pA[ith] - pD))
+        dock_gap = max(0.0, dist_rel - float(params.collision_radius_m)) / (float(R) + eps)
 
-    pD = np.asarray(xD_pred[:D], float)
-    pA = [np.asarray(x[:D], float) for x in xA_pred]
-
-    # idx0 matches core/env.py; other modes are exploratory overrides.
-    ith = _pick_threat_attacker(pA, center, params.threat_mode)
-
-    d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
-    dist_rel = float(np.linalg.norm(pA[ith] - pD))
-    dock_gap = max(0.0, dist_rel - float(params.collision_radius_m)) / (float(R) + eps)
-
-    uD = np.asarray(uD, float).reshape(-1)
-    umax2 = float(umax) * float(umax) + eps
-    aD_n2 = float(np.dot(uD, uD)) / umax2
-    aA_n2 = float(
-        np.mean([
-            float(np.dot(np.asarray(uA, float).reshape(-1), np.asarray(uA, float).reshape(-1))) / umax2
-            for uA in uA_list
-        ])
-    )
-
-    g = (
-        float(params.k_pos) * d2
-        - float(params.k_dock) * dock_gap
-        - float(params.lD) * aD_n2
-        + float(params.lA) * aA_n2
-    )
-
-    # Optional smooth stabilizers. These are not part of the default PPO g.
-
-    if params.include_step_walls:
-        g -= _wall_penalty(pD, center, R, params.soft_wall, params.wallK)
-
-    if params.include_keepout:
-        g -= _def_keepout_penalty(
-            p_def=pD, center=center,
-            oi_r=params.oi_radius_m,
-            buf=params.def_keepout_buffer_m,
-            coef=params.def_center_avoid_coef
+        uD_loc = np.asarray(uD, float).reshape(-1)
+        umax2 = float(umax) * float(umax) + eps
+        aD_n2 = float(np.dot(uD_loc, uD_loc)) / umax2
+        aA_n2 = float(
+            np.mean([
+                float(np.dot(np.asarray(uA, float).reshape(-1), np.asarray(uA, float).reshape(-1))) / umax2
+                for uA in uA_list
+            ])
         )
 
-    if params.include_terminal:
-        g_term, _ = _ppo_terminal_adjustment(
+        g_step = (
+            float(params.k_pos) * d2
+            - float(params.k_dock) * dock_gap
+            - float(params.lD) * aD_n2
+            + float(params.lA) * aA_n2
+        )
+
+        if params.include_step_walls:
+            g_step -= _wall_penalty(pD, center, R, params.soft_wall, params.wallK)
+
+        if params.include_keepout:
+            g_step -= _def_keepout_penalty(
+                p_def=pD,
+                center=center,
+                oi_r=params.oi_radius_m,
+                buf=params.def_keepout_buffer_m,
+                coef=params.def_center_avoid_coef,
+            )
+
+        return float(g_step)
+
+    lookahead = max(1, int(params.lookahead))
+    objective_mode = (params.objective_mode or "discounted_sum").lower()
+
+    if objective_mode == "terminal_state":
+        xD_pred, xA_pred = _predict_positions(
+            xE=xD, xP=xA_list,
+            uE=uD, uP=uA_list,
+            k0=k, n_steps=lookahead,
+            step_plant_single=step_plant_single,
+        )
+        pD = np.asarray(xD_pred[:D], float)
+        pA = [np.asarray(x[:D], float) for x in xA_pred]
+        g = _ppo_step_reward_g(pD, pA)
+        if params.include_terminal:
+            g_term, _ = _ppo_terminal_adjustment(
+                pD=pD,
+                pA_list=pA,
+                center=center,
+                R=R,
+                params=params,
+                primary_idx=0,
+            )
+            g += g_term
+        return float(g)
+
+    gamma = float(params.gamma)
+    xD_cur = np.asarray(xD, np.float32).copy()
+    xA_cur = [np.asarray(x, np.float32).copy() for x in xA_list]
+    total_g = 0.0
+    disc = 1.0
+
+    for t in range(lookahead):
+        kk = k + t
+        xD_cur = step_plant_single(xD_cur, uD, kk)
+        for i in range(len(xA_cur)):
+            xA_cur[i] = step_plant_single(xA_cur[i], uA_list[i], kk)
+
+        pD = np.asarray(xD_cur[:D], float)
+        pA = [np.asarray(x[:D], float) for x in xA_cur]
+
+        g_step = _ppo_step_reward_g(pD, pA)
+        g_term, term_dbg = _ppo_terminal_adjustment(
             pD=pD,
             pA_list=pA,
             center=center,
@@ -1014,9 +1046,15 @@ def _ppo_security_value_g(
             params=params,
             primary_idx=0,
         )
-        g += g_term
+        if params.include_terminal:
+            g_step += g_term
 
-    return float(g)
+        total_g += disc * float(g_step)
+        if term_dbg["done"]:
+            break
+        disc *= gamma
+
+    return float(total_g)
 
 
 def _solve_one_step_minmax_team_ppo_oi(

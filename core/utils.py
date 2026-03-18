@@ -1,5 +1,7 @@
+import math
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 # =============================================================
 # Utils
@@ -20,7 +22,8 @@ def squash_action(u_raw: torch.Tensor, act_scale: float) -> torch.Tensor:
 
 
 def logprob_squashed(dist: torch.distributions.Normal, u_raw: torch.Tensor) -> torch.Tensor:
-    # log p(tanh(u)) = log p(u) - sum log(1 - tanh(u)^2)
+    # Stable tanh-squash correction:
+    # log(1 - tanh(u)^2) = 2 * (log 2 - u - softplus(-2u))
     logp = dist.log_prob(u_raw).sum(-1)
-    correction = torch.log1p(-torch.tanh(u_raw).pow(2) + 1e-8).sum(-1)
+    correction = (2.0 * (math.log(2.0) - u_raw - F.softplus(-2.0 * u_raw))).sum(-1)
     return logp - correction

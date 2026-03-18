@@ -2,6 +2,7 @@ import gc
 import os
 import time
 from typing import Any, Dict
+from collections import Counter
 
 import numpy as np
 import torch
@@ -10,9 +11,10 @@ from config_rl import build_dyn, config_for_train
 from core.buffers import RolloutBuffer
 from core.distill import distill_from_teacher
 from core.env import Env, VecEnv, collect_ic_history_from_vecenv
+from core.models import ActorCriticDiff
 from core.plotting import make_tb_writer
 from core.ppo import PPO
-from core.utils import set_seed
+from core.utils import set_seed, squash_action
 from core.freeze_utils import freeze_module_, snapshot_state_dict, assert_frozen_unchanged, assert_deterministic_action
 
 # =============================================================
@@ -35,6 +37,129 @@ def _save_role_checkpoint(ppo, train_role: str, path: str):
 
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(_cpu_state_dict(net), path)
+
+
+def _normalize_probs(entries):
+    probs = np.asarray([float(e.get("prob", 0.0)) for e in entries], dtype=float)
+    if np.all(probs <= 0.0):
+        probs = np.full((len(entries),), 1.0 / max(1, len(entries)), dtype=float)
+    total = float(probs.sum())
+    if total <= 0.0:
+        raise ValueError("Opponent mix probabilities must sum to a positive value.")
+    return probs / total
+
+
+def _load_frozen_policy(
+    *,
+    obs_dim: int,
+    act_dim: int,
+    cfg: Dict[str, Any],
+    device: str,
+    ckpt_path: str,
+):
+    net = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    state = torch.load(ckpt_path, map_location=device)
+    net.load_state_dict(state)
+    freeze_module_(net)
+    return net
+
+
+def _build_opponent_policy_mix(
+    *,
+    cfg: Dict[str, Any],
+    obs_dim: int,
+    act_dim: int,
+    device: str,
+    train_role: str,
+):
+    mix = cfg.get("opp_mix", {}) or {}
+    policy_entries = list(mix.get("policies", []) or [])
+    if not policy_entries:
+        return None
+
+    opp_role = "def" if train_role == "att" else "att"
+    if opp_role == "att" and str(cfg.get("attacker_mode", "rule")).lower() != "rl":
+        raise ValueError("Checkpoint-based opp_mix for defender training requires attacker_mode='rl'.")
+
+    entries = []
+    for item in policy_entries:
+        name = str(item.get("name", f"{opp_role}_policy_{len(entries)}"))
+        path = item.get("path")
+        if not path:
+            raise ValueError(f"opp_mix policy entry {name!r} is missing 'path'.")
+
+        net = _load_frozen_policy(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            cfg=cfg,
+            device=device,
+            ckpt_path=path,
+        )
+        entries.append({
+            "name": name,
+            "net": net,
+            "prob": float(item.get("prob", 0.0)),
+            "path": path,
+            "action_scale": float(item.get("action_scale", 1.0)),
+            "noise_std": float(item.get("noise_std", 0.0)),
+            "idle_prob": float(item.get("idle_prob", 0.0)),
+        })
+
+    probs = _normalize_probs(entries)
+    resample = str(mix.get("resample", "episode")).lower()
+    if resample not in ("episode", "update", "never"):
+        raise ValueError(f"Unsupported opp_mix resample={resample!r}; expected 'episode', 'update', or 'never'.")
+
+    return {
+        "opp_role": opp_role,
+        "entries": entries,
+        "probs": probs,
+        "resample": resample,
+        "act_dim": act_dim,
+    }
+
+
+def _sample_opponent_indices(mix_state, size: int):
+    return np.random.choice(len(mix_state["entries"]), size=size, p=mix_state["probs"]).astype(np.int64)
+
+
+@torch.no_grad()
+def _act_from_opponent_policy_mix(
+    obs_batch: torch.Tensor,
+    mix_state,
+    active_indices: np.ndarray,
+    act_scale: float,
+):
+    opp_role = mix_state["opp_role"]
+    act_dim = int(mix_state["act_dim"])
+    out = torch.zeros((obs_batch.shape[0], act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
+
+    unique_ids = np.unique(active_indices)
+    for idx in unique_ids:
+        mask_np = (active_indices == idx)
+        mask = torch.as_tensor(mask_np, dtype=torch.bool, device=obs_batch.device)
+        entry = mix_state["entries"][int(idx)]
+        net = entry["net"]
+        dist = net.dist(obs_batch[mask], who=opp_role)
+        a = squash_action(dist.mean, act_scale)
+
+        action_scale = float(entry.get("action_scale", 1.0))
+        noise_std = float(entry.get("noise_std", 0.0))
+        idle_prob = float(entry.get("idle_prob", 0.0))
+
+        if action_scale != 1.0:
+            a = action_scale * a
+
+        if noise_std > 0.0:
+            a = a + noise_std * torch.randn_like(a)
+
+        if idle_prob > 0.0:
+            idle_mask = (torch.rand((a.shape[0], 1), device=a.device) < idle_prob)
+            a = torch.where(idle_mask, torch.zeros_like(a), a)
+
+        a = torch.clamp(a, -act_scale, act_scale)
+        out[mask] = a
+    return out
 
 def train(cfg: Dict[str, Any]):
 
@@ -144,9 +269,6 @@ def train(cfg: Dict[str, Any]):
         # attacker is frozen opponent in defender-training
         snap_att = snapshot_state_dict(ppo.att_net)
 
-
-
-
     # NEW: LR schedule config
     lr_schedule = cfg.get("lr_schedule", "none")
     lr_final_factor = float(cfg.get("lr_final_factor", 0.1))
@@ -179,6 +301,24 @@ def train(cfg: Dict[str, Any]):
         metrics["mdot_def_mean"] = []
         metrics["mdot_att_mean"] = []
 
+    opp_policy_mix = _build_opponent_policy_mix(
+        cfg=cfg,
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        device=device,
+        train_role=train_role,
+    )
+    mix_name_to_metric = None
+    mix_active_idx = None
+    if opp_policy_mix is not None:
+        mix_name_to_metric = {
+            entry["name"]: f"opp_mix__{entry['name']}"
+            for entry in opp_policy_mix["entries"]
+        }
+        for metric_name in mix_name_to_metric.values():
+            metrics[metric_name] = []
+        mix_active_idx = _sample_opponent_indices(opp_policy_mix, num_envs)
+
 
 
     # Optional anneal of defender center tether
@@ -187,6 +327,10 @@ def train(cfg: Dict[str, Any]):
 
     for upd in range(1, total_updates + 1):
         term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
+        mix_counts_update = Counter()
+
+        if (opp_policy_mix is not None) and (opp_policy_mix["resample"] == "update"):
+            mix_active_idx = _sample_opponent_indices(opp_policy_mix, num_envs)
 
 
         # ---------- optional LR decay (linear) ----------
@@ -246,11 +390,28 @@ def train(cfg: Dict[str, Any]):
 
         for _ in range(steps_per_env):
             with torch.no_grad():
-                det_def = (train_role != "def")   # defender is opponent unless training defender
-                det_att = (train_role != "att")   # attacker is opponent unless training attacker
-
-                a1, lp1, v1 = ppo.act(o, who="def", deterministic=det_def)
-                a2, lp2, v2 = ppo.act(o, who="att", deterministic=det_att)
+                if train_role == "def":
+                    a1, lp1, v1 = ppo.act(o, who="def", deterministic=False)
+                    if opp_policy_mix is not None:
+                        a2 = _act_from_opponent_policy_mix(
+                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
+                        )
+                        lp2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        v2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                    else:
+                        a2, lp2, v2 = ppo.act(o, who="att", deterministic=True)
+                elif train_role == "att":
+                    if opp_policy_mix is not None:
+                        a1 = _act_from_opponent_policy_mix(
+                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
+                        )
+                        lp1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        v1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                    else:
+                        a1, lp1, v1 = ppo.act(o, who="def", deterministic=True)
+                    a2, lp2, v2 = ppo.act(o, who="att", deterministic=False)
+                else:
+                    raise ValueError(f"Unknown train_role={train_role!r}")
 
 
             a1_np = a1.cpu().numpy()
@@ -287,6 +448,16 @@ def train(cfg: Dict[str, Any]):
                 ep_ret_att += r2_np
             
             o = o2
+
+            if opp_policy_mix is not None:
+                mix_counts_update.update(int(i) for i in mix_active_idx.tolist())
+                if opp_policy_mix["resample"] == "episode":
+                    done_mask = d_np.astype(bool)
+                    if np.any(done_mask):
+                        mix_active_idx[done_mask] = _sample_opponent_indices(
+                            opp_policy_mix,
+                            int(done_mask.sum()),
+                        )
 
             # ---- accumulate truth / belief metrics from Env.info ----
             for inf in infos:
@@ -509,6 +680,14 @@ def train(cfg: Dict[str, Any]):
 
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
+            if opp_policy_mix is not None:
+                total_mix = max(1, sum(mix_counts_update.values()))
+                mix_summary = []
+                for idx, entry in enumerate(opp_policy_mix["entries"]):
+                    frac = float(mix_counts_update.get(idx, 0)) / total_mix
+                    metrics[mix_name_to_metric[entry["name"]]].append(frac)
+                    mix_summary.append(f"{entry['name']}={frac:.2f}")
+                print("opp mix usage:", ", ".join(mix_summary))
 
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
@@ -716,6 +895,7 @@ def train_with_distill(
     #         cfg_teacher["train_ic_mode"] = "random_shell"
 
     DISTILL = bool(cfg_teacher.get("distill", False))
+    DISTILL_METHOD = str(cfg_teacher.get("distill_method", "modern"))
 
     build_dyn(cfg_teacher)
 
@@ -731,7 +911,7 @@ def train_with_distill(
         )
 
     print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-    print(f"[{phase_name.upper()}] train_role={train_role}  distill={DISTILL}")
+    print(f"[{phase_name.upper()}] train_role={train_role}  distill={DISTILL}  distill_method={DISTILL_METHOD}")
 
     cfg_teacher["checkpoint_dir"] = out_dir
     cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
@@ -813,6 +993,7 @@ def train_with_distill(
         "teacher_last_ckpt_path": ckpt_info["last_ckpt_path"],
         "student_ckpt": student_out,
         "distill_enabled": DISTILL,
+        "distill_method": DISTILL_METHOD,
     }
 
     return teacher_ckpt, student_out, meta

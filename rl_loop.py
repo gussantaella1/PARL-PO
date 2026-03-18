@@ -163,6 +163,37 @@ if __name__ == "__main__":
             #     "weak_scale": 0.25,              # 0.0 -> basically none, 1.0 -> full def0
             #     "weak_noise_std": 0.00,          # optional additive Gaussian in action space
             # },
+            # Checkpoint-based defender mixture:
+            "opp_mix": {
+                "resample": "episode",
+                "policies": [
+                    {
+                        "name": "def0_full",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.5,
+                        "action_scale": 1.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def0_weak",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.3,
+                        "action_scale": 0.25,
+                        "noise_std": 0.05,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def0_very_weak",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.2,
+                        "action_scale": 0.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                ],
+            },
+
         }
 
         with runlog.stage(
@@ -222,6 +253,37 @@ if __name__ == "__main__":
                         # "gamma": 0.990, # Performed poorly against .994 attacker, good against .990 
                         # "gamma": 0.994, # Performed poorly against .994 attacker
                         "gamma": 0.991,
+                        # Checkpoint-based attacker mixture:
+                        "opp_mix": {
+                            "resample": "episode",
+                            "policies": [
+                                {
+                                    "name": "att1_full",
+                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "prob": 0.5,
+                                    "action_scale": 1.0,
+                                    "noise_std": 0.0,
+                                    "idle_prob": 0.0,
+                                },
+                                {
+                                    "name": "att1_weak",
+                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "prob": 0.3,
+                                    "action_scale": 0.25,
+                                    "noise_std": 0.05,
+                                    "idle_prob": 0.0,
+                                },
+                                {
+                                    "name": "att1_very_weak",
+                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "prob": 0.2,
+                                    "action_scale": 0.0,
+                                    "noise_std": 0.0,
+                                    "idle_prob": 0.0,
+                                },
+                            ],
+                        },
+
                         }
 
         with runlog.stage(
@@ -280,6 +342,63 @@ if __name__ == "__main__":
             "train_ic_mode": "random_shell",
             "r_att_min": 0.0,
             "gamma": 0.991,
+
+            # Checkpoint-based attacker mixture:
+            "opp_mix": {
+                "resample": "episode",
+                "policies": [
+                    {
+                        "name": "def0_full",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.15,
+                        "action_scale": 1.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def0_weak",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.15,
+                        "action_scale": 0.25,
+                        "noise_std": 0.05,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def0_very_weak",
+                        "path": "Training_Policy/def0_teacher.pt",
+                        "prob": 0.1,
+                        "action_scale": 0.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+
+                    {
+                        "name": "def1_full",
+                        "path": "Training_Policy/def1_teacher.pt",
+                        "prob": 0.3,
+                        "action_scale": 1.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def1_weak",
+                        "path": "Training_Policy/def1_teacher.pt",
+                        "prob": 0.2,
+                        "action_scale": 0.25,
+                        "noise_std": 0.05,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "def1_very_weak",
+                        "path": "Training_Policy/def1_teacher.pt",
+                        "prob": 0.1,
+                        "action_scale": 0.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                ],
+            },
+
         }
 
         with runlog.stage(
@@ -336,6 +455,65 @@ if __name__ == "__main__":
             "def_ckpt_path": def1_teacher_ckpt,
             "freeze_attacker": True,
             "gamma": 0.991,
+
+                # Checkpoint-based attacker mixture:
+            "opp_mix": {
+                "resample": "episode",
+                "policies": [
+                    {
+                        "name": "att1_full",
+                        "path": "Training_Policy/att1_teacher.pt",
+                        "prob": 0.15,
+                        "action_scale": 1.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "att1_weak",
+                        "path": "Training_Policy/att1_teacher.pt",
+                        "prob": 0.15,
+                        "action_scale": 0.25,
+                        "noise_std": 0.05,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "att1_very_weak",
+                        "path": "Training_Policy/att1_teacher.pt",
+                        "prob": 0.1,
+                        "action_scale": 0.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+
+                    {
+                        "name": "att2_full",
+                        "path": "Training_Policy/att2_teacher.pt",
+                        "prob": 0.3,
+                        "action_scale": 1.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "att2_weak",
+                        "path": "Training_Policy/att2_teacher.pt",
+                        "prob": 0.2,
+                        "action_scale": 0.25,
+                        "noise_std": 0.05,
+                        "idle_prob": 0.0,
+                    },
+                    {
+                        "name": "att2_very_weak",
+                        "path": "Training_Policy/att2_teacher.pt",
+                        "prob": 0.1,
+                        "action_scale": 0.0,
+                        "noise_std": 0.0,
+                        "idle_prob": 0.0,
+                    },
+                ],
+            },
+
+
+            
         }
 
         with runlog.stage(

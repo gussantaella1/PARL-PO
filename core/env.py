@@ -117,6 +117,9 @@ class Env:
         self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
+        self.reward_from_belief = bool(cfg.get("reward_from_belief", False))
+        self.belief_clip_factor = float(cfg.get("belief_clip_factor", 2.0))
+        self.reset_ukf_on_diverge = bool(cfg.get("reset_ukf_on_diverge", True))
 
         #Fuel config
         fuel = cfg.get("fuel", {})
@@ -235,6 +238,33 @@ class Env:
 
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
+
+    def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
+        if (not self.use_ukf) or (self.ukf is None):
+            return p2_true, v2_true
+
+        p2_bel = self.ukf.x[:self.D].copy()
+        v2_bel = self.ukf.x[self.D:2*self.D].copy()
+
+        r_est = np.linalg.norm(p2_bel - self.center)
+        r_max = self.belief_clip_factor * self.radius
+
+        if (not np.isfinite(r_est)) or (r_est > r_max):
+            if np.isfinite(r_est) and r_est > 1e-9:
+                direction = (p2_bel - self.center) / r_est
+                p2_bel = self.center + direction * r_max
+            else:
+                p2_bel = p2_true.copy()
+                v2_bel = v2_true.copy()
+
+            if self.reset_ukf_on_diverge:
+                self.ukf.x[:self.D] = p2_true
+                self.ukf.x[self.D:2*self.D] = v2_true
+                self.ukf.P = self._ukf_P0.copy()
+                p2_bel = p2_true.copy()
+                v2_bel = v2_true.copy()
+
+        return p2_bel, v2_bel
 
     def reset(self) -> np.ndarray:
         self.t = 0
@@ -479,26 +509,9 @@ class Env:
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
 
-        # ---- initialize d2_prev using belief if UKF is on ----
-        if self.use_ukf and (self.ukf is not None):
-            p2_geom = self.ukf.x[:self.D].copy()
-
-            r_est = np.linalg.norm(p2_geom - self.center)
-            R = self.radius
-            clip_factor = float(self.cfg.get("belief_clip_factor", 2.0))
-            r_max = clip_factor * R
-
-            if (not np.isfinite(r_est)) or (r_est > r_max):
-                if np.isfinite(r_est) and r_est > 1e-9:
-                    direction = (p2_geom - self.center) / r_est
-                    p2_geom = self.center + direction * r_max
-                else:
-                    p2_geom = p2.copy()
-
-                if self.cfg.get("reset_ukf_on_diverge", True):
-                    self.ukf.x[:self.D] = p2
-                    self.ukf.x[self.D:2*self.D] = v2
-                    self.ukf.P = self._ukf_P0.copy()
+        # ---- initialize d2_prev using the same geometry mode as step rewards ----
+        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
+            p2_geom, _ = self._belief_state(p2, v2)
         else:
             p2_geom = p2
 
@@ -632,13 +645,18 @@ class Env:
         # else:
         #     p2_geom = p2
 
+        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
+            p2_reward, v2_reward = self._belief_state(p2, v2)
+        else:
+            p2_reward, v2_reward = p2, v2
+
         # ---- shared geometry needed by whichever reward(s) we compute ----
         # d2 and rel2 are used by both rewards
-        d2_raw = float(np.dot(p2 - self.center, p2 - self.center))
+        d2_raw = float(np.dot(p2_reward - self.center, p2_reward - self.center))
         d2 = d2_raw / (self.radius**2)
         delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
-        rel2 = float(np.dot((p2 - p1), (p2 - p1))) / (self.radius**2)
+        rel2 = float(np.dot((p2_reward - p1), (p2_reward - p1))) / (self.radius**2)
 
         # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
         if need_def:
@@ -653,7 +671,7 @@ class Env:
         center_keepout = 0.0
 
         rho1 = np.linalg.norm(p1 - self.center)/ self.radius
-        rho2 = np.linalg.norm(p2 - self.center) / self.radius
+        rho2 = np.linalg.norm(p2_reward - self.center) / self.radius
 
         v_scale = self.radius / self.dt
 
@@ -673,7 +691,7 @@ class Env:
 
         #Attacker vars
 
-        v2n2 = float(np.dot(v2, v2)) / (v_scale**2)
+        v2n2 = float(np.dot(v2_reward, v2_reward)) / (v_scale**2)
         a2n2 = float(np.dot(a2_cmd, a2_cmd)) / (self.u_hi**2)
 
         wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
@@ -803,7 +821,7 @@ class Env:
 
         elif use_zero_sum:
 
-            dist_rel = np.linalg.norm(p2 - p1)
+            dist_rel = np.linalg.norm(p2_reward - p1)
             dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self.radius
 
             g = (
@@ -816,6 +834,9 @@ class Env:
 
             #Effort regularizer 
             g += - self.lD * a1n2 + self.lA * a2n2
+
+            if self.use_ukf and self.use_meas_reward:
+                g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
 
             if self.use_fuel:
                 # eff_def = thrust_def / (self.Tmax_def + 1e-9)
@@ -917,7 +938,10 @@ class Env:
         # ---- always compute these for logging ----
         d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
         d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
-        # d2_belief_norm = float(np.dot(p2_geom - self.center, p2_geom - self.center)) / (self.radius**2)
+        d2_belief_norm = None
+        if self.use_ukf and (self.ukf is not None):
+            p2_belief, _ = self._belief_state(p2, v2)
+            d2_belief_norm = float(np.dot(p2_belief - self.center, p2_belief - self.center)) / (self.radius**2)
 
         info = {
             "t": self.t,
@@ -930,7 +954,6 @@ class Env:
             # NEW: what your logger expects
             "d1_true_norm": d1_true_norm,
             "d2_true_norm": d2_true_norm,
-            # "d2_belief_norm": d2_belief_norm,
 
             "collision": bool(collision),
 
@@ -939,6 +962,8 @@ class Env:
         if self.use_ukf:
             info["meas_innov_sq"] = meas_innov_sq
             info["ukf_trPpos"] = meas_trPpos
+            if d2_belief_norm is not None:
+                info["d2_belief_norm"] = d2_belief_norm
 
         if self.use_fuel:
             fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
@@ -1292,5 +1317,3 @@ def _sample_opp_domain(cfg: Dict[str, Any]) -> str:
 
     probs = probs / (probs.sum() + 1e-12)
     return str(np.random.choice(modes, p=probs))
-
-

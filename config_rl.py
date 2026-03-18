@@ -189,6 +189,23 @@ TRAIN: Dict[str, Any] = {
     "scale_invariant": True, # Normalizes radii
 
     "distill": True, #Does policy distillation, True or False
+    "distill_method": "modern",  # "modern", "teacher_forced", "intervention", or "original"
+    "distill_warm_start_from_teacher": True,
+    "distill_teacher_label": "mean",   # "mean" or "sample"
+    "distill_batch_size": 2048,
+    "distill_epochs": 4,
+    "distill_buffer_capacity": None,   # if None, derived from max_dataset_episodes * max_steps
+    "distill_w_nll": 1.0,
+    "distill_w_kl": 0.0,
+    "distill_w_mse": 0.0,
+    "distill_w_v": 0.0,
+    "distill_train_logstd": False,
+    "distill_logstd_min": -5.0,
+    "distill_logstd_max": 1.0,
+    "distill_intervention_action_l2_thresh": None,
+    "distill_intervention_oi_margin_m": 1.0,
+    "distill_intervention_collision_margin_m": 1.0,
+    "distill_log_every": 10,
 
     "def_ckpt_path": None,
     "att_ckpt_path": None,
@@ -280,6 +297,7 @@ TRAIN: Dict[str, Any] = {
     # "target_hit_reward_penalty": 5.0,
     # "collision_penalty": 5.0,
     # "wall_penalty": 5.0,
+    # "fuel_depletion_penalty": 5.0,
 
     "record_ic_history": True,
     "max_ic_history": 300000,
@@ -359,6 +377,12 @@ TRAIN: Dict[str, Any] = {
     "dagger_decay_iters": 50,
     "lambda_intent": 1.0,
     "reward_mode_for_step": "def",
+    "distill_original_student_lstm_hidden": 256,
+    "distill_original_action_loss": "mse",
+    "distill_original_intent_loss": "mse",
+    "distill_original_grad_clip_norm": None,
+    "distill_original_log_every": 10,
+    "distill_original_allow_sim_intent_fallback": True,
 
 
 
