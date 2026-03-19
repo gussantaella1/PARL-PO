@@ -1,0 +1,949 @@
+                                                                               I. INTRODUCTION
+                                                                                    Orbital pursuit–evasion (PE) is a critical problem that
+Multiple-to-One Orbital                                                        has garnered significant attention from scholars engaged in
+                                                                               diverse aerospace science, such as spacecraft rendezvous,
+Pursuit: A Computational                                                       object capture, and space debris removal [1], [2], [3].
+                                                                               Without sacrificing generality, relative motion models serve
+Game Strategy                                                                  as the efficient foundation for resolving orbital motion
+                                                                               problems. Given the assumption of a reference spacecraft
+                                                                               operating in close proximity to the controlled spacecraft,
+                                                                               the dynamics of the latter can be effectively described
+                                                                               relative to the former using differential equations, such
+YUCHEN LIU                                                                     as Clohessy–Wiltshire equations [4], Tschauner–Hempel
+Zhejiang University, Hangzhou, China
+                                                                               equations [5], and the line-of-sight equations [6]. Over the
+YONGHE ZHANG                                                                   past decades, several effective solutions have emerged to
+JUN JIANG                                                                      tackle the underlying problem. In the realm of rendezvous
+Chinese Academy of Sciences, Shanghai, China                                   control, the strategy of two-impulse control [7], [8] ini-
+CHAOYONG LI , Senior Member, IEEE
+                                                                               tially gained substantial attention and evolved into more
+Zhejiang University, Hangzhou, China                                           sophisticated techniques, such as multi-impulse control [9],
+                                                                               [10]. Furthermore, continuous thrust strategies have been
+                                                                               increasingly explored to enhance control accuracy in orbital
+                                                                               transfers. For instance, a rendezvous strategy leveraging
+    In this article, we investigate the cooperative pursuit–evasion prob-      proximal policy optimization was proposed, enabling the
+lem among multiple spacecraft. The presented problem involves a                satellite to achieve proximity as close as centimeters to the
+dynamic pursuit process that gives rise to a multiple-to-one pursuit
+                                                                               intended target without collision [11]; an approximate solu-
+game, in which multiple pursuing spacecraft collaborate to collectively
+minimize the minimum distance between pursuers and evader. The                 tion to the time-optimal rendezvous problem was presented
+main challenge lies in establishing the game amidst intricate mission          in [12], where the control problem was formulated in terms
+intentions and ensuring efficient generation of game strategies, e.g.,         of the true longitude using the Sundman transformation.
+the Nash equilibrium strategy. To this end, we innovatively formulate               However, in the aforementioned studies, the predom-
+the multiple spacecraft pursuit–evasion problem conundrum within
+                                                                               inant focus was on targets operating within static orbits.
+the framework of a multiplayer computational game. Subsequently,
+an one-step look-ahead Nash equilibrium is introduced to facilitate            In practice, with the development of autonomous decision-
+the periodic modification of ideal trajectories during the dynamic             making capabilities, the target in most situation will
+game process. In addition, in order to enhance the solution efficiency,        employ evasive maneuvers based on space situational
+we integrate an action/reaction search procedure, embedded with a              awareness [13]. In fact, the PE problem involving two
+dynamic pruning technique, into the search for the Nash equilibrium.
+                                                                               spacecraft can be regarded as a game problem characterized
+Simulation results validate the effectiveness of the proposed scheme.
+                                                                               by an inherent conflict of interest between the pursuer and
+                                                                               evader. It is worth noting that, obtaining an analytical feed-
+                                                                               back solution from the Hamilton–Jacobi–Isaacs functions
+                                                                               presents a considerable challenge [14], promoting many
+                                                                               researchers to concentrate on determining the open-loop
+Received 14 March 2023; revised 16 February 2024 and 26 June 2024;
+accepted 17 September 2024. Date of publication 30 September 2024;             trajectory of the saddle-point solution [15], [16]. Typically
+date of current version 14 April 2025.                                         speaking, the open-loop saddle-point problem of the PE
+                                                                               game can be transformed into a two-point boundary value
+DOI. No. 10.1109/TAES.2024.3471497
+                                                                               problem (TPBVP) [17], which can be solved by using
+Refereeing of this contribution was handled by M. Romano.                      various established theories, such as direct, indirect, and
+This work was supported in part by the National Natural Science Founda-        semi-direct methods [18], [19], [20]. Toward this, in [21],
+tion of China under Grant 12372050 and Grant 62088101, and in part by          the problem of determining the saddle-point solution of the
+the Zhejiang Provincial Natural Science Foundation of China under Grant        game was transformed into a TPBVP and effectively ad-
+LR20F030003.
+                                                                               dressed through a hybrid algorithm that combines heuristic
+Authors’ addresses: Yuchen Liu and Chaoyong Li are with the College            searching with the Newton method. In addition, a genetic al-
+of Electrical Engineering, Zhejiang University, Hangzhou 310027, China,        gorithm, combined with a semi-direct collocation nonlinear
+E-mail: (yuchenliu@zju.edu.cn; chaoyong@zju.edu.cn); Yonghe Zhang
+                                                                               programming method, was proposed to find the saddle-point
+and Jun Jiang are with the Key Laboratory for Satellite Digitalization
+Technology, Chinese Academy of Sciences, Shanghai 201210, China, E-            solution [22]. However, it seems that it will incur significant
+mail: (zhangyh@microsate.com; jiangj@microsate.com). (Corresponding            computational time. To enhance the speed advantage, a
+authors: Yonghe Zhang; Chaoyong Li.)                                           homotopic strategy based on the theory of optimal control
+                                                                               was employed in [23] for the PE game, while it requires
+0018-9251 © 2024 IEEE                                                          a large number of prior trajectories. Moreover, in [24],
+
+
+IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025                                                                      2213
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+a well-designed mixed global-local optimization strategy                      open-loop NE solutions. In conclusion, the aforementioned
+was proposed, which exhibited superior computational ef-                      findings underscore the potency of game theory-based con-
+ficiency compared to the differential evolution method.                       trollers in navigating multiplayer scenarios, thereby moti-
+    Although various strategies, as mentioned previously,                     vating the inclination to apply analogous methodologies to
+have proven effective in orbital PE games, most achieve-                      address the multiple-to-one PE problem in orbital spacecraft
+ments are based on simplified linear systems that reduce the                  domains.
+complexity of the orbital game. However, practical space                           In this article, we attempt to tackle the cooperative PE
+missions contend with unavoidable disturbances, including                     problem encompassing multiple spacecraft using a com-
+Earth’s oblateness, atmospheric perturbations, and geomag-                    putational strategy. In this problem, all pursuers share a
+netic effects, all of which exert a detrimental influence on                  common mission objective, while each spacecraft retains
+spacecraft trajectories. It is essential to recognize that these              its individual interests. It is imperative to underscore that
+external disturbances significantly impact the anticipated                    while aforementioned studies grounded in differential game
+trajectories, introducing uncertainties that pose challenges                  theory have made considerable headway in addressing mul-
+to the success of orbital maneuvers. To overcome the nega-                    tiplayer scenarios, they often presuppose the formation of
+tive effect, the linear dynamics and the nonlinear dynamics                   performance index conforming strictly to linear quadratic
+were both discussed in [25]. In that study, an algorithm                      functions. Moreover, in practical pursuit scenarios, targets
+based on the state-dependent Riccati equation (SDRE) was                      may dynamically adjust their strategies to effectively evade
+developed for nonlinear scenarios, and the simulation re-                     pursuers, as elucidated in [33]. Hence, the development of
+sults demonstrated that the SDRE algorithm outperformed                       controllers capable of dynamic decision-making, adept at
+the linear control law in terms of performance. Furthermore,                  handling nonlinear problems beyond the purview of linear
+advancements in artificial intelligence have catalyzed the                    quadratic functions, assumes paramount importance. In this
+development of various control strategies grounded in neu-                    vein, we propose a pioneering computational strategy based
+ral networks (NNs) that exhibit exceptional performance                       on sampled data game theory to grapple with the cooperative
+in nonlinear systems. For instance, to attain saddle-point                    PE challenge encountered by multiple spacecraft. The pri-
+equilibrium, an adaptive dynamic programming algorithm                        mary contributions of this article are three-fold as follows.
+leveraging NNs was proposed in [26], extending the solution
+domain to encompass zero-sum game scenarios in nonlinear                          1) The proposed control strategy transcends the con-
+systems. In addition, to alleviate reliance on system matri-                         straints of linear models, boasting broad applicability
+ces, a Q-learning-based pursuit control strategy integrated                          across intricate dynamical systems.
+with a nonlinear adaptive gain estimator was introduced for                       2) Aligned with the computational game framework,
+orbital PE games in [27].                                                            the control strategy excels in addressing inherently
+    It is worth noting that despite their demonstrable effi-                         nonlinear problems that defy accurate formulating
+cacy, the aforementioned studies predominantly address the                           by linear quadratic performance index functions.
+PE problem within a two-player framework, overlooking                             3) The proposed scheme offers great performance for
+the more intricate roundup problems inherent in scenarios                            dynamic/real-time PE game, and, by introducing
+involving multiple cooperative agents. In practical domains,                         action/reaction search(ARS) procedure, paves the
+the cooperative games of multiagent systems has garnered                             way for potential applications in real-time decision-
+increasing attention across diverse disciplines. For instance,                       making.
+a feedback Nash strategy was designed in [28] to tackle a                         The rest of this article is organized as follows. A brief
+differential game entailing multiple pursuers and a solitary                  setup of the game problem is presented in Section II. The
+evader, navigating through constraints imposed by limited                     main results of computational game-based control strat-
+observational capacities. To surmount the challenges in-                      egy and the detailed search procedure are presented in
+herent in state observation, a distributed open-loop Nash                     Section III. The illustrative examples are presented and
+equilibrium (NE) controller was introduced in [29], under-                    analyzed in Section IV. Finally, Section V concludes this
+pinned by analytical solutions, to address the complexities                   article.
+of formation control. In addition, expanding upon this sem-
+inal work, the distributed Nash strategies were extended                      II. PROBLEM FORMULATION
+to spacecraft formation problems, introducing the notion
+of NE/worst case equilibrium, wherein disturbances are                        A. Model of Relative Motion
+treated as adversarial fictitious entities aimed at compro-                       For spacecraft proximity PE problems, the relative mo-
+mising individual player performance [30]. Coincidentally,                    tions are characterized within the orbital coordinate sys-
+in [31], the NE strategies were employed within a cooper-                     tem, specifically the local vertical local horizontal (LVLH)
+ative interception framework, leveraging an observer’s role                   frame, as delineated in Fig. 1. Within this framework, the
+to streamline the implementation of a prescribed guidance                     relative dynamics governing all pursuit and evasion space-
+protocol at a localized level. Acknowledging the limitations                  craft are delineated with respect to a virtual spacecraft, the
+of open-loop control in terms of robustness, a sample-data-                   orbital trajectory of which is postulated to be circular [34].
+based Nash/worst case strategy was proposed to facilitate                     Subsequently, the LVLH frame is established with its origin
+active rendezvous [32], exhibiting superior accuracy under                    situated at the centroid of the virtual reference spacecraft.
+
+2214                                 IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+  Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                                                                               orbit radius of the reference spacecraft, ω = μe /r03 in-
+                                                                               dicates the orbital angular velocity of the reference space-
+                                                                               craft, and u = [ux , uy , uz ]T denotes the control input vec-
+                                                                               tor. In what follows, the state vectors of the ith pur-
+                                                                               suer spacecraft and evader spacecraft are defined as x pi =
+                                                                               [x pi , y pi , z pi , ẋ pi , ẏ pi , ż pi ]T and xe = [xe , ye , ze , ẋe , ẏe , że ]T ,
+                                                                               respectively, for the sake of brevity. Then, the dynamics
+                                                                               described in (1) for each controlled spacecraft can be suc-
+                                                                               cinctly expressed as
+                                                                                                                                 
+                                                                                   ẋ pi = Ax pi + B L pi + D pi + Bu pi , i = 1, 2, . . . , n
+                                                                                   ẋe = Axe + B (Le + De ) + Bue
+                                                                                                                             
+                                                                                               03 I3                            0
+                                                                                   A=                            , B= 3                                               (5)
+                                                                                               A2 A1                            I3
+                                                                               where n indicates the number of pursuer spacecraft.
+
+                                                                               B. Formulation of Orbital PE Problem
+                    Fig. 1. LVLH coordinate system.
+                                                                                   In this article, the investigation centers around the or-
+                                                                               bital pursuit problem entailing multiple pursuers and an
+The x-axis is directed from the Earth’s center to the origin,                  evader within space missions. Specifically, each pursuer is
+the y-axis coincides with the orbit of the reference space-                    tasked with achieving the cooperative pursuit mission via
+craft, and the z-axis completes the right-handed orthogonal                    low thrust, with the primary goal of capturing the target
+coordinate system. For each controlled spacecraft, the rel-                    spacecraft. Conversely, the target spacecraft endeavors to
+ative dynamics, including J2 perturbation effects, can be                      evade capture by all pursuers through the implementation
+mathmatically formulated [35]                                                  of corresponding control strategies. Formally, the intentions
+          ⎡ ⎤         ⎡ ⎤       ⎡ ⎤                                            of the pursuers can be described as follows:
+            ẍ          ẋ        x
+          ⎣ÿ⎦ = A1 ⎣ẏ⎦ + A2 ⎣y⎦ + L + D + u             (1)                            ∃t ∈ [0, +∞ )
+            z̈          ż        z                                                                                                    
+                                                                                         d pe (t )  min d pi,e (t )|i = 1, 2, . . . , n ≤ dcap                       (6)
+with
+                ⎡      ⎤      ⎡ 2     ⎤                                        where dcap denotes the capture distance, and d pi,e indicates
+               0  2ω 0         ω  0 0                                          the distance between ith pursuer and the evader, which can
+        A1 = ⎣−2ω 0 0⎦ , A2 = ⎣ 0 ω2 0⎦                                (2)     be expressed as
+               0   0 0          0 0 0
+                                                                                                            2         2         2
+where L and D refer to the nonlinear terms and the J2                               d pi,e =        x pi − xe + y pi − ye + z pi − ze .                               (7)
+perturbation, respectively. That is                                            Alternatively, the motivation behind the orbital maneuvers
+            ⎡                 ⎤
+               r0 + x     1                                                    of the evader can be defined as follows:
+            ⎢ r3        −
+            ⎢             r02 ⎥
+                              ⎥                                                                              d pe (t ) > dcap , t ≥ 0.                                (8)
+  L = −μe ⎢ ⎢        y        ⎥
+                              ⎥
+            ⎣       rz3       ⎦                                                In addition, it is imperative to note that maintaining a safe
+                        r3                                                     distance among each pursuer is crucial to avoid collisions,
+         ⎡                                              ⎤                     that is
+      μe (r0 + x ) 3        2 5z
+                                  2
+                                             3 μe J2 Re2
+    ⎢                  J2 R          −1 +
+    ⎢      r5         2 e r 2               2 r04 ⎥     ⎥                                              d pi,p(−i ) (t ) > dsafe , t ≥ 0                              (9)
+    ⎢           μ    y   3         5 z 2                 ⎥
+    ⎢
+  D=⎢              e
+                           J2 Re2
+                                         −1              ⎥
+                                                         ⎥                     where dsafe denotes the safe distance between pursuers, and
+    ⎢             r 5
+                        2          r 2
+                                                         ⎥
+    ⎣           μe z 3                 2                 ⎦                     p(−i ) denotes an arbitrary pursuer except pi . Furthermore, it
+                                2 5z
+                           J2 Re         − 3                                   is essential that the control strategies of both pursuers and
+                  r5 2              r2                                         the evader should satisfy
+                                                          (3)
+                                                                                          u pi (t ) ≤ u pi,max , t ≥ 0, i = 1, 2, . . . , n
+with
+                                                                                          ue (t ) ≤ ue,max , t ≥ 0                                                (10)
+                     r=      (r0 + x )2 + y2 + z2                      (4)
+                                                                               where u pi,max and ue,max represent the maximum accelera-
+where μe denotes the gravitational constant, Re and J2 are                     tion capabilities of the pursuers and the evader, respectively.
+the mean radius and second zonal harmonic coefficient                              Obviously, the PE mission presents a confluence of
+of the Earth, respectively. In addition, r0 represents the                     diverging objectives between the pursuers and the evader,
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                                          2215
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                                                                                                                                                                       
+mandating each participant to meticulously weigh the in-                                                   · · · , u∗pn (tk , t, x pn (tk )), u∗e (tk , t, xe (tk ))
+fluence exerted by all other spacecraft, be it through col-
+                                                                                                   Je ( u∗p1 (tk , t, x p1 (tk )), . . . , u∗pn (tk , t, x pn (tk ))
+laborative efforts or potential hindrances. Without loss of                                                                     
+generality, it is a PE game with multiple players, which can                                             u∗e (tk , t, xe (tk ))
+be defined as Problem 1 under Assumption 1.                                                      ≥ Je ( u∗p1 (tk , t, x p1 (tk )), . . . , u∗pn (tk , t, x pn (tk ))
+ASSUMPTION 1 Each player is presumed to exhibit rational                                                   ue (tk , t, xe (tk )))                                          (12)
+behavior, operating under the assumption that all other                                  for u pi (tk , t, x pi (tk )) ∈ U pi and ue (tk , t, xe (tk )) ∈ Ue for all
+players within the game are endowed with an equivalent                                   k ∈ N.
+level of rationality.
+                                                                                             It is imperative to acknowledge that while the optimal
+PROBLEM 1 Assuming that each pursuer is inclined to min-                                 strategy can be accurately determined in many scenarios,
+imize its own performance while the evader endeavors to                                  the proposed differential game problem encounters inher-
+maximize its performance, the goal is to ascertain a strategy                            ent limitations when the problem cannot be effectively
+profile (u∗p1 (t ), . . . , u∗pn (t ), u∗e (t )) that forms an open-loop                 formulated using a linear quadratic performance function.
+NE, denoted as                                                                           Upon reviewing (6) and (8), it becomes evident that defin-
+                                                                                         ing an ideal linear quadratic performance function for the
+             Jpi (u∗p1 (t ), . . . , u∗pi (t ), . . . , u∗pn , u∗e (t ))
+                                                                                         pursuers, conducive to cooperative pursuit, is impractical.
+              ≤ Jpi (u∗p1 (t ), . . . , u pi (t ), . . . , u∗pn , u∗e (t ))              Specifically, in the context of the multiple spacecraft pursuit
+             Je (u∗p1 (t ), . . . , u∗pn (t ), u∗e (t ))                                 problem, the focus is not solely on reducing the PE distance
+                                                                                         of all pursuers, but rather on ensuring that the target is
+              ≥ Je (u∗p1 (t ), . . . , u∗pn (t ), ue (t ))                        (11)   captured by at least one pursuer. Consequently, under the
+hold for u pi ∈ U pi and ue ∈ Ue , where U(·) denotes the                                aforementioned Assumptions 1 and 2, the orbital pursuit
+admissible control space of respective spacecraft over en-                               problem discussed in this article is precisely formulated as a
+tire time horizon. Particularly, Jpi (· ) and Je (· ) indicate the                       multiple-player computational game, as defined in Problem
+performance index of ith pursuer spacecraft and evader                                   S.P. 1.
+spacecraft, respectively.                                                                PROBLEM S.P. 1 Assuming that each pursuer or evader has
+    However, albeit the effectiveness of the open-loop NE                                access to state information at consistent sampling periods
+solution, it does not provide assurance that each player                                 T , and generates constant acceleration commands for each
+adheres to its optimal orbit trajectory for the entirety of                              sampling period, denoted as u pi (t ) = ukT          pi and ue (t ) = ue
+                                                                                                                                                                   kT
+
+the time horizon. In addition, the optimality of the solution                            for t ∈ [kT, (k + 1)T ), where k ∈ N. Then, the problem
+would be compromised should any player deviate from the                                  is defined as finding the solution (U ∗kT                       ∗kT    ∗kT
+                                                                                                                                          p1 , . . . , U pn , U e ),
+NE. Conversely, while the closed-loop NE is posited as an                                which forms an Nk -step look-ahead NE. This is formulated
+efficient alternative to the open-loop NE, the continuous                                as
+                                                                                                                                                          
+acquisition of spacecraft state information via onboard sen-                                        JpikT U ∗kT             ∗kT              ∗kT
+                                                                                                             p1 , . . . , U pi , . . . , U pn , U e
+                                                                                                                                                       ∗kT
+sors poses a formidable challenge. Toward this, we expand                                                                                                 
+                                                                                                   ≤ JpikT U ∗kT                              ∗kT
+                                                                                                               p1 , . . . , U pi , . . . , U pn , U e
+                                                                                                                              kT                       ∗kT
+upon the problem statement introduced in Problem 1 by                                                                                     
+considering the sample-data game [36] under Assumption 2,                                           JekT U ∗kT              ∗kT
+                                                                                                             p1 , . . . , U pn , U e
+                                                                                                                                      ∗kT
+                                                                                                                                           
+as defined in Problem S.1.                                                                         ≥ JekT U ∗kT               ∗kT
+                                                                                                               p1 , . . . , U pn , U e
+                                                                                                                                        kT
+                                                                                                                                                                 (13)
+ASSUMPTION 2 Each player, at any sampling time, pos-                                     with
+sesses complete knowledge regarding the system state, ad-                                                                                             
+                                                                                                                       (k +1)T             (k +Nk −1)T
+missible strategies and performance index with correspond-                                           U kT
+                                                                                                       pi =   ukT
+                                                                                                                pi , u pi      , . . . , u pi
+ing strategy.                                                                                                        (k +1)T
+                                                                                                              pi × U pi
+                                                                                                          ∈ UkT               × · · · U(pik +Nk −1)T
+                                                                                                                                                  
+PROBLEM S. 1 Assume that measurements of the state                                                     e = ue , ue
+                                                                                                     U kT      kT  (k +1)T
+                                                                                                                           , . . . , ue(k +Nk −1)T
+vector are obtained at fixed time intervals of period                                                       ∈ UkT   (k +1)T
+                                                                                                                            × · · · Ue(k +Nk −1)T
+                                                                                                               e × Ue                                                      (14)
+T . Then, the controls formed as u pi (tk , t, x pi (tk )) and
+ue (tk , t, xe (tk )), i = 1, . . . , n and k ∈ N, can be referred                       where JpikT and JekT represent the performance index that
+to as sampled-data controls, with tk = kT denoting                                       evaluate the pursuit over time horizon [kT, (k + Nk )T ) of ith
+the sampling time. Consequently, the PE game is                                          pursuer and evader, respectively. In particular, UkT(· ) indicates
+transformed into finding the control strategy profile                                    the admissible control space of kth sampling period of the
+(u∗p1 (tk , t, x p1 (tk )), . . . , u∗pn (tk , t, x pn (tk )), u∗e (tk , t, xe (tk )))   corresponding spacecraft, which consists of a finite number
+for t ∈ [tk , t f ] that satisfies                                                       of acceleration strategies
+                                                                                                                                          
+            Jpi ( u∗p1 (tk , t, x p1 (tk )), . . . , u∗pi (tk , t, x pi (tk )),          UkT        (k−1)T
+                                                                                                           ± j u p | j = 0, 1, . . . , Nup
+                                                                                          pi = u pi
+                   · · · , u∗pn (tk , t, x pn (tk )), u∗e (tk , t, xe (tk ))                                          T                                 
+                                                                                               (k−1)T    (k−1)T  (k−1)T
+                                                                                         = ux pi , uypi , uzpi             ± j u p | j = 0, 1, . . . , Nup
+        ≤ Jpi ( u∗p1 (tk , t, x p1 (tk )), . . . , u pi (tk , t, x pi (tk )),
+
+2216                                          IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+   Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+ e = {ue
+UkT                ± j ue | j = 0, 1, . . . , Nue }
+          (k−1)T
+     (k−1)T (k−1)T (k−1)T T                                    
+= uxe        , uye    , uze       ± j ue | j = 0, 1, . . . , Nue
+                                                                      (15)
+where u p and ue represent the grid unit of acceleration,
+and 2Nup − 1 and 2Nue − 1 denote the number of grid units
+in the strategy space of pursuers and evader, respectively.
+REMARK 1 Obviously, the control strategy is determined by
+the last controller inputs (i.e., u(pik−1)T and ue(k−1)T ), thereby
+avoiding any abrupt changes in actuator commands and
+ensuring temporal continuity in the controller inputs.
+    Hence, in accordance with Problem S.P. 1, the un-
+derlying orbital PE problem is effectively reformulated
+as a computational NE-seeking problem, especially when
+any spacecraft exhibits nonlinear intention. However, its
+algebraic complexity could become overwhelming as Nk
+evolves. Hence, a tradeoff between solution accuracy and                       Fig. 2. Influence of one-period distance reduction on pursuit trajectory.
+computational solvency must be sought to ensure timely
+decision-making for PE operations. Toward this, in this arti-
+cle, each rational player only considers one-step look-ahead                   with
+results, namely, Nk = 1, such that the proposed computa-                                                    β1 + β 2 = 1                             (18)
+tional NE-seeking problem (13) will be simplified to
+                                                                               where α1 , α2 , β1 , and β2 are weight coefficients that can
+            JpikT (u∗kT           ∗kT             ∗kT    ∗kT
+                    p1 , . . . , u pi , . . . , u pn , ue )                    be adjusted according to specific applications and require-
+             ≤ JpikT (u∗kT            kT             ∗kT    ∗kT
+                        p1 , . . . , u pi , . . . , u pn , ue )                ments. In addition, the PE distances, d pe             k
+                                                                                                                                         = d pe (kT ) and
+            JekT (u∗kT            ∗kT     ∗kT
+                    p1 , . . . , u pn , ue )                                   d p j,e = d p j,e (kT ), have previously been defined in (6) and
+                                                                                 k
+
+             ≥ JekT (u∗kT             ∗kT
+                        p1 , . . . , u pn , ue )
+                                                kT
+                                                                      (16)     (7). It should be pointed out that, the adoption of the
+                                                                               arctan(· ) function at the core of (17) is employed for the
+     pi ∈ U pi and ue ∈ Ue .
+for ukT                                                                        purpose of normalization, as well as the parameter π/2.
+            kT       kT     kT
+
+    In what follows, the notations JpikT , JekT , UkT  pi , Ue , u pi ,
+                                                               kT   kT         With regard to the parameters β1 and β2 , they are chosen as
+                                                                               the weight coefficients about minimum distance factor and
+      e will be simplified to J pi , Je , U pi , Ue , u pi , and ue for
+and ukT                         k     k    k      k    k          k
+
+the sake of brevity.                                                           the cooperative distance factor, respectively, and then (18)
+                                                                               also serves the purpose for the normalization.
+C. Performance Index Function                                                        However, owing to the inherent inadequacy of one-step
+    Upon reviewing (6), (8), and (16), it is imperative to en-                 lookahead, reducing the distance within a single period
+sure that the performance index can adequately incentivize                     may occasionally cast a shadow over the mission, as shown
+the pursuers to minimize the minimum PE distance in the                        in Fig. 2. As illustrated, despite achieving commendable
+subsequent sampling interval. To this end, we introduce a                      performance at t = (k + 1)T , the distance escalates over
+one-step distance factor as the primary guiding mechanism,                     subsequent time intervals. Then, to surmount this challenge,
+which can be formally defined as                                               we subsequently introduce the prediction guidance factor,
+                  ⎡                                                            denoted as F2k,pi and F2k,e , defined as follows:
+                                   k               
+                2             α    d     −   d k +1                                                          k                 
+       F1k,pi = ⎣β1 arctan
+                                1                                                                                       k+ k
+                                      pe       pe
+                                                                                               2         α3 d pe − d pe
+                π                        k
+                                       d pe                                         F2,pi = arctan
+                                                                                      k
+                                                                                                                                  , i = 1, . . . , n
+                                                               ⎤                           π                    k
+                                                                                                                 d pe
+                                   n                 n     k +1
+                                                                                                  ⎡               k                 
+                           α2            d  k
+                                    j =1 p j,e    −       d
+                                                      j =1 p j,e                               2             α4 d pe     − d pek+ k
+               + β2 arctan                                        ⎦                  F2,e =
+                                                                                       k          ⎣β1 arctan
+                                                 k
+                                              d pe                                            π                           k
+                                                                                                                        d pe
+                                                                                                                                   n              ⎤
+            i = 1, . . . , n                                                                               α5       n                          k+ k
+                                                                                                                     j =1 d p j,e −
+                                                                                                                            k
+             ⎡               k                                                                                                        j =1 d p j,e
+                        α1 d pe  − d pek +1                                                 + β2 arctan                                               ⎦
+        2                                                                                                                          k
+ F1,e =
+   k      ⎣β1 arctan                                                                                                            d pe
+        π                         k
+                                d pe
+                                                             ⎤                                                                                    (19)
+                                     n             n     k +1
+                             α2           d k
+                                     j =1 p j,e  −      d
+                                                    j =1 p j,e                 where α3 , α4 , and α5 denote weight coefficients, and k
+             + β2 arctan                                        ⎦
+                                                k
+                                              d pe                             represents the number of periods each player will predict.
+                                                                               It should be pointed out that, F2k,e resembles F1k,e as it aligns
+                                                                      (17)     with the singular objective of the evader. Conversely, the
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                           2217
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+one-step distance factor F1k,pi signifies the immediate inten-                span is contingent upon the selection of controllers, char-
+tion of all the cooperative pursuers, while the prediction                    acterized by
+guidance factor F2k,pi encapsulates the individual interests                                  ⎧ ∗0
+                                                                                              ⎪u , 0≤t <T
+of ith pursuer.                                                                               ⎪ pi
+                                                                                              ⎪
+                                                                                              ⎪
+                                                                                              ⎪..
+     In addition, to prevent control inputs from saturating                                   ⎪
+                                                                                              ⎨.
+over prolonged durations, we introduce the energy factor                           u pi (t ) = u∗kpi , kT ≤ t < (k + 1)T
+(i.e., F3k ) to strike a tradeoff between pursuit efficiency and                              ⎪
+                                                                                              ⎪.
+                                                                                              ⎪.
+                                                                                              ⎪
+energy consumption, that is                                                                   ⎪
+                                                                                              ⎪.
+                                                                                              ⎩ ∗k̂
+                                                                                               u pi , k̂T ≤ t < (k̂ + 1)T
+                            ukpi                                                  u∗k                  ∗k                            ∗k     ∗k
+                                                                                     pi = arg min J pi (u p1 , . . . , u pi , . . . , u pn , ue )
+                                                                                                    k                   k
+                 F3k,pi =              , i = 1, . . . , n                                                                                               (23)
+                            u pi,max                                                             ukpi ∈Ukpi
+
+                            uke                                             hold for all i = 1, . . . , n, and
+                  F3k,e =                                           (20)                     ⎧ ∗0
+                            ue,max                                                             ue , 0 ≤ t < T
+                                                                                             ⎪
+                                                                                             ⎪
+                                                                                             ⎪
+                                                                                             ⎪ .
+where the maximum acceleration in denominator obviously                                      ⎪
+                                                                                             ⎪ .
+                                                                                             ⎨.
+plays a role in ensuring the normalization.                                        ue (t ) = u∗k e , kT ≤ t < (k + 1)T
+    As the result, subject to the constraints (9) and (10), the                              ⎪
+                                                                                             ⎪..
+                                                                                             ⎪
+                                                                                             ⎪
+performance index function of the evader is defined as                                       ⎪
+                                                                                             ⎪ .
+                                                                                             ⎩ ∗k̂
+                                                                                              ue , k̂T ≤ t < (k̂ + 1)T
+           −c1 F1k,e − c2 F2k,e − c3 F3k,e , if uke  ≤ u pi,max
+   Je =                                                                             u∗k           k ∗k               ∗k             ∗k
+    k
+                                                                                     e = arg max Je (u p1 , . . . , u pi , . . . , u pn , ue ).
+                                                                                                                                           k
+                                                                                                                                                        (24)
+           −10,                                     others                                        uke ∈Uke
+                                                                (21)
+                                                                              PROOF As per (23) and (24), the subsequent inequalities
+and similarly, for all i = 1, . . . , n for pursuer pi , the perfor-          evidently hold at t = kT for all k = 0, 1, . . . , k̂, namely
+mance index function is defined as                                                                                                  
+                                                                                 Jpik u∗k                                  ∗k
+                                                                                        p1 , . . . , u pi (t ), . . . , u pn , ue
+                                                                                                                                  ∗k
+         ⎧                                                                                                                           
+         ⎨−c1 F1k,pi − c2 F2k,pi + c3 F3k,pi ,                                    ≤ Jpik u∗k                                ∗k     ∗k
+                                                                                              p1 , . . . , u pi , . . . , u pn , ue , i = 1, . . . , n.
+                                                                                                            k
+                                            k +1
+   Jpi =
+     k
+               if ukpi  ≤ u pi,max and d pi,p (−i ) > dsafe  (22)                                                            ∗k              
+         ⎩                                                                       Jek u∗k               ∗k                                ∗k
+                                                                                        p1 , . . . , u pn , ue (t ) ≥ Je u p1 , . . . , u pn , ue
+                                                                                                                              k                 k
+                                                                                                                                                        (25)
+           10, others
+                                                                              which remain valid for all ukpi ∈ Ukpi and uke ∈ Uke . Hence,
+where c1 , c2 , and c3 represent weight coefficients, subject
+                                                                              the proposed pair of strategy profiles form a one-step look-
+to the constraint c1 + c2 + c3 = 1. It is imperative to un-
+                                                                              ahead NE for each sampling period.
+derscore that the relative variation in the PE distance is
+relatively minor. As a consequence, the weight coefficient                         It is pertinent to underscore that NE invariably exists in
+allocated to the distance factor should substantially surpass                 finite strategy games, characterized by a finite number of
+that designated to the energy factor, thereby enhancing the                   players and strategies [37]. However, in the PE game delib-
+sensitivity inherent in the distance factor.                                  erated in this study, despite its finite strategy composition,
+                                                                              the quest for a controller solution may elude resolution as
+III. MAIN RESULTS                                                             it is formed by pure strategy game. To be specific, in pure
+                                                                              strategy games, players have complete knowledge of their
+    In this article, we have elucidated the computational
+                                                                              own available strategies as well as the strategies chosen
+game tailored to address the complex cooperative pursuit
+                                                                              by their opponents, and the decision-making process does
+problem across multiple spacecraft. Moving forward, in
+                                                                              not involve any randomness or uncertainty, while the exis-
+this section, we delve into the meticulous formulation of
+                                                                              tence of NE cannot be ensured in some special scenarios.
+controllers for each spacecraft, accompanied by a compre-
+                                                                              Consequently, it becomes imperative to provide a viable
+hensive exposition of the solving procedure. Specifically,
+                                                                              alternative scheme in case the NE cannot be found within a
+the controllers are periodically crafted as computational so-
+                                                                              constrained time. Mathematically, for all k = 0, 1, . . . , k̂,
+lutions of NE. Furthermore, we introduce an ARS structure
+                                                                              if NE is not existed for kth sampling period game, the
+fortified with a dynamic pruning technique, meticulously
+                                                                              controllers will be articulated as
+designed to optimize time consumption, thereby enhancing
+operational efficiency.                                                        ue (t ) = û∗k
+                                                                                           e
+                                                                                                                                                           
+THEOREM 1 Let us consider the orbital PE problem in-                                  = arg max Jek u∗p(1k−1) , . . . , u∗pi(k−1) , . . . , u∗pn(k−1) , uke
+volving multiple spacecraft within the prescribed LVLH                                      uke ∈Uke
+
+frame. Assuming the spacecraft dynamics conform to (5),                       u pi (t ) = û∗k
+                                                                                            pi
+and the performance index functions are defined in (21)                                                                                                 
+and (22). Then, if the pursuit mission terminates at t ∈                              = arg min Jpik u∗p(1k−1) , . . . , ukpi , . . . , u∗pn(k−1) , û∗k
+                                                                                                                                                      e
+                                                                                           ukpi ∈Ukpi
+[k̂T, (k̂ + 1)T ), the existence of a one-step look-ahead NE
+within each sampling period throughout the entire temporal                                                                                              (26)
+
+2218                                    IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+  Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                                                                                 Algorithm 1: ARS Procedure.
+
+
+
+
+          Fig. 3. Strategy profile space based on tree-model.
+
+
+
+for k ≤ t < k + 1, where ue(−1) and u(pi−1) are specified as the
+initial static acceleration of evader and ith pursuer, respec-
+tively. Obviously, the evader is postulated as a leader, main-
+taining a one-step advantage over the pursuers, prompting
+each pursuer to adopt a corresponding one-sided optimal
+strategy. Analogous paradigms can be observed in Stackel-
+berg game [38] and Nash/worst case game [39].
+
+REMARK 2 It is imperative to underscore that while the
+certainty of NE across all k ∈ N remains elusive, its nonex-
+istence exerts a negligible influence throughout the en-
+tire temporal expanse. Specifically, owing to the intrinsic
+characteristics of sampled data, the controllers possess the
+unique ability to establish NE from any point within the
+initiation of the sampling period, encompassing any k ∈ N                      conclusion, the time complexity will be optimized as [40]
+and any admissible initial state at that juncture. As such, the                                        !                   #
+significance is particularly pronounced in instances where                                                      "n
+
+deviations from optimal trajectories occur during the PE                                      OARS = O NUke +        NUkpi           (27)
+mission.                                                                                                                   i=1
+
+
+    Particular, emphasis will be placed on optimizing the                      where NUke and NUkpi indicate the number of units in Uke and
+search procedure for NE to ensure the attainment of solution                   Ukpi , respectively. Obviously, compared to the complexity
+inputs within acceptable time constraints. Conventionally,                     associated with exhaustively $   searching the entire strategy
+the determination of Nash solution entails an exhaustive                       profile space, namely, O (NUke ni=1 NUkpi ), the proposed ap-
+exploration of the admissible control space of all players,                    proach offers greater efficiency in overcoming this scalabil-
+whereby each potential control strategy of one player ne-                      ity challenge.
+cessitates the identification of the corresponding optimal                          Before proceeding further, it is evident that several
+reaction strategy for all other players. Undoubtedly, the                      impractical strategy profiles could be eliminated without
+principal obstacle in employing this conventional approach                     the accurate calculation of entire strategy space. To enhance
+to address the PE game for multiple spacecraft lies in the                     clarity, we construct the tree-model to visually depict the
+immense computational complexity associated with con-                          strategy space, as illustrated in Fig. 3, where the bad node
+ducting a comprehensive search across the strategy space.                      signifies a control input that exceeds the maximum acceler-
+Furthermore, notwithstanding its efficacy and accuracy, ex-                    ation limit, while the bad path indicates that a collision
+haustively identifying all NE solutions within the strategy                    would occur if the control strategies represented by the
+space for the underlying problem is practically unnecessary.                   nodes at both ends of the path were pursued. Obviously,
+    Toward this, we introduce the standard iterative ARS                       we can efficiently eliminate strategy profiles containing a
+methodology to ascertain a NE. Specifically, ARS eschews                       bad node without requiring extensive computational re-
+the exhaustive exploration of all potential NE solutions                       sources, enabling us to proceed with the search for a NE
+within the strategy space, instead focusing on efficiently                     in the pruned strategy space directly. However, attempting
+identifying a single equilibrium point. It circumvents the                     to identify all strategy profiles involving a bad path would
+computational burden associated with the full computation                      entail an exhaustive exploration of the entire strategy space,
+of the performance index value matrix, thereby effectively                     making it an impractical computational endeavor, especially
+addressing the challenge posed by dimension explosion. In                      when employing the ARS search procedure. To this end,
+essence, the architecture of ARS for locating a NE solution                    a technique for dynamically storing and updating the bad
+is delineated as depicted in Algorithm 1.                                      path is integrated into the search procedure. Specifically, the
+    It is worth noticing that, in the case of attaining a NE, the              focus is directed solely toward conflicting strategies associ-
+convergence typically manifests within a constrained num-                      ated with strategies that have been encountered in previous
+ber of iterations. Therefore, building upon the proceeding                     iterations. Toward this, for clarity, the Definition 1 about
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                           2219
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+the disjoint strategy pair, namely (%
+                                    ukpi ,%
+                                          ukp j ), is introduced                      Algorithm 2: Controller Solving Procedure With
+mathematically before proceeding.                                                     ARS.
+DEFINITION 1 For each discrete time step k ∈ N, it holds
+true that, for all i, j = 1, . . . , n, (%
+                                         ukpi ,%
+                                               ukp j ) forms a disjoint
+strategy pair if
+                          %
+                          d k +1 < dsafe                           (28)
+                                   pi,p j
+
+where the resulting orbital propagation % k +1
+                                        d pi,p j is governed
+by the control inputs %
+                      u pi and %
+                       k        k
+                               up j .
+    More specifically, at each iteration, the focus is solely
+on identifying and recording disjoint strategy pairs for each
+pursuer pi , denoted by (% ukpi , ukp(− j ) ). Particularly, these pairs
+are determined by the currently assumed strategies of the
+other pursuers, where ukp(− j ) represents the assumed strategy
+of p(− j ) at the current iteration. Hence, the significance of
+this dynamic pruning technique can be summarized in two-
+fold: 1) it will not involve additional computation because of
+the necessity of the ergodic strategy search of a participant
+in each iteration; 2) it directly eliminates all strategy profiles
+containing disjoint strategy pairs in subsequent iterations.
+To enhance comprehension of the proposed approach, the
+pseudocode of ARS integrated with the pruning technique
+for searching NE solutions in the kth sampling period is
+presented in Algorithm 2.
+    Then, by reviewing the solving procedure, we can arrive
+at the following conclusion apparently.
+LEMMA 1 For each k ∈ N, for any strategy profile U                           %k ∈
+{(u p1 , . . . , u pn , ue )|∃(%
+   k              k      k
+                               u pi ,%
+                                k
+                                     u p j ) ∈ (u p1 , . . . , u pn , ue )}, it can
+                                      k             k             k     k
+
+not become the NE solution. Mathematically speaking, it
+can be inferred that
+                                                                   
+             %k ∈
+             U     / U ∗k | U ∗k = u∗k                     ∗k     ∗k
+                                             p1 , . . . , u pn , ue     .      (29)
+PROOF In the event of collisions across all strategy profiles,
+the pursuit mission is deemed futile, rendering the pursuit
+strategy inconsequential. Conversely, if there exists at least
+one strategy profile that complies with the aforementioned
+constraints, then we have
+       −1 < min Jpik (ukp1 , . . . , ukpi , . . . , ukpn , uke ) ≤ 1         (30)
+holds for all i = 1, . . . , n, while, according to (22) there
+exists
+               Jpik (%
+                     ukpi ,%
+                           ukp j , ukp(−i,− j ) , uke ) > 1
+                ≥ min Jpik (ukp1 , . . . , ukpi , . . . , ukpn , uke )       (31)
+for all ukp(−i,− j ) ∈ Ukp(−i,− j ) for all i, j = 1, . . . , n, where
+p(−i,− j ) denotes an arbitrary pursuer except pi and p j .
+Hence, it can be concluded that any strategy profile con-
+taining a disjoint strategy pair will not constitute the NE
+solution.
+REMARK 3 It is worthwhile mentioning that the compu-
+tational overhead associated with Step 5 in Algorithm 2
+cannot be overlooked during the NE search process. Specif-
+ically, it is the orbit propagation under all admissible con-
+trol inputs that casts a shadow over online computation.
+
+
+2220                                        IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+   Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                            TABLE I
+                   Maximum Acceleration Constraints
+
+
+
+
+                               TABLE II
+                       Strategy Space Parameters
+
+
+
+
+                              TABLE III
+          Weight Coefficients for Performance Index Function
+
+
+
+
+To tackle this issue, we opt for the Picard–Chebyshev
+iteration method [41] instead of the Runge–Kutta method
+to solve the relative dynamics described by (5) for orbit
+propagation. More specifically, the time horizon of orbit
+propagation is transformed to the interval [−1, 1], and a
+best square approximation is conducted on the basis of the
+first Chebyshev polynomial. Furthermore, the Chebyshev
+series approximation yields a discrete representation of the
+differential equations, which can be further transformed into
+an initial value problem via Picard iteration theory. The
+mathematical iteration formulas proposed in [41] have been
+validated for convergence, ensuring the effectiveness of the
+method.
+
+IV. NUMERICAL SIMULATION AND ANALYSIS
+     In this section, we investigate orbital PE scenarios
+comprising three pursuer spacecraft (i.e., n = 3) and an
+evader spacecraft. The objective is to evaluate the efficacy of
+the implemented computational game-based Nash control
+strategies through simulations and subsequent analysis of
+the results in two distinct scenarios. Note that the following
+simulations are carried out on the personal computer with
+2.8 GHz Intel Core i5-8400 CPU.
+     Before proceeding with the simulations, it is assumed
+that each spacecraft has the capability to obtain state mea-
+surements every second, i.e., T = 1. In addition, in order
+to mitigate the inherent disadvantage in the quantity of
+evasion spacecraft, it is further assumed that the evader
+has an advantage over the pursuers in terms of maximum
+acceleration constraints. The parameters related to acceler-
+ation constraints for both scenarios are detailed in Table I,
+and the relevant parameters concerning the strategy space
+are outlined in Table II. Particularly, we intend to assess
+the varying intentions of the pursuers by manipulating the
+values of β1 and β2 in the two scenarios. To be specific,
+in the first scenario, we set β1 = 0.9 and β2 = 0.1, while
+in the second scenario, we assigned equal values to both
+β1 and β2 , i.e., β1 = β2 = 0.5. Moreover, the other weight
+coefficients are consistently chosen for the performance                        Fig. 4. PE trajectories in scenario 1. (a) Trajectories on 3-D view. (b)
+index function in both scenarios, as detailed in Table III.                     Trajectories on X-Y view. (c) Trajectories on Y-Z view. (d) Trajectories
+It is crucial to note that the weight coefficient of the energy                                              on X-Z view.
+
+
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                           2221
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                  Fig. 5. PE distance in scenario 1.
+
+
+
+
+             Fig. 6. Value of control inputs in scenario 1.
+
+                                TABLE IV
+                    Initial States of Each Spacecraft
+
+
+
+
+factor, denoted as c3 , should be significantly smaller than
+the weight coefficients associated with the distance factor,
+i.e., c3   c1 and c3     c2 .
+     Furthermore, the orbit radius of the virtual reference
+spacecraft is set to 7378 km. Subsequently, the initial state
+vectors of each spacecraft in both scenarios are detailed in
+Table IV.
+     Scenario 1: In this particular scenario, where β1 > β2 ,
+the mission intention of the pursuit spacecraft is inclined
+toward facilitating the successful proximity of one of them
+to the evader. Subsequently, the resulting PE trajectories of
+each spacecraft are illustrated in Fig. 4, plotted in the spec-
+ified LVLH coordinate frame, under the proposed control                        Fig. 7. PE trajectories in scenario 2. (a) Trajectories on 3-D view. (b)
+strategies. To enable a more detailed analysis of the mission                  Trajectories on X-Y view. (c) Trajectories on Y-Z view. (d) Trajectories
+process, the PE distances of each pursuer are plotted in                                                    on X-Z view.
+
+
+
+2222                                 IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+  Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+                   Fig. 8. PE distance in scenario 2.                            Fig. 11. Time consumption for generating strategies in scenario 2.
+
+
+
+
+                                                                               the significance of the proposed approach in addressing
+                                                                               cooperative PE problems involving multiple spacecraft, as
+                                                                               evidenced by the simulation results. Consequently, based on
+                                                                               the above results, we conclude that the cooperative pursuit
+                                                                               problem can be effectively addressed without requiring a
+                                                                               reduction in the PE distance of all pursuit spacecraft. Thus,
+                                                                               it is of great significance to overcome the limitations of dif-
+                                                                               ferential games, which traditionally mandate the reduction
+                                                                               of the PE distance of all pursuers.
+                                                                                    Scenario 2: In order to further validate the effective-
+              Fig. 9. Value of control inputs in scenario 2.                   ness of the proposed cooperative PE strategies in different
+                                                                               mission intention, both the minimum distance factor and
+                                                                               cooperative distance factor are assigned the equal values in
+                                                                               this scenario, namely, β1 = β2 = 0.5. Then, Fig. 7 displays
+                                                                               the trajectories of each spacecraft, and Fig. 8 illustrates
+                                                                               the temporal evolution of the PE distance. Apparently, the
+                                                                               graphical representation in Fig. 8 indicates that the distance
+                                                                               between any pursuer and the evader is decreasing, aligning
+                                                                               with the expectations of pursuit spacecraft. To be specific,
+                                                                               as the weight of the minimum distance decreases and the
+                                                                               weight of the cooperative distance increases, the pursuer
+                                                                               spacecraft exhibits a stronger collective capture intention to
+                                                                               minimize the PE distance of any spacecraft. Subsequently,
+                                                                               the energy consumption, elucidated by the values of the
+                                                                               control inputs, is illustrated in Fig. 9. It is evident that all
+                                                                               pursuers maintain nearly maximum maneuvering ability to
+  Fig. 10. Time consumption for generating strategies in scenario 1.
+                                                                               approach the evader. Meanwhile, the evader attempts to
+                                                                               evade the pursuers but cannot break away from the encir-
+Fig. 5. Clearly, as depicted in Fig. 5, at the terminal time                   clement. In addition, the evader sustains weak maneuvers
+t = 1276 s, the evader is successfully captured by the third                   for a period, seemingly aiming to maximize the energy
+pursuer. In addition, the temporal evolution of the control                    consumption of all pursuers.
+input magnitudes is depicted in Fig. 6. Notably, as illustrated                     Furthermore, to corroborate the temporal efficiency of
+in Fig. 6, the first pursuit spacecraft exhibits negligible                    the proposed methodology in both scenarios, the time con-
+control inputs throughout the entire duration of the PE game.                  sumption of solution search for each sampling period is
+This implies that it operates in a static orbit with minimal                   depicted in Figs. 10 and 11, respectively, with an average
+energy consumption. In other words, during this dynamic                        of 159.427 and 168.725 ms over the entire time horizon.
+game process, the first pursuer can anticipate in advance that                      In conclusion, we can summarize that the proposed
+even if it does not take the initiative to maneuver, the evader                scheme offers great results of multiple spacecraft PE prob-
+can still be captured by other pursuers. This highlights                       lem, in terms of solution, with a rapid decision time.
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                           2223
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+V. CONCLUSION                                                                  [14] M. Pontani, “Numerical solution of orbital combat games involving
+                                                                                    missiles and spacecraft,” Dynamic Games Appl., vol. 1, pp. 534–557,
+    In this article, we innovatively introduce a computa-                           2011.
+tional strategy to deal with the multiple-to-one PE game                       [15] J. Stupik, M. Pontani, and B. Conway, “Optimal pursuit/evasion
+for orbital spacecraft under J2 perturbation and nonlinear-                         spacecraft trajectories in the hill reference frame,” in Proc. AIAA/AAS
+quadratic mission intentions. The underlying problem is                             Astrodynamics Specialist Conf., 2012, Art. no. 4882.
+                                                                               [16] E. R. Prince, J. A. Hess, R. G. Cobb, and R. W. Carr, “Elliptical orbit
+formulated as a sampled-data computational game wherein                             proximity operations differential games,” J. Guidance, Control, Dyn.,
+the objective of the pursuers is not solely to minimize                             vol. 42, no. 7, pp. 1458–1472, 2019.
+their individual PE distance, but rather to collaboratively                    [17] K. Horie and B. A. Conway, “Optimal fighter pursuit-evasion ma-
+achieve a capture, ensuring that at least one pursuer suc-                          neuvers found via two-sided optimization,” J. Guidance, Control,
+cessfully intercepts the target. Moreover, the ARS tech-                            Dyn., vol. 29, no. 1, pp. 105–112, 2006.
+                                                                               [18] M. Pontani and B. A. Conway, “Optimal interception of evasive
+nique is introduced in NE searching procedure such that                             missile warheads: Numerical solution of the differential game,” J.
+the controllers can be particularly suitable for real-time                          Guidance, Control, Dyn., vol. 31, no. 4, pp. 1111–1122, 2008.
+decision-making scenarios. Simulation results verified that                    [19] B. A. Conway, “A survey of methods available for the numerical
+the proposed scheme offers great performance, in terms of                           optimization of continuous dynamic systems,” J. Optim. Theory
+solution accuracy, with a rapid decision time.                                      Appl., vol. 152, pp. 271–306, 2012.
+                                                                               [20] H.-X. Shen and L. Casalino, “Revisit of the three-dimensional orbital
+                                                                                    pursuit-evasion game,” J. Guidance, Control, Dyn., vol. 41, no. 8,
+ACKNOWLEDGMENT                                                                      pp. 1823–1831, 2018.
+                                                                               [21] D. Ye, M. Shi, and Z. Sun, “Satellite proximate pursuit-evasion game
+The authors would like to thank associate editor and anony-
+                                                                                    with different thrust configurations,” Aerosp. Sci. Technol., vol. 99,
+mous reviewers for their constructive comments that im-                             2020, Art. no. 105715.
+proved this article.                                                           [22] M. Pontani and B. A. Conway, “Numerical solution of the three-
+                                                                                    dimensional orbital pursuit-evasion game,” J. Guidance, Control,
+                                                                                    Dyn., vol. 32, no. 2, pp. 474–487, 2009.
+REFERENCES                                                                     [23] W. T. Hafer, H. L. Reed, J. D. Turner, and K. Pham, “Sensitivity
+                                                                                    methods applied to orbital pursuit evasion,” J. Guidance, Control,
+ [1] C. Yue et al., “A systematic method for constrained attitude control           Dyn., vol. 38, no. 6, pp. 1118–1126, 2015.
+     under input saturation,” IEEE Trans. Aerosp. Electron. Syst., vol. 59,    [24] X. Zeng, L. Yang, Y. Zhu, and F. Yang, “Comparison of two
+     no. 5, pp. 6005–6015, Oct. 2023.                                               optimal guidance methods for the long-distance orbital pursuit-
+ [2] M. Shan, J. Guo, and E. Gill, “Review and comparison of active space           evasion game,” IEEE Trans. Aerosp. Electron. Syst., vol. 57, no. 1,
+     debris capturing and removal methods,” Prog. Aerosp. Sci., vol. 80,            pp. 521–539, Feb. 2021.
+     pp. 18–32, 2016.                                                          [25] A. Jagat and A. J. Sinclair, “Nonlinear control for spacecraft pursuit-
+ [3] Y. Wu, Z. Yu, C. Li, M. He, B. Hua, and Z. Chen, “Reinforcement                evasion game using the state-dependent Riccati equation method,”
+     learning in dual-arm trajectory planning for a free-floating space             IEEE Trans. Aerosp. Electron. Syst., vol. 53, no. 6, pp. 3032–3042,
+     robot,” Aerosp. Sci. Technol., vol. 98, 2020, Art. no. 105657.                 Dec. 2017.
+ [4] W. Clohessy and R. Wiltshire, “Terminal guidance system for satel-        [26] Q. Wei, D. Liu, Q. Lin, and R. Song, “Adaptive dynamic program-
+     lite rendezvous,” J. Aerosp. Sci., vol. 27, no. 9, pp. 653–658, 1960.          ming for discrete-time zero-sum games,” IEEE Trans. Neural Netw.
+ [5] S. Li, X. Zhang, W. Liu, and N. Cui, “Optimization-based iterative             Learn. Syst., vol. 29, no. 4, pp. 957–969, Apr. 2018.
+     and robust strategy for spacecraft relative navigation in elliptical      [27] Z. Zheng, P. Zhang, and J. Yuan, “Nonzero-sum pursuit-evasion
+     orbit,” Aerosp. Sci. Technol., vol. 133, 2023, Art. no. 108138.                game control for spacecraft systems: A Q-learning method,” IEEE
+ [6] H. Li, Y. Liu, K. Li, and Y. Liang, “Analytical prescribed perfor-             Trans. Aerosp. Electron. Syst., vol. 59, no. 4, pp. 3971–3981,
+     mance guidance with field-of-view and impact-angle constraints,” J.            Aug. 2023.
+     Guidance, Control, Dyn., vol. 47, no. 4, pp. 728–741, 2024.               [28] W. Lin, Z. Qu, and M. A. Simaan, “Nash strategies for pursuit-
+ [7] J. Prussing, “Optimal two-and three-impulse fixed-time rendezvous              evasion differential games involving limited observations,” IEEE
+     in the vicinity of a circular orbit,” Amer. Inst. Aeronaut. Astronaut.         Trans. Aerosp. Electron. Syst., vol. 51, no. 2, pp. 1347–1356,
+     J., vol. 8, no. 7, pp. 1221–1228, 1970.                                        Apr. 2015.
+ [8] G. Zhang, D. Zhou, Z. Sun, and X. Cao, “Optimal two-impulse cotan-        [29] W. Lin, C. Li, Z. Qu, and M. A. Simaan, “Distributed forma-
+     gent rendezvous between coplanar elliptical orbits,” J. Guidance,              tion control with open-loop Nash strategy,” Automatica, vol. 106,
+     Control, Dyn., vol. 36, no. 3, pp. 677–685, 2013.                              pp. 266–273, 2019.
+ [9] A. Shirazi, J. Ceberio, and J. A. Lozano, “An evolutionary discretized    [30] J. Li, S. Chen, C. Li, and F. Wang, “Distributed game strategy for
+     lambert approach for optimal long-range rendezvous considering                 formation flying of multiple spacecraft with disturbance rejection,”
+     impulse limit,” Aerosp. Sci. Technol., vol. 94, 2019, Art. no. 105400.         IEEE Trans. Aerosp. Electron. Syst., vol. 57, no. 1, pp. 119–128,
+[10] S. Samsam and R. Chhabra, “Multi-impulse smooth trajectory de-                 Feb. 2021.
+     sign for long-range rendezvous with an orbiting target using multi-       [31] S. Chen, Y. Yang, D. Ma, X. Wang, K. Li, and C. Li, “Cooperative
+     objective non-dominated sorting genetic algorithm,” Aerosp. Sci.               guidance law with impact angle coordination: A Nash approach,”
+     Technol., vol. 120, 2022, Art. no. 107285.                                     IEEE Trans. Aerosp. Electron. Syst., vol. 58, no. 5, pp. 3924–3931,
+[11] J. Broida and R. Linares, “Spacecraft rendezvous guidance in                   Oct. 2022.
+     cluttered environments via reinforcement learning,” in Proc. 29th         [32] Y. Liu, X. Chen, Y. Zhang, and C. Li, “Sample data game strategy for
+     AAS/AIAA Space Flight Mechan. Meeting, American Astronautical                  active rendezvous with disturbance rejection,” Aerosp. Sci. Technol.,
+     Society, 2019, pp. 1–15.                                                       vol. 121, 2022, Art. no. 107358.
+[12] D. Wu, L. Cheng, S. Gong, and H. Baoyin, “Approximate time-               [33] X. Tang, D. Ye, L. Huang, Z. Sun, and J. Sun, “Pursuit-evasion game
+     optimal low-thrust rendezvous solutions between circular orbits,”              switching strategies for spacecraft with incomplete-information,”
+     Aerosp. Sci. Technol., vol. 131, 2022, Art. no. 108011.                        Aerosp. Sci. Technol., vol. 119, 2021, Art. no. 107112.
+[13] Q. Sun and Z. Dang, “Deep neural network for non-cooperative space        [34] M. Wang and H.-N. Wu, “Autonomous game control for spacecraft
+     target intention recognition,” Aerosp. Sci. Technol., vol. 142, 2023,          rendezvous via adaptive perception and interaction,” IEEE Trans.
+     Art. no. 108681.                                                               Aerosp. Electron. Syst., vol. 59, no. 3, pp. 3188–3200, Jun. 2023.
+
+
+2224                                  IEEE TRANSACTIONS ON AEROSPACE AND ELECTRONIC SYSTEMS VOL. 61, NO. 2 APRIL 2025
+
+   Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+[35] K. T. Alfriend, S. R. Vadali, P. Gurfil, J. P. How, and L. Breger,                               Yonghe Zhang received the M.S. degree in con-
+     Spacecraft Formation Flying: Dynamics, Control and Navigation.                                   trol science and engineering from the Harbin
+     Amsterdam, the Netherlands: Elsevier, 2009.                                                      Institute of Technology, Harbin, China, in 2003,
+[36] M. Imaan and J. Cruz Jr, “Sampled-data nash controls in non-                                     and the Ph.D degree in communication and in-
+     zero-sum differential games,” Int. J. Control, vol. 17, no. 6,                                   formation system from the Chinese Academy of
+                                                                                                      Science (CAS) University, Shanghai, China, in
+     pp. 1201–1209, 1973.                                                                             2016.
+[37] M. J. Osborne and A. Rubinstein, A Course in Game Theory. Cam-                                      He is currently working as a Vice Director
+     bridge, MA, USA: MIT press, 1994.                                                                of the Innovation Academy for Microsatellites,
+[38] Y. Zhang, P. Zhang, X. Wang, F. Song, and C. Li, “A payoff aug-                                  CAS, and Director of the Key lab for Satellite
+     mentation approach to two pursuers and one evader inertial model                                 Digitalization Technology. His research interests
+     differential game,” IEEE Trans. Aerosp. Electron. Syst., vol. 59, no. 2,   include dynamics and control of spacecraft, and mission planning of
+     pp. 1371–1381, Apr. 2023.                                                  space swarm systems.
+[39] J. C. Engwerda, “Robust open-loop nash equilibria in the noncoop-
+     erative LQ game revisited,” Optimal Control Appl. Methods, vol. 38,
+     no. 5, pp. 795–813, 2017.
+[40] D. Galati, Y. Liu, and M. A. Simaan, “A fast algorithm for unit level
+                                                                                                         Jun Jiang received the Ph.D degree in mechani-
+     team resource allocation in a game environment,” in Proc. 42nd IEEE                                 cal engineering from the Shanghai Jiaotong Uni-
+     Int. Conf. Decis. Control, 2003, pp. 2872–2877.                                                     versity, Shanghai, China, in 2014.
+[41] X. Bai and J. L. Junkins, “Modified chebyshev-picard iteration                                         He is currently working as a Research Fellow
+     methods for solution of initial value problems,” J. Astronautical Sci.,                             with the Innovation Academy for Microsatel-
+     vol. 59, no. 1–2, pp. 327–351, 2012.                                                                lites, China Academy of Sciences, Shanghai. His
+                                                                                                         research interests include designing of space-
+                                                                                                         craft cluster and mission planning.
+
+
+
+
+                                                                                                          Chaoyong Li (Senior Member, IEEE) received
+                                                                                                          the Ph.D. degree in aerospace engineering from
+                                                                                                          the Harbin Institute of Technology, Harbin,
+                          Yuchen Liu received the Ph.D degree in control                                  China, in 2008.
+                          theory and control engineering from the Zhe-                                       He was a Postdoctoral Researcher and a Re-
+                          jiang University, Hangzhou, China, in 2024.                                     search Scientist with the University of Central
+                             He is currently an Research Engineer with the                                Florida, Orlando, FL, USA, and Intelligent Fu-
+                          Beijing Institute of Control Engineering, Bei-                                  sion Technology Inc., Germantown, MD, USA,
+                          jing, China. His recent research interets include                               respectively. Since 2015, he has been a Research
+                          game theory and its applications in multiagent                                  Professor with the College of Electrical Engi-
+                          systems, dynamics, and control of spacecraft.                                   neering, Zhejiang University, Hangzhou, China.
+                                                                                His research interests include guidance and control of aerial vehicles,
+                                                                                distributed control, and optimization of multiagent systems.
+
+
+
+
+LIU ET AL.: MULTIPLE-TO-ONE ORBITAL PURSUIT: A COMPUTATIONAL GAME STRATEGY                                                                           2225
+
+Authorized licensed use limited to: University of Texas at Austin. Downloaded on February 26,2026 at 22:38:58 UTC from IEEE Xplore. Restrictions apply.
+

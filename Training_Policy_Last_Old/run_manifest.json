@@ -1,9 +1,9 @@
 {
-  "created_utc": "2026-03-19T18:44:41.921464+00:00",
+  "created_utc": "2026-03-18T20:00:30.875857+00:00",
   "out_dir": "Training_Policy",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
-    "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35"
+    "platform": "Linux-6.8.0-101-generic-x86_64-with-glibc2.35"
   },
   "configs": {
     "training config used": {
@@ -82,7 +82,7 @@
         "min_sep": 3.0
       },
       "zero_sum_reward": {
-        "mode": "legacy_dock",
+        "mode": "progress_barrier",
         "progress_coef": 2.0,
         "safe_sep_m": 3.0,
         "unsafe_close_coef": 2.0,
@@ -165,7 +165,7 @@
       "save_best_ckpt": true,
       "save_last_ckpt": true,
       "scale_invariant": true,
-      "distill": false,
+      "distill": true,
       "distill_method": "modern",
       "distill_collection_mode": "dagger",
       "distill_paper_student_lstm_hidden": 256,
@@ -182,21 +182,21 @@
       "att_ckpt_path": null,
       "verify_freeze": true,
       "freeze_tol": 0.0,
-      "num_envs": 256,
-      "steps_per_env": 512,
-      "total_updates": 1000,
+      "num_envs": 1,
+      "steps_per_env": 256,
+      "total_updates": 100,
       "train_epochs": 3,
-      "minibatch_size": 4096,
+      "minibatch_size": 1024,
       "log_every": 10,
       "entropy_coef": 0.01,
-      "k_pos": 0.3,
-      "k_dock": 0.0,
-      "gamma": 0.992,
-      "target_hit_reward_penalty": 10.0,
-      "collision_penalty": 10.0,
-      "wall_penalty": 2.5,
+      "k_pos": 0.04,
+      "k_dock": 0.5,
+      "gamma": 0.998,
+      "target_hit_reward_penalty": 5.0,
+      "collision_penalty": 5.0,
+      "wall_penalty": 5.0,
       "fuel_depletion_penalty": 5.0,
-      "collision_radius_m": 0.75,
+      "collision_radius_m": 0.8,
       "record_ic_history": true,
       "max_ic_history": 300000,
       "k_eff_def": 0.01,
@@ -242,5 +242,20 @@
       "train_role": "rl"
     }
   },
-  "stages": []
+  "stages": [
+    {
+      "name": "PHASE0_train_def0",
+      "start_utc": "2026-03-18T20:00:30.877870+00:00",
+      "meta": {
+        "phase_name": "def0",
+        "attacker_mode": "rule",
+        "extra_train_cfg": {
+          "gamma": 0.99,
+          "hit_buffer_def": 0.25
+        }
+      },
+      "end_utc": "2026-03-18T20:02:21.655855+00:00",
+      "duration_s": 110.77799406484701
+    }
+  ]
 }

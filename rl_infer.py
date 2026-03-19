@@ -251,12 +251,13 @@ class RLPolicyDiff:
         meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
         payload_cfg = payload.get("cfg", {}) if isinstance(payload, dict) else {}
         latent_dim = int(meta.get("latent_dim", payload_cfg.get("distill_latent_dim", 8)))
+        lstm_hidden = int(meta.get("lstm_hidden", payload_cfg.get("distill_recurrent_student_lstm_hidden", 256)))
         return PartialObsStudentPolicy(
             xhat_dim=self.student_xhat_dim,
             sigma_dim=self.student_sigma_dim,
             act_dim=self.act_dim,
             latent_dim=latent_dim,
-            lstm_hidden=256,
+            lstm_hidden=lstm_hidden,
             act_scale=self.umax,
         )
 

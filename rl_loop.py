@@ -92,7 +92,7 @@ if __name__ == "__main__":
         print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
 
         phase0_extra = {
-            "gamma": 0.990,
+            "gamma": 0.991,
             "hit_buffer_def": 0.25,
         }
         with runlog.stage(

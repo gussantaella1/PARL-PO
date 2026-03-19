@@ -98,6 +98,19 @@ COMMON: Dict[str, Any] = {
         "min_sep": 3.0
     },
 
+    # Zero-sum step shaping used by the PPO env.
+    # "progress_barrier" rewards attacker progress to the objective while only
+    # penalizing proximity inside a local safety bubble around the defender.
+    # "legacy_dock" reproduces the old global stay-away dock-gap shaping.
+    "zero_sum_reward": {
+        "mode": "legacy_dock",
+        "progress_coef": 2.0,
+        "safe_sep_m": 3.0,
+        "unsafe_close_coef": 2.0,
+        "unsafe_close_power": 2.0,
+        "progress_gate_power": 1.0,
+    },
+
     # Filled by build_dyn()
     "dyn": {"Ad": None, "Bd": None},
 
@@ -188,23 +201,18 @@ TRAIN: Dict[str, Any] = {
     # Optional checkpoints
     "scale_invariant": True, # Normalizes radii
 
-    "distill": True, #Does policy distillation, True or False
-    "distill_method": "modern",  # "modern", "teacher_forced", "intervention", or "original"
-    "distill_warm_start_from_teacher": True,
-    "distill_teacher_label": "mean",   # "mean" or "sample"
-    "distill_batch_size": 2048,
-    "distill_epochs": 4,
-    "distill_buffer_capacity": None,   # if None, derived from max_dataset_episodes * max_steps
-    "distill_w_nll": 1.0,
-    "distill_w_kl": 0.0,
-    "distill_w_mse": 0.0,
-    "distill_w_v": 0.0,
-    "distill_train_logstd": False,
-    "distill_logstd_min": -5.0,
-    "distill_logstd_max": 1.0,
-    "distill_intervention_action_l2_thresh": None,
-    "distill_intervention_oi_margin_m": 1.0,
-    "distill_intervention_collision_margin_m": 1.0,
+    "distill": False, #Does policy distillation, True or False
+    "distill_method": "modern",  # "modern" or "paper_recurrent"
+    "distill_collection_mode": "dagger",  # modern/paper_recurrent only support "dagger"
+    "distill_paper_student_lstm_hidden": 256,
+    "distill_paper_tbptt_chunk_len": 40,
+    "distill_paper_train_episodes_per_iter": 64,  # None => train on the full aggregated dataset
+    "distill_paper_lambda_intent": 1.0,
+    "distill_paper_action_loss": "mse",
+    "distill_paper_intent_loss": "mse",
+    "distill_paper_grad_clip_norm": None,
+    "distill_paper_log_every": 10,
+    "distill_paper_allow_sim_intent_fallback": True,
     "distill_log_every": 10,
 
     "def_ckpt_path": None,
@@ -224,14 +232,14 @@ TRAIN: Dict[str, Any] = {
     "entropy_coef": 0.01,
 
     "k_pos": 0.3, #Was 0.05
-    "k_dock": 0.5,
+    "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
 
     "gamma": 0.992, #Was 0.995
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 10.0,
     "wall_penalty": 2.5,
     "fuel_depletion_penalty": 5.0,
-    "collision_radius_m": 0.25,            # meters
+    "collision_radius_m": 0.75,            # meters
 
     # "k_pos": 0.05, #Was 0.05
     # "k_dock": 0.5,
@@ -377,12 +385,6 @@ TRAIN: Dict[str, Any] = {
     "dagger_decay_iters": 50,
     "lambda_intent": 1.0,
     "reward_mode_for_step": "def",
-    "distill_original_student_lstm_hidden": 256,
-    "distill_original_action_loss": "mse",
-    "distill_original_intent_loss": "mse",
-    "distill_original_grad_clip_norm": None,
-    "distill_original_log_every": 10,
-    "distill_original_allow_sim_intent_fallback": True,
 
 
 

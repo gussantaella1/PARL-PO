@@ -827,16 +827,17 @@ class Env:
             g = (
                 #Both agents: TBoth terms
                 self.k_pos * d2
-                - (self.k_dock) * dock_gap                
+                # - (self.k_dock) * dock_gap                
                 # - (self.k_pos/1.5) * rel2
                 # + k_time
             )
 
-            #Effort regularizer 
+            # Control effort: defender pays for actuation directly in g, attacker sees the
+            # sign-flipped version through r_att = -g.
             g += - self.lD * a1n2 + self.lA * a2n2
 
-            if self.use_ukf and self.use_meas_reward:
-                g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
+            # if self.use_ukf and self.use_meas_reward:
+            #     g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
 
             if self.use_fuel:
                 # eff_def = thrust_def / (self.Tmax_def + 1e-9)
@@ -882,53 +883,7 @@ class Env:
             
 
         else:
-
-            if need_def:
-                r1 = (
-                    self.alpha * delta_d2
-                    + self.k_pos * d2
-                    # - self.k_rel * rel2
-                    # - self.k_vel * v1n2
-                    # - k_vrad * (vrad1**2)
-                    - self.lD * a1n2
-                    - wall1
-                    - center_keepout
-                )
-
-            if need_att:
-
-                dist = float(np.linalg.norm(p2 - p1))  # meters
-                x = dist / (float(self.att_min_sep) + 1e-9)  # 1.0 at the boundary
-                close_pen = max(0.0, 1.0 - x) ** 2           # ramps up as dist -> min_sep
-                d2_prev = float(self._d2_prev if self._d2_prev is not None else d2)
-
-                progress = d2_prev - d2  # positive inward
-                r2 = (
-                    + self.k_att_prog * progress
-                    - self.k_att_close * close_pen
-                    - self.lA  * a2n2
-                    - wall2
-                )
-
-            if need_def:
-                if done:
-                    if collision:
-                        r1 -= self.collision_penalty
-                    if oob1: 
-                        r1 -= self.wallK
-                    if att_hit_target: 
-                        r1 -= self.target_hit_reward_penalty
-                    if def_hit_target: 
-                        r1 -= self.target_hit_reward_penalty
-
-            if need_att:
-                if done:
-                    if collision:
-                        r2 -= self.collision_penalty
-                    if oob2_any: 
-                        r2 -= self.wallK
-                    if att_hit_target: 
-                        r2 += self.target_hit_reward_penalty
+            raise("Failed")
 
 
         # track d2_prev based on the geometry used for reward (same as your current logic)

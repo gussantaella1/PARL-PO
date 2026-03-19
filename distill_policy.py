@@ -17,13 +17,17 @@ from core.distill import distill_from_teacher
 DISTILL_RUN: Dict[str, Any] = {
     # Required paths
     "teacher_ckpt": "Training_Policy/def1_teacher.pt",
-    "out_path": "Distillation_Tester/def1_ukf_student_manual_intervention.pt",
-    "metrics_out": "Distillation_Tester/distill_metrics_def1_student_manual_intervention.npz",
+    "out_path": "Distillation_Tester/def1_ukf_student_manual_modern.pt",
+    "metrics_out": "Distillation_Tester/distill_metrics_def1_student_manual_modern.npz",
 
     # Basic role/mode selection
     "train_role": "def",          # "def" or "att"
     "attacker_mode": "rule",      # "rule" or "rl"
-    "distill_method": "intervention",   # "modern", "teacher_forced", "intervention", or "original"
+    # "distill_method": "paper_recurrent",   # "modern" or "paper_recurrent"
+
+    "distill_method": "paper_recurrent",
+    "distill_collection_mode": "dagger",
+
 
     # Optional frozen opponent checkpoints for attacker_mode="rl"
     "def_ckpt_path": None,
@@ -32,45 +36,29 @@ DISTILL_RUN: Dict[str, Any] = {
     # Optional top-level overrides applied on top of config_for_train(...)
     # Any key from config_rl can go here. Nested dicts are allowed.
     "cfg_overrides": {
-        "device": "cpu",
-        "distill": True,
-        "use_ukf": True,
-
-        # Modern distill knobs
-        "distill_warm_start_from_teacher": True,
-        "distill_teacher_label": "mean",
-        "distill_batch_size": 2048,
-        "distill_epochs": 4,
-        "distill_buffer_capacity": None,
-        "distill_w_nll": 1.0,
-        # "distill_w_kl": 0.0,
-        "distill_w_kl": 0.05,
-        # "distill_w_mse": 0.0,
-        "distill_w_mse": 0.25,
-        "distill_w_v": 0.0,
-        "distill_train_logstd": False,
-        "distill_logstd_min": -5.0,
-        "distill_logstd_max": 1.0,
-        "distill_intervention_action_l2_thresh": None,
-        "distill_intervention_oi_margin_m": 1.0,
-        "distill_intervention_collision_margin_m": 1.0,
-        "distill_log_every": 10,
-
-        # Shared rollout / DAgger knobs
+        "device": "cuda",
+        "distill_paper_student_lstm_hidden": 256,
+        "distill_paper_tbptt_chunk_len": 40,
+        "distill_paper_train_episodes_per_iter": None,   # or 128 if runtime matters
+        "distill_paper_lambda_intent": 0.25,
+        "distill_paper_action_loss": "mse",
+        "distill_paper_intent_loss": "mse",
+        "distill_paper_grad_clip_norm": None,
+        "distill_paper_log_every": 10,
+        "distill_paper_allow_sim_intent_fallback": True,
         "episodes_per_iter": 8,
         "max_steps": 300,
         "iters": 100,
         "dagger_beta_start": 1.0,
         "dagger_beta_end": 0.0,
         "dagger_decay_iters": 50,
-
-        # UKF / belief knobs
         "reward_from_belief": True,
         "use_meas_reward": False,
         "meas_innov_coef": 0.0,
         "meas_cov_coef": 0.0,
-    },
-}
+
+            },
+        }
 
 
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
@@ -97,6 +85,8 @@ def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
         cfg["att_ckpt_path"] = run_cfg["att_ckpt_path"]
 
     _deep_update(cfg, dict(run_cfg.get("cfg_overrides", {})))
+    if run_cfg.get("distill_collection_mode") is not None:
+        cfg["distill_collection_mode"] = run_cfg["distill_collection_mode"]
     build_dyn(cfg)
     return cfg
 
@@ -119,6 +109,7 @@ def main() -> None:
                 "train_role": cfg["train_role"],
                 "attacker_mode": cfg["attacker_mode"],
                 "distill_method": cfg["distill_method"],
+                "distill_collection_mode": cfg.get("distill_collection_mode"),
                 "device": cfg["device"],
             },
             indent=2,

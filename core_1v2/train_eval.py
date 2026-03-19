@@ -1,29 +1,33 @@
+from __future__ import annotations
+
 import gc
 import os
 import time
-from typing import Any, Dict
 from collections import Counter
+from typing import Any, Dict
 
 import numpy as np
 import torch
 
 from config_rl import build_dyn, config_for_train
-from core.buffers import RolloutBuffer
 from core.distill import distill_from_teacher
-from core.env import Env, VecEnv, collect_ic_history_from_vecenv
-from core.models import ActorCriticDiff
-from core.plotting import make_tb_writer
-from core.ppo import PPO
-from core.utils import set_seed, squash_action
-from core.freeze_utils import freeze_module_, snapshot_state_dict, assert_frozen_unchanged, assert_deterministic_action
-
-# =============================================================
-# Training & Evaluation
-# =============================================================
+from core_1v2.buffers import RolloutBuffer
+from core_1v2.env import Env, VecEnv, collect_ic_history_from_vecenv
+from core_1v2.freeze_utils import (
+    assert_deterministic_action,
+    assert_frozen_unchanged,
+    freeze_module_,
+    snapshot_state_dict,
+)
+from core_1v2.models import ActorCriticDiff
+from core_1v2.plotting import make_tb_writer
+from core_1v2.ppo import PPO
+from core_1v2.utils import permute_obs_for_attacker, set_seed, squash_action
 
 
 def _cpu_state_dict(m: torch.nn.Module) -> dict:
     return {k: v.detach().cpu() for k, v in m.state_dict().items()}
+
 
 def _save_role_checkpoint(ppo, train_role: str, path: str):
     if train_role == "def":
@@ -95,20 +99,24 @@ def _build_opponent_policy_mix(
             device=device,
             ckpt_path=path,
         )
-        entries.append({
-            "name": name,
-            "net": net,
-            "prob": float(item.get("prob", 0.0)),
-            "path": path,
-            "action_scale": float(item.get("action_scale", 1.0)),
-            "noise_std": float(item.get("noise_std", 0.0)),
-            "idle_prob": float(item.get("idle_prob", 0.0)),
-        })
+        entries.append(
+            {
+                "name": name,
+                "net": net,
+                "prob": float(item.get("prob", 0.0)),
+                "path": path,
+                "action_scale": float(item.get("action_scale", 1.0)),
+                "noise_std": float(item.get("noise_std", 0.0)),
+                "idle_prob": float(item.get("idle_prob", 0.0)),
+            }
+        )
 
     probs = _normalize_probs(entries)
     resample = str(mix.get("resample", "episode")).lower()
     if resample not in ("episode", "update", "never"):
-        raise ValueError(f"Unsupported opp_mix resample={resample!r}; expected 'episode', 'update', or 'never'.")
+        raise ValueError(
+            f"Unsupported opp_mix resample={resample!r}; expected 'episode', 'update', or 'never'."
+        )
 
     return {
         "opp_role": opp_role,
@@ -116,6 +124,8 @@ def _build_opponent_policy_mix(
         "probs": probs,
         "resample": resample,
         "act_dim": act_dim,
+        "num_attackers": int(cfg.get("num_attackers", 1)),
+        "D": int(cfg["D"]),
     }
 
 
@@ -132,16 +142,31 @@ def _act_from_opponent_policy_mix(
 ):
     opp_role = mix_state["opp_role"]
     act_dim = int(mix_state["act_dim"])
-    out = torch.zeros((obs_batch.shape[0], act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
+    Na = int(mix_state["num_attackers"])
+    D = int(mix_state["D"])
+
+    if opp_role == "att" and Na > 1:
+        out = torch.zeros((obs_batch.shape[0], Na, act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
+    else:
+        out = torch.zeros((obs_batch.shape[0], act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
 
     unique_ids = np.unique(active_indices)
     for idx in unique_ids:
-        mask_np = (active_indices == idx)
+        mask_np = active_indices == idx
         mask = torch.as_tensor(mask_np, dtype=torch.bool, device=obs_batch.device)
         entry = mix_state["entries"][int(idx)]
         net = entry["net"]
-        dist = net.dist(obs_batch[mask], who=opp_role)
-        a = squash_action(dist.mean, act_scale)
+
+        if opp_role == "att" and Na > 1:
+            a_list = []
+            for k in range(Na):
+                obs_k = permute_obs_for_attacker(obs_batch[mask], k, D, Na)
+                dist = net.dist(obs_k, who="att")
+                a_list.append(squash_action(dist.mean, act_scale))
+            a = torch.stack(a_list, dim=1)
+        else:
+            dist = net.dist(obs_batch[mask], who=opp_role)
+            a = squash_action(dist.mean, act_scale)
 
         action_scale = float(entry.get("action_scale", 1.0))
         noise_std = float(entry.get("noise_std", 0.0))
@@ -149,22 +174,20 @@ def _act_from_opponent_policy_mix(
 
         if action_scale != 1.0:
             a = action_scale * a
-
         if noise_std > 0.0:
             a = a + noise_std * torch.randn_like(a)
-
         if idle_prob > 0.0:
-            idle_mask = (torch.rand((a.shape[0], 1), device=a.device) < idle_prob)
+            idle_shape = (a.shape[0], 1, 1) if (opp_role == "att" and Na > 1) else (a.shape[0], 1)
+            idle_mask = torch.rand(idle_shape, device=a.device) < idle_prob
             a = torch.where(idle_mask, torch.zeros_like(a), a)
 
         a = torch.clamp(a, -act_scale, act_scale)
         out[mask] = a
+
     return out
 
+
 def train(cfg: Dict[str, Any]):
-
-
-
     set_seed(cfg["seed"])
     device = cfg["device"]
 
@@ -175,24 +198,13 @@ def train(cfg: Dict[str, Any]):
     if cfg.get("use_tensorboard", False):
         writer, tb_logdir = make_tb_writer(cfg)
 
-        # Optional: show model graphs once (often noisy / can break with custom ops)
-        # writer.add_text("notes", "PPO Diffgame run", 0)
+    train_role = cfg.get("train_role", "def")
+    reward_mode = "def" if train_role == "def" else "att"
 
-    train_role = cfg.get("train_role", "def")  # <-- NEW
-
-    if train_role == "def":
-        reward_mode = "def"
-    elif train_role == "att":
-        reward_mode = "att"
-
-    # -------------------------
-    # Checkpoint saving config
-    # -------------------------
     save_best_ckpt = bool(cfg.get("save_best_ckpt", True))
     save_last_ckpt = bool(cfg.get("save_last_ckpt", True))
     checkpoint_dir = cfg.get("checkpoint_dir", None)
     checkpoint_prefix = cfg.get("checkpoint_prefix", f"{train_role}_teacher")
-
     tracked_metric_name = "R_def_mean" if train_role == "def" else "R_att_mean"
     best_metric = -float("inf")
     best_update = None
@@ -209,6 +221,7 @@ def train(cfg: Dict[str, Any]):
     steps_per_env = int(cfg.get("steps_per_env"))
     total_updates = int(cfg.get("total_updates"))
     log_every = int(cfg.get("log_every"))
+    Na = int(cfg.get("num_attackers", 1))
 
     vec = VecEnv(make_env, num_envs)
     obs_dim = vec.obs.shape[1]
@@ -216,7 +229,6 @@ def train(cfg: Dict[str, Any]):
 
     ppo = PPO(obs_dim, act_dim, cfg, device=device)
 
-    # Optional: initialize attacker from a BC checkpoint (before PPO training)
     att_init = cfg.get("att_init_path", None)
     if att_init is not None:
         if ppo.att_net is None:
@@ -225,18 +237,14 @@ def train(cfg: Dict[str, Any]):
         ppo.att_net.load_state_dict(state)
         print(f"[train] Loaded attacker init from: {att_init}")
 
-
-    # Optional: load fixed defender
     def_ckpt = cfg.get("def_ckpt_path", None)
     if def_ckpt is not None:
         state = torch.load(def_ckpt, map_location=device)
         ppo.def_net.load_state_dict(state)
-        # If defender should be frozen:
         if cfg.get("freeze_defender", False):
             for p in ppo.def_net.parameters():
                 p.requires_grad_(False)
 
-    # Optional: load fixed attacker
     att_ckpt = cfg.get("att_ckpt_path", None)
     if att_ckpt is not None and ppo.att_net is not None:
         state = torch.load(att_ckpt, map_location=device)
@@ -245,46 +253,34 @@ def train(cfg: Dict[str, Any]):
             for p in ppo.att_net.parameters():
                 p.requires_grad_(False)
 
-    # Freeze whichever role we do NOT train in this phase
     if cfg.get("freeze_defender", False):
         freeze_module_(ppo.def_net)
-
     if cfg.get("freeze_attacker", False) and (ppo.att_net is not None):
         freeze_module_(ppo.att_net)
 
-    # =========================================================
-    # NEW: Freeze verification snapshots (opponents must not move)
-    # =========================================================
     verify_freeze = bool(cfg.get("verify_freeze"))
-    freeze_tol = float(cfg.get("freeze_tol"))  # set 0.0 for exact; or 1e-12 if you’re paranoid
+    freeze_tol = float(cfg.get("freeze_tol"))
+    snap_def = snapshot_state_dict(ppo.def_net) if verify_freeze and cfg.get("freeze_defender") else None
+    snap_att = (
+        snapshot_state_dict(ppo.att_net)
+        if verify_freeze and cfg.get("freeze_attacker") and (ppo.att_net is not None)
+        else None
+    )
 
-    snap_def = None
-    snap_att = None
-
-    if verify_freeze and cfg.get("freeze_defender"):
-        # defender is frozen opponent in attacker-training
-        snap_def = snapshot_state_dict(ppo.def_net)
-
-    if verify_freeze and cfg.get("freeze_attacker") and (ppo.att_net is not None):
-        # attacker is frozen opponent in defender-training
-        snap_att = snapshot_state_dict(ppo.att_net)
-
-    # NEW: LR schedule config
     lr_schedule = cfg.get("lr_schedule", "none")
     lr_final_factor = float(cfg.get("lr_final_factor", 0.1))
 
-    # ---- NEW: metrics container ----
     metrics = {
         "update": [],
         "R_def_mean": [],
         "R_att_mean": [],
         "muD_abs_mean": [],
         "stdD_mean": [],
-        "d1_mean": [],          # defender true distance
-        "d2_mean": [],          # attacker belief distance (what obs sees)
-        "d2_true_mean": [],     # attacker true distance
-        "meas_innov_mean": [],  # optional
-        "ukf_trPpos_mean": [],  # optional
+        "d1_mean": [],
+        "d2_mean": [],
+        "d2_true_mean": [],
+        "meas_innov_mean": [],
+        "ukf_trPpos_mean": [],
         "lr_pi": [],
         "lr_vf": [],
     }
@@ -294,8 +290,6 @@ def train(cfg: Dict[str, Any]):
         metrics["fuel_used_att_mean"] = []
         metrics["fuel_frac_def_mean"] = []
         metrics["fuel_frac_att_mean"] = []
-
-        # optional
         metrics["thrust_def_mean"] = []
         metrics["thrust_att_mean"] = []
         metrics["mdot_def_mean"] = []
@@ -312,63 +306,48 @@ def train(cfg: Dict[str, Any]):
     mix_active_idx = None
     if opp_policy_mix is not None:
         mix_name_to_metric = {
-            entry["name"]: f"opp_mix__{entry['name']}"
-            for entry in opp_policy_mix["entries"]
+            entry["name"]: f"opp_mix__{entry['name']}" for entry in opp_policy_mix["entries"]
         }
         for metric_name in mix_name_to_metric.values():
             metrics[metric_name] = []
         mix_active_idx = _sample_opponent_indices(opp_policy_mix, num_envs)
 
-
-
-    # Optional anneal of defender center tether
     def_center_base = cfg.get("def_center_coef", 0.0)
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
 
     for upd in range(1, total_updates + 1):
-        term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
+        term_counts = {"oob_def": 0, "oob_att": 0, "hit_target": 0, "collision": 0}
         mix_counts_update = Counter()
 
-        if (opp_policy_mix is not None) and (opp_policy_mix["resample"] == "update"):
+        if opp_policy_mix is not None and opp_policy_mix["resample"] == "update":
             mix_active_idx = _sample_opponent_indices(opp_policy_mix, num_envs)
 
-
-        # ---------- optional LR decay (linear) ----------
         if lr_schedule == "linear":
-            # frac_lr goes 0 → 1 over training
             frac_lr = (upd - 1) / max(1, total_updates - 1)
             scale = 1.0 - frac_lr * (1.0 - lr_final_factor)
-
-            # defender
             for g, base in zip(ppo.def_opt.param_groups, ppo.def_base_lrs):
                 g["lr"] = base * scale
-
-            # attacker RL (if you ever turn it on)
             if ppo.att_opt is not None and getattr(ppo, "att_base_lrs", None) is not None:
                 for g, base in zip(ppo.att_opt.param_groups, ppo.att_base_lrs):
                     g["lr"] = base * scale
-        # ------------------------------------------------
 
-        # Linear anneal multiplier from 1.0 → min_anneal for k_cent
         center_frac = upd / max(1, total_updates)
         k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
         for e in vec.envs:
             e.k_cent = def_center_base * k_cent_mul
 
-        # Buffers
         bufD = RolloutBuffer(obs_dim, act_dim, num_envs, steps_per_env, device)
-        rule_att = (cfg.get("attacker_mode", "rule") == "rule")
-        if (not rule_att) and (train_role in ("att", "both")):
-            bufA = RolloutBuffer(obs_dim, act_dim, num_envs, steps_per_env, device)
+        rule_att = cfg.get("attacker_mode", "rule") == "rule"
+        if (not rule_att) and train_role in ("att", "both"):
+            bufA_envs = num_envs * Na if Na > 1 else num_envs
+            bufA = RolloutBuffer(obs_dim, act_dim, bufA_envs, steps_per_env, device)
         else:
             bufA = None
-
 
         o = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
         ep_ret_def = np.zeros(num_envs, dtype=np.float64)
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
-        # accumulators for metrics over this update
         d1_true_acc = 0.0
         d2_true_acc = 0.0
         d2_belief_acc = 0.0
@@ -381,7 +360,6 @@ def train(cfg: Dict[str, Any]):
             fuel_used_att_acc = 0.0
             fuel_frac_def_acc = 0.0
             fuel_frac_att_acc = 0.0
-
             thrust_def_acc = 0.0
             thrust_att_acc = 0.0
             mdot_def_acc = 0.0
@@ -393,60 +371,73 @@ def train(cfg: Dict[str, Any]):
                 if train_role == "def":
                     a1, lp1, v1 = ppo.act(o, who="def", deterministic=False)
                     if opp_policy_mix is not None:
-                        a2 = _act_from_opponent_policy_mix(
-                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
-                        )
-                        lp2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
-                        v2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        a2 = _act_from_opponent_policy_mix(o, opp_policy_mix, mix_active_idx, ppo.act_scale)
                     else:
-                        a2, lp2, v2 = ppo.act(o, who="att", deterministic=True)
+                        a2, _, _ = ppo.act(o, who="att", deterministic=True)
+                    lp2 = None
+                    v2 = None
                 elif train_role == "att":
                     if opp_policy_mix is not None:
-                        a1 = _act_from_opponent_policy_mix(
-                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
-                        )
-                        lp1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
-                        v1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        a1 = _act_from_opponent_policy_mix(o, opp_policy_mix, mix_active_idx, ppo.act_scale)
                     else:
-                        a1, lp1, v1 = ppo.act(o, who="def", deterministic=True)
+                        a1, _, _ = ppo.act(o, who="def", deterministic=True)
                     a2, lp2, v2 = ppo.act(o, who="att", deterministic=False)
+                    lp1 = None
+                    v1 = None
                 else:
                     raise ValueError(f"Unknown train_role={train_role!r}")
 
-
             a1_np = a1.cpu().numpy()
-
             a2_np = a2.cpu().numpy()
-            # normalize shapes to what Env expects:
-            # - if attacker RL: (B, D) ok
-            # - if rule attacker: (B, Na, D) ok
-            # - if rule attacker but produced (B, D): expand to (B,1,D)
-            if a2_np.ndim == 2 and cfg.get("attacker_mode", "rule") == "rule" and cfg.get("num_attackers", 1) == 1:
+            if a2_np.ndim == 2 and cfg.get("attacker_mode", "rule") == "rule" and Na == 1:
                 a2_np = a2_np[:, None, :]
 
-            o2_np, r1_np, r2_np, d_np, infos = vec.step(
-                a1_np,
-                a2_np,
-                reward_mode=reward_mode,
-            )
-
+            o2_np, r1_np, r2_np, d_np, infos = vec.step(a1_np, a2_np, reward_mode=reward_mode)
 
             o2 = torch.as_tensor(o2_np, dtype=torch.float32, device=device)
             r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
             r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
-            d  = torch.as_tensor(d_np,  dtype=torch.float32, device=device)
+            d = torch.as_tensor(d_np, dtype=torch.float32, device=device)
 
-            bufD.add(o.detach(), a1.detach(), lp1.detach(), v1.detach(), r1, d)
+            logp1_store = lp1.detach() if lp1 is not None else torch.zeros_like(r1)
+            val1_store = v1.detach() if v1 is not None else torch.zeros_like(r1)
+            bufD.add(o.detach(), a1.detach(), logp1_store, val1_store, r1, d)
+
             if bufA is not None:
-                bufA.add(o.detach(), a2.detach(), lp2.detach(), v2.detach(), r2, d)
-
+                if Na == 1:
+                    bufA.add(o.detach(), a2.detach(), lp2.detach(), v2.detach(), r2, d)
+                else:
+                    o_perm = [permute_obs_for_attacker(o, k, cfg["D"], Na) for k in range(Na)]
+                    o_att_step = torch.cat(o_perm, dim=0)
+                    a_att_step = torch.cat([a2[:, k, :] for k in range(Na)], dim=0)
+                    lp_att_step = torch.cat([lp2[:, k] for k in range(Na)], dim=0)
+                    v_att_step = torch.cat([v2[:, k] for k in range(Na)], dim=0)
+                    if infos and all("r_att_each" in inf for inf in infos):
+                        rA_np = np.stack([inf["r_att_each"] for inf in infos], axis=0).astype(np.float32)
+                    else:
+                        # The shared env currently exposes only the team attacker reward.
+                        # Reuse that scalar for each shared-policy attacker sample.
+                        rA_np = np.repeat(r2_np[:, None].astype(np.float32), Na, axis=1)
+                    r_att_step = torch.as_tensor(
+                        np.concatenate([rA_np[:, k] for k in range(Na)], axis=0),
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    d_att_step = d.repeat(Na)
+                    bufA.add(
+                        o_att_step.detach(),
+                        a_att_step.detach(),
+                        lp_att_step.detach(),
+                        v_att_step.detach(),
+                        r_att_step,
+                        d_att_step,
+                    )
 
             if train_role == "def":
                 ep_ret_def += r1_np
-
             if train_role == "att":
                 ep_ret_att += r2_np
-            
+
             o = o2
 
             if opp_policy_mix is not None:
@@ -455,60 +446,46 @@ def train(cfg: Dict[str, Any]):
                     done_mask = d_np.astype(bool)
                     if np.any(done_mask):
                         mix_active_idx[done_mask] = _sample_opponent_indices(
-                            opp_policy_mix,
-                            int(done_mask.sum()),
+                            opp_policy_mix, int(done_mask.sum())
                         )
 
-            # ---- accumulate truth / belief metrics from Env.info ----
             for inf in infos:
-                # count every env-step
                 info_count += 1
-
-                # always accumulate if present
                 if "d1_true_norm" in inf:
                     d1_true_acc += inf["d1_true_norm"]
-
                 if "d2_true_norm" in inf:
                     d2_true_acc += inf["d2_true_norm"]
-
-                # belief distance: fall back safely
                 if "d2_belief_norm" in inf:
                     d2_belief_acc += inf["d2_belief_norm"]
                 elif "d2_true_norm" in inf:
                     d2_belief_acc += inf["d2_true_norm"]
                 elif "d2_norm" in inf:
                     d2_belief_acc += inf["d2_norm"]
-
                 if "meas_innov_sq" in inf:
                     meas_innov_acc += inf["meas_innov_sq"]
-
                 if "ukf_trPpos" in inf:
                     trP_acc += inf["ukf_trPpos"]
+                if inf.get("oob_def", False):
+                    term_counts["oob_def"] += 1
+                if inf.get("oob_att", False):
+                    term_counts["oob_att"] += 1
+                if inf.get("hit_target", False):
+                    term_counts["hit_target"] += 1
+                if inf.get("collision", False):
+                    term_counts["collision"] += 1
 
-                if inf.get("oob_def", False): term_counts["oob_def"] += 1
-                if inf.get("oob_att", False): term_counts["oob_att"] += 1
-                if inf.get("hit_target", False): term_counts["hit_target"] += 1
-                if inf.get("collision", False): term_counts["collision"] += 1
-
-                if cfg.get("fuel", {}).get("enable", False):
-                    if "fuel_used_def" in inf:
-                        fuel_used_def_acc += inf["fuel_used_def"]
-                        fuel_used_att_acc += inf["fuel_used_att"]
-                        fuel_frac_def_acc += inf["fuel_frac_def"]
-                        fuel_frac_att_acc += inf["fuel_frac_att"]
-
-                        thrust_def_acc += inf.get("thrust_def", 0.0)
-                        thrust_att_acc += inf.get("thrust_att", 0.0)
-                        mdot_def_acc += inf.get("mdot_def", 0.0)
-                        mdot_att_acc += inf.get("mdot_att", 0.0)
-
-                        fuel_info_count += 1
-
+                if cfg.get("fuel", {}).get("enable", False) and "fuel_used_def" in inf:
+                    fuel_used_def_acc += inf["fuel_used_def"]
+                    fuel_used_att_acc += inf["fuel_used_att"]
+                    fuel_frac_def_acc += inf["fuel_frac_def"]
+                    fuel_frac_att_acc += inf["fuel_frac_att"]
+                    thrust_def_acc += inf.get("thrust_def", 0.0)
+                    thrust_att_acc += inf.get("thrust_att", 0.0)
+                    mdot_def_acc += inf.get("mdot_def", 0.0)
+                    mdot_att_acc += inf.get("mdot_att", 0.0)
+                    fuel_info_count += 1
 
             global_env_step += num_envs
-
-
-
 
         with torch.no_grad():
             next_v_def = ppo.def_net.value(o)
@@ -516,70 +493,47 @@ def train(cfg: Dict[str, Any]):
 
         if bufA is not None:
             with torch.no_grad():
-                next_v_att = ppo.att_net.value(o)
+                if Na == 1:
+                    next_v_att = ppo.att_net.value(o)
+                else:
+                    next_v_list = [
+                        ppo.att_net.value(permute_obs_for_attacker(o, k, cfg["D"], Na)) for k in range(Na)
+                    ]
+                    next_v_att = torch.cat(next_v_list, dim=0)
             bufA.finalize(next_v_att)
 
-        # ---- choose what to update ----
         if train_role == "def":
             ppo.update_defender_only(bufD)
-
         elif train_role == "att":
             if bufA is None:
                 raise RuntimeError("train_role='att' requires attacker_mode='rl'")
             ppo.update_attacker_only(bufA)
-
         else:
             raise ValueError(f"Unknown train_role={train_role!r}")
-        
-        #explicit cleanup (place it right here)
-        # del bufD
-        # try:
-        #     del bufA
-        # except NameError:
-        #     pass
 
-        # gc.collect()
-        # if torch.cuda.is_available():
-        #     torch.cuda.empty_cache()
-                
-        # =========================================================
-        # NEW: Verify frozen opponent did not change
-        # =========================================================
         if verify_freeze:
-            # If training attacker, defender should be frozen (Phase 1)
-            if (train_role == "att") and (snap_def is not None):
+            if train_role == "att" and (snap_def is not None):
                 assert_frozen_unchanged(snap_def, ppo.def_net, name="frozen_defender", tol=freeze_tol)
-
-            # If training defender, attacker should be frozen (Phase 2)
-            if (train_role == "def") and (snap_att is not None):
+            if train_role == "def" and (snap_att is not None):
                 assert_frozen_unchanged(snap_att, ppo.att_net, name="frozen_attacker", tol=freeze_tol)
-
-
 
         if upd % log_every == 0:
             R_def_mean = ep_ret_def.mean()
             R_att_mean = ep_ret_att.mean()
-
             tracked_metric_value = R_def_mean if train_role == "def" else R_att_mean
 
-            if save_best_ckpt and checkpoint_dir is not None:
-                if tracked_metric_value > best_metric:
-                    best_metric = float(tracked_metric_value)
-                    best_update = int(upd)
-                    best_ckpt_path = os.path.join(
-                        checkpoint_dir,
-                        f"{checkpoint_prefix}__best.pt"
-                    )
-                    _save_role_checkpoint(ppo, train_role, best_ckpt_path)
-                    print(
-                        f"[checkpoint] new best {tracked_metric_name}={best_metric:+.3f} "
-                        f"at update {best_update} -> {best_ckpt_path}"
-                    )
+            if save_best_ckpt and checkpoint_dir is not None and tracked_metric_value > best_metric:
+                best_metric = float(tracked_metric_value)
+                best_update = int(upd)
+                best_ckpt_path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}__best.pt")
+                _save_role_checkpoint(ppo, train_role, best_ckpt_path)
+                print(
+                    f"[checkpoint] new best {tracked_metric_name}={best_metric:+.3f} "
+                    f"at update {best_update} -> {best_ckpt_path}"
+                )
 
-            # means over all steps collected this update
             if info_count > 0:
                 R = cfg["arena"]["r"]
-
                 d1_true_mean = np.sqrt(d1_true_acc / info_count) * R
                 d2_true_mean = np.sqrt(d2_true_acc / info_count) * R
                 d2_belief_mean = np.sqrt(d2_belief_acc / info_count) * R
@@ -589,8 +543,6 @@ def train(cfg: Dict[str, Any]):
                 d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
                 meas_innov_mean = trP_mean = 0.0
 
-
-
             with torch.no_grad():
                 flat_obs = bufD.obs.reshape(-1, obs_dim)
                 distD = ppo.def_net.dist(flat_obs, who="def")
@@ -598,42 +550,17 @@ def train(cfg: Dict[str, Any]):
                 stdD = distD.stddev.mean().item()
 
                 if verify_freeze:
-                    # Check determinism of the opponent (not the learner)
                     if train_role == "att":
-                        # opponent is defender
                         assert_deterministic_action(ppo, flat_obs[:256], who="def", tol=0.0)
                     if train_role == "def" and (ppo.att_net is not None):
-                        # opponent is attacker (RL opponent case)
                         assert_deterministic_action(ppo, flat_obs[:256], who="att", tol=0.0)
 
-
-                # obs = [p1c, p2c, rel, v1, v2]
                 Dcfg = cfg["D"]
                 p1c = flat_obs[:, :Dcfg]
-                p2c = flat_obs[:, Dcfg:2*Dcfg]
-
-                # -------------------------------
-                # #5: opponent policy std logging
-                # -------------------------------
-                dist_opp = (
-                    ppo.def_net.dist(flat_obs, who="def")
-                    if train_role == "att"  # training attacker => opponent is defender
-                    else ppo.att_net.dist(flat_obs, who="att")
-                    if (train_role == "def" and ppo.att_net is not None)  # training defender => opponent is attacker RL
-                    else None
-                )
-                if dist_opp is not None:
-                    print("opp std mean:", dist_opp.stddev.mean().item())
-
-                # ... your obs-derived d1/d2 means ...
-                Dcfg = cfg["D"]
-                p1c = flat_obs[:, :Dcfg]
-                p2c = flat_obs[:, Dcfg:2*Dcfg]
+                p2c = flat_obs[:, Dcfg:2 * Dcfg]
                 d1_obs_mean = p1c.pow(2).sum(-1).mean().sqrt().item()
                 d2_obs_mean = p2c.pow(2).sum(-1).mean().sqrt().item()
 
-
-            # grab learning rates (assuming two param groups: policy+logstd and value)
             lr_pi = ppo.def_opt.param_groups[0]["lr"]
             lr_vf = ppo.def_opt.param_groups[-1]["lr"]
 
@@ -643,7 +570,6 @@ def train(cfg: Dict[str, Any]):
                     fuel_used_att_mean = fuel_used_att_acc / fuel_info_count
                     fuel_frac_def_mean = fuel_frac_def_acc / fuel_info_count
                     fuel_frac_att_mean = fuel_frac_att_acc / fuel_info_count
-
                     thrust_def_mean = thrust_def_acc / fuel_info_count
                     thrust_att_mean = thrust_att_acc / fuel_info_count
                     mdot_def_mean = mdot_def_acc / fuel_info_count
@@ -658,28 +584,24 @@ def train(cfg: Dict[str, Any]):
                 metrics["fuel_used_att_mean"].append(fuel_used_att_mean)
                 metrics["fuel_frac_def_mean"].append(fuel_frac_def_mean)
                 metrics["fuel_frac_att_mean"].append(fuel_frac_att_mean)
-
                 metrics["thrust_def_mean"].append(thrust_def_mean)
                 metrics["thrust_att_mean"].append(thrust_att_mean)
                 metrics["mdot_def_mean"].append(mdot_def_mean)
                 metrics["mdot_att_mean"].append(mdot_att_mean)
 
-
-            # ---- store in metrics ----
             metrics["update"].append(upd)
             metrics["R_def_mean"].append(R_def_mean)
             metrics["R_att_mean"].append(R_att_mean)
             metrics["muD_abs_mean"].append(muD)
             metrics["stdD_mean"].append(stdD)
-
             metrics["d1_mean"].append(d1_true_mean)
             metrics["d2_mean"].append(d2_belief_mean)
             metrics["d2_true_mean"].append(d2_true_mean)
             metrics["meas_innov_mean"].append(meas_innov_mean)
             metrics["ukf_trPpos_mean"].append(trP_mean)
-
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
+
             if opp_policy_mix is not None:
                 total_mix = max(1, sum(mix_counts_update.values()))
                 mix_summary = []
@@ -689,7 +611,10 @@ def train(cfg: Dict[str, Any]):
                     mix_summary.append(f"{entry['name']}={frac:.2f}")
                 print("opp mix usage:", ", ".join(mix_summary))
 
-            print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
+            print(
+                f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  "
+                f"R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})"
+            )
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
             print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
             print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
@@ -697,93 +622,58 @@ def train(cfg: Dict[str, Any]):
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
 
-            if cfg.get("fuel", {}).get("enable", False):
-                print(
-                    f"   fuel used: def={fuel_used_def_mean:.6f}, att={fuel_used_att_mean:.6f}   "
-                    f"fuel remaining: def={fuel_frac_def_mean:.6f}, att={fuel_frac_att_mean:.6f}"
-                )
-                print(
-                    f"   thrust mean: def={thrust_def_mean:.6e}, att={thrust_att_mean:.6e}   "
-                    f"mdot mean: def={mdot_def_mean:.6e}, att={mdot_att_mean:.6e}"
-                )
-
-            
             if writer is not None:
-                gs = global_env_step  # x-axis = env steps
-
-                # ===== Returns =====
+                gs = global_env_step
                 writer.add_scalar("returns/def_mean", R_def_mean, gs)
                 writer.add_scalar("returns/att_mean", R_att_mean, gs)
-
-                # ===== Distances (meters) =====
                 writer.add_scalar("dist/def_true_p1_to_center_m", d1_true_mean, gs)
                 writer.add_scalar("dist/att_true_p2_to_center_m", d2_true_mean, gs)
                 writer.add_scalar("dist/att_belief_p2_to_center_m", d2_belief_mean, gs)
-
-                # ===== Policy stats =====
                 writer.add_scalar("policy/def_mu_abs_mean", muD, gs)
                 writer.add_scalar("policy/def_std_mean", stdD, gs)
-
-                # ===== Learning rates =====
                 writer.add_scalar("lr/def_policy", lr_pi, gs)
-                writer.add_scalar("lr/def_value",  lr_vf, gs)
-
-                # ===== UKF stats (if enabled) =====
+                writer.add_scalar("lr/def_value", lr_vf, gs)
                 if cfg.get("use_ukf", False):
                     writer.add_scalar("ukf/meas_innov_sq_mean", meas_innov_mean, gs)
                     writer.add_scalar("ukf/trP_pos_mean", trP_mean, gs)
 
-                if info_count > 0:
-                    term_rates = {k: v / info_count for k, v in term_counts.items()}
-                else:
-                    term_rates = {k: 0.0 for k in term_counts}
-
-
+                term_rates = {k: (v / info_count if info_count > 0 else 0.0) for k, v in term_counts.items()}
                 writer.add_scalar("term_rate/oob_def", term_rates["oob_def"], gs)
                 writer.add_scalar("term_rate/oob_att", term_rates["oob_att"], gs)
                 writer.add_scalar("term_rate/hit_target", term_rates["hit_target"], gs)
                 writer.add_scalar("term_rate/collision", term_rates["collision"], gs)
-
-                writer.add_scalar("act/def_abs_mean", a1.abs().mean().item(), global_env_step)
-                writer.add_scalar("act/def_abs_max",  a1.abs().max().item(),  global_env_step)
+                writer.add_scalar("act/def_abs_mean", a1.abs().mean().item(), gs)
+                writer.add_scalar("act/def_abs_max", a1.abs().max().item(), gs)
 
                 if cfg.get("fuel", {}).get("enable", False):
                     writer.add_scalar("fuel/used_def_mean", fuel_used_def_mean, gs)
                     writer.add_scalar("fuel/used_att_mean", fuel_used_att_mean, gs)
                     writer.add_scalar("fuel/remaining_def_mean", fuel_frac_def_mean, gs)
                     writer.add_scalar("fuel/remaining_att_mean", fuel_frac_att_mean, gs)
-
                     writer.add_scalar("fuel/thrust_def_mean", thrust_def_mean, gs)
                     writer.add_scalar("fuel/thrust_att_mean", thrust_att_mean, gs)
                     writer.add_scalar("fuel/mdot_def_mean", mdot_def_mean, gs)
                     writer.add_scalar("fuel/mdot_att_mean", mdot_att_mean, gs)
 
-
-
     ic_used_path = None
     if cfg.get("record_ic_history", False) and checkpoint_dir is not None:
         def_used, att_used = collect_ic_history_from_vecenv(vec)
         ic_used_path = os.path.join(checkpoint_dir, f"ic_samples_{checkpoint_prefix}.npz")
-        np.savez(
-            ic_used_path,
-            def_pos=def_used,
-            att_pos=att_used,
-        )
+        np.savez(ic_used_path, def_pos=def_used, att_pos=att_used)
         print(f"[ic] saved actual training IC samples -> {ic_used_path}")
 
-            
-            
-    # ---- end-of-train cleanup ----
     try:
         del bufD
-    except: pass
+    except Exception:
+        pass
     try:
         del bufA
-    except: pass
+    except Exception:
+        pass
     try:
         del vec
-    except: pass
-
+    except Exception:
+        pass
 
     gc.collect()
     if torch.cuda.is_available():
@@ -793,10 +683,7 @@ def train(cfg: Dict[str, Any]):
         writer.close()
 
     if save_last_ckpt and checkpoint_dir is not None:
-        last_ckpt_path = os.path.join(
-            checkpoint_dir,
-            f"{checkpoint_prefix}.pt"
-        )
+        last_ckpt_path = os.path.join(checkpoint_dir, f"{checkpoint_prefix}.pt")
         _save_role_checkpoint(ppo, train_role, last_ckpt_path)
         print(f"[checkpoint] saved last checkpoint -> {last_ckpt_path}")
 
@@ -807,7 +694,6 @@ def train(cfg: Dict[str, Any]):
         "best_ckpt_path": best_ckpt_path,
         "last_ckpt_path": last_ckpt_path,
         "ic_used_path": ic_used_path,
-
     }
 
     print("Training finished.")
@@ -838,9 +724,6 @@ def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
         trajs.append({"states": np.stack(states), "actions": actions, "infos": infos})
     return trajs
 
-    # ---------------------------------------------------------
-    # Helper: train defender teacher + distill to UKF student
-    # ---------------------------------------------------------
 
 def train_with_distill(
     phase_name: str,
@@ -849,83 +732,40 @@ def train_with_distill(
     out_dir: str,
     extra_train_cfg: Dict[str, Any] | None = None,
 ):
-    """
-    Unified wrapper for:
-      - teacher training (full-state)
-      - optional UKF student distillation
-
-    Replaces both:
-      - train_defender_with_distill(...)
-      - train_attacker_with_distill(...)
-
-    Args:
-        phase_name: label used for checkpoints / metrics filenames
-        attacker_mode: "rule" or "rl"
-        train_role: "def" or "att"
-        extra_train_cfg: optional overrides merged into both teacher and student cfgs
-
-    Returns
-    -------
-    teacher_ckpt : str
-        Path to best teacher checkpoint (or last if best missing)
-    student_ckpt : str | None
-        Path to distilled student checkpoint if distill=True, else None
-    """
     if train_role not in ("def", "att"):
         raise ValueError(f"train_role must be 'def' or 'att', got {train_role!r}")
 
-    role_upper = "DEFENDER" if train_role == "def" else "ATTACKER"
     role_lower = "defender" if train_role == "def" else "attacker"
-
-    # =========================================================
-    # TEACHER (full-state)
-    # =========================================================
-    cfg_teacher = config_for_train(
-        attacker_mode=attacker_mode,
-        train_role=train_role,
-    )
-    cfg_teacher["use_ukf"] = False  # teacher is always full-state
+    cfg_teacher = config_for_train(attacker_mode=attacker_mode, train_role=train_role)
+    cfg_teacher["use_ukf"] = False
 
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)
 
-    # if cfg_teacher["train_ic_mode"] == "random_shell_advantage":
-    #     if train_role == "att": 
-    #         cfg_teacher["r_att_min"] = 0.0
-    #         cfg_teacher["train_ic_mode"] = "random_shell"
-
-    DISTILL = bool(cfg_teacher.get("distill", False))
+    DISTILL = bool(cfg_teacher.get("distill", False)) and int(cfg_teacher.get("num_attackers", 1)) == 1
     DISTILL_METHOD = str(cfg_teacher.get("distill_method", "modern"))
 
     build_dyn(cfg_teacher)
 
-    # dynamics_config = cfg_teacher["dyn"]
-    # print(dynamics_config["Ad"])
-    # print(dynamics_config["Bd"])
-
-    # raise("Debug")
-
     if cfg_teacher["device"] == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError(
-            f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available."
-        )
+        raise RuntimeError(f"[{phase_name.upper()} TEACHER] device='cuda' but CUDA not available.")
 
     print(f"[{phase_name.upper()} TEACHER] Using device: {cfg_teacher['device']}")
-    print(f"[{phase_name.upper()}] train_role={train_role}  distill={DISTILL}  distill_method={DISTILL_METHOD}")
+    print(
+        f"[{phase_name.upper()}] train_role={train_role}  "
+        f"distill={DISTILL}  distill_method={DISTILL_METHOD}"
+    )
 
     cfg_teacher["checkpoint_dir"] = out_dir
     cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
 
     ppo_teacher, metrics_teacher, ckpt_info = train(cfg_teacher)
-
     teacher_ckpt = ckpt_info["last_ckpt_path"]
-    teacher_ckpt_best = ckpt_info["best_ckpt_path"]
 
     print(f"[{phase_name.upper()} TEACHER] Using {role_lower} checkpoint: {teacher_ckpt}")
     print(
-        f"[{phase_name.upper()} TEACHER] "
-        f"best {ckpt_info['tracked_metric_name']}={ckpt_info['best_metric']:+.3f} "
-        f"at update {ckpt_info['best_update']}"
+        f"[{phase_name.upper()} TEACHER] best {ckpt_info['tracked_metric_name']}="
+        f"{ckpt_info['best_metric']:+.3f} at update {ckpt_info['best_update']}"
     )
 
     metrics_path = os.path.join(out_dir, f"train_metrics_{phase_name}_teacher.npz")
@@ -937,48 +777,31 @@ def train_with_distill(
     except Exception:
         pass
 
-    # =========================================================
-    # STUDENT (UKF-observation) via configurable distillation method
-    # =========================================================
     student_out = None
     distill_duration_s = None
 
     if DISTILL:
-        cfg_student = config_for_train(
-            attacker_mode=attacker_mode,
-            train_role=train_role,
-        )
+        cfg_student = config_for_train(attacker_mode=attacker_mode, train_role=train_role)
         cfg_student["use_ukf"] = True
         cfg_student["seed"] = cfg_teacher["seed"] + 1
-
         if extra_train_cfg is not None:
             cfg_student.update(extra_train_cfg)
 
         build_dyn(cfg_student)
 
         if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
-            raise RuntimeError(
-                f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available."
-            )
+            raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
 
         print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
-
         student_out = os.path.join(out_dir, f"{phase_name}_ukf_student.pt")
         distill_t0 = time.perf_counter()
-
-        student, metrics_student = distill_from_teacher(
-            cfg_student,
-            teacher_ckpt,
-            out_path=student_out,
-        )
+        student, metrics_student = distill_from_teacher(cfg_student, teacher_ckpt, out_path=student_out)
         distill_duration_s = float(time.perf_counter() - distill_t0)
 
         print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
         print(f"[{phase_name.upper()} STUDENT] Distillation time: {distill_duration_s:.3f} s")
 
-        distill_metrics_path = os.path.join(
-            out_dir, f"distill_metrics_{phase_name}_student.npz"
-        )
+        distill_metrics_path = os.path.join(out_dir, f"distill_metrics_{phase_name}_student.npz")
         np.savez(distill_metrics_path, **metrics_student)
         print(f"[{phase_name.upper()} STUDENT] Saved distillation metrics to {distill_metrics_path}")
 
@@ -1000,15 +823,8 @@ def train_with_distill(
         "distill_method": DISTILL_METHOD,
         "distill_duration_s": distill_duration_s,
     }
-
     return teacher_ckpt, student_out, meta
 
-
-
-
-# =============================================================
-# End phase cleanup
-# =============================================================
 
 def end_phase_cleanup(
     tag: str = "",
@@ -1019,41 +835,24 @@ def end_phase_cleanup(
     clear_matplotlib: bool = True,
     sleep_s: float = 0.0,
 ):
-    """
-    Best-effort memory cleanup after a training phase.
-
-    - CPU RAM: delete references + gc.collect()
-    - GPU VRAM (CUDA): empty_cache(), ipc_collect()
-    - MPS (Apple): empty_cache()
-    - Matplotlib: close figures so they don't accumulate
-    """
     print(f"\n[cleanup] {tag} ...")
 
-    # ---- close any lingering matplotlib figures (common silent RAM leak) ----
     if clear_matplotlib:
         try:
             import matplotlib.pyplot as plt
+
             plt.close("all")
         except Exception:
             pass
 
-    # ---- Python heap cleanup ----
     gc.collect()
 
-    # ---- PyTorch device-specific cleanup ----
     if clear_cuda and torch.cuda.is_available():
-        # Clears cached blocks held by the CUDA allocator (does not free tensors you still reference).
         torch.cuda.empty_cache()
-
         if clear_ipc:
-            # Helps in some multi-process / DataLoader / vector-env setups.
             torch.cuda.ipc_collect()
 
-        # Optional: if you're debugging fragmentation, you can print stats:
-        # print(torch.cuda.memory_summary())
-
     if clear_mps and hasattr(torch, "mps") and torch.mps.is_available():
-        # Apple Silicon
         try:
             torch.mps.empty_cache()
         except Exception:
@@ -1065,19 +864,4 @@ def end_phase_cleanup(
     print(f"[cleanup] {tag} done.")
 
 
-def rollout_metrics(states: np.ndarray, center: np.ndarray, R: float):
-    """
-    states: [T+1, 12] for D=3 => [p1(3), v1(3), p2(3), v2(3)]
-    center: (D,)
-    R: arena radius (m)
-    """
-    D = center.shape[0]
-    p1 = states[:, 0:D];      v1 = states[:, D:2*D]
-    p2 = states[:, 2*D:3*D];  v2 = states[:, 3*D:4*D]
-
-    d1 = np.sum((p1 - center)**2, axis=1) / (R*R)
-    d2 = np.sum((p2 - center)**2, axis=1) / (R*R)
-    rel2 = np.sum((p2 - p1)**2, axis=1) / (R*R)
-    d2_delta = np.diff(d2, prepend=d2[:1])
-
-    return {"d1_norm": d1, "d2_norm": d2, "rel2_norm": rel2, "d2_delta": d2_delta}
+__all__ = ["train", "evaluate", "train_with_distill", "end_phase_cleanup"]

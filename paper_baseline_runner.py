@@ -9,7 +9,11 @@
 #         - minmax    : zero-sum security (maximin) on a scalar g derived from the paper
 #
 #   (2) "ppo_zero_sum" objectives (match the current PPO env zero-sum g):
-#         g = k_pos * d2 - k_dock * dock_gap - lD * ||uD||^2 + lA * ||uA||^2
+#         legacy_dock:
+#           g = k_pos * d2 - k_dock * dock_gap - lD * ||uD||^2 + lA * ||uA||^2
+#         progress_barrier:
+#           g = k_pos * d2 - k_prog * safe_progress + k_close * unsafe_close
+#               - lD * ||uD||^2 + lA * ||uA||^2
 #         plus the same terminal events/order used in core/env.py
 #
 # Output dict keys are styled to match your RL rollout runners:
@@ -100,6 +104,122 @@ def _paper_params_from_cfg(cfg: Dict[str, Any]) -> PaperParams:
     return p
 
 
+def _paper_control_limits_from_cfg(cfg: Dict[str, Any]) -> Tuple[float, float]:
+    """
+    Paper simulations use asymmetric acceleration limits:
+      - evader   = 0.2 m/s^2
+      - pursuers = 0.15 m/s^2
+
+    We allow overrides through cfg["paper"] while keeping the current project
+    behavior of falling back to the shared cfg["umax"] when no paper-specific
+    limits are supplied.
+    """
+    paper_cfg = cfg.get("paper", {}) or {}
+    umax_default = float(cfg.get("umax", 5e-4))
+    umax_e = float(paper_cfg.get("umax_e", cfg.get("umax_e", umax_default)))
+    umax_p = float(paper_cfg.get("umax_p", cfg.get("umax_p", umax_default)))
+    return umax_e, umax_p
+
+
+def _paper_parameter_check(
+    cfg: Dict[str, Any],
+    paper_params: PaperParams,
+    *,
+    turn_len: int,
+) -> Dict[str, Any]:
+    """
+    Compare the active configuration against the paper's reported defaults.
+
+    Verified from the attached paper tables / text:
+      - Table I:  u_e,max = 0.2, u_p,max = 0.15
+      - Table II: Nup = 3, Nue = 3, dup = 1e-3, due = 1e-3
+      - Table III: alpha1..alpha5 = 2.5, c1 = c2 = 0.475, c3 = 0.05
+      - Text: beta scenarios are (0.9, 0.1) or (0.5, 0.5), and c1+c2+c3 = 1
+      - Text: control update period is 1 s
+    """
+    umax_e, umax_p = _paper_control_limits_from_cfg(cfg)
+    dt = float(cfg.get("dt", 0.0))
+    sample_period_s = float(turn_len) * dt
+
+    checks: List[Dict[str, Any]] = []
+
+    def add_check(name: str, actual: float | int, expected: float | int, tol: float = 1e-12):
+        match = abs(float(actual) - float(expected)) <= tol
+        checks.append(
+            {
+                "name": name,
+                "actual": float(actual) if isinstance(actual, (int, float)) else actual,
+                "expected": float(expected) if isinstance(expected, (int, float)) else expected,
+                "match": bool(match),
+            }
+        )
+
+    add_check("umax_e", umax_e, 0.2)
+    add_check("umax_p", umax_p, 0.15)
+    add_check("Nup", paper_params.Nup, 3, tol=0.0)
+    add_check("Nue", paper_params.Nue, 3, tol=0.0)
+    add_check("dup", paper_params.dup, 1e-3)
+    add_check("due", paper_params.due, 1e-3)
+    add_check("alpha1", paper_params.alpha1, 2.5)
+    add_check("alpha2", paper_params.alpha2, 2.5)
+    add_check("alpha3", paper_params.alpha3, 2.5)
+    add_check("alpha4", paper_params.alpha4, 2.5)
+    add_check("alpha5", paper_params.alpha5, 2.5)
+    add_check("c1", paper_params.c1, 0.475)
+    add_check("c2", paper_params.c2, 0.475)
+    add_check("c3", paper_params.c3, 0.05)
+    add_check("control_update_period_s", sample_period_s, 1.0)
+
+    beta_pair = (round(float(paper_params.beta1), 6), round(float(paper_params.beta2), 6))
+    beta_matches_scenario_1 = beta_pair == (0.9, 0.1)
+    beta_matches_scenario_2 = beta_pair == (0.5, 0.5)
+
+    notes = []
+    if not (beta_matches_scenario_1 or beta_matches_scenario_2):
+        notes.append(
+            "beta1/beta2 do not match either reported paper scenario; "
+            "the paper uses (0.9, 0.1) or (0.5, 0.5)."
+        )
+    if abs(float(paper_params.c1 + paper_params.c2 + paper_params.c3) - 1.0) > 1e-6:
+        notes.append("c1 + c2 + c3 is not normalized to 1.")
+    if abs(float(paper_params.beta1 + paper_params.beta2) - 1.0) > 1e-6:
+        notes.append("beta1 + beta2 is not normalized to 1.")
+    notes.append(
+        "dsafe is part of the paper constraints, but its simulation value is not recoverable "
+        "from the text layer of the attached PDF and is therefore reported as configurable."
+    )
+
+    mismatches = [c["name"] for c in checks if not c["match"]]
+    return {
+        "reference": {
+            "umax_e": 0.2,
+            "umax_p": 0.15,
+            "Nup": 3,
+            "Nue": 3,
+            "dup": 1e-3,
+            "due": 1e-3,
+            "alpha1": 2.5,
+            "alpha2": 2.5,
+            "alpha3": 2.5,
+            "alpha4": 2.5,
+            "alpha5": 2.5,
+            "c1": 0.475,
+            "c2": 0.475,
+            "c3": 0.05,
+            "beta_scenarios": [(0.9, 0.1), (0.5, 0.5)],
+            "control_update_period_s": 1.0,
+        },
+        "checks": checks,
+        "beta_pair": beta_pair,
+        "beta_matches_scenario_1": bool(beta_matches_scenario_1),
+        "beta_matches_scenario_2": bool(beta_matches_scenario_2),
+        "dsafe_configured": float(paper_params.dsafe),
+        "matches_reference_defaults": len(mismatches) == 0 and (beta_matches_scenario_1 or beta_matches_scenario_2),
+        "mismatches": mismatches,
+        "notes": notes,
+    }
+
+
 def _pick_paper_game_mode(cfg: Dict[str, Any]) -> str:
     """
     Paper-only game mode:
@@ -145,6 +265,12 @@ class PPOObjectiveParams:
     lA: float = 0.0
     collision_radius_m: float = 0.0
     gamma: float = 1.0
+    zero_sum_mode: str = "legacy_dock"
+    progress_coef: float = 0.0
+    safe_sep_m: float = 0.0
+    unsafe_close_coef: float = 0.0
+    unsafe_close_power: float = 2.0
+    progress_gate_power: float = 1.0
 
     # Optional extras (off by default; not part of the default PPO g)
     include_step_walls: bool = False
@@ -176,6 +302,8 @@ def _ppo_obj_params_from_cfg(cfg: Dict[str, Any]) -> PPOObjectiveParams:
 
 def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PPOObjectiveParams:
     oi = cfg.get("oi", {}) or {}
+    att_reward = cfg.get("att_reward", {}) or {}
+    zero_sum = cfg.get("zero_sum_reward", {}) or {}
     p.oi_radius_m = float(oi.get("r", p.oi_radius_m))
 
     p.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", p.def_keepout_buffer_m))
@@ -197,6 +325,19 @@ def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PP
     p.lA = float(cfg.get("effort_att", p.lA))
     p.gamma = float(cfg.get("gamma", p.gamma))
     p.collision_radius_m = float(cfg.get("collision_radius_m", p.collision_radius_m))
+    p.zero_sum_mode = str(zero_sum.get("mode", p.zero_sum_mode)).lower()
+    p.progress_coef = float(zero_sum.get("progress_coef", att_reward.get("k_prog", p.progress_coef)))
+    p.safe_sep_m = float(zero_sum.get("safe_sep_m", att_reward.get("min_sep", p.safe_sep_m)))
+    p.unsafe_close_coef = float(
+        zero_sum.get("unsafe_close_coef", att_reward.get("k_close", p.unsafe_close_coef))
+    )
+    p.unsafe_close_power = float(zero_sum.get("unsafe_close_power", p.unsafe_close_power))
+    p.progress_gate_power = float(zero_sum.get("progress_gate_power", p.progress_gate_power))
+    if p.zero_sum_mode not in ("legacy_dock", "progress_barrier"):
+        raise ValueError(
+            "zero_sum_reward.mode must be 'progress_barrier' or 'legacy_dock', "
+            f"got {p.zero_sum_mode!r}"
+        )
     p.hit_buffer_def = float(cfg.get("hit_buffer_def", p.hit_buffer_def))
     p.hit_buffer_att = float(cfg.get("hit_buffer_att", p.hit_buffer_att))
 
@@ -833,7 +974,8 @@ def _solve_controls_paper(
     k: int,
     step_plant_single,
     paper_params: PaperParams,
-    umax: float,
+    umax_e: float,
+    umax_p: float,
 ) -> Tuple[np.ndarray, List[np.ndarray], Dict[str, Any]]:
     """
     Paper objective dispatch:
@@ -846,13 +988,13 @@ def _solve_controls_paper(
             xE=xE, xP=xP,
             uE_prev=uE_prev, uP_prev=uP_prev,
             k=k, step_plant_single=step_plant_single,
-            params=paper_params, umax_e=umax, umax_p=umax
+            params=paper_params, umax_e=umax_e, umax_p=umax_p
         )
     return _solve_one_step_ne_ars(
         xE=xE, xP=xP,
         uE_prev=uE_prev, uP_prev=uP_prev,
         k=k, step_plant_single=step_plant_single,
-        params=paper_params, umax_e=umax, umax_p=umax
+        params=paper_params, umax_e=umax_e, umax_p=umax_p
     )
 
 
@@ -960,11 +1102,16 @@ def _ppo_security_value_g(
     D = int(xD.size // 2)
     eps = 1e-12
 
-    def _ppo_step_reward_g(pD: np.ndarray, pA: List[np.ndarray]) -> float:
+    def _ppo_step_reward_g(
+        pD_prev: np.ndarray,
+        pA_prev: List[np.ndarray],
+        pD: np.ndarray,
+        pA: List[np.ndarray],
+    ) -> float:
         ith = _pick_threat_attacker(pA, center, params.threat_mode)
+        d2_prev = float(np.dot(pA_prev[ith] - center, pA_prev[ith] - center)) / (R * R + eps)
         d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
         dist_rel = float(np.linalg.norm(pA[ith] - pD))
-        dock_gap = max(0.0, dist_rel - float(params.collision_radius_m)) / (float(R) + eps)
 
         uD_loc = np.asarray(uD, float).reshape(-1)
         umax2 = float(umax) * float(umax) + eps
@@ -976,12 +1123,33 @@ def _ppo_security_value_g(
             ])
         )
 
-        g_step = (
-            float(params.k_pos) * d2
-            - float(params.k_dock) * dock_gap
-            - float(params.lD) * aD_n2
-            + float(params.lA) * aA_n2
-        )
+        if params.zero_sum_mode == "legacy_dock":
+            dock_gap = max(0.0, dist_rel - float(params.collision_radius_m)) / (float(R) + eps)
+            g_step = (
+                float(params.k_pos) * d2
+                - float(params.k_dock) * dock_gap
+                - float(params.lD) * aD_n2
+                + float(params.lA) * aA_n2
+            )
+        else:
+            attacker_progress = max(0.0, d2_prev - d2)
+            safe_sep = max(float(params.safe_sep_m), float(params.collision_radius_m) + 1e-6)
+            unsafe_close = max(0.0, safe_sep - dist_rel) / (safe_sep + eps)
+            gate_denom = max(safe_sep - float(params.collision_radius_m), 1e-6)
+            progress_gate = np.clip(
+                (dist_rel - float(params.collision_radius_m)) / gate_denom,
+                0.0,
+                1.0,
+            )
+            progress_gate = progress_gate ** float(params.progress_gate_power)
+
+            g_step = (
+                float(params.k_pos) * d2
+                - float(params.progress_coef) * progress_gate * attacker_progress
+                + float(params.unsafe_close_coef) * (unsafe_close ** float(params.unsafe_close_power))
+                - float(params.lD) * aD_n2
+                + float(params.lA) * aA_n2
+            )
 
         if params.include_step_walls:
             g_step -= _wall_penalty(pD, center, R, params.soft_wall, params.wallK)
@@ -1007,9 +1175,11 @@ def _ppo_security_value_g(
             k0=k, n_steps=lookahead,
             step_plant_single=step_plant_single,
         )
+        pD_prev = np.asarray(xD[:D], float)
+        pA_prev = [np.asarray(x[:D], float) for x in xA_list]
         pD = np.asarray(xD_pred[:D], float)
         pA = [np.asarray(x[:D], float) for x in xA_pred]
-        g = _ppo_step_reward_g(pD, pA)
+        g = _ppo_step_reward_g(pD_prev, pA_prev, pD, pA)
         if params.include_terminal:
             g_term, _ = _ppo_terminal_adjustment(
                 pD=pD,
@@ -1030,6 +1200,8 @@ def _ppo_security_value_g(
 
     for t in range(lookahead):
         kk = k + t
+        pD_prev = np.asarray(xD_cur[:D], float)
+        pA_prev = [np.asarray(x[:D], float) for x in xA_cur]
         xD_cur = step_plant_single(xD_cur, uD, kk)
         for i in range(len(xA_cur)):
             xA_cur[i] = step_plant_single(xA_cur[i], uA_list[i], kk)
@@ -1037,7 +1209,7 @@ def _ppo_security_value_g(
         pD = np.asarray(xD_cur[:D], float)
         pA = [np.asarray(x[:D], float) for x in xA_cur]
 
-        g_step = _ppo_step_reward_g(pD, pA)
+        g_step = _ppo_step_reward_g(pD_prev, pA_prev, pD, pA)
         g_term, term_dbg = _ppo_terminal_adjustment(
             pD=pD,
             pA_list=pA,
@@ -1239,8 +1411,10 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     obj_mode = _baseline_objective_mode(cfg)
 
     umax = float(cfg.get("umax", 5e-4))
+    umax_e, umax_p = _paper_control_limits_from_cfg(cfg)
     step_plant_single, center, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     R = float(cfg.get("arena", {}).get("r", 30.0))
+    paper_check = _paper_parameter_check(cfg, paper_params, turn_len=turn_len)
 
     # PPO zero-sum objective params (only used if obj_mode == "ppo_zero_sum")
     ppo_obj = _populate_ppo_obj_from_cfg(cfg, _ppo_obj_params_from_cfg(cfg))
@@ -1253,6 +1427,8 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     # previous controls (neighborhood centers)
     uE_prev = np.zeros((D,), dtype=np.float32)
     uP_prev = [np.zeros((D,), dtype=np.float32)]
+    active_uE = uE_prev.copy()
+    active_uP = [u.copy() for u in uP_prev]
 
     # logs for animator
     plan_hist1, plan_hist2 = [], []
@@ -1280,34 +1456,42 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     fov_axis_hist.append(None); fov_seen_mask.append(False)
 
     for k in range(steps):
-        # --- solve controls ---
-        if obj_mode == "paper":
-            uE, uP_list, dbg = _solve_controls_paper(
-                cfg,
-                xE=xE, xP=[xP],
-                uE_prev=uE_prev, uP_prev=uP_prev,
-                k=k, step_plant_single=step_plant_single,
-                paper_params=paper_params,
-                umax=umax,
-            )
-            uP = uP_list[0]
-
+        should_resolve = (k == 0) or ((k % turn_len) == 0)
+        if should_resolve:
+            if obj_mode == "paper":
+                active_uE, active_uP_list, dbg = _solve_controls_paper(
+                    cfg,
+                    xE=xE, xP=[xP],
+                    uE_prev=uE_prev, uP_prev=uP_prev,
+                    k=k, step_plant_single=step_plant_single,
+                    paper_params=paper_params,
+                    umax_e=umax_e,
+                    umax_p=umax_p,
+                )
+                active_uP = [active_uP_list[0]]
+            else:
+                active_uD, active_uA_list, dbg = _solve_one_step_minmax_team_ppo_oi(
+                    xD=xE, xA_list=[xP],
+                    uD_prev=uE_prev, uA_prev=uP_prev,
+                    k=k,
+                    step_plant_single=step_plant_single,
+                    center=center, R=R,
+                    paper_params=paper_params,
+                    ppo_params=ppo_obj,
+                    umax=umax,
+                )
+                active_uE = active_uD
+                active_uP = [active_uA_list[0]]
         else:
-            # PPO-style zero-sum game:
-            # - defender maximizes g
-            # - attacker minimizes g
-            uD, uA_list, dbg = _solve_one_step_minmax_team_ppo_oi(
-                xD=xE, xA_list=[xP],
-                uD_prev=uE_prev, uA_prev=uP_prev,
-                k=k,
-                step_plant_single=step_plant_single,
-                center=center, R=R,
-                paper_params=paper_params,
-                ppo_params=ppo_obj,
-                umax=umax,
-            )
-            uE = uD
-            uP = uA_list[0]
+            dbg = {
+                "objective": obj_mode,
+                "reused_action": True,
+                "ars_iters": 0,
+                "g_star": float(g_star_hist[-1]) if g_star_hist else float("nan"),
+            }
+
+        uE = active_uE
+        uP = active_uP[0]
 
         # debug traces
         it_hist.append(int(dbg.get("ars_iters", 0)))
@@ -1370,6 +1554,7 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
 
         # debug/meta
         "paper_params": paper_params.__dict__,
+        "paper_parameter_check": paper_check,
         "paper_game_mode": _pick_paper_game_mode(cfg),
         "baseline_objective": obj_mode,
         "iters_hist": it_hist,
@@ -1411,8 +1596,10 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     obj_mode = _baseline_objective_mode(cfg)
 
     umax = float(cfg.get("umax", 5e-4))
+    umax_e, umax_p = _paper_control_limits_from_cfg(cfg)
     step_plant_single, center, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     R = float(cfg.get("arena", {}).get("r", 30.0))
+    paper_check = _paper_parameter_check(cfg, paper_params, turn_len=turn_len)
 
     ppo_obj = _populate_ppo_obj_from_cfg(cfg, _ppo_obj_params_from_cfg(cfg))
 
@@ -1426,6 +1613,8 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
 
     uE_prev = np.zeros((D,), dtype=np.float32)
     uP_prev = [np.zeros((D,), dtype=np.float32), np.zeros((D,), dtype=np.float32)]
+    active_uE = uE_prev.copy()
+    active_uP = [u.copy() for u in uP_prev]
 
     plan_hist1, plan_hist2, plan_hist3 = [], [], []
     plan_att1, plan_att2, plan_att3 = [], [], []
@@ -1453,31 +1642,41 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     fov_axis_hist.append(None); fov_seen_mask.append(False)
 
     for k in range(steps):
-        # --- solve controls ---
-        if obj_mode == "paper":
-            uE, uP_list, dbg = _solve_controls_paper(
-                cfg,
-                xE=xE, xP=[xP0, xP1],
-                uE_prev=uE_prev, uP_prev=uP_prev,
-                k=k, step_plant_single=step_plant_single,
-                paper_params=paper_params,
-                umax=umax,
-            )
-            uP0, uP1 = uP_list[0], uP_list[1]
-
+        should_resolve = (k == 0) or ((k % turn_len) == 0)
+        if should_resolve:
+            if obj_mode == "paper":
+                active_uE, active_uP, dbg = _solve_controls_paper(
+                    cfg,
+                    xE=xE, xP=[xP0, xP1],
+                    uE_prev=uE_prev, uP_prev=uP_prev,
+                    k=k, step_plant_single=step_plant_single,
+                    paper_params=paper_params,
+                    umax_e=umax_e,
+                    umax_p=umax_p,
+                )
+            else:
+                active_uD, active_uA, dbg = _solve_one_step_minmax_team_ppo_oi(
+                    xD=xE, xA_list=[xP0, xP1],
+                    uD_prev=uE_prev, uA_prev=uP_prev,
+                    k=k,
+                    step_plant_single=step_plant_single,
+                    center=center, R=R,
+                    paper_params=paper_params,
+                    ppo_params=ppo_obj,
+                    umax=umax,
+                )
+                active_uE = active_uD
+                active_uP = active_uA
         else:
-            uD, uA_list, dbg = _solve_one_step_minmax_team_ppo_oi(
-                xD=xE, xA_list=[xP0, xP1],
-                uD_prev=uE_prev, uA_prev=uP_prev,
-                k=k,
-                step_plant_single=step_plant_single,
-                center=center, R=R,
-                paper_params=paper_params,
-                ppo_params=ppo_obj,
-                umax=umax,
-            )
-            uE = uD
-            uP0, uP1 = uA_list[0], uA_list[1]
+            dbg = {
+                "objective": obj_mode,
+                "reused_action": True,
+                "ars_iters": 0,
+                "g_star": float(g_star_hist[-1]) if g_star_hist else float("nan"),
+            }
+
+        uE = active_uE
+        uP0, uP1 = active_uP[0], active_uP[1]
 
         # debug traces
         it_hist.append(int(dbg.get("ars_iters", 0)))
@@ -1561,6 +1760,7 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
 
         # debug/meta
         "paper_params": paper_params.__dict__,
+        "paper_parameter_check": paper_check,
         "paper_game_mode": _pick_paper_game_mode(cfg),
         "baseline_objective": obj_mode,
         "iters_hist": it_hist,
