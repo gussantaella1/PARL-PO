@@ -59,6 +59,8 @@ class RLPolicyDiff:
         device: str = "cpu",
         def_ckpt: Optional[str] = None,
         att_ckpt: Optional[str] = None,
+        load_defender: bool = True,
+        load_attacker: bool = True,
     ):
         self.cfg = copy.deepcopy(cfg)
 
@@ -92,6 +94,8 @@ class RLPolicyDiff:
         self.use_mean_at_eval = bool(self.cfg.get("rl_eval_deterministic", True))
         self.use_fuel = bool(self.cfg.get("fuel", {}).get("enable"))
         self.obs_extra = 2 if self.use_fuel else 0
+        self.load_defender = bool(load_defender)
+        self.load_attacker = bool(load_attacker)
 
         self.obs_dim_def = 5 * self.D + self.obs_extra
         self.obs_dim_att = 5 * self.D + self.obs_extra
@@ -110,36 +114,41 @@ class RLPolicyDiff:
         )[: self.D]
 
         # ==================== DEFENDER (always RL) ====================
-        self.def_ckpt = def_ckpt or self._pick(
-            self.cfg,
-            [
-                "def_ckpt_path",
-                "def_ckpt",
-                "def_policy_path",
-                "defender_ckpt_path",
-                "defender_ckpt",
-                "ckpt_def",
-            ],
-            "ppo_def.pt",
-        )
-        if not os.path.exists(self.def_ckpt):
-            raise FileNotFoundError(f"Defender checkpoint not found: {self.def_ckpt}")
+        self.def_ckpt = None
+        self.def_is_student = False
+        self.def_net = None
+        self.def_hidden = None
+        self.def_u_prev = None
 
-        def_payload = _load_checkpoint_payload(self.def_ckpt, map_location=self.device, label="DEF")
-        self.def_is_student = self._extract_student_state_dict(def_payload) is not None
-        if self.def_is_student:
-            self.def_net = self._build_student_model(def_payload).to(self.device)
-            self._load_student_checkpoint(self.def_net, def_payload, name="DEF")
-            self.def_hidden = self.def_net.init_hidden(batch_size=1, device=self.device)
-            self.def_u_prev = np.zeros((self.act_dim,), dtype=np.float32)
-        else:
-            self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, self.cfg).to(self.device)
-            self._load_net_checkpoint_from_payload(self.def_net, def_payload, name="DEF")
-            self.def_hidden = None
-            self.def_u_prev = None
-        self.def_net.eval()
-        for p in self.def_net.parameters():
-            p.requires_grad_(False)
+        if self.load_defender:
+            self.def_ckpt = def_ckpt or self._pick(
+                self.cfg,
+                [
+                    "def_ckpt_path",
+                    "def_ckpt",
+                    "def_policy_path",
+                    "defender_ckpt_path",
+                    "defender_ckpt",
+                    "ckpt_def",
+                ],
+                "ppo_def.pt",
+            )
+            if not os.path.exists(self.def_ckpt):
+                raise FileNotFoundError(f"Defender checkpoint not found: {self.def_ckpt}")
+
+            def_payload = _load_checkpoint_payload(self.def_ckpt, map_location=self.device, label="DEF")
+            self.def_is_student = self._extract_student_state_dict(def_payload) is not None
+            if self.def_is_student:
+                self.def_net = self._build_student_model(def_payload).to(self.device)
+                self._load_student_checkpoint(self.def_net, def_payload, name="DEF")
+                self.def_hidden = self.def_net.init_hidden(batch_size=1, device=self.device)
+                self.def_u_prev = np.zeros((self.act_dim,), dtype=np.float32)
+            else:
+                self.def_net = ActorCriticDiff(self.obs_dim_def, self.act_dim, self.cfg).to(self.device)
+                self._load_net_checkpoint_from_payload(self.def_net, def_payload, name="DEF")
+            self.def_net.eval()
+            for p in self.def_net.parameters():
+                p.requires_grad_(False)
 
         # ==================== ATTACKER (RL or RULE) ====================
         self.att_net = None
@@ -148,7 +157,7 @@ class RLPolicyDiff:
         self.att_hidden = None
         self.att_u_prev = None
 
-        if self.attacker_mode == "rl":
+        if self.attacker_mode == "rl" and self.load_attacker:
             self.att_ckpt = att_ckpt or self._pick(
                 self.cfg,
                 [
@@ -177,7 +186,7 @@ class RLPolicyDiff:
             self.att_net.eval()
             for p in self.att_net.parameters():
                 p.requires_grad_(False)
-        else:
+        elif self.attacker_mode == "rule" and self.load_attacker:
             self.rule_ctrl = AttackerRuleController(self.cfg)
 
     # ------------------------------------------------------------------
@@ -393,6 +402,8 @@ class RLPolicyDiff:
         """
         Defender action from observation.
         """
+        if self.def_net is None:
+            raise RuntimeError("Defender policy was not loaded in RLPolicyDiff.")
         if self.def_is_student:
             a, self.def_hidden, self.def_u_prev = self._act_one_student(
                 self.def_net,
@@ -420,7 +431,7 @@ class RLPolicyDiff:
 
         if self.attacker_mode == "rl":
             if self.att_net is None:
-                raise RuntimeError("attacker_mode='rl' but attacker net is not initialized.")
+                raise RuntimeError("Attacker policy was not loaded in RLPolicyDiff.")
             if self.att_is_student:
                 a, self.att_hidden, self.att_u_prev = self._act_one_student(
                     self.att_net,

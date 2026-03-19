@@ -1403,7 +1403,7 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     T_horizon = int(cfg["T"])
 
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
     if turn_len is None:
         turn_len = 1
 
@@ -1588,7 +1588,7 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     T_horizon = int(cfg["T"])
 
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
     if turn_len is None:
         turn_len = 1
 

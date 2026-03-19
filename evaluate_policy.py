@@ -33,6 +33,7 @@ import csv
 import importlib
 import json
 import math
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -42,7 +43,53 @@ import numpy as np
 
 # IMPORTANT: must match your CURRENT runner
 from game_runner import run_rhc_with_rl_and_collect_frames_3d
+from matchup_runner import (
+    SUPPORTED_BASELINE_OPPONENTS,
+    run_rhc_with_policy_vs_baseline_collect_frames_3d,
+)
 from dispersion import build_episode_cfg_and_x0
+
+
+# ------------------------- local defaults -------------------------
+
+# Edit these when you want persistent evaluate_policy preferences without
+# repeating them on the bash command line. CLI flags still override any entry.
+EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
+    "out_dir": "eval_out",
+    "num_trials": 200,
+    "seed": 0,
+    "steps": None,
+    "policy_role": "def",          # "def" or "att"
+    "opponent_source": "policy",   # "policy" | "paper" | "game_theory" | "ipopt"
+    "sample_ic": False,
+    "pos_scale": 0.95,
+    "vel_scale": 0.0,
+    "min_sep": 0.0,
+    "multi_att_mode": "worst",
+    "device": None,
+    "def_ckpt_path": None,
+    "att_ckpt_path": None,
+    "deterministic": False,
+    "use_ukf": False,
+    "x0_pos_jitter": None,
+    "x0_vel_jitter": None,
+    "alpha": 0.05,
+    "log_every": 10,
+    "print_first_out_keys": False,
+    "print_errors": False,
+    "trace_errors": False,
+    "trials_in": None,
+    "grid_mode": "paired",
+    "def_trials_in": None,
+    "att_trials_in": None,
+    "max_pairs": None,
+    "auto_shell_grid": False,
+    "shell_fracs": "0.2,0.4,0.6,0.8",
+    "points_per_shell": 40,
+    "include_center": False,
+    "dynamics": None,
+    "dt": None,
+}
 
 
 # ------------------------- ckpt overrides -------------------------
@@ -175,6 +222,39 @@ def _quantiles(x: np.ndarray, qs=(0.0, 0.25, 0.5, 0.75, 1.0)) -> Dict[str, float
         return {f"q{int(100*q):02d}": float("nan") for q in qs}
     vals = np.quantile(x, qs)
     return {f"q{int(100*q):02d}": float(v) for q, v in zip(qs, vals)}
+
+
+def _cli_option_strings(argv: List[str]) -> set[str]:
+    present: set[str] = set()
+    for tok in argv[1:]:
+        if tok == "--":
+            break
+        if tok.startswith("--"):
+            present.add(tok.split("=", 1)[0])
+    return present
+
+
+def _apply_parser_defaults_from_cfg(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    defaults: Dict[str, Any],
+    argv: List[str],
+) -> List[str]:
+    if not defaults:
+        return []
+
+    cli_present = _cli_option_strings(argv)
+    applied: List[str] = []
+    for action in parser._actions:
+        if action.dest == "help" or not action.option_strings:
+            continue
+        if action.dest not in defaults:
+            continue
+        if any(opt in cli_present for opt in action.option_strings):
+            continue
+        setattr(args, action.dest, defaults[action.dest])
+        applied.append(action.dest)
+    return applied
 
 
 # ------------------------- config helpers -------------------------
@@ -696,6 +776,18 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument("--def_ckpt_path", default=None)
     ap.add_argument("--att_ckpt_path", default=None)
+    ap.add_argument(
+        "--policy_role",
+        default="def",
+        choices=["def", "att"],
+        help="When evaluating against a baseline opponent, choose whether the tested policy is the defender or attacker.",
+    )
+    ap.add_argument(
+        "--opponent_source",
+        default="policy",
+        choices=["policy", *SUPPORTED_BASELINE_OPPONENTS],
+        help="Opponent controller used in evaluation. 'policy' preserves the current policy-vs-policy rollout path.",
+    )
     ap.add_argument("--deterministic", action="store_true", help="Force rl_eval_deterministic=True")
     ap.add_argument("--use_ukf", action="store_true", help="Force use_ukf=True")
     ap.add_argument("--x0_pos_jitter", type=float, default=None)
@@ -752,8 +844,15 @@ def main():
     )
 
     args = ap.parse_args()
+    applied_defaults = _apply_parser_defaults_from_cfg(args, ap, EVALUATE_POLICY_DEFAULTS, sys.argv)
     if args.trace_errors:
         args.print_errors = True
+
+    mod = importlib.import_module(args.config_module)
+    if not hasattr(mod, "config_for_eval") or not hasattr(mod, "build_dyn"):
+        raise RuntimeError(f"Module '{args.config_module}' must define config_for_eval(...) and build_dyn(cfg).")
+
+    cfg0: Dict[str, Any] = mod.config_for_eval()
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -761,16 +860,9 @@ def main():
     t_global0 = time.time()
     log(f"[eval] starting; out_dir={out_dir.resolve()}")
     log(f"[eval] config_module={args.config_module}")
-
-    # Import config module
-    log("[eval] importing config module...")
-    mod = importlib.import_module(args.config_module)
-    if not hasattr(mod, "config_for_eval") or not hasattr(mod, "build_dyn"):
-        raise RuntimeError(f"Module '{args.config_module}' must define config_for_eval(...) and build_dyn(cfg).")
     log("[eval] config module imported OK.")
-
-    cfg0: Dict[str, Any] = mod.config_for_eval()
-
+    if applied_defaults:
+        log(f"[eval] applied script defaults for: {', '.join(sorted(applied_defaults))}")
     log("[eval] base cfg created from config_for_eval().")
 
 
@@ -810,6 +902,7 @@ def main():
     log(f"[eval] cfg summary: D={D} num_attackers={num_attackers} dynamics={dyn_name}")
     log(f"[eval] ckpts: def={cfg0.get('def_ckpt_path', None)} att={cfg0.get('att_ckpt_path', None)} "
         f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} use_ukf={cfg0.get('use_ukf', False)}")
+    log(f"[eval] matchup: policy_role={args.policy_role} opponent_source={args.opponent_source}")
 
     # ---------------------------
     # Build dyn (once, based on cfg0)
@@ -1036,7 +1129,15 @@ def main():
             cfg_run["T"] = steps_run
 
             try:
-                out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
+                if args.opponent_source == "policy":
+                    out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
+                else:
+                    out = run_rhc_with_policy_vs_baseline_collect_frames_3d(
+                        cfg_run,
+                        policy_role=args.policy_role,
+                        opponent_baseline=args.opponent_source,
+                        steps=steps_run,
+                    )
 
                 if (i == 0 and j == 0 and args.print_first_out_keys):
                     log("[eval] first rollout returned keys:")
@@ -1050,6 +1151,9 @@ def main():
                         log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
 
                 m = _compute_trial_metrics(cfg_run, out)
+                rollout_timing = out.get("rollout_timing_sec", {}) or {}
+                for timing_key in ("setup", "simulation", "total"):
+                    m[f"rollout_{timing_key}_sec"] = float(rollout_timing.get(timing_key, float("nan")))
 
             except Exception as e:
                 per_att_errors += 1
@@ -1110,6 +1214,7 @@ def main():
             last_hit = row.get("att1_attacker_hit", None)
             last_def_term = row.get("att1_def_term", None)
             last_att_term = row.get("att1_att_term", None)
+            last_rollout_sim = row.get("att1_rollout_simulation_sec", None)
 
             extra = ""
             if args.grid_mode == "cartesian":
@@ -1117,6 +1222,7 @@ def main():
 
             log(f"[eval] progress {i+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
                 f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
+                f"rollout_sim={last_rollout_sim} | "
                 f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
                 f"errors_this_trial={per_att_errors}{extra}")
 
@@ -1142,6 +1248,15 @@ def main():
         "num_trials": n,
         "passes": k,
         "success_rate": float(sr),
+        "defender_pass_rate": float(sr),
+        "policy_role": args.policy_role,
+        "opponent_source": args.opponent_source,
+        "policy_primary_metric": {
+            "name": "defender_pass_rate" if args.policy_role == "def" else "attacker_hit_rate",
+            "value": float(sr) if args.policy_role == "def" else (
+                float(np.mean(_col("att1_attacker_hit"))) if _col("att1_attacker_hit").size else float("nan")
+            ),
+        },
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
         "grid_mode": args.grid_mode,
@@ -1155,13 +1270,14 @@ def main():
             "trial_loop": float(time.time() - t_loop0),
         },
         "notes": [
-            "Rollouts use game_runner_diff.run_rhc_with_rl_and_collect_frames_3d.",
+            "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
             "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
             "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
             "Set cfg['verify_require_capture']=True to require collision/capture as well.",
             "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
             "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
             "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
+            "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_att1.attacker_hit_rate for attacker-side comparisons.",
         ],
         "metrics_att1": {
             "min_rel_dist": {"mean": float(np.nanmean(_col("att1_min_rel_dist"))) if _col("att1_min_rel_dist").size else float("nan"),
@@ -1178,6 +1294,12 @@ def main():
                           **_quantiles(_col("att1_udef_mean"))},
             "uatt_mean": {"mean": float(np.nanmean(_col("att1_uatt_mean"))) if _col("att1_uatt_mean").size else float("nan"),
                           **_quantiles(_col("att1_uatt_mean"))},
+            "rollout_setup_sec": {"mean": float(np.nanmean(_col("att1_rollout_setup_sec"))) if _col("att1_rollout_setup_sec").size else float("nan"),
+                                  **_quantiles(_col("att1_rollout_setup_sec"))},
+            "rollout_simulation_sec": {"mean": float(np.nanmean(_col("att1_rollout_simulation_sec"))) if _col("att1_rollout_simulation_sec").size else float("nan"),
+                                       **_quantiles(_col("att1_rollout_simulation_sec"))},
+            "rollout_total_sec": {"mean": float(np.nanmean(_col("att1_rollout_total_sec"))) if _col("att1_rollout_total_sec").size else float("nan"),
+                                  **_quantiles(_col("att1_rollout_total_sec"))},
         }
     }
 

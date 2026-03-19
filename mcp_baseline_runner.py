@@ -1267,7 +1267,7 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
     att_umax = _attacker_umax_from_cfg(cfg, mcpp)
 
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
     if turn_len is None:
         turn_len = int(mcpp.turn_len)
     turn_len = max(1, int(turn_len))
@@ -1417,7 +1417,7 @@ def run_rhc_with_mcp_game_1v2_team_collect_frames_3d(
     umax = float(cfg.get("umax", 5e-4))
 
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
     if turn_len is None:
         turn_len = 1
 

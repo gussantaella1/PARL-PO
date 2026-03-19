@@ -161,7 +161,7 @@ def _run_rollout(
     T_horizon = int(cfg["T"])
 
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
 
     solver_params = _gt_params_from_cfg(cfg)
     if turn_len is None:

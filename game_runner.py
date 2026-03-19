@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 from typing import Dict, Any
+import time
 import numpy as np
 
 from rl_infer import RLPolicyDiff
@@ -15,6 +16,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
     steps: int | None = None,
     turn_len: int | None = None,
 ):
+    t_fn0 = time.perf_counter()
     # -------------------- basics & dims --------------------
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx = 2 * D
@@ -31,7 +33,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
     # -------------------- sim length --------------------
     if steps is None:
-        steps = int(cfg.get("T_eval", cfg.get("steps", 60)))
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
     if turn_len is None:
         turn_len = 1  # kept for API symmetry
 
@@ -460,6 +462,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         fuel_frac_att_hist.append(float(np.clip((m_att - mdry_att) / (m0_att - mdry_att + 1e-9), 0.0, 1.0)))
 
     # ==================== ROLLOUT ====================
+    t_roll0 = time.perf_counter()
     for k in range(steps):
         # 1) build observations and query policies ONCE
         x2_for_def_obs = x2_est if (use_ukf and ukf12 is not None) else x2
@@ -612,6 +615,13 @@ def run_rhc_with_rl_and_collect_frames_3d(
         if done and stop_on_done:
             break
 
+    t_fn1 = time.perf_counter()
+    timing = {
+        "setup": float(t_roll0 - t_fn0),
+        "simulation": float(t_fn1 - t_roll0),
+        "total": float(t_fn1 - t_fn0),
+    }
+
     # -------------------- pack results --------------------
     out = {
         "plan_hist1": plan_hist1,
@@ -646,6 +656,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         ],
 
         "done_info": done_info,
+        "rollout_timing_sec": timing,
     }
 
     if use_fuel:
