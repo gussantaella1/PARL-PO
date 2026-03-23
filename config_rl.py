@@ -231,7 +231,7 @@ TRAIN: Dict[str, Any] = {
     "log_every": 10,
     "entropy_coef": 0.01,
 
-    "k_pos": 0.3, #Was 0.05
+    "k_pos": 0.1, #Was 0.05
     "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
 
     "gamma": 0.992, #Was 0.995
@@ -239,7 +239,7 @@ TRAIN: Dict[str, Any] = {
     "collision_penalty": 10.0,
     "wall_penalty": 2.5,
     "fuel_depletion_penalty": 5.0,
-    "collision_radius_m": 0.75,            # meters
+    "collision_radius_m": 0.05,            # meters
 
     # "k_pos": 0.05, #Was 0.05
     # "k_dock": 0.5,

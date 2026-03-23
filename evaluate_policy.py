@@ -87,8 +87,9 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "shell_fracs": "0.2,0.4,0.6,0.8",
     "points_per_shell": 40,
     "include_center": False,
-    "dynamics": None,
+    "dynamics": "hcw",
     "dt": None,
+    "collision_radius_m": None,
 }
 
 
@@ -110,6 +111,33 @@ def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
         cfg["att_policy_path"] = ap
         cfg["attacker_ckpt_path"] = ap
         cfg["attacker_ckpt"] = ap
+
+
+
+def _require_existing_file(path_str: Optional[str], label: str) -> None:
+    if path_str is None:
+        raise RuntimeError(f"Missing required {label} path.")
+    p = Path(path_str).expanduser()
+    if not p.is_file():
+        raise RuntimeError(f"Required {label} file does not exist: {p}")
+
+
+
+def _validate_eval_inputs(args: argparse.Namespace, cfg: Dict[str, Any]) -> None:
+    if args.trials_in is not None:
+        _require_existing_file(args.trials_in, "trials_in CSV")
+    if args.def_trials_in is not None:
+        _require_existing_file(args.def_trials_in, "def_trials_in CSV")
+    if args.att_trials_in is not None:
+        _require_existing_file(args.att_trials_in, "att_trials_in CSV")
+
+    if args.opponent_source == "policy":
+        _require_existing_file(cfg.get("def_ckpt_path"), "defender checkpoint")
+        _require_existing_file(cfg.get("att_ckpt_path"), "attacker checkpoint")
+    elif args.policy_role == "def":
+        _require_existing_file(cfg.get("def_ckpt_path"), "defender checkpoint")
+    else:
+        _require_existing_file(cfg.get("att_ckpt_path"), "attacker checkpoint")
 
 
 # ------------------------- CSV loaders -------------------------
@@ -259,6 +287,90 @@ def _apply_parser_defaults_from_cfg(
 
 # ------------------------- config helpers -------------------------
 
+def _load_json_dict(path: Path) -> Dict[str, Any]:
+    with open(path, "r") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Expected JSON object in {path}, got {type(data).__name__}.")
+    return data
+
+
+def _resolve_run_manifest_path(
+    run_manifest: Optional[str],
+    run_dir: Optional[str],
+    def_ckpt_path: Optional[str],
+    att_ckpt_path: Optional[str],
+) -> Optional[Path]:
+    if run_manifest is not None:
+        path = Path(run_manifest).expanduser()
+        if not path.is_file():
+            raise RuntimeError(f"--run_manifest file does not exist: {path}")
+        return path
+
+    if run_dir is not None:
+        path = Path(run_dir).expanduser() / "run_manifest.json"
+        if not path.is_file():
+            raise RuntimeError(f"--run_dir does not contain run_manifest.json: {path}")
+        return path
+
+    candidates: List[Path] = []
+    for ckpt_path in (def_ckpt_path, att_ckpt_path):
+        if ckpt_path is None:
+            continue
+        path = Path(ckpt_path).expanduser().parent / "run_manifest.json"
+        if path.is_file():
+            candidates.append(path.resolve())
+
+    unique = sorted({p for p in candidates})
+    if not unique:
+        return None
+    if len(unique) > 1:
+        joined = ", ".join(str(p) for p in unique)
+        raise RuntimeError(
+            "Found multiple candidate run manifests from checkpoint paths. "
+            f"Please pass --run_manifest or --run_dir explicitly. Candidates: {joined}"
+        )
+    return unique[0]
+
+
+def _extract_manifest_training_cfg(manifest: Dict[str, Any], manifest_path: Path) -> Dict[str, Any]:
+    configs = manifest.get("configs") or {}
+    if not isinstance(configs, dict):
+        raise RuntimeError(f"Manifest {manifest_path} is missing a dict-valued 'configs' section.")
+
+    cfg = configs.get("training config used")
+    if isinstance(cfg, dict):
+        return copy.deepcopy(cfg)
+
+    dict_cfgs = [(k, v) for k, v in configs.items() if isinstance(v, dict)]
+    if len(dict_cfgs) == 1:
+        return copy.deepcopy(dict_cfgs[0][1])
+
+    keys = ", ".join(sorted(str(k) for k in configs.keys()))
+    raise RuntimeError(
+        f"Could not find 'configs[\"training config used\"]' in {manifest_path}. "
+        f"Available config keys: {keys}"
+    )
+
+
+def _load_base_cfg(
+    args: argparse.Namespace,
+    mod: Any,
+) -> Tuple[Dict[str, Any], str, Optional[Path]]:
+    manifest_path = _resolve_run_manifest_path(
+        run_manifest=args.run_manifest,
+        run_dir=args.run_dir,
+        def_ckpt_path=args.def_ckpt_path,
+        att_ckpt_path=args.att_ckpt_path,
+    )
+    if manifest_path is not None:
+        manifest = _load_json_dict(manifest_path)
+        cfg = _extract_manifest_training_cfg(manifest, manifest_path)
+        return cfg, f"run_manifest:{manifest_path}", manifest_path
+
+    return mod.config_for_eval(), f"{args.config_module}.config_for_eval()", None
+
+
 def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
     ar = cfg.get("arena", {}) or {}
     cx, cy = float(ar.get("cx", 0.0)), float(ar.get("cy", 0.0))
@@ -393,6 +505,59 @@ def _make_paired_rows_from_def_att(def_rows: List[Dict[str, float]],
     return out
 
 
+def _radial_advantage_margin(cfg: Dict[str, Any]) -> float:
+    oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
+    percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
+    return float(percent_advantage_defender * np.pi * 2.0 * oi_r)
+
+
+def _valid_def_att_pair_indices(
+    cfg: Dict[str, Any],
+    def_rows: List[Dict[str, float]],
+    att_rows: List[Dict[str, float]],
+    require_training_advantage: bool = False,
+) -> List[Tuple[int, int]]:
+    center, _arena_r = _get_center_and_radius(cfg, int(cfg.get("D", 3)))
+    radial_margin = _radial_advantage_margin(cfg)
+    min_sep = float(cfg.get("train_min_sep", 0.0)) if require_training_advantage else 0.0
+
+    out: List[Tuple[int, int]] = []
+    for di, rd in enumerate(def_rows):
+        p_def = np.array([rd["def_x"], rd["def_y"], rd["def_z"]], dtype=float)
+        r_def = float(np.linalg.norm(p_def - center))
+
+        for ai, ra in enumerate(att_rows):
+            p_att = np.array([ra["att1_x"], ra["att1_y"], ra["att1_z"]], dtype=float)
+            r_att = float(np.linalg.norm(p_att - center))
+
+            if require_training_advantage and (r_def > (r_att - radial_margin)):
+                continue
+            if min_sep > 0.0 and np.linalg.norm(p_def - p_att) < min_sep:
+                continue
+
+            out.append((di, ai))
+
+    return out
+
+
+def _paired_rows_from_pair_indices(
+    def_rows: List[Dict[str, float]],
+    att_rows: List[Dict[str, float]],
+    pair_indices: List[Tuple[int, int]],
+    n: int,
+) -> List[Dict[str, float]]:
+    out: List[Dict[str, float]] = []
+    for di, ai in pair_indices[:max(0, int(n))]:
+        rd, ra = def_rows[di], att_rows[ai]
+        out.append({
+            "def_x": rd["def_x"], "def_y": rd["def_y"], "def_z": rd["def_z"],
+            "def_vx": rd.get("def_vx", 0.0), "def_vy": rd.get("def_vy", 0.0), "def_vz": rd.get("def_vz", 0.0),
+            "att1_x": ra["att1_x"], "att1_y": ra["att1_y"], "att1_z": ra["att1_z"],
+            "att1_vx": ra.get("att1_vx", 0.0), "att1_vy": ra.get("att1_vy", 0.0), "att1_vz": ra.get("att1_vz", 0.0),
+        })
+    return out
+
+
 # ------------------------- scenario generation (random sampling) -------------------------
 
 def _sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: float) -> np.ndarray:
@@ -404,18 +569,169 @@ def _sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: f
     return center + rad * v
 
 
+def _sample_in_shell(
+    rng: np.random.Generator,
+    center: np.ndarray,
+    r_min: float,
+    r_max: float,
+) -> np.ndarray:
+    if r_max < r_min:
+        raise ValueError(f"Invalid shell: r_min={r_min} > r_max={r_max}")
+
+    D = center.size
+    d = rng.normal(size=D)
+    d /= (np.linalg.norm(d) + 1e-9)
+
+    u = rng.random()
+    r = (r_min**D + (r_max**D - r_min**D) * u) ** (1.0 / D)
+    return center + r * d
+
+
+def _sample_x0_random_shell_advantage(
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    num_attackers: int,
+    vel_scale_override: Optional[float] = None,
+    min_sep_override: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Mirror core/env.py random_shell_advantage so evaluation can sample the
+    same defender-favored radial geometry used during training.
+    """
+    D = int(cfg.get("D", 3))
+    center, R = _get_center_and_radius(cfg, D)
+    nx = 2 * D
+
+    v_max = float(cfg.get("train_ic_vmax", 0.0))
+    if vel_scale_override is not None:
+        v_max = float(vel_scale_override)
+
+    min_sep = float(cfg.get("train_min_sep", 0.0))
+    if min_sep_override is not None:
+        min_sep = float(min_sep_override)
+
+    oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
+    percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
+    radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
+
+    r_def_min = float(cfg.get("r_def_min", 0.0)) * R
+    r_def_max = float(cfg.get("r_def_max", 1.0)) * R
+    r_att_min = float(cfg.get("r_att_min", 0.0)) * R
+    r_att_max = float(cfg.get("r_att_max", 1.0)) * R
+    r_att_min = max(r_att_min, radial_margin)
+
+    if radial_margin < 0.0:
+        raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
+    if r_def_min > r_def_max:
+        raise ValueError(f"Invalid defender shell: [{r_def_min}, {r_def_max}]")
+    if r_att_min > r_att_max:
+        raise ValueError(f"Invalid attacker shell: [{r_att_min}, {r_att_max}]")
+    if num_attackers > 0 and r_def_min > (r_att_max - radial_margin):
+        raise ValueError(
+            "Infeasible radial shells: defender cannot be at least "
+            f"{radial_margin:.3f} m closer to center than attacker. "
+            f"Got r_def_min={r_def_min:.3f}, r_att_max={r_att_max:.3f}."
+        )
+
+    placed = False
+    p_def = np.zeros(D, dtype=float)
+    v_def = np.zeros(D, dtype=float)
+    p_atts: List[np.ndarray] = []
+    v_atts: List[np.ndarray] = []
+
+    for _scene_try in range(2000):
+        p_atts = []
+        v_atts = []
+        r_atts: List[float] = []
+
+        attackers_ok = True
+        for _ in range(num_attackers):
+            found_att = False
+            for _att_try in range(1000):
+                p_att = _sample_in_shell(rng, center, r_att_min, r_att_max)
+                r_att = float(np.linalg.norm(p_att - center))
+
+                if any(np.linalg.norm(p_att - p_prev) < min_sep for p_prev in p_atts):
+                    continue
+
+                p_atts.append(p_att)
+                r_atts.append(r_att)
+                v_atts.append(rng.uniform(-v_max, v_max, size=D))
+                found_att = True
+                break
+
+            if not found_att:
+                attackers_ok = False
+                break
+
+        if not attackers_ok:
+            continue
+
+        if num_attackers <= 0:
+            p_def = _sample_in_shell(rng, center, r_def_min, r_def_max)
+            v_def = rng.uniform(-v_max, v_max, size=D)
+            placed = True
+            break
+
+        r_att_nearest = min(r_atts)
+        r_def_max_eff = min(r_def_max, r_att_nearest - radial_margin)
+        if r_def_max_eff < r_def_min:
+            continue
+
+        found_def = False
+        for _def_try in range(1000):
+            cand = _sample_in_shell(rng, center, r_def_min, r_def_max_eff)
+            if any(np.linalg.norm(cand - p_att) < min_sep for p_att in p_atts):
+                continue
+            p_def = cand
+            found_def = True
+            break
+
+        if not found_def:
+            continue
+
+        v_def = rng.uniform(-v_max, v_max, size=D)
+        placed = True
+        break
+
+    if not placed:
+        raise RuntimeError(
+            "random_shell_advantage: could not sample a feasible initial condition after many attempts. "
+            "Try relaxing r_def_max, increasing r_att_min/r_att_max, reducing train_min_sep, "
+            "or reducing percent_advantage_defender."
+        )
+
+    xs = [np.concatenate([p_def, v_def], dtype=float)[:nx]]
+    for p_att, v_att in zip(p_atts, v_atts):
+        xs.append(np.concatenate([p_att, v_att], dtype=float)[:nx])
+    return np.asarray(xs, dtype=float)
+
+
 def _sample_x0(
     cfg: Dict[str, Any],
     rng: np.random.Generator,
     num_attackers: int,
     pos_scale: float,
     vel_scale: float,
-    min_sep: float = 0.0
+    min_sep: float = 0.0,
+    cli_present: Optional[set[str]] = None,
 ) -> np.ndarray:
     """
     Returns x0 with shape (1 + num_attackers, 2D).
     Enforces a minimum defender-attacker separation if min_sep > 0.
     """
+    train_ic_mode = str(cfg.get("train_ic_mode", "fixed"))
+    if train_ic_mode == "random_shell_advantage":
+        vel_scale_override = float(vel_scale) if cli_present and "--vel_scale" in cli_present else None
+        min_sep_override = float(min_sep) if cli_present and "--min_sep" in cli_present else None
+        return _sample_x0_random_shell_advantage(
+            cfg,
+            rng,
+            num_attackers=num_attackers,
+            vel_scale_override=vel_scale_override,
+            min_sep_override=min_sep_override,
+        )
+
     D = int(cfg.get("D", 3))
     center, R = _get_center_and_radius(cfg, D)
     nx = 2 * D
@@ -449,6 +765,111 @@ def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndar
     return p1, p2
 
 
+def _classify_trial_outcome(row: Dict[str, Any]) -> str:
+    if int(row.get("num_att_errors", 0)) > 0 or row.get("att1_error"):
+        return "rollout_error"
+
+    pass_trial = int(row.get("pass_trial", 0))
+    collided = int(row.get("att1_collided", 0)) == 1
+    attacker_hit = int(row.get("att1_attacker_hit", 0)) == 1
+    att_term = int(row.get("att1_att_term", 0)) == 1
+    def_term = int(row.get("att1_def_term", 0)) == 1
+    oi_viol_att = int(row.get("att1_oi_viol_att", 0)) == 1
+    oi_viol_def = int(row.get("att1_oi_viol_def", 0)) == 1
+    att_oob = int(row.get("att1_att_oob", 0)) == 1
+    def_oob = int(row.get("att1_def_oob", 0)) == 1
+    success_mode = str(row.get("att1_success_mode", "")).strip().lower()
+
+    if pass_trial:
+        if collided:
+            return "defender_capture"
+        return "defender_success"
+
+    if attacker_hit or oi_viol_att:
+        return "attacker_hit_oi"
+    if def_term or def_oob:
+        return "defender_crashed_wall"
+    if att_term or att_oob:
+        return "attacker_crashed_wall"
+    if oi_viol_def:
+        return "defender_hit_oi"
+    if collided:
+        return "collision_but_not_success"
+    if success_mode == "zero_sum_capture":
+        return "timeout_no_capture"
+    if success_mode == "legacy_verify":
+        return "capture_required_not_met"
+    return "unclassified_failure"
+
+
+def _save_outcome_histogram(
+    out_dir: Path,
+    trial_rows: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    import matplotlib.pyplot as plt
+
+    labels = [
+        "defender_capture",
+        "defender_success",
+        "attacker_hit_oi",
+        "defender_crashed_wall",
+        "attacker_crashed_wall",
+        "defender_hit_oi",
+        "collision_but_not_success",
+        "timeout_no_capture",
+        "capture_required_not_met",
+        "rollout_error",
+        "unclassified_failure",
+    ]
+    pretty = {
+        "defender_capture": "Defender capture",
+        "defender_success": "Defender success",
+        "attacker_hit_oi": "Attacker hit OI",
+        "defender_crashed_wall": "Defender crashed wall",
+        "attacker_crashed_wall": "Attacker crashed wall",
+        "defender_hit_oi": "Defender hit OI",
+        "collision_but_not_success": "Collision but not success",
+        "timeout_no_capture": "Timeout / no capture",
+        "capture_required_not_met": "Capture required not met",
+        "rollout_error": "Rollout error",
+        "unclassified_failure": "Unclassified failure",
+    }
+
+    counts = {k: 0 for k in labels}
+    for row in trial_rows:
+        counts[_classify_trial_outcome(row)] += 1
+
+    n = max(1, len(trial_rows))
+    present = [k for k in labels if counts[k] > 0]
+    if not present:
+        present = labels
+
+    values = [counts[k] / float(n) for k in present]
+    fig_h = max(4.0, 0.55 * len(present) + 1.5)
+    fig, ax = plt.subplots(figsize=(9, fig_h))
+    bars = ax.barh(range(len(present)), values, color="steelblue", edgecolor="black")
+    ax.set_yticks(range(len(present)))
+    ax.set_yticklabels([pretty[k] for k in present])
+    ax.set_xlim(0.0, max(values) * 1.15 if values else 1.0)
+    ax.set_xlabel("Proportion of trials")
+    ax.set_title("Trial Outcome Breakdown")
+    ax.grid(True, axis="x", alpha=0.3)
+
+    for idx, (bar, key) in enumerate(zip(bars, present)):
+        v = values[idx]
+        ax.text(v + 0.01 * max(1.0, max(values)), bar.get_y() + bar.get_height() / 2.0,
+                f"{counts[key]}/{n} ({v:.1%})", va="center", fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(out_dir / "outcome_hist.png", dpi=180)
+    plt.close(fig)
+
+    return {
+        "counts": counts,
+        "proportions": {k: counts[k] / float(n) for k in labels},
+    }
+
+
 def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
     D = int(cfg.get("D", 3))
     center, arena_r = _get_center_and_radius(cfg, D)
@@ -475,8 +896,12 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
     term_margin = float(cfg.get("arena_terminate_margin", 0.0))
     att_oob = bool(np.any(att_center > arena_r))
     def_oob = bool(np.any(def_center > arena_r))
-    att_term = bool(np.any(att_center > arena_r + term_margin))
-    def_term = bool(np.any(def_center > arena_r + term_margin))
+    att_term_idx = np.where(att_center > arena_r + term_margin)[0]
+    def_term_idx = np.where(def_center > arena_r + term_margin)[0]
+    att_term = bool(att_term_idx.size > 0)
+    def_term = bool(def_term_idx.size > 0)
+    t_att_term = int(att_term_idx[0]) if att_term else -1
+    t_def_term = int(def_term_idx[0]) if def_term else -1
 
     oi = cfg.get("oi", {}) or {}
     oi_enabled = bool(oi.get("enabled", False))
@@ -491,11 +916,17 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
 
     oi_viol_def = False
     oi_viol_att = False
+    t_oi_viol_def = -1
+    t_oi_viol_att = -1
     if oi_enabled and oi_safe_r > 0:
         if 0 in avoid_by:
-            oi_viol_def = bool(np.any(def_center <= oi_safe_r))
+            def_oi_idx = np.where(def_center <= oi_safe_r)[0]
+            oi_viol_def = bool(def_oi_idx.size > 0)
+            t_oi_viol_def = int(def_oi_idx[0]) if oi_viol_def else -1
         if 1 in avoid_by:
-            oi_viol_att = bool(np.any(att_center <= oi_safe_r))
+            att_oi_idx = np.where(att_center <= oi_safe_r)[0]
+            oi_viol_att = bool(att_oi_idx.size > 0)
+            t_oi_viol_att = int(att_oi_idx[0]) if oi_viol_att else -1
 
     u_norms = out.get("u_cmd_norm_all", None)
     udef_mean = uatt_mean = udef_max = uatt_max = float("nan")
@@ -508,16 +939,31 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
             uatt_mean, uatt_max = float(np.mean(uatt)), float(np.max(uatt))
 
     verify_require_capture = bool(cfg.get("verify_require_capture", False))
-    pass_flag = (
-        (not attacker_hit)
-        and (not att_term) and (not def_term)
-        and (not oi_viol_def) and (not oi_viol_att)
-    )
-    if verify_require_capture and collision_r > 0:
-        pass_flag = pass_flag and collided
+    zero_sum_cfg = cfg.get("zero_sum_reward", {}) or {}
+    zero_sum_mode = str(zero_sum_cfg.get("mode", "")).strip().lower()
+    zero_sum_eval = zero_sum_mode not in ("", "none") and collision_r > 0.0
+
+    if zero_sum_eval:
+        fail_times = [
+            t for t in (t_att_hit, t_att_term, t_def_term, t_oi_viol_def, t_oi_viol_att)
+            if t >= 0
+        ]
+        first_fail_t = min(fail_times) if fail_times else math.inf
+        pass_flag = collided and (t_collide <= first_fail_t)
+        success_mode = "zero_sum_capture"
+    else:
+        pass_flag = (
+            (not attacker_hit)
+            and (not att_term) and (not def_term)
+            and (not oi_viol_def) and (not oi_viol_att)
+        )
+        if verify_require_capture and collision_r > 0:
+            pass_flag = pass_flag and collided
+        success_mode = "legacy_verify"
 
     return {
         "pass": int(pass_flag),
+        "success_mode": success_mode,
 
         "min_rel_dist": float(np.min(rel)),
         "t_min_rel": int(np.argmin(rel)),
@@ -535,9 +981,13 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
         "def_oob": int(def_oob),
         "att_term": int(att_term),
         "def_term": int(def_term),
+        "t_att_term": t_att_term,
+        "t_def_term": t_def_term,
 
         "oi_viol_def": int(oi_viol_def),
         "oi_viol_att": int(oi_viol_att),
+        "t_oi_viol_def": t_oi_viol_def,
+        "t_oi_viol_att": t_oi_viol_att,
 
         "udef_mean": udef_mean,
         "uatt_mean": uatt_mean,
@@ -754,6 +1204,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config_module", default="config_rl",
                     help="Python module containing config_for_eval and build_dyn (default: config_rl).")
+    ap.add_argument("--run_dir", default=None,
+                    help="Training run directory containing run_manifest.json. If set, its saved training config becomes the base eval config.")
+    ap.add_argument("--run_manifest", default=None,
+                    help="Path to a specific run_manifest.json to use as the base eval config.")
     ap.add_argument("--out_dir", default="eval_out", help="Output directory.")
     ap.add_argument("--num_trials", type=int, default=200, help="Number of trials (paired mode).")
     ap.add_argument("--seed", type=int, default=0, help="Base seed.")
@@ -842,9 +1296,14 @@ def main():
         default=None,
         help="Optional override for cfg['dt'] (if you want)."
     )
+    ap.add_argument(
+        "--collision_radius_m",
+        type=float,
+        default=None,
+        help="Optional override for cfg['collision_radius_m'] used by capture evaluation."
+    )
 
     args = ap.parse_args()
-    applied_defaults = _apply_parser_defaults_from_cfg(args, ap, EVALUATE_POLICY_DEFAULTS, sys.argv)
     if args.trace_errors:
         args.print_errors = True
 
@@ -852,7 +1311,9 @@ def main():
     if not hasattr(mod, "config_for_eval") or not hasattr(mod, "build_dyn"):
         raise RuntimeError(f"Module '{args.config_module}' must define config_for_eval(...) and build_dyn(cfg).")
 
-    cfg0: Dict[str, Any] = mod.config_for_eval()
+    cli_present = _cli_option_strings(sys.argv)
+    cfg0, base_cfg_source, manifest_path = _load_base_cfg(args, mod)
+    applied_defaults = _apply_parser_defaults_from_cfg(args, ap, EVALUATE_POLICY_DEFAULTS, sys.argv)
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -862,8 +1323,10 @@ def main():
     log(f"[eval] config_module={args.config_module}")
     log("[eval] config module imported OK.")
     if applied_defaults:
-        log(f"[eval] applied script defaults for: {', '.join(sorted(applied_defaults))}")
-    log("[eval] base cfg created from config_for_eval().")
+        log(f"[eval] applied evaluate_policy defaults for: {', '.join(sorted(applied_defaults))}")
+    log(f"[eval] base cfg loaded from {base_cfg_source}.")
+    if manifest_path is not None:
+        log(f"[eval] run manifest={manifest_path}")
 
 
     # Dynamics override (must happen before build_dyn)
@@ -872,6 +1335,8 @@ def main():
 
     if args.dt is not None:
         cfg0["dt"] = float(args.dt)
+    if args.collision_radius_m is not None:
+        cfg0["collision_radius_m"] = float(args.collision_radius_m)
 
     mod.build_dyn(cfg0)
 
@@ -880,6 +1345,7 @@ def main():
         cfg0["device"] = args.device
 
     _apply_ckpt_overrides(cfg0, args.def_ckpt_path, args.att_ckpt_path)
+    _validate_eval_inputs(args, cfg0)
 
     if args.deterministic:
         cfg0["rl_eval_deterministic"] = True
@@ -918,6 +1384,7 @@ def main():
     paired_rows: Optional[List[Dict[str, float]]] = None
     def_rows: Optional[List[Dict[str, float]]] = None
     att_rows: Optional[List[Dict[str, float]]] = None
+    valid_pair_indices: Optional[List[Tuple[int, int]]] = None
 
     n_total: int
 
@@ -942,22 +1409,32 @@ def main():
 
         def_rows = _rows_from_positions("def", def_pos)
         att_rows = _rows_from_positions("att1", att_pos)
+        valid_pair_indices = _valid_def_att_pair_indices(
+            cfg0,
+            def_rows,
+            att_rows,
+            require_training_advantage=(str(cfg0.get("train_ic_mode", "fixed")) == "random_shell_advantage"),
+        )
+        total_pairs_all = len(def_rows) * len(att_rows)
+        total_pairs_valid = len(valid_pair_indices)
+        if total_pairs_valid <= 0:
+            raise RuntimeError(
+                "auto_shell_grid produced no defender/attacker pairs that satisfy the configured training constraints."
+            )
 
         # Now choose how to pair them
         if args.grid_mode == "paired":
-            # n_total bounded by requested num_trials and available pairs
-            n_total = min(int(args.num_trials), min(len(def_rows), len(att_rows)))
-            paired_rows = _make_paired_rows_from_def_att(def_rows, att_rows, n_total)
+            n_total = min(int(args.num_trials), total_pairs_valid)
+            paired_rows = _paired_rows_from_pair_indices(def_rows, att_rows, valid_pair_indices, n_total)
             log(f"[eval] auto_shell_grid paired: shells={shell_fracs} points_per_shell={args.points_per_shell} "
-                f"include_center={args.include_center} -> paired_rows={len(paired_rows)}")
+                f"include_center={args.include_center} valid_pairs={total_pairs_valid}/{total_pairs_all} -> paired_rows={len(paired_rows)}")
         else:
-            total_pairs = len(def_rows) * len(att_rows)
             if args.max_pairs is None:
-                n_total = total_pairs
-                log(f"[eval] auto_shell_grid cartesian: evaluating ALL pairs = {total_pairs}")
+                n_total = total_pairs_valid
+                log(f"[eval] auto_shell_grid cartesian: evaluating ALL valid pairs = {total_pairs_valid} / {total_pairs_all}")
             else:
-                n_total = min(int(args.max_pairs), total_pairs)
-                log(f"[eval] auto_shell_grid cartesian: total pairs={total_pairs}, evaluating={n_total} (sampled)")
+                n_total = min(int(args.max_pairs), total_pairs_valid)
+                log(f"[eval] auto_shell_grid cartesian: valid pairs={total_pairs_valid} / {total_pairs_all}, evaluating={n_total} (sampled)")
             log(f"[eval] auto_shell_grid cartesian grids: def_rows={len(def_rows)} att_rows={len(att_rows)}")
 
         # Make CSV args irrelevant
@@ -1001,7 +1478,10 @@ def main():
     # 4) RANDOM SAMPLING
     elif args.sample_ic:
         n_total = int(args.num_trials)
-        log(f"[eval] random sampling: num_trials={n_total} pos_scale={args.pos_scale} vel_scale={args.vel_scale} min_sep={args.min_sep}")
+        log(
+            f"[eval] random sampling: num_trials={n_total} train_ic_mode={cfg0.get('train_ic_mode', 'fixed')} "
+            f"pos_scale={args.pos_scale} vel_scale={args.vel_scale} min_sep={args.min_sep}"
+        )
 
     # 5) DEFAULT SINGLE x0
     else:
@@ -1062,16 +1542,23 @@ def main():
                            np.concatenate([p_att, v_att])], axis=0)
 
         elif args.grid_mode == "cartesian" and (def_rows is not None and att_rows is not None):
-            total_pairs = len(def_rows) * len(att_rows)
-
-            if args.max_pairs is None:
-                pair_idx = i
+            if valid_pair_indices is not None:
+                total_pairs = len(valid_pair_indices)
+                if args.max_pairs is None:
+                    di, ai = valid_pair_indices[i]
+                else:
+                    di, ai = valid_pair_indices[int(rng.integers(0, total_pairs))]
             else:
-                # sampled pairs (not guaranteed unique) - fine for MC
-                pair_idx = int(rng.integers(0, total_pairs))
+                total_pairs = len(def_rows) * len(att_rows)
+                if args.max_pairs is None:
+                    pair_idx = i
+                else:
+                    # sampled pairs (not guaranteed unique) - fine for MC
+                    pair_idx = int(rng.integers(0, total_pairs))
 
-            di = pair_idx // len(att_rows)
-            ai = pair_idx % len(att_rows)
+                di = pair_idx // len(att_rows)
+                ai = pair_idx % len(att_rows)
+
             cart_di, cart_ai = int(di), int(ai)
 
             rd = def_rows[di]
@@ -1093,6 +1580,7 @@ def main():
                 pos_scale=float(args.pos_scale),
                 vel_scale=float(args.vel_scale),
                 min_sep=float(args.min_sep),
+                cli_present=cli_present,
             )
 
         else:
@@ -1244,6 +1732,8 @@ def main():
                 vals.append(fv)
         return np.asarray(vals, dtype=float)
 
+    outcome_breakdown = _save_outcome_histogram(out_dir, trial_rows)
+
     results = {
         "num_trials": n,
         "passes": k,
@@ -1252,13 +1742,15 @@ def main():
         "policy_role": args.policy_role,
         "opponent_source": args.opponent_source,
         "policy_primary_metric": {
-            "name": "defender_pass_rate" if args.policy_role == "def" else "attacker_hit_rate",
+            "name": "defender_capture_pass_rate" if args.policy_role == "def" else "attacker_hit_rate",
             "value": float(sr) if args.policy_role == "def" else (
                 float(np.mean(_col("att1_attacker_hit"))) if _col("att1_attacker_hit").size else float("nan")
             ),
         },
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
+        "base_cfg_source": base_cfg_source,
+        "run_manifest": str(manifest_path) if manifest_path is not None else None,
         "grid_mode": args.grid_mode,
         "auto_shell_grid": bool(args.auto_shell_grid),
         "shell_fracs": args.shell_fracs if args.auto_shell_grid else None,
@@ -1269,11 +1761,12 @@ def main():
             "total": float(time.time() - t_global0),
             "trial_loop": float(time.time() - t_loop0),
         },
+        "outcome_breakdown": outcome_breakdown,
         "notes": [
             "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
             "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
-            "PASS criterion defaults to 'attacker does not hit target and no terminations/keepout violations'.",
-            "Set cfg['verify_require_capture']=True to require collision/capture as well.",
+            "When zero_sum_reward.mode is enabled and collision_radius_m > 0, PASS means the defender captures the attacker before any attacker hit or invalid termination/keepout event.",
+            "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
             "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
             "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
             "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
@@ -1342,12 +1835,38 @@ def main():
 if __name__ == "__main__":
     main()
 
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy \
+  --def_ckpt_path Training_Policy/def1_teacher.pt \
+  --att_ckpt_path Training_Policy/att1_teacher.pt \
+  --sample_ic \
+  --out_dir Training_Policy/MC_eval/def1_vs_att1
+
+
+"""
+
 """
 
 python evaluate_policy.py \
   --def_ckpt_path Training_Policy/def1_def_teacher.pt \
   --att_ckpt_path Training_Policy/att1_att_teacher.pt \
   --out_dir Training_Policy/MC_eval/def1_vs_att1
+
+"""
+
+"""
+
+python evaluate_policy.py \
+  --def_ckpt_path Training_Policy_0.75_Collision/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_0.75_Collision/att1_teacher.pt \
+  --out_dir Training_Policy_0.75_Collision/MC_eval/def1_vs_att1
+  --auto_shell_grid
+  --grid_mode cartesian
+  --shell_fracs 0.2,0.4,0.6,0.8
+  --points_per_shell 40
+  
 
 """
 

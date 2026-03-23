@@ -825,7 +825,6 @@ class Env:
             dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self.radius
 
             g = (
-                #Both agents: TBoth terms
                 self.k_pos * d2
                 # - (self.k_dock) * dock_gap                
                 # - (self.k_pos/1.5) * rel2
@@ -834,7 +833,7 @@ class Env:
 
             # Control effort: defender pays for actuation directly in g, attacker sees the
             # sign-flipped version through r_att = -g.
-            g += - self.lD * a1n2 + self.lA * a2n2
+            # g += - self.lD * a1n2 + self.lA * a2n2
 
             # if self.use_ukf and self.use_meas_reward:
             #     g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
