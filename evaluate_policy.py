@@ -55,10 +55,11 @@ from dispersion import build_episode_cfg_and_x0
 # Edit these when you want persistent evaluate_policy preferences without
 # repeating them on the bash command line. CLI flags still override any entry.
 EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
+    # Eval-harness defaults: these control evaluation flow/output and do not
+    # overwrite fields loaded from run_manifest.json.
     "out_dir": "eval_out",
     "num_trials": 200,
     "seed": 0,
-    "steps": None,
     "policy_role": "def",          # "def" or "att"
     "opponent_source": "policy",   # "policy" | "paper" | "game_theory" | "ipopt"
     "sample_ic": False,
@@ -66,13 +67,6 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "vel_scale": 0.0,
     "min_sep": 0.0,
     "multi_att_mode": "worst",
-    "device": None,
-    "def_ckpt_path": None,
-    "att_ckpt_path": None,
-    "deterministic": False,
-    "use_ukf": False,
-    "x0_pos_jitter": None,
-    "x0_vel_jitter": None,
     "alpha": 0.05,
     "log_every": 10,
     "print_first_out_keys": False,
@@ -87,7 +81,18 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "shell_fracs": "0.2,0.4,0.6,0.8",
     "points_per_shell": 40,
     "include_center": False,
-    "dynamics": "hcw",
+
+    # Intentional config overrides: these can overwrite fields loaded from
+    # run_manifest.json when set to a non-None or active value.
+    "steps": None,
+    "device": None,
+    "def_ckpt_path": None,
+    "att_ckpt_path": None,
+    "deterministic": False,
+    "use_ukf": False,
+    "x0_pos_jitter": None,
+    "x0_vel_jitter": None,
+    "dynamics": None,
     "dt": None,
     "collision_radius_m": None,
 }
@@ -230,6 +235,115 @@ def _load_att_csv(path: str, D: int) -> List[Dict[str, float]]:
     return rows
 
 
+# ------------------------- row helpers -------------------------
+
+def _has_entity_xyz(row: Dict[str, float], prefix: str, D: int) -> bool:
+    axes = ["x", "y", "z"][:D]
+    return all(f"{prefix}_{ax}" in row for ax in axes)
+
+
+def _entity_state_from_row(row: Dict[str, float], prefix: str, D: int) -> np.ndarray:
+    axes = ["x", "y", "z"][:D]
+    missing = [f"{prefix}_{ax}" for ax in axes if f"{prefix}_{ax}" not in row]
+    if missing:
+        missing_str = ", ".join(missing)
+        raise RuntimeError(f"Row is missing required columns for {prefix}: {missing_str}")
+
+    vals = [float(row[f"{prefix}_{ax}"]) for ax in axes]
+    vals.extend(float(row.get(f"{prefix}_v{ax}", 0.0)) for ax in axes)
+    return np.asarray(vals, dtype=float)
+
+
+def _row_num_attackers(row: Dict[str, float], D: int) -> int:
+    n = 0
+    while _has_entity_xyz(row, f"att{n + 1}", D):
+        n += 1
+    return n
+
+
+def _copy_attacker_state(row: Dict[str, float], src_idx: int, dst_idx: int, D: int) -> Dict[str, float]:
+    axes = ["x", "y", "z"][:D]
+    src = f"att{src_idx}"
+    dst = f"att{dst_idx}"
+    if not _has_entity_xyz(row, src, D):
+        raise RuntimeError(f"Row is missing required attacker columns for {src}.")
+
+    out: Dict[str, float] = {}
+    for ax in axes:
+        out[f"{dst}_{ax}"] = float(row[f"{src}_{ax}"])
+        out[f"{dst}_v{ax}"] = float(row.get(f"{src}_v{ax}", 0.0))
+    return out
+
+
+def _attacker_states_from_row(row: Dict[str, float], D: int, num_attackers: int) -> List[np.ndarray]:
+    available = _row_num_attackers(row, D)
+    if available < num_attackers:
+        raise RuntimeError(
+            f"Expected attacker columns att1..att{num_attackers} but row only provides att1..att{available}."
+        )
+    return [_entity_state_from_row(row, f"att{j + 1}", D) for j in range(num_attackers)]
+
+
+def _expand_attacker_team_rows(
+    att_rows: List[Dict[str, float]],
+    D: int,
+    num_attackers: int,
+) -> List[Dict[str, float]]:
+    if num_attackers <= 1 or not att_rows:
+        return att_rows
+
+    counts = [_row_num_attackers(row, D) for row in att_rows]
+    min_count = min(counts)
+    max_count = max(counts)
+
+    if min_count >= num_attackers:
+        return att_rows
+    if max_count >= num_attackers and min_count < num_attackers:
+        raise RuntimeError(
+            f"attacker rows are inconsistent: some rows provide fewer than {num_attackers} attackers."
+        )
+    if max_count != 1:
+        raise RuntimeError(
+            "attacker rows must provide either a full attacker team (att1_*, att2_*, ...) "
+            "or exactly one attacker state per row."
+        )
+
+    n = len(att_rows)
+    stride = max(1, n // num_attackers)
+    expanded: List[Dict[str, float]] = []
+    for i in range(n):
+        team_row: Dict[str, float] = {}
+        used: set[int] = set()
+        for dst_idx in range(1, num_attackers + 1):
+            src_idx = (i + (dst_idx - 1) * stride) % n
+            if n >= num_attackers:
+                for _ in range(n):
+                    if src_idx not in used:
+                        break
+                    src_idx = (src_idx + 1) % n
+            used.add(src_idx)
+            team_row.update(_copy_attacker_state(att_rows[src_idx], 1, dst_idx, D))
+        expanded.append(team_row)
+    return expanded
+
+
+def _build_paired_x0(row: Dict[str, float], D: int, num_attackers: int) -> np.ndarray:
+    xs = [_entity_state_from_row(row, "def", D)]
+    xs.extend(_attacker_states_from_row(row, D, num_attackers))
+    return np.stack(xs, axis=0)
+
+
+def _build_cartesian_x0(
+    def_row: Dict[str, float],
+    att_row: Dict[str, float],
+    D: int,
+    num_attackers: int,
+) -> np.ndarray:
+    xs = [_entity_state_from_row(def_row, "def", D)]
+    xs.extend(_attacker_states_from_row(att_row, D, num_attackers))
+    return np.stack(xs, axis=0)
+
+
 # ------------------------- stats -------------------------
 
 def wilson_ci(k: int, n: int, alpha: float = 0.05) -> Tuple[float, float]:
@@ -363,12 +477,15 @@ def _load_base_cfg(
         def_ckpt_path=args.def_ckpt_path,
         att_ckpt_path=args.att_ckpt_path,
     )
-    if manifest_path is not None:
-        manifest = _load_json_dict(manifest_path)
-        cfg = _extract_manifest_training_cfg(manifest, manifest_path)
-        return cfg, f"run_manifest:{manifest_path}", manifest_path
+    if manifest_path is None:
+        raise RuntimeError(
+            "Could not find run_manifest.json. Pass --run_manifest, --run_dir, or use checkpoint paths "
+            "whose parent directory contains run_manifest.json."
+        )
 
-    return mod.config_for_eval(), f"{args.config_module}.config_for_eval()", None
+    manifest = _load_json_dict(manifest_path)
+    cfg = _extract_manifest_training_cfg(manifest, manifest_path)
+    return cfg, f"run_manifest:{manifest_path}", manifest_path
 
 
 def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
@@ -489,51 +606,75 @@ def _rows_from_positions(prefix: str, positions: np.ndarray) -> List[Dict[str, f
     return rows
 
 
-def _make_paired_rows_from_def_att(def_rows: List[Dict[str, float]],
-                                   att_rows: List[Dict[str, float]],
-                                   n: int) -> List[Dict[str, float]]:
+
+def _make_paired_rows_from_def_att(
+    def_rows: List[Dict[str, float]],
+    att_rows: List[Dict[str, float]],
+    n: int,
+    D: int,
+    num_attackers: int,
+) -> List[Dict[str, float]]:
     n_pair = min(len(def_rows), len(att_rows), int(n))
+    axes = ["x", "y", "z"][:D]
     out: List[Dict[str, float]] = []
     for i in range(n_pair):
         rd, ra = def_rows[i], att_rows[i]
-        out.append({
-            "def_x": rd["def_x"], "def_y": rd["def_y"], "def_z": rd["def_z"],
-            "def_vx": rd.get("def_vx", 0.0), "def_vy": rd.get("def_vy", 0.0), "def_vz": rd.get("def_vz", 0.0),
-            "att1_x": ra["att1_x"], "att1_y": ra["att1_y"], "att1_z": ra["att1_z"],
-            "att1_vx": ra.get("att1_vx", 0.0), "att1_vy": ra.get("att1_vy", 0.0), "att1_vz": ra.get("att1_vz", 0.0),
-        })
+        row = {}
+        for ax in axes:
+            row[f"def_{ax}"] = float(rd[f"def_{ax}"])
+            row[f"def_v{ax}"] = float(rd.get(f"def_v{ax}", 0.0))
+        for j in range(num_attackers):
+            row.update(_copy_attacker_state(ra, j + 1, j + 1, D))
+        out.append(row)
     return out
 
 
 def _radial_advantage_margin(cfg: Dict[str, Any]) -> float:
     oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
     percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
-    return float(percent_advantage_defender * np.pi * 2.0 * oi_r)
+    radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
+    if radial_margin < 0.0:
+        raise ValueError(f"percent_advantage_defender must be >= 0, got {percent_advantage_defender}")
+    return radial_margin
 
 
 def _valid_def_att_pair_indices(
     cfg: Dict[str, Any],
     def_rows: List[Dict[str, float]],
     att_rows: List[Dict[str, float]],
+    num_attackers: int,
     require_training_advantage: bool = False,
 ) -> List[Tuple[int, int]]:
-    center, _arena_r = _get_center_and_radius(cfg, int(cfg.get("D", 3)))
+    D = int(cfg.get("D", 3))
+    center, _arena_r = _get_center_and_radius(cfg, D)
     radial_margin = _radial_advantage_margin(cfg)
     min_sep = float(cfg.get("train_min_sep", 0.0)) if require_training_advantage else 0.0
 
     out: List[Tuple[int, int]] = []
     for di, rd in enumerate(def_rows):
-        p_def = np.array([rd["def_x"], rd["def_y"], rd["def_z"]], dtype=float)
+        p_def = _entity_state_from_row(rd, "def", D)[:D]
         r_def = float(np.linalg.norm(p_def - center))
 
         for ai, ra in enumerate(att_rows):
-            p_att = np.array([ra["att1_x"], ra["att1_y"], ra["att1_z"]], dtype=float)
-            r_att = float(np.linalg.norm(p_att - center))
+            att_states = _attacker_states_from_row(ra, D, num_attackers)
+            p_atts = [x[:D] for x in att_states]
+            r_atts = [float(np.linalg.norm(p_att - center)) for p_att in p_atts]
 
-            if require_training_advantage and (r_def > (r_att - radial_margin)):
+            if require_training_advantage and any(r_def > (r_att - radial_margin) for r_att in r_atts):
                 continue
-            if min_sep > 0.0 and np.linalg.norm(p_def - p_att) < min_sep:
+            if min_sep > 0.0 and any(np.linalg.norm(p_def - p_att) < min_sep for p_att in p_atts):
                 continue
+            if min_sep > 0.0 and len(p_atts) > 1:
+                attackers_ok = True
+                for j in range(len(p_atts)):
+                    for k in range(j + 1, len(p_atts)):
+                        if np.linalg.norm(p_atts[j] - p_atts[k]) < min_sep:
+                            attackers_ok = False
+                            break
+                    if not attackers_ok:
+                        break
+                if not attackers_ok:
+                    continue
 
             out.append((di, ai))
 
@@ -545,16 +686,20 @@ def _paired_rows_from_pair_indices(
     att_rows: List[Dict[str, float]],
     pair_indices: List[Tuple[int, int]],
     n: int,
+    D: int,
+    num_attackers: int,
 ) -> List[Dict[str, float]]:
+    axes = ["x", "y", "z"][:D]
     out: List[Dict[str, float]] = []
     for di, ai in pair_indices[:max(0, int(n))]:
         rd, ra = def_rows[di], att_rows[ai]
-        out.append({
-            "def_x": rd["def_x"], "def_y": rd["def_y"], "def_z": rd["def_z"],
-            "def_vx": rd.get("def_vx", 0.0), "def_vy": rd.get("def_vy", 0.0), "def_vz": rd.get("def_vz", 0.0),
-            "att1_x": ra["att1_x"], "att1_y": ra["att1_y"], "att1_z": ra["att1_z"],
-            "att1_vx": ra.get("att1_vx", 0.0), "att1_vy": ra.get("att1_vy", 0.0), "att1_vz": ra.get("att1_vz", 0.0),
-        })
+        row = {}
+        for ax in axes:
+            row[f"def_{ax}"] = float(rd[f"def_{ax}"])
+            row[f"def_v{ax}"] = float(rd.get(f"def_v{ax}", 0.0))
+        for j in range(num_attackers):
+            row.update(_copy_attacker_state(ra, j + 1, j + 1, D))
+        out.append(row)
     return out
 
 
@@ -766,19 +911,19 @@ def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndar
 
 
 def _classify_trial_outcome(row: Dict[str, Any]) -> str:
-    if int(row.get("num_att_errors", 0)) > 0 or row.get("att1_error"):
+    if int(row.get("num_att_errors", 0)) > 0 or int(row.get("trial_rollout_error_any", 0)) == 1 or row.get("att1_error"):
         return "rollout_error"
 
     pass_trial = int(row.get("pass_trial", 0))
-    collided = int(row.get("att1_collided", 0)) == 1
-    attacker_hit = int(row.get("att1_attacker_hit", 0)) == 1
-    att_term = int(row.get("att1_att_term", 0)) == 1
-    def_term = int(row.get("att1_def_term", 0)) == 1
-    oi_viol_att = int(row.get("att1_oi_viol_att", 0)) == 1
-    oi_viol_def = int(row.get("att1_oi_viol_def", 0)) == 1
-    att_oob = int(row.get("att1_att_oob", 0)) == 1
-    def_oob = int(row.get("att1_def_oob", 0)) == 1
-    success_mode = str(row.get("att1_success_mode", "")).strip().lower()
+    collided = int(row.get("trial_collided_any", row.get("att1_collided", 0))) == 1
+    attacker_hit = int(row.get("trial_attacker_hit_any", row.get("att1_attacker_hit", 0))) == 1
+    att_term = int(row.get("trial_att_term_any", row.get("att1_att_term", 0))) == 1
+    def_term = int(row.get("trial_def_term_any", row.get("att1_def_term", 0))) == 1
+    oi_viol_att = int(row.get("trial_oi_viol_att_any", row.get("att1_oi_viol_att", 0))) == 1
+    oi_viol_def = int(row.get("trial_oi_viol_def_any", row.get("att1_oi_viol_def", 0))) == 1
+    att_oob = int(row.get("trial_att_oob_any", row.get("att1_att_oob", 0))) == 1
+    def_oob = int(row.get("trial_def_oob_any", row.get("att1_def_oob", 0))) == 1
+    success_mode = str(row.get("trial_success_mode", row.get("att1_success_mode", ""))).strip().lower()
 
     if pass_trial:
         if collided:
@@ -998,6 +1143,105 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
 
 # ------------------------- plotting -------------------------
 
+def _extract_single_attacker_rollout(out: Dict[str, Any], attacker_idx: int) -> Dict[str, Any]:
+    exec_xyz_all = out.get("exec_xyz_all", None)
+    u_cmd_norm_all = out.get("u_cmd_norm_all", None)
+
+    if exec_xyz_all is not None:
+        if (1 + attacker_idx) >= len(exec_xyz_all):
+            raise IndexError(f"Missing attacker index {attacker_idx} in rollout with {len(exec_xyz_all) - 1} attackers.")
+        single = {
+            "exec1_xyz": exec_xyz_all[0],
+            "exec2_xyz": exec_xyz_all[1 + attacker_idx],
+            "done_info": out.get("done_info", None),
+        }
+        if isinstance(u_cmd_norm_all, list) and (1 + attacker_idx) < len(u_cmd_norm_all):
+            single["u_cmd_norm_all"] = [u_cmd_norm_all[0], u_cmd_norm_all[1 + attacker_idx]]
+        elif u_cmd_norm_all is not None:
+            single["u_cmd_norm_all"] = u_cmd_norm_all
+        return single
+
+    single = {
+        "exec1_xyz": out.get("exec1_xyz", None),
+        "exec2_xyz": out.get("exec2_xyz", None),
+        "done_info": out.get("done_info", None),
+    }
+    if u_cmd_norm_all is not None:
+        single["u_cmd_norm_all"] = u_cmd_norm_all
+    return single
+
+
+def _rollout_num_steps(out: Dict[str, Any]) -> int:
+    p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
+    if p1.ndim == 0 or p1.size == 0:
+        return 0
+    return max(0, int(len(p1)) - 1)
+
+
+def _min_non_negative(vals: List[Any]) -> int:
+    finite = []
+    for v in vals:
+        try:
+            iv = int(v)
+        except Exception:
+            continue
+        if iv >= 0:
+            finite.append(iv)
+    return min(finite) if finite else -1
+
+
+def _mean_metric(per_att_metrics: List[Dict[str, Any]], key: str) -> float:
+    vals = []
+    for m in per_att_metrics:
+        try:
+            v = float(m.get(key, float("nan")))
+        except Exception:
+            continue
+        if np.isfinite(v):
+            vals.append(v)
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _aggregate_trial_metrics(per_att_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not per_att_metrics:
+        return {
+            "trial_rollout_error_any": 1,
+            "trial_success_mode": "",
+        }
+
+    success_modes = [str(m.get("success_mode", "")).strip().lower() for m in per_att_metrics if str(m.get("success_mode", "")).strip()]
+
+    return {
+        "trial_rollout_error_any": int(any(bool(m.get("error")) for m in per_att_metrics)),
+        "trial_success_mode": success_modes[0] if success_modes else "",
+        "trial_min_rel_dist": min(float(m.get("min_rel_dist", float("inf"))) for m in per_att_metrics),
+        "trial_min_att_center": min(float(m.get("min_att_center", float("inf"))) for m in per_att_metrics),
+        "trial_collided_any": int(any(int(m.get("collided", 0)) == 1 for m in per_att_metrics)),
+        "trial_attacker_hit_any": int(any(int(m.get("attacker_hit", 0)) == 1 for m in per_att_metrics)),
+        "trial_att_oob_any": int(any(int(m.get("att_oob", 0)) == 1 for m in per_att_metrics)),
+        "trial_def_oob_any": int(any(int(m.get("def_oob", 0)) == 1 for m in per_att_metrics)),
+        "trial_att_term_any": int(any(int(m.get("att_term", 0)) == 1 for m in per_att_metrics)),
+        "trial_def_term_any": int(any(int(m.get("def_term", 0)) == 1 for m in per_att_metrics)),
+        "trial_oi_viol_def_any": int(any(int(m.get("oi_viol_def", 0)) == 1 for m in per_att_metrics)),
+        "trial_oi_viol_att_any": int(any(int(m.get("oi_viol_att", 0)) == 1 for m in per_att_metrics)),
+        "trial_t_collide": _min_non_negative([m.get("t_collide", -1) for m in per_att_metrics]),
+        "trial_t_att_hit": _min_non_negative([m.get("t_att_hit", -1) for m in per_att_metrics]),
+        "trial_t_att_term": _min_non_negative([m.get("t_att_term", -1) for m in per_att_metrics]),
+        "trial_t_def_term": _min_non_negative([m.get("t_def_term", -1) for m in per_att_metrics]),
+        "trial_t_oi_viol_def": _min_non_negative([m.get("t_oi_viol_def", -1) for m in per_att_metrics]),
+        "trial_t_oi_viol_att": _min_non_negative([m.get("t_oi_viol_att", -1) for m in per_att_metrics]),
+        "trial_udef_mean": _mean_metric(per_att_metrics, "udef_mean"),
+        "trial_uatt_mean": _mean_metric(per_att_metrics, "uatt_mean"),
+        "trial_rollout_num_steps": _mean_metric(per_att_metrics, "rollout_num_steps"),
+        "trial_rollout_setup_sec": _mean_metric(per_att_metrics, "rollout_setup_sec"),
+        "trial_rollout_setup_sec_per_step": _mean_metric(per_att_metrics, "rollout_setup_sec_per_step"),
+        "trial_rollout_simulation_sec": _mean_metric(per_att_metrics, "rollout_simulation_sec"),
+        "trial_rollout_simulation_sec_per_step": _mean_metric(per_att_metrics, "rollout_simulation_sec_per_step"),
+        "trial_rollout_total_sec": _mean_metric(per_att_metrics, "rollout_total_sec"),
+        "trial_rollout_total_sec_per_step": _mean_metric(per_att_metrics, "rollout_total_sec_per_step"),
+    }
+
+
 def _save_start_plots(
     out_dir: Path,
     cfg: Dict[str, Any],
@@ -1112,27 +1356,37 @@ def _save_start_plots(
     def _key(p, nd=6):
         return (round(float(p[0]), nd), round(float(p[1]), nd), round(float(p[2]), nd))
 
+
+
     def_counts: Dict[Tuple[float, float, float], List[int]] = {}
     att_counts: Dict[Tuple[float, float, float], List[int]] = {}
 
     for r in trial_rows:
         p = int(r.get("pass_trial", 0))
         kd = _key([r["def_x"], r["def_y"], r["def_z"]])
-        ka = _key([r["att1_x"], r["att1_y"], r["att1_z"]])
 
         def_counts.setdefault(kd, [0, 0])
-        att_counts.setdefault(ka, [0, 0])
-
         def_counts[kd][0] += p
         def_counts[kd][1] += 1
-        att_counts[ka][0] += p
-        att_counts[ka][1] += 1
+
+        n_att_row = max(1, int(r.get("num_attackers", 1)))
+        for j in range(n_att_row):
+            ax = r.get(f"att{j+1}_x", float("nan"))
+            ay = r.get(f"att{j+1}_y", float("nan"))
+            az = r.get(f"att{j+1}_z", float("nan"))
+            if any(np.isnan(float(v)) for v in (ax, ay, az)):
+                continue
+            ka = _key([ax, ay, az])
+            att_counts.setdefault(ka, [0, 0])
+            att_counts[ka][0] += p
+            att_counts[ka][1] += 1
 
     def_pts = np.array(list(def_counts.keys()), dtype=float)
     def_rates = np.array([def_counts[k][0] / max(1, def_counts[k][1]) for k in def_counts], dtype=float)
 
     att_pts = np.array(list(att_counts.keys()), dtype=float)
     att_rates = np.array([att_counts[k][0] / max(1, att_counts[k][1]) for k in att_counts], dtype=float)
+
 
     # Defender success XY
     fig, ax = plt.subplots()
@@ -1224,7 +1478,7 @@ def main():
     # multi-attacker aggregation mode
     ap.add_argument("--multi_att_mode", default="worst",
                     choices=["worst", "avg"],
-                    help="If num_attackers>1, evaluate defender vs each attacker separately then aggregate.")
+                    help="If num_attackers>1, aggregate per-attacker metrics from the same joint rollout.")
 
     # common overrides
     ap.add_argument("--device", default=None)
@@ -1270,7 +1524,7 @@ def main():
     ap.add_argument("--def_trials_in", default=None,
                     help="CSV of defender start states (def_x,def_y,def_z[,def_vx,def_vy,def_vz]).")
     ap.add_argument("--att_trials_in", default=None,
-                    help="CSV of attacker start states (att1_x,att1_y,att1_z[,att1_vx,att1_vy,att1_vz]).")
+                    help="CSV of attacker start states. Rows may provide att1_* only or a full attacker team att1_*, att2_*, ....")
     ap.add_argument("--max_pairs", type=int, default=None,
                     help="If set in cartesian mode, cap total evaluated pairs (sampled).")
 
@@ -1408,11 +1662,12 @@ def main():
                                               rng=rng_grid, include_center=bool(args.include_center))
 
         def_rows = _rows_from_positions("def", def_pos)
-        att_rows = _rows_from_positions("att1", att_pos)
+        att_rows = _expand_attacker_team_rows(_rows_from_positions("att1", att_pos), D, num_attackers)
         valid_pair_indices = _valid_def_att_pair_indices(
             cfg0,
             def_rows,
             att_rows,
+            num_attackers=num_attackers,
             require_training_advantage=(str(cfg0.get("train_ic_mode", "fixed")) == "random_shell_advantage"),
         )
         total_pairs_all = len(def_rows) * len(att_rows)
@@ -1425,7 +1680,7 @@ def main():
         # Now choose how to pair them
         if args.grid_mode == "paired":
             n_total = min(int(args.num_trials), total_pairs_valid)
-            paired_rows = _paired_rows_from_pair_indices(def_rows, att_rows, valid_pair_indices, n_total)
+            paired_rows = _paired_rows_from_pair_indices(def_rows, att_rows, valid_pair_indices, n_total, D, num_attackers)
             log(f"[eval] auto_shell_grid paired: shells={shell_fracs} points_per_shell={args.points_per_shell} "
                 f"include_center={args.include_center} valid_pairs={total_pairs_valid}/{total_pairs_all} -> paired_rows={len(paired_rows)}")
         else:
@@ -1446,6 +1701,10 @@ def main():
     elif args.grid_mode == "paired" and args.trials_in is not None:
         paired_rows = _load_trials_csv(args.trials_in, D)
         log(f"[eval] loaded paired trials_in: {args.trials_in} ({len(paired_rows)} rows)")
+        if num_attackers > 1 and any(_row_num_attackers(r, D) < num_attackers for r in paired_rows):
+            raise RuntimeError(
+                f"--trials_in rows must include att1..att{num_attackers} columns when cfg['num_attackers']={num_attackers}."
+            )
         if len(paired_rows) < int(args.num_trials):
             raise RuntimeError(
                 f"--trials_in has {len(paired_rows)} rows but --num_trials={args.num_trials}. "
@@ -1459,7 +1718,7 @@ def main():
         if args.def_trials_in is None or args.att_trials_in is None:
             raise RuntimeError("cartesian mode requires --def_trials_in and --att_trials_in (unless using --auto_shell_grid)")
         def_rows = _load_def_csv(args.def_trials_in, D)
-        att_rows = _load_att_csv(args.att_trials_in, D)
+        att_rows = _expand_attacker_team_rows(_load_att_csv(args.att_trials_in, D), D, num_attackers)
 
         total_pairs = len(def_rows) * len(att_rows)
         if total_pairs <= 0:
@@ -1532,14 +1791,7 @@ def main():
 
         if paired_rows is not None:
             r = paired_rows[i]
-            p_def = np.array([r["def_x"], r["def_y"], r["def_z"]], dtype=float)
-            v_def = np.array([r.get("def_vx", 0.0), r.get("def_vy", 0.0), r.get("def_vz", 0.0)], dtype=float)
-
-            p_att = np.array([r["att1_x"], r["att1_y"], r["att1_z"]], dtype=float)
-            v_att = np.array([r.get("att1_vx", 0.0), r.get("att1_vy", 0.0), r.get("att1_vz", 0.0)], dtype=float)
-
-            x0 = np.stack([np.concatenate([p_def, v_def]),
-                           np.concatenate([p_att, v_att])], axis=0)
+            x0 = _build_paired_x0(r, D, num_attackers)
 
         elif args.grid_mode == "cartesian" and (def_rows is not None and att_rows is not None):
             if valid_pair_indices is not None:
@@ -1564,14 +1816,7 @@ def main():
             rd = def_rows[di]
             ra = att_rows[ai]
 
-            p_def = np.array([rd["def_x"], rd["def_y"], rd["def_z"]], dtype=float)
-            v_def = np.array([rd.get("def_vx", 0.0), rd.get("def_vy", 0.0), rd.get("def_vz", 0.0)], dtype=float)
-
-            p_att = np.array([ra["att1_x"], ra["att1_y"], ra["att1_z"]], dtype=float)
-            v_att = np.array([ra.get("att1_vx", 0.0), ra.get("att1_vy", 0.0), ra.get("att1_vz", 0.0)], dtype=float)
-
-            x0 = np.stack([np.concatenate([p_def, v_def]),
-                           np.concatenate([p_att, v_att])], axis=0)
+            x0 = _build_cartesian_x0(rd, ra, D, num_attackers)
 
         elif args.sample_ic:
             x0 = _sample_x0(
@@ -1586,6 +1831,12 @@ def main():
         else:
             x0 = np.asarray(cfg_trial["x0"], dtype=float)
 
+        expected_rows = 1 + num_attackers
+        if x0.ndim != 2 or x0.shape[0] != expected_rows or x0.shape[1] < (2 * D):
+            raise RuntimeError(
+                f"Expected x0 shape ({expected_rows}, >= {2 * D}) for num_attackers={num_attackers}, got {tuple(x0.shape)}"
+            )
+
         x0 = _apply_x0_jitter(cfg_trial, x0, rng)
 
         # log starts (for plots)
@@ -1594,42 +1845,51 @@ def main():
             if 1 + j < x0.shape[0]:
                 starts_atts[j].append(x0[1 + j, :D].copy())
 
+
+
         per_att_metrics = []
         per_att_errors = 0
 
-        # For multi-attackers, evaluate def vs each attacker separately
-        for j in range(num_attackers):
-            if 1 + j >= x0.shape[0]:
-                continue
+        cfg_run = copy.deepcopy(cfg_trial)
+        cfg_run["x0"] = np.asarray(x0, dtype=float).tolist()
 
-            cfg_run = copy.deepcopy(cfg_trial)
-            cfg_run["x0"] = np.asarray([x0[0], x0[1 + j]], dtype=float).tolist()
+        # force CLI ckpt paths into the rollout cfg
+        _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
-            # force CLI ckpt paths into the rollout cfg
-            _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
+        # Determine steps for this rollout (never pass None)
+        steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
+        if steps_run <= 0:
+            raise RuntimeError(f"Invalid steps_run={steps_run}. Provide --steps or ensure cfg['T'] is set.")
 
-            # Determine steps for this rollout (never pass None)
-            steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
-            if steps_run <= 0:
-                raise RuntimeError(f"Invalid steps_run={steps_run}. Provide --steps or ensure cfg['T'] is set.")
+        # Also keep cfg_run['T'] consistent with steps
+        cfg_run["T"] = steps_run
 
-            # Also keep cfg_run['T'] consistent with steps
-            cfg_run["T"] = steps_run
+        try:
+            if args.opponent_source == "policy":
+                out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
+            else:
+                out = run_rhc_with_policy_vs_baseline_collect_frames_3d(
+                    cfg_run,
+                    policy_role=args.policy_role,
+                    opponent_baseline=args.opponent_source,
+                    steps=steps_run,
+                )
 
-            try:
-                if args.opponent_source == "policy":
-                    out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
+            if i == 0 and args.print_first_out_keys:
+                log("[eval] first rollout returned keys:")
+                log("  " + ", ".join(sorted(list(out.keys()))))
+                exec_xyz_all = out.get("exec_xyz_all", None)
+                if isinstance(exec_xyz_all, list) and exec_xyz_all:
+                    lens = [len(np.asarray(p, dtype=float)) for p in exec_xyz_all]
+                    log(f"[eval] first rollout sanity: len(exec_xyz_all)={lens}")
+                    if len(exec_xyz_all) >= 2:
+                        p1 = np.asarray(exec_xyz_all[0], dtype=float)
+                        p2 = np.asarray(exec_xyz_all[1], dtype=float)
+                        if p1.size and p2.size:
+                            d0 = float(np.linalg.norm(p1[0, :D] - p2[0, :D]))
+                            dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
+                            log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
                 else:
-                    out = run_rhc_with_policy_vs_baseline_collect_frames_3d(
-                        cfg_run,
-                        policy_role=args.policy_role,
-                        opponent_baseline=args.opponent_source,
-                        steps=steps_run,
-                    )
-
-                if (i == 0 and j == 0 and args.print_first_out_keys):
-                    log("[eval] first rollout returned keys:")
-                    log("  " + ", ".join(sorted(list(out.keys()))))
                     p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
                     p2 = np.asarray(out.get("exec2_xyz", []), dtype=float)
                     log(f"[eval] first rollout sanity: len(exec1_xyz)={len(p1)} len(exec2_xyz)={len(p2)}")
@@ -1638,20 +1898,36 @@ def main():
                         dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
                         log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
 
-                m = _compute_trial_metrics(cfg_run, out)
-                rollout_timing = out.get("rollout_timing_sec", {}) or {}
-                for timing_key in ("setup", "simulation", "total"):
-                    m[f"rollout_{timing_key}_sec"] = float(rollout_timing.get(timing_key, float("nan")))
+            rollout_timing = out.get("rollout_timing_sec", {}) or {}
+            for j in range(num_attackers):
+                try:
+                    out_j = _extract_single_attacker_rollout(out, j)
+                    m = _compute_trial_metrics(cfg_run, out_j)
+                    rollout_steps = _rollout_num_steps(out_j)
+                    m["rollout_num_steps"] = int(rollout_steps)
+                    for timing_key in ("setup", "simulation", "total"):
+                        timing_val = float(rollout_timing.get(timing_key, float("nan")))
+                        m[f"rollout_{timing_key}_sec"] = timing_val
+                        if rollout_steps > 0 and np.isfinite(timing_val):
+                            m[f"rollout_{timing_key}_sec_per_step"] = timing_val / float(rollout_steps)
+                        else:
+                            m[f"rollout_{timing_key}_sec_per_step"] = float("nan")
+                except Exception as e:
+                    per_att_errors += 1
+                    m = {"pass": 0, "error": str(e)}
+                    if args.print_errors:
+                        log(f"[eval][trial {i}/{n_total-1}][att {j+1}] ERROR: {e}")
+                        if args.trace_errors:
+                            log(traceback.format_exc())
+                per_att_metrics.append(m)
 
-            except Exception as e:
-                per_att_errors += 1
-                m = {"pass": 0, "error": str(e)}
-                if args.print_errors:
-                    log(f"[eval][trial {i}/{n_total-1}][att {j+1}] ERROR: {e}")
-                    if args.trace_errors:
-                        log(traceback.format_exc())
-
-            per_att_metrics.append(m)
+        except Exception as e:
+            per_att_errors = num_attackers
+            per_att_metrics = [{"pass": 0, "error": str(e)} for _ in range(num_attackers)]
+            if args.print_errors:
+                log(f"[eval][trial {i}/{n_total-1}] ERROR: {e}")
+                if args.trace_errors:
+                    log(traceback.format_exc())
 
         if not per_att_metrics:
             per_att_metrics = [{"pass": 0, "error": "no attackers present"}]
@@ -1665,7 +1941,7 @@ def main():
 
         passes += pass_trial
 
-        # One row per trial; stores attacker #1 metrics by default
+        # One row per trial; stores aggregate trial metrics and per-attacker metrics
         row: Dict[str, Any] = {
             "trial": i,
             "seed": seed,
@@ -1677,19 +1953,20 @@ def main():
             "def_x": float(x0[0, 0]),
             "def_y": float(x0[0, 1]) if D >= 2 else 0.0,
             "def_z": float(x0[0, 2]) if D == 3 else 0.0,
-
-            "att1_x": float(x0[1, 0]) if x0.shape[0] > 1 else float("nan"),
-            "att1_y": float(x0[1, 1]) if (x0.shape[0] > 1 and D >= 2) else float("nan"),
-            "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
         }
+        for j in range(num_attackers):
+            row[f"att{j+1}_x"] = float(x0[1 + j, 0]) if (1 + j) < x0.shape[0] else float("nan")
+            row[f"att{j+1}_y"] = float(x0[1 + j, 1]) if ((1 + j) < x0.shape[0] and D >= 2) else float("nan")
+            row[f"att{j+1}_z"] = float(x0[1 + j, 2]) if ((1 + j) < x0.shape[0] and D == 3) else float("nan")
 
         if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
             row["def_idx"] = cart_di
             row["att_idx"] = cart_ai
 
-        m0 = per_att_metrics[0]
-        for k_, v_ in m0.items():
-            row[f"att1_{k_}"] = v_
+        row.update(_aggregate_trial_metrics(per_att_metrics))
+        for j, metrics in enumerate(per_att_metrics, start=1):
+            for k_, v_ in metrics.items():
+                row[f"att{j}_{k_}"] = v_
 
         trial_rows.append(row)
 
@@ -1698,21 +1975,23 @@ def main():
             sr_sofar = passes / float(i + 1)
             dt_trial = time.time() - t_trial0
 
-            last_min_rel = row.get("att1_min_rel_dist", None)
-            last_hit = row.get("att1_attacker_hit", None)
-            last_def_term = row.get("att1_def_term", None)
-            last_att_term = row.get("att1_att_term", None)
-            last_rollout_sim = row.get("att1_rollout_simulation_sec", None)
+            last_min_rel = row.get("trial_min_rel_dist", row.get("att1_min_rel_dist", None))
+            last_hit = row.get("trial_attacker_hit_any", row.get("att1_attacker_hit", None))
+            last_def_term = row.get("trial_def_term_any", row.get("att1_def_term", None))
+            last_att_term = row.get("trial_att_term_any", row.get("att1_att_term", None))
+            last_rollout_sim = row.get("trial_rollout_simulation_sec", row.get("att1_rollout_simulation_sec", None))
 
             extra = ""
             if args.grid_mode == "cartesian":
                 extra = f" | def_idx={row.get('def_idx')} att_idx={row.get('att_idx')}"
 
-            log(f"[eval] progress {i+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
+            log(
+                f"[eval] progress {i+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
                 f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
                 f"rollout_sim={last_rollout_sim} | "
                 f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
-                f"errors_this_trial={per_att_errors}{extra}")
+                f"errors_this_trial={per_att_errors}{extra}"
+            )
 
     # Aggregate stats
     n = len(trial_rows)
@@ -1732,7 +2011,47 @@ def main():
                 vals.append(fv)
         return np.asarray(vals, dtype=float)
 
+
+
     outcome_breakdown = _save_outcome_histogram(out_dir, trial_rows)
+
+    def _metric_summary(name: str) -> Dict[str, float]:
+        vals = _col(name)
+        return {
+            "mean": float(np.nanmean(vals)) if vals.size else float("nan"),
+            **_quantiles(vals),
+        }
+
+
+    def _attacker_metric_block(prefix: str) -> Dict[str, Any]:
+        return {
+            "min_rel_dist": _metric_summary(f"{prefix}_min_rel_dist"),
+            "min_att_center": _metric_summary(f"{prefix}_min_att_center"),
+            "attacker_hit_rate": float(np.mean(_col(f"{prefix}_attacker_hit"))) if _col(f"{prefix}_attacker_hit").size else float("nan"),
+            "collision_rate": float(np.mean(_col(f"{prefix}_collided"))) if _col(f"{prefix}_collided").size else float("nan"),
+            "att_term_rate": float(np.mean(_col(f"{prefix}_att_term"))) if _col(f"{prefix}_att_term").size else float("nan"),
+            "def_term_rate": float(np.mean(_col(f"{prefix}_def_term"))) if _col(f"{prefix}_def_term").size else float("nan"),
+            "oi_viol_def_rate": float(np.mean(_col(f"{prefix}_oi_viol_def"))) if _col(f"{prefix}_oi_viol_def").size else float("nan"),
+            "oi_viol_att_rate": float(np.mean(_col(f"{prefix}_oi_viol_att"))) if _col(f"{prefix}_oi_viol_att").size else float("nan"),
+            "udef_mean": _metric_summary(f"{prefix}_udef_mean"),
+            "uatt_mean": _metric_summary(f"{prefix}_uatt_mean"),
+            "rollout_num_steps": _metric_summary(f"{prefix}_rollout_num_steps"),
+            "rollout_setup_sec": _metric_summary(f"{prefix}_rollout_setup_sec"),
+            "rollout_setup_sec_per_step": _metric_summary(f"{prefix}_rollout_setup_sec_per_step"),
+            "rollout_simulation_sec": _metric_summary(f"{prefix}_rollout_simulation_sec"),
+            "rollout_simulation_sec_per_step": _metric_summary(f"{prefix}_rollout_simulation_sec_per_step"),
+            "rollout_total_sec": _metric_summary(f"{prefix}_rollout_total_sec"),
+            "rollout_total_sec_per_step": _metric_summary(f"{prefix}_rollout_total_sec_per_step"),
+        }
+
+
+    trial_attacker_hit_vals = _col("trial_attacker_hit_any")
+    primary_metric_name = "defender_capture_pass_rate" if args.policy_role == "def" else (
+        "attacker_hit_any_rate" if num_attackers > 1 else "attacker_hit_rate"
+    )
+    primary_metric_value = float(sr) if args.policy_role == "def" else (
+        float(np.mean(trial_attacker_hit_vals)) if trial_attacker_hit_vals.size else float("nan")
+    )
 
     results = {
         "num_trials": n,
@@ -1742,10 +2061,8 @@ def main():
         "policy_role": args.policy_role,
         "opponent_source": args.opponent_source,
         "policy_primary_metric": {
-            "name": "defender_capture_pass_rate" if args.policy_role == "def" else "attacker_hit_rate",
-            "value": float(sr) if args.policy_role == "def" else (
-                float(np.mean(_col("att1_attacker_hit"))) if _col("att1_attacker_hit").size else float("nan")
-            ),
+            "name": primary_metric_name,
+            "value": primary_metric_value,
         },
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
@@ -1764,46 +2081,71 @@ def main():
         "outcome_breakdown": outcome_breakdown,
         "notes": [
             "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
-            "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
+            "For num_attackers>1, evaluation runs one joint rollout per trial and extracts attacker-specific metrics from the shared trajectory.",
             "When zero_sum_reward.mode is enabled and collision_radius_m > 0, PASS means the defender captures the attacker before any attacker hit or invalid termination/keepout event.",
             "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
             "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
             "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
+            "If attacker grid rows only provide att1_* and num_attackers>1, evaluation deterministically expands them into attacker-team rows.",
             "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
-            "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_att1.attacker_hit_rate for attacker-side comparisons.",
+            "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_trial.attacker_hit_any_rate for attacker-side comparisons.",
         ],
-        "metrics_att1": {
-            "min_rel_dist": {"mean": float(np.nanmean(_col("att1_min_rel_dist"))) if _col("att1_min_rel_dist").size else float("nan"),
-                             **_quantiles(_col("att1_min_rel_dist"))},
-            "min_att_center": {"mean": float(np.nanmean(_col("att1_min_att_center"))) if _col("att1_min_att_center").size else float("nan"),
-                               **_quantiles(_col("att1_min_att_center"))},
-            "attacker_hit_rate": float(np.mean(_col("att1_attacker_hit"))) if _col("att1_attacker_hit").size else float("nan"),
-            "collision_rate": float(np.mean(_col("att1_collided"))) if _col("att1_collided").size else float("nan"),
-            "att_term_rate": float(np.mean(_col("att1_att_term"))) if _col("att1_att_term").size else float("nan"),
-            "def_term_rate": float(np.mean(_col("att1_def_term"))) if _col("att1_def_term").size else float("nan"),
-            "oi_viol_def_rate": float(np.mean(_col("att1_oi_viol_def"))) if _col("att1_oi_viol_def").size else float("nan"),
-            "oi_viol_att_rate": float(np.mean(_col("att1_oi_viol_att"))) if _col("att1_oi_viol_att").size else float("nan"),
-            "udef_mean": {"mean": float(np.nanmean(_col("att1_udef_mean"))) if _col("att1_udef_mean").size else float("nan"),
-                          **_quantiles(_col("att1_udef_mean"))},
-            "uatt_mean": {"mean": float(np.nanmean(_col("att1_uatt_mean"))) if _col("att1_uatt_mean").size else float("nan"),
-                          **_quantiles(_col("att1_uatt_mean"))},
-            "rollout_setup_sec": {"mean": float(np.nanmean(_col("att1_rollout_setup_sec"))) if _col("att1_rollout_setup_sec").size else float("nan"),
-                                  **_quantiles(_col("att1_rollout_setup_sec"))},
-            "rollout_simulation_sec": {"mean": float(np.nanmean(_col("att1_rollout_simulation_sec"))) if _col("att1_rollout_simulation_sec").size else float("nan"),
-                                       **_quantiles(_col("att1_rollout_simulation_sec"))},
-            "rollout_total_sec": {"mean": float(np.nanmean(_col("att1_rollout_total_sec"))) if _col("att1_rollout_total_sec").size else float("nan"),
-                                  **_quantiles(_col("att1_rollout_total_sec"))},
-        }
+        "metrics_trial": {
+            "min_rel_dist": _metric_summary("trial_min_rel_dist"),
+            "min_att_center": _metric_summary("trial_min_att_center"),
+            "attacker_hit_any_rate": float(np.mean(_col("trial_attacker_hit_any"))) if _col("trial_attacker_hit_any").size else float("nan"),
+            "collision_any_rate": float(np.mean(_col("trial_collided_any"))) if _col("trial_collided_any").size else float("nan"),
+            "att_term_any_rate": float(np.mean(_col("trial_att_term_any"))) if _col("trial_att_term_any").size else float("nan"),
+            "def_term_any_rate": float(np.mean(_col("trial_def_term_any"))) if _col("trial_def_term_any").size else float("nan"),
+            "oi_viol_def_any_rate": float(np.mean(_col("trial_oi_viol_def_any"))) if _col("trial_oi_viol_def_any").size else float("nan"),
+            "oi_viol_att_any_rate": float(np.mean(_col("trial_oi_viol_att_any"))) if _col("trial_oi_viol_att_any").size else float("nan"),
+            "rollout_error_any_rate": float(np.mean(_col("trial_rollout_error_any"))) if _col("trial_rollout_error_any").size else float("nan"),
+            "udef_mean": _metric_summary("trial_udef_mean"),
+            "uatt_mean": _metric_summary("trial_uatt_mean"),
+            "rollout_num_steps": _metric_summary("trial_rollout_num_steps"),
+            "rollout_setup_sec": _metric_summary("trial_rollout_setup_sec"),
+            "rollout_setup_sec_per_step": _metric_summary("trial_rollout_setup_sec_per_step"),
+            "rollout_simulation_sec": _metric_summary("trial_rollout_simulation_sec"),
+            "rollout_simulation_sec_per_step": _metric_summary("trial_rollout_simulation_sec_per_step"),
+            "rollout_total_sec": _metric_summary("trial_rollout_total_sec"),
+            "rollout_total_sec_per_step": _metric_summary("trial_rollout_total_sec_per_step"),
+        },
     }
+    for j in range(num_attackers):
+        results[f"metrics_att{j+1}"] = _attacker_metric_block(f"att{j+1}")
+
 
     (out_dir / "results.json").write_text(json.dumps(results, indent=2))
 
     csv_path = out_dir / "trials.csv"
+    fieldnames = sorted({k_ for r in trial_rows for k_ in r.keys()})
     with csv_path.open("w", newline="") as f:
-        fieldnames = sorted({k_ for r in trial_rows for k_ in r.keys()})
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in trial_rows:
+            w.writerow(r)
+
+    timeout_rows = [r for r in trial_rows if r.get("outcome_label") == "timeout_no_capture"]
+    timeout_csv_path = out_dir / "timeout_no_capture_cases.csv"
+    with timeout_csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in timeout_rows:
+            w.writerow(r)
+
+    clean_resolution_rows = [
+        r for r in trial_rows
+        if int(r.get("trial_attacker_hit_any", 0)) == 0
+        and int(r.get("trial_def_term_any", 0)) == 0
+        and int(r.get("trial_att_term_any", 0)) == 0
+        and int(r.get("trial_oi_viol_def_any", 0)) == 0
+        and int(r.get("trial_oi_viol_att_any", 0)) == 0
+    ]
+    clean_csv_path = out_dir / "clean_non_hit_non_term_cases.csv"
+    with clean_csv_path.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in clean_resolution_rows:
             w.writerow(r)
 
     starts_def_arr = np.asarray(starts_def, dtype=float)
@@ -1827,6 +2169,8 @@ def main():
     log(f"[eval] DONE | trials={n} passes={k} success_rate={sr:.3f} CI={lo:.3f}..{hi:.3f}")
     log(f"[eval] wrote: {out_dir/'results.json'}")
     log(f"[eval] wrote: {out_dir/'trials.csv'}")
+    log(f"[eval] wrote: {out_dir/'timeout_no_capture_cases.csv'} ({len(timeout_rows)} rows)")
+    log(f"[eval] wrote: {out_dir/'clean_non_hit_non_term_cases.csv'} ({len(clean_resolution_rows)} rows)")
     log(f"[eval] wrote: {out_dir/'starts_xy.png'}")
     log(f"[eval] wrote: {out_dir/'starts_xz.png'}")
     log(f"[eval] total_time={time.time() - t_global0:.3f}s")

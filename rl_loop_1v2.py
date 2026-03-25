@@ -10,7 +10,7 @@ logic into dedicated modules under `core_1v2/`.
 
 import os
 
-from config_rl import config_for_train
+from config_rl_1v2 import config_for_train
 from core_1v2.logger_utils import RunLogger
 from core_1v2.models import ActorCriticDiff
 from core_1v2.plotting import (
@@ -33,12 +33,12 @@ if __name__ == "__main__":
     do_phase_3 = True
     do_phase_4 = True
 
-    def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
-    att1_teacher_ckpt = "Training_Policy/att1_teacher.pt"
-    def1_teacher_ckpt = "Training_Policy/def1_teacher.pt"
-    att2_teacher_ckpt = "Training_Policy/att2_teacher.pt"
+    def0_teacher_ckpt = "Training_Policy_1v2/def0_teacher.pt"
+    att1_teacher_ckpt = "Training_Policy_1v2/att1_teacher.pt"
+    def1_teacher_ckpt = "Training_Policy_1v2/def1_teacher.pt"
+    att2_teacher_ckpt = "Training_Policy_1v2/att2_teacher.pt"
 
-    OUT_DIR = "Training_Policy"
+    OUT_DIR = "Training_Policy_1v2"
     os.makedirs(OUT_DIR, exist_ok=True)
 
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
@@ -131,7 +131,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "def0_full",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.5,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -139,7 +139,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.3,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -147,7 +147,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_very_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.2,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -212,7 +212,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "att1_full",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.5,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -220,7 +220,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.3,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -228,7 +228,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_very_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.2,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -294,7 +294,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "def0_full",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.15,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -302,7 +302,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.15,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -310,7 +310,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_very_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": "Training_Policy_1v2/def0_teacher.pt",
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -318,7 +318,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def1_full",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": "Training_Policy_1v2/def1_teacher.pt",
                         "prob": 0.3,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -326,7 +326,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def1_weak",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": "Training_Policy_1v2/def1_teacher.pt",
                         "prob": 0.2,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -334,7 +334,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def1_very_weak",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": "Training_Policy_1v2/def1_teacher.pt",
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -399,7 +399,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "att1_full",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.15,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -407,7 +407,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.15,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -415,7 +415,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_very_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": "Training_Policy_1v2/att1_teacher.pt",
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -423,7 +423,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att2_full",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": "Training_Policy_1v2/att2_teacher.pt",
                         "prob": 0.3,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -431,7 +431,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att2_weak",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": "Training_Policy_1v2/att2_teacher.pt",
                         "prob": 0.2,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -439,7 +439,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att2_very_weak",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": "Training_Policy_1v2/att2_teacher.pt",
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,

@@ -3,12 +3,472 @@
 # No attitude/FOV (identity stubs)
 
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Dict, Any, List
 import time
 import numpy as np
 
+from paper_baseline_runner import _build_step_plant_single, _identity_R, _p3
 from rl_infer import RLPolicyDiff
+from rl_infer_1v2 import RLPolicy_Multi
 from ukf_estimator import KF_CV
+
+
+def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
+    u = np.asarray(u, float).reshape(-1)
+    if D == 3:
+        return u[:3]
+    return np.array([u[0], u[1], 0.0], dtype=float)
+
+
+def _pack_multi_agent_rollout(
+    *,
+    plan_hist_all,
+    plan_att_all,
+    exec_xyz_all,
+    exec_att_all,
+    phi_hist_all,
+    fov_axis_hist,
+    fov_seen_mask,
+    u_cmd_all,
+    u_cmd_norm_all,
+    u_real_all,
+    u_real_norm_all,
+    done_info,
+    rollout_timing_sec,
+    fuel_frac_all=None,
+    thrust_all=None,
+    mdot_all=None,
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "num_attackers": max(0, len(exec_xyz_all) - 1),
+        "plan_hist_all": plan_hist_all,
+        "plan_att_all": plan_att_all,
+        "exec_xyz_all": exec_xyz_all,
+        "exec_att_all": exec_att_all,
+        "phi_hist_all": phi_hist_all,
+        "fov_axis_hist": fov_axis_hist,
+        "fov_seen_mask": fov_seen_mask,
+        "u_cmd_all": [np.asarray(u, dtype=float) for u in u_cmd_all],
+        "u_cmd_norm_all": [np.asarray(u, dtype=float) for u in u_cmd_norm_all],
+        "u_real_all": [np.asarray(u, dtype=float) for u in u_real_all],
+        "u_real_norm_all": [np.asarray(u, dtype=float) for u in u_real_norm_all],
+        "done_info": done_info,
+        "rollout_timing_sec": rollout_timing_sec,
+    }
+
+    for idx in range(len(exec_xyz_all)):
+        key = idx + 1
+        out[f"plan_hist{key}"] = plan_hist_all[idx]
+        out[f"plan_att{key}"] = plan_att_all[idx]
+        out[f"exec{key}_xyz"] = exec_xyz_all[idx]
+        out[f"exec_att{key}"] = exec_att_all[idx]
+        out[f"phi_hist{key}"] = phi_hist_all[idx]
+
+    if fuel_frac_all is not None:
+        out["fuel_frac_all"] = [np.asarray(v, dtype=float) for v in fuel_frac_all]
+    if thrust_all is not None:
+        out["thrust_all"] = [np.asarray(v, dtype=float) for v in thrust_all]
+    if mdot_all is not None:
+        out["mdot_all"] = [np.asarray(v, dtype=float) for v in mdot_all]
+
+    return out
+
+
+def _run_rhc_with_rl_and_collect_frames_3d_multi(
+    cfg: Dict[str, Any],
+    steps: int | None = None,
+    turn_len: int | None = None,
+):
+    t_fn0 = time.perf_counter()
+
+    D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
+    nx = 2 * D
+    T = int(cfg["T"])
+    dt = float(cfg["dt"])
+    Na = int(cfg.get("num_attackers", 1))
+
+    if Na <= 1:
+        raise ValueError("_run_rhc_with_rl_and_collect_frames_3d_multi expects num_attackers > 1.")
+
+    if steps is None:
+        steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
+    if turn_len is None:
+        turn_len = 1
+
+    ar = cfg.setdefault("arena", {})
+    ar.setdefault("type", "sphere")
+    ar.setdefault("cx", 0.0)
+    ar.setdefault("cy", 0.0)
+    ar.setdefault("cz", 0.0)
+    ar.setdefault("r", 30.0)
+    if ar["type"] != "sphere":
+        raise ValueError("Only spherical arena is supported in this rollout helper.")
+
+    center = np.array(
+        [ar["cx"], ar["cy"], (ar.get("cz", 0.0) if D == 3 else 0.0)],
+        dtype=np.float32,
+    )[:D]
+    arena_r = float(ar["r"])
+
+    x0 = np.asarray(cfg["x0"], dtype=np.float32)
+    if x0.shape[0] < 1 + Na:
+        raise ValueError(f"cfg['x0'] must contain defender plus {Na} attackers for num_attackers={Na}.")
+
+    xD = x0[0, :nx].copy()
+    xA_list = [x0[i + 1, :nx].copy() for i in range(Na)]
+
+    deterministic = bool(cfg.get("rl_eval_deterministic", True))
+    umax = float(cfg.get("umax", 5e-4))
+    debug_actions = bool(cfg.get("debug_actions", False))
+    stop_on_done = bool(cfg.get("stop_on_done", True))
+
+    use_fuel = bool(cfg.get("fuel", {}).get("enable"))
+    g0 = 9.80665
+
+    if use_fuel:
+        fuel_cfg = cfg["fuel"]
+        fdef = fuel_cfg["def"]
+        fatt = fuel_cfg["att"]
+
+        m0_def = float(fdef["m0"])
+        mdry_def = float(fdef["m_dry"])
+        Tmax_def = float(fdef["Tmax"])
+        Isp_def = float(fdef["Isp"])
+
+        m0_att = float(fatt["m0"])
+        mdry_att = float(fatt["m_dry"])
+        Tmax_att = float(fatt["Tmax"])
+        Isp_att = float(fatt["Isp"])
+
+        m_def = m0_def
+        m_att = [m0_att for _ in range(Na)]
+    else:
+        m0_def = mdry_def = Tmax_def = Isp_def = None
+        m0_att = mdry_att = Tmax_att = Isp_att = None
+        m_def = None
+        m_att = [None for _ in range(Na)]
+
+    def apply_propulsion(
+        a_cmd: np.ndarray,
+        m: float,
+        m_dry: float,
+        Tmax: float,
+        Isp: float,
+    ):
+        a_cmd = np.asarray(a_cmd, dtype=float)
+
+        if m <= m_dry + 1e-9:
+            return np.zeros_like(a_cmd, dtype=np.float32), float(m_dry), True, 0.0, 0.0
+
+        F_req = m * a_cmd
+        F_req_norm = np.linalg.norm(F_req)
+
+        if F_req_norm > Tmax:
+            F = F_req * (Tmax / (F_req_norm + 1e-9))
+        else:
+            F = F_req
+
+        a_real = F / max(m, 1e-9)
+        thrust_norm = float(np.linalg.norm(F))
+        mdot = thrust_norm / (Isp * g0)
+        m_next = max(m_dry, m - mdot * dt)
+        fuel_depleted = bool(m_next <= m_dry + 1e-9)
+        return a_real.astype(np.float32), float(m_next), fuel_depleted, thrust_norm, float(mdot)
+
+    use_obsnorm = bool(cfg.get("obsnorm", False))
+    obs_mean = None
+    obs_std = None
+    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0)
+
+    if use_obsnorm and "obs_stats" in cfg:
+        import os
+
+        mp = cfg["obs_stats"].get("mean_path", None)
+        sp = cfg["obs_stats"].get("std_path", None)
+
+        if mp and os.path.exists(mp):
+            obs_mean = np.load(mp).astype(np.float32)
+        if sp and os.path.exists(sp):
+            obs_std = np.load(sp).astype(np.float32)
+
+        if obs_mean is not None and obs_mean.shape[0] != obs_expected:
+            raise ValueError(f"obs_mean has dim {obs_mean.shape[0]}, expected {obs_expected}.")
+        if obs_std is not None and obs_std.shape[0] != obs_expected:
+            raise ValueError(f"obs_std has dim {obs_std.shape[0]}, expected {obs_expected}.")
+
+    def build_train_obs(
+        xD_vec: np.ndarray,
+        xA_vecs: List[np.ndarray],
+        m_def_cur: float | None,
+        m_att_cur: List[float | None],
+    ) -> np.ndarray:
+        pD = xD_vec[:D]
+        vD = xD_vec[D:2 * D]
+        parts: List[np.ndarray] = [pD - center]
+
+        for xA_vec in xA_vecs:
+            parts.append(xA_vec[:D] - center)
+        for xA_vec in xA_vecs:
+            parts.append(xA_vec[:D] - pD)
+
+        parts.append(vD)
+        for xA_vec in xA_vecs:
+            parts.append(xA_vec[D:2 * D])
+
+        if use_fuel:
+            fuel_frac_def = (m_def_cur - mdry_def) / (m0_def - mdry_def + 1e-9)
+            fuel_frac_att = (m_att_cur[0] - mdry_att) / (m0_att - mdry_att + 1e-9)
+            parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
+            parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
+
+        obs = np.concatenate(parts).astype(np.float32)
+        if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
+            obs = (obs - obs_mean) / (obs_std + 1e-8)
+        return obs
+
+    step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
+    center = np.asarray(center_from_dyn, dtype=np.float32)
+
+    use_ukf = bool(cfg.get("use_ukf", False))
+    if use_ukf:
+        print("[warn] UKF eval path is only implemented for num_attackers == 1 in game_runner; disabling use_ukf.")
+
+    pol = RLPolicy_Multi(cfg, device=cfg.get("device", "cpu"))
+    din_def, din_att = pol.verify_ckpt_compat()
+    if din_def != obs_expected or din_att != obs_expected:
+        raise RuntimeError(
+            f"Policy obs dims mismatch: defender={din_def}, attacker={din_att}, "
+            f"expected={obs_expected} (D={D}, Na={Na}, use_fuel={use_fuel})."
+        )
+
+    oi = cfg.get("oi", {}) or {}
+    oi_radius = float(oi.get("r", 0.0))
+    oi_radius_norm = oi_radius / arena_r if arena_r > 0 else 0.0
+    hit_buffer_def = 0.0
+    hit_buffer_att = 0.0
+    collision_radius_m = float(cfg.get("collision_radius_m"))
+    arena_margin = float(cfg.get("arena_terminate_margin"))
+
+    def check_done(
+        xD_vec: np.ndarray,
+        xA_vecs: List[np.ndarray],
+        fuel_depleted_def: bool,
+        fuel_depleted_att: List[bool],
+    ):
+        pD = xD_vec[:D]
+        pA_list = [xA[:D] for xA in xA_vecs]
+
+        rhoD = np.linalg.norm(pD - center) / max(arena_r, 1e-9)
+        rhoA = [np.linalg.norm(pA - center) / max(arena_r, 1e-9) for pA in pA_list]
+
+        oob_def = rhoD >= arena_margin
+        oob_att = [rho >= arena_margin for rho in rhoA]
+
+        def_hit_target = False
+        att_hit_target = [False for _ in range(Na)]
+        if oi_radius_norm > 0.0:
+            def_hit_target = rhoD <= (1.0 + hit_buffer_def) * oi_radius_norm
+            att_hit_target = [rho <= (1.0 + hit_buffer_att) * oi_radius_norm for rho in rhoA]
+
+        collision = [False for _ in range(Na)]
+        if collision_radius_m > 0.0:
+            collision = [np.linalg.norm(pA - pD) <= collision_radius_m for pA in pA_list]
+
+        done = (
+            oob_def
+            or any(oob_att)
+            or def_hit_target
+            or any(att_hit_target)
+            or any(collision)
+            or (use_fuel and (fuel_depleted_def or any(fuel_depleted_att)))
+        )
+
+        reason = None
+        attacker_idx = -1
+        if done:
+            if any(collision):
+                attacker_idx = int(np.argmax(np.asarray(collision, dtype=int)))
+                reason = "collision"
+            elif any(att_hit_target):
+                attacker_idx = int(np.argmax(np.asarray(att_hit_target, dtype=int)))
+                reason = "attacker_hit_target"
+            elif def_hit_target:
+                reason = "defender_hit_target"
+            elif oob_def:
+                reason = "defender_oob"
+            elif any(oob_att):
+                attacker_idx = int(np.argmax(np.asarray(oob_att, dtype=int)))
+                reason = "attacker_oob"
+            elif use_fuel and fuel_depleted_def:
+                reason = "defender_fuel_depleted"
+            elif use_fuel and any(fuel_depleted_att):
+                attacker_idx = int(np.argmax(np.asarray(fuel_depleted_att, dtype=int)))
+                reason = "attacker_fuel_depleted"
+
+        return done, {
+            "oob_def": bool(oob_def),
+            "oob_att": [bool(v) for v in oob_att],
+            "oob_att_any": bool(any(oob_att)),
+            "def_hit_target": bool(def_hit_target),
+            "att_hit_target": [bool(v) for v in att_hit_target],
+            "att_hit_target_any": bool(any(att_hit_target)),
+            "collision": [bool(v) for v in collision],
+            "collision_any": bool(any(collision)),
+            "fuel_depleted_def": bool(fuel_depleted_def),
+            "fuel_depleted_att": [bool(v) for v in fuel_depleted_att],
+            "fuel_depleted_att_any": bool(any(fuel_depleted_att)),
+            "done_reason": reason,
+            "done_attacker_idx": int(attacker_idx),
+        }
+
+    plan_hist_all = [[] for _ in range(1 + Na)]
+    plan_att_all = [[] for _ in range(1 + Na)]
+    exec_xyz_all = [[] for _ in range(1 + Na)]
+    exec_att_all = [[] for _ in range(1 + Na)]
+    phi_hist_all = [[] for _ in range(1 + Na)]
+    fov_axis_hist, fov_seen_mask = [], []
+
+    u_cmd_all = [[] for _ in range(1 + Na)]
+    u_cmd_norm_all = [[] for _ in range(1 + Na)]
+    u_real_all = [[] for _ in range(1 + Na)]
+    u_real_norm_all = [[] for _ in range(1 + Na)]
+
+    fuel_frac_all = [[] for _ in range(1 + Na)]
+    thrust_all = [[] for _ in range(1 + Na)]
+    mdot_all = [[] for _ in range(1 + Na)]
+    done_info = None
+
+    I = _identity_R()
+    all_states = [xD] + xA_list
+    for idx, xs in enumerate(all_states):
+        exec_xyz_all[idx].append(_p3(xs, D))
+        exec_att_all[idx].append({"R": I, "phi": 0.0})
+        phi_hist_all[idx].append(0.0)
+    fov_axis_hist.append(None)
+    fov_seen_mask.append(False)
+
+    if use_fuel:
+        fuel_frac_all[0].append(float(np.clip((m_def - mdry_def) / (m0_def - mdry_def + 1e-9), 0.0, 1.0)))
+        for j in range(Na):
+            fuel_frac_all[1 + j].append(float(np.clip((m_att[j] - mdry_att) / (m0_att - mdry_att + 1e-9), 0.0, 1.0)))
+
+    t_roll0 = time.perf_counter()
+    for k in range(steps):
+        obs = build_train_obs(xD, xA_list, m_def, m_att)
+        uD_cmd = np.clip(
+            np.asarray(pol.act_def_obs(obs, deterministic=deterministic), dtype=np.float32),
+            -umax,
+            +umax,
+        )
+        uA_cmd = [
+            np.clip(
+                np.asarray(pol.act_att_obs(obs, deterministic=deterministic, attacker_idx=j), dtype=np.float32),
+                -umax,
+                +umax,
+            )
+            for j in range(Na)
+        ]
+
+        cmd_actions = [uD_cmd] + uA_cmd
+        for idx, u_cmd in enumerate(cmd_actions):
+            u3 = _u3_from_action(u_cmd, D)
+            u_cmd_all[idx].append(u3.copy())
+            u_cmd_norm_all[idx].append(float(np.linalg.norm(u3)))
+
+        if debug_actions and k < 3:
+            att_norms = [float(np.linalg.norm(u)) for u in uA_cmd]
+            print(
+                f"[k={k:02d}] ||a_def_cmd||={np.linalg.norm(uD_cmd):.3g}, "
+                f"att_cmd_norms={att_norms}, obs[:6]={obs[:6]}"
+            )
+
+        if use_fuel:
+            uD_real, m_def, fuel_depleted_def, thrust_def, mdot_def = apply_propulsion(
+                uD_cmd, m_def, mdry_def, Tmax_def, Isp_def
+            )
+            uA_real = []
+            fuel_depleted_att = []
+            thrust_att = []
+            mdot_att = []
+            for j in range(Na):
+                u_real_j, m_att[j], fuel_j, thrust_j, mdot_j = apply_propulsion(
+                    uA_cmd[j], m_att[j], mdry_att, Tmax_att, Isp_att
+                )
+                uA_real.append(u_real_j)
+                fuel_depleted_att.append(bool(fuel_j))
+                thrust_att.append(float(thrust_j))
+                mdot_att.append(float(mdot_j))
+        else:
+            uD_real = uD_cmd
+            uA_real = list(uA_cmd)
+            fuel_depleted_def = False
+            fuel_depleted_att = [False for _ in range(Na)]
+            thrust_def = 0.0
+            mdot_def = 0.0
+            thrust_att = [0.0 for _ in range(Na)]
+            mdot_att = [0.0 for _ in range(Na)]
+
+        real_actions = [uD_real] + uA_real
+        for idx, u_real in enumerate(real_actions):
+            u3 = _u3_from_action(u_real, D)
+            u_real_all[idx].append(u3.copy())
+            u_real_norm_all[idx].append(float(np.linalg.norm(u3)))
+
+        thrust_all[0].append(float(thrust_def))
+        mdot_all[0].append(float(mdot_def))
+        for j in range(Na):
+            thrust_all[1 + j].append(float(thrust_att[j]))
+            mdot_all[1 + j].append(float(mdot_att[j]))
+
+        xD = step_plant_single(xD, uD_real, k)
+        for j in range(Na):
+            xA_list[j] = step_plant_single(xA_list[j], uA_real[j], k)
+
+        if use_fuel:
+            fuel_frac_all[0].append(float(np.clip((m_def - mdry_def) / (m0_def - mdry_def + 1e-9), 0.0, 1.0)))
+            for j in range(Na):
+                fuel_frac_all[1 + j].append(float(np.clip((m_att[j] - mdry_att) / (m0_att - mdry_att + 1e-9), 0.0, 1.0)))
+
+        cur_states = [xD] + xA_list
+        for idx, xs in enumerate(cur_states):
+            plan_hist_all[idx].append([_p3(xs, D)] * T)
+            plan_att_all[idx].append([{"R": I, "phi": 0.0} for _ in range(T)])
+            exec_xyz_all[idx].append(_p3(xs, D))
+            exec_att_all[idx].append({"R": I, "phi": 0.0})
+            phi_hist_all[idx].append(0.0)
+
+        fov_axis_hist.append(None)
+        fov_seen_mask.append(False)
+
+        done, done_info = check_done(xD, xA_list, fuel_depleted_def, fuel_depleted_att)
+        if done and stop_on_done:
+            break
+
+    t_fn1 = time.perf_counter()
+    timing = {
+        "setup": float(t_roll0 - t_fn0),
+        "simulation": float(t_fn1 - t_roll0),
+        "total": float(t_fn1 - t_fn0),
+    }
+
+    return _pack_multi_agent_rollout(
+        plan_hist_all=plan_hist_all,
+        plan_att_all=plan_att_all,
+        exec_xyz_all=exec_xyz_all,
+        exec_att_all=exec_att_all,
+        phi_hist_all=phi_hist_all,
+        fov_axis_hist=fov_axis_hist,
+        fov_seen_mask=fov_seen_mask,
+        u_cmd_all=u_cmd_all,
+        u_cmd_norm_all=u_cmd_norm_all,
+        u_real_all=u_real_all,
+        u_real_norm_all=u_real_norm_all,
+        done_info=done_info,
+        rollout_timing_sec=timing,
+        fuel_frac_all=(fuel_frac_all if use_fuel else None),
+        thrust_all=(thrust_all if use_fuel else None),
+        mdot_all=(mdot_all if use_fuel else None),
+    )
 
 
 def run_rhc_with_rl_and_collect_frames_3d(
@@ -24,10 +484,8 @@ def run_rhc_with_rl_and_collect_frames_3d(
     dt = float(cfg["dt"])
 
     num_attackers = int(cfg.get("num_attackers", 1))
-    if num_attackers != 1:
-        raise NotImplementedError(
-            "run_rhc_with_rl_and_collect_frames_3d currently supports only num_attackers == 1."
-        )
+    if num_attackers > 1:
+        return _run_rhc_with_rl_and_collect_frames_3d_multi(cfg, steps=steps, turn_len=turn_len)
 
     dyn_name = str(cfg.get("dynamics", "hcw")).lower()
 

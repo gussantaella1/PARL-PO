@@ -9,7 +9,7 @@ from typing import Any, Dict
 import numpy as np
 import torch
 
-from config_rl import build_dyn, config_for_train
+from config_rl_1v2 import build_dyn, config_for_train
 from core.distill import distill_from_teacher
 from core_1v2.buffers import RolloutBuffer
 from core_1v2.env import Env, VecEnv, collect_ic_history_from_vecenv
@@ -742,7 +742,7 @@ def train_with_distill(
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)
 
-    DISTILL = bool(cfg_teacher.get("distill", False)) and int(cfg_teacher.get("num_attackers", 1)) == 1
+    DISTILL = bool(cfg_teacher.get("distill", False))
     DISTILL_METHOD = str(cfg_teacher.get("distill_method", "modern"))
 
     build_dyn(cfg_teacher)
@@ -782,7 +782,7 @@ def train_with_distill(
 
     if DISTILL:
         cfg_student = config_for_train(attacker_mode=attacker_mode, train_role=train_role)
-        cfg_student["use_ukf"] = True
+        cfg_student["use_ukf"] = int(cfg_student.get("num_attackers", 1)) == 1
         cfg_student["seed"] = cfg_teacher["seed"] + 1
         if extra_train_cfg is not None:
             cfg_student.update(extra_train_cfg)

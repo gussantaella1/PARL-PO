@@ -10,7 +10,7 @@ from typing import Any, Dict, Tuple
 import numpy as np
 import torch
 
-from config_rl import build_dyn
+from config_rl_1v2 import build_dyn
 from core_1v2.controllers import AttackerRuleController
 from core_1v2.models import ActorCriticDiff
 from core_1v2.utils import permute_obs_for_attacker

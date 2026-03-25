@@ -14,11 +14,63 @@ import torch.nn as nn
 import torch.optim as optim
 
 from core.utils import set_seed
-from config_rl import build_dyn
-from core.models import ActorCriticDiff
-from core.controllers import AttackerRuleController
-from core.env import Env
+from core.models import ActorCriticDiff as ActorCriticDiffSingle
 
+
+def _build_dyn_for_cfg(cfg: Dict[str, Any]):
+    if int(cfg.get("num_attackers", 1)) > 1:
+        from config_rl_1v2 import build_dyn as build_dyn_impl
+    else:
+        from config_rl import build_dyn as build_dyn_impl
+    return build_dyn_impl(cfg)
+
+from core_1v2.models import ActorCriticDiff as ActorCriticDiffMulti
+from core.controllers import AttackerRuleController
+from core_1v2.utils import _obs_offsets, permute_obs_for_attacker
+
+
+def _env_cls_for_cfg(cfg: Dict[str, Any]):
+    if int(cfg.get("num_attackers", 1)) > 1:
+        from core_1v2.env import Env as EnvImpl
+    else:
+        from core.env import Env as EnvImpl
+    return EnvImpl
+
+
+def _num_attackers(cfg: Dict[str, Any]) -> int:
+    return max(1, int(cfg.get("num_attackers", 1)))
+
+
+def _actor_critic_cls(cfg: Dict[str, Any]):
+    return ActorCriticDiffMulti if _num_attackers(cfg) > 1 else ActorCriticDiffSingle
+
+
+def _obs_dim_from_cfg(cfg: Dict[str, Any]) -> int:
+    D = int(cfg["D"])
+    Na = _num_attackers(cfg)
+    fuel_dim = 2 if cfg.get("fuel", {}).get("enable", False) else 0
+    return (2 + 3 * Na) * D + fuel_dim
+
+
+def _permute_obs_np(obs: np.ndarray, D: int, Na: int, attacker_idx: int) -> np.ndarray:
+    obs_np = np.asarray(obs, dtype=np.float32)
+    if Na <= 1 or attacker_idx == 0:
+        return obs_np
+    obs_t = torch.as_tensor(obs_np[None, :], dtype=torch.float32)
+    obs_perm = permute_obs_for_attacker(obs_t, attacker_idx, D, Na)
+    return obs_perm.squeeze(0).cpu().numpy().astype(np.float32)
+
+
+def _relative_state_from_obs(obs: np.ndarray, D: int, Na: int) -> np.ndarray:
+    obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
+    _off_p1, _off_pA, off_rel, off_v1, off_vA = _obs_offsets(D, Na)
+    rel_blocks = [obs_np[off_rel + k * D : off_rel + (k + 1) * D] for k in range(Na)]
+    v1 = obs_np[off_v1 : off_v1 + D]
+    dv_blocks = []
+    for k in range(Na):
+        vA_k = obs_np[off_vA + k * D : off_vA + (k + 1) * D]
+        dv_blocks.append(vA_k - v1)
+    return np.concatenate(rel_blocks + dv_blocks).astype(np.float32)
 
 
 def _load_checkpoint_payload(path: str, map_location, label: str):
@@ -300,7 +352,7 @@ def _load_teacher_bundle(
             "cfg['allow_sim_intent_fallback']=True to use simulation-derived intent labels."
         )
 
-    teacher_policy = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    teacher_policy = _actor_critic_cls(cfg)(obs_dim, act_dim, cfg).to(device)
     teacher_policy.load_state_dict(policy_sd, strict=False)
     teacher_policy.eval()
     for p in teacher_policy.parameters():
@@ -369,7 +421,7 @@ def _load_policy_if_needed(
         else:
             raise RuntimeError(f"Could not parse policy checkpoint: {ckpt_path}")
 
-    policy = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
+    policy = _actor_critic_cls(cfg)(obs_dim, act_dim, cfg).to(device)
     policy.load_state_dict(sd, strict=False)
     policy.eval()
     for p in policy.parameters():
@@ -381,23 +433,23 @@ def _load_policy_if_needed(
 # Env feature builders
 # =========================================================
 
+
 def _full_obs_from_env(env) -> np.ndarray:
     """
-    True full-state teacher observation:
-      [p1-c, p2-c, (p2-p1), v1, v2, (optional fuel fracs)]
+    True full-state teacher observation with the same layout as Env._obs(),
+    but built from the underlying state rather than the UKF estimate.
     """
     p1, v1, pA_list, vA_list = env._unpack(env.state)
-    p2 = pA_list[0]
-    v2 = vA_list[0]
     c = env.center
 
-    parts = [
-        p1 - c,
-        p2 - c,
-        p2 - p1,
-        v1,
-        v2,
-    ]
+    parts = [p1 - c]
+    for pA in pA_list:
+        parts.append(pA - c)
+    for pA in pA_list:
+        parts.append(pA - p1)
+    parts.append(v1)
+    for vA in vA_list:
+        parts.append(vA)
 
     if getattr(env, "use_fuel", False):
         fdef = (env.m_def - env.mdry_def) / (env.m0_def - env.mdry_def + 1e-9)
@@ -408,40 +460,57 @@ def _full_obs_from_env(env) -> np.ndarray:
     return np.concatenate(parts).astype(np.float32)
 
 
-def _true_relative_state_from_env(env) -> np.ndarray:
+def _true_relative_state_from_env(
+    env,
+    *,
+    distill_role: str = "def",
+    attacker_idx: int = 0,
+) -> np.ndarray:
     """
     Relative physical state used for privileged future-trajectory labels.
-    In your HCW setting we use [p_rel, v_rel].
+    For multi-attacker settings we concatenate [rel_k, dv_k] for all attackers.
+    For attacker distillation, the observation is permuted so attacker idx occupies
+    slot 0, matching the shared attacker policy convention.
     """
-    p1, v1, pA_list, vA_list = env._unpack(env.state)
-    p2 = pA_list[0]
-    v2 = vA_list[0]
-    return np.concatenate([p2 - p1, v2 - v1]).astype(np.float32)
+    D = int(env.D)
+    Na = int(getattr(env, "num_attackers", 1))
+    full_obs = _full_obs_from_env(env)
+    if distill_role == "att":
+        full_obs = _permute_obs_np(full_obs, D, Na, attacker_idx)
+    return _relative_state_from_obs(full_obs, D, Na)
 
 
-def _ukf_student_features_from_env(env, u_prev: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _ukf_student_features_from_env(
+    env,
+    u_prev: np.ndarray,
+    *,
+    distill_role: str = "def",
+    attacker_idx: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Student-side input at one timestep:
       xhat_rel_t, Sigma_t, u_{t-1}
 
-    We derive xhat_rel_t from the env's current observation, which already uses UKF/KF estimates
-    when use_ukf=True. Sigma_t comes from the estimator covariance if available.
+    For num_attackers>1 the env does not provide a UKF, so we fall back to the
+    current observation with zero covariance features.
     """
     obs = env._obs().astype(np.float32)
     D = int(env.D)
+    Na = int(getattr(env, "num_attackers", 1))
 
-    rel = obs[2 * D : 3 * D]
-    v1  = obs[3 * D : 4 * D]
-    v2  = obs[4 * D : 5 * D]
-    xhat_rel = np.concatenate([rel, v2 - v1]).astype(np.float32)
+    if distill_role == "att":
+        obs = _permute_obs_np(obs, D, Na, attacker_idx)
 
-    if getattr(env, "use_ukf", False) and getattr(env, "ukf", None) is not None:
+    xhat_rel = _relative_state_from_obs(obs, D, Na)
+    sigma_dim = xhat_rel.size * (xhat_rel.size + 1) // 2
+
+    if getattr(env, "use_ukf", False) and getattr(env, "ukf", None) is not None and Na == 1:
         P = np.asarray(env.ukf.P, dtype=np.float32)
         P_rel = P[: 2 * D, : 2 * D]
         iu = np.triu_indices(2 * D)
         sigma_feat = P_rel[iu].astype(np.float32)
     else:
-        sigma_feat = np.zeros((2 * D) * (2 * D + 1) // 2, dtype=np.float32)
+        sigma_feat = np.zeros((sigma_dim,), dtype=np.float32)
 
     u_prev = np.asarray(u_prev, dtype=np.float32).reshape(-1)
     return xhat_rel, sigma_feat, u_prev
@@ -451,18 +520,62 @@ def _ukf_student_features_from_env(env, u_prev: np.ndarray) -> Tuple[np.ndarray,
 # Opponent + teacher rollout helpers
 # =========================================================
 
+
+def _policy_action_from_obs(
+    policy,
+    obs: np.ndarray,
+    device: torch.device,
+    act_scale: float,
+    who: str,
+) -> np.ndarray:
+    o = torch.as_tensor(np.asarray(obs, dtype=np.float32)[None, :], dtype=torch.float32, device=device)
+    with torch.no_grad():
+        dist = policy.dist(o, who=who)
+        a_env = torch.tanh(dist.mean) * act_scale
+    return a_env[0].detach().cpu().numpy().astype(np.float32)
+
+
 def _teacher_action_env(
     teacher_policy,
     full_obs: np.ndarray,
     device: torch.device,
     act_scale: float,
     distill_role: str,
+    *,
+    D: int,
+    Na: int,
+    attacker_idx: int = 0,
 ) -> np.ndarray:
-    o = torch.as_tensor(full_obs[None, :], dtype=torch.float32, device=device)
-    with torch.no_grad():
-        dist = teacher_policy.dist(o, who=distill_role)
-        a_env = torch.tanh(dist.mean) * act_scale
-    return a_env[0].detach().cpu().numpy().astype(np.float32)
+    obs_policy = np.asarray(full_obs, dtype=np.float32)
+    who = "def"
+    if distill_role == "att":
+        obs_policy = _permute_obs_np(obs_policy, D, Na, attacker_idx)
+        who = "att"
+    return _policy_action_from_obs(teacher_policy, obs_policy, device, act_scale, who=who)
+
+
+def _teacher_attacker_team_actions_env(
+    teacher_policy,
+    full_obs: np.ndarray,
+    device: torch.device,
+    act_scale: float,
+    *,
+    D: int,
+    Na: int,
+) -> np.ndarray:
+    acts = [
+        _policy_action_from_obs(
+            teacher_policy,
+            _permute_obs_np(full_obs, D, Na, k),
+            device,
+            act_scale,
+            who="att",
+        )
+        for k in range(Na)
+    ]
+    if Na == 1:
+        return acts[0]
+    return np.stack(acts, axis=0).astype(np.float32)
 
 
 def _opponent_action_env(
@@ -473,25 +586,45 @@ def _opponent_action_env(
     opponent_policy,
     device: torch.device,
     act_scale: float,
+    *,
+    D: int,
+    Na: int,
 ) -> np.ndarray:
     if distill_role == "def" and attacker_mode == "rule":
+        if rule_ctrl is None:
+            raise RuntimeError("Rule-based attacker opponent requested but rule controller is not initialized.")
         p1, v1, pA_list, vA_list = env._unpack(env.state)
-        p2 = pA_list[0]
-        v2 = vA_list[0]
-        return rule_ctrl.act(p1, v1, p2, v2).astype(np.float32)
+        acts = [rule_ctrl.act(p1, v1, pA_list[k], vA_list[k]).astype(np.float32) for k in range(Na)]
+        if Na == 1:
+            return acts[0]
+        return np.stack(acts, axis=0).astype(np.float32)
+
+    if opponent_policy is None:
+        raise RuntimeError("Frozen opponent policy is required for distillation in this configuration.")
 
     full_obs = _full_obs_from_env(env)
-    o = torch.as_tensor(full_obs[None, :], dtype=torch.float32, device=device)
-    with torch.no_grad():
-        who = "att" if distill_role == "def" else "def"
-        dist = opponent_policy.dist(o, who=who)
-        a_env = torch.tanh(dist.mean) * act_scale
-    return a_env[0].detach().cpu().numpy().astype(np.float32)
+    if distill_role == "def":
+        acts = [
+            _policy_action_from_obs(
+                opponent_policy,
+                _permute_obs_np(full_obs, D, Na, k),
+                device,
+                act_scale,
+                who="att",
+            )
+            for k in range(Na)
+        ]
+        if Na == 1:
+            return acts[0]
+        return np.stack(acts, axis=0).astype(np.float32)
+
+    return _policy_action_from_obs(opponent_policy, full_obs, device, act_scale, who="def")
 
 
 # =========================================================
 # Paper-style recurrent distillation path
 # =========================================================
+
 
 def _future_rel_traj_from_env(
     env,
@@ -505,49 +638,73 @@ def _future_rel_traj_from_env(
     act_scale: float,
     lookahead_H: int,
     reward_mode_for_step: str,
+    D: int,
+    Na: int,
+    attacker_idx: int = 0,
 ) -> np.ndarray:
     try:
         env_roll = copy.deepcopy(env)
     except Exception:
-        base = _true_relative_state_from_env(env)
+        base = _true_relative_state_from_env(env, distill_role=distill_role, attacker_idx=attacker_idx)
         return np.repeat(base[None, :], lookahead_H + 1, axis=0).astype(np.float32)
 
-    rel_hist = [_true_relative_state_from_env(env_roll)]
+    rel_hist = [_true_relative_state_from_env(env_roll, distill_role=distill_role, attacker_idx=attacker_idx)]
     for _ in range(lookahead_H):
         full_obs_np = _full_obs_from_env(env_roll)
-        a_role = _teacher_action_env(
-            teacher_policy=teacher_policy,
-            full_obs=full_obs_np,
-            device=device,
-            act_scale=act_scale,
-            distill_role=distill_role,
-        )
-        a_opp = _opponent_action_env(
-            env=env_roll,
-            distill_role=distill_role,
-            attacker_mode=attacker_mode,
-            rule_ctrl=rule_ctrl,
-            opponent_policy=opponent_policy,
-            device=device,
-            act_scale=act_scale,
-        )
         if distill_role == "def":
-            a1_env, aA_env = a_role, a_opp
+            a1_env = _teacher_action_env(
+                teacher_policy=teacher_policy,
+                full_obs=full_obs_np,
+                device=device,
+                act_scale=act_scale,
+                distill_role=distill_role,
+                D=D,
+                Na=Na,
+            )
+            aA_env = _opponent_action_env(
+                env=env_roll,
+                distill_role=distill_role,
+                attacker_mode=attacker_mode,
+                rule_ctrl=rule_ctrl,
+                opponent_policy=opponent_policy,
+                device=device,
+                act_scale=act_scale,
+                D=D,
+                Na=Na,
+            )
         else:
-            a1_env, aA_env = a_opp, a_role
+            a1_env = _opponent_action_env(
+                env=env_roll,
+                distill_role=distill_role,
+                attacker_mode=attacker_mode,
+                rule_ctrl=rule_ctrl,
+                opponent_policy=opponent_policy,
+                device=device,
+                act_scale=act_scale,
+                D=D,
+                Na=Na,
+            )
+            aA_env = _teacher_attacker_team_actions_env(
+                teacher_policy=teacher_policy,
+                full_obs=full_obs_np,
+                device=device,
+                act_scale=act_scale,
+                D=D,
+                Na=Na,
+            )
 
         _, _, _, done, _ = env_roll.step(
             a1_env=a1_env,
             aA_env=aA_env,
             reward_mode=reward_mode_for_step,
         )
-        rel_hist.append(_true_relative_state_from_env(env_roll))
+        rel_hist.append(_true_relative_state_from_env(env_roll, distill_role=distill_role, attacker_idx=attacker_idx))
         if done:
             break
 
     rel = np.stack(rel_hist, axis=0).astype(np.float32)
     if rel.shape[0] < (lookahead_H + 1):
-        pad = np.repeat(rel[-1: , :], (lookahead_H + 1) - rel.shape[0], axis=0)
+        pad = np.repeat(rel[-1:, :], (lookahead_H + 1) - rel.shape[0], axis=0)
         rel = np.concatenate([rel, pad], axis=0)
     return rel
 
@@ -572,11 +729,18 @@ def distill_from_teacher_paper_recurrent(
     teacher_ckpt_path: str,
     out_path: str = "ppo_def_ukf_distilled.pt",
 ):
+
     cfg = copy.deepcopy(cfg)
-    cfg["use_ukf"] = True
+    Na = _num_attackers(cfg)
+    cfg["use_ukf"] = (Na == 1)
+    if Na > 1:
+        print(
+            "[distill] num_attackers>1: UKF is unavailable, so distillation uses direct env observations "
+            "with zero covariance features."
+        )
 
     if ("dyn" not in cfg) or (cfg["dyn"].get("Ad") is None) or (cfg["dyn"].get("Bd") is None):
-        build_dyn(cfg)
+        _build_dyn_for_cfg(cfg)
 
     set_seed(int(cfg["seed"]))
 
@@ -584,17 +748,13 @@ def distill_from_teacher_paper_recurrent(
     act_scale = float(cfg["umax"])
     D = int(cfg["D"])
     act_dim = D
-    xhat_dim = 2 * D
-    sigma_dim = (2 * D) * (2 * D + 1) // 2
-    obs_dim = 5 * D + (2 if cfg.get("fuel", {}).get("enable", False) else 0)
+    xhat_dim = 2 * Na * D
+    sigma_dim = xhat_dim * (xhat_dim + 1) // 2
+    obs_dim = _obs_dim_from_cfg(cfg)
     distill_role = str(cfg.get("train_role", "def")).lower()
     if distill_role not in {"def", "att"}:
         raise ValueError(f"Unsupported train_role for distillation: {distill_role!r}")
-    if distill_role == "att":
-        print(
-            "[distill] warning: attacker distillation still uses the shared defender-centric "
-            "observation layout; no attacker-specific UKF belief model is implemented."
-        )
+
 
     episodes_per_iter = int(cfg.get("episodes_per_iter", 8))
     max_steps = int(cfg.get("max_steps", cfg.get("T", 300)))
@@ -636,7 +796,7 @@ def distill_from_teacher_paper_recurrent(
         cfg=cfg,
         device=device,
         lookahead_H=lookahead_H,
-        rel_dim=2 * D,
+        rel_dim=xhat_dim,
         latent_dim=latent_dim,
     )
 
@@ -727,99 +887,201 @@ def distill_from_teacher_paper_recurrent(
         beta = beta_at(it)
         new_episodes: List[DAggerEpisode] = []
 
+
         for _ in range(episodes_per_iter):
-            env = Env(cfg)
+            env = _env_cls_for_cfg(cfg)(cfg)
             env.reset()
 
-            xhat_list: List[np.ndarray] = []
-            sig_list: List[np.ndarray] = []
-            u_prev_list: List[np.ndarray] = []
-            u_teacher_list: List[np.ndarray] = []
-            z_teacher_list: List[np.ndarray] = []
-
-            u_prev_np = np.zeros((act_dim,), dtype=np.float32)
-            hidden = student.init_hidden(batch_size=1, device=device)
+            role_indices = [0] if distill_role == "def" else list(range(Na))
+            xhat_lists: Dict[int, List[np.ndarray]] = {idx: [] for idx in role_indices}
+            sig_lists: Dict[int, List[np.ndarray]] = {idx: [] for idx in role_indices}
+            u_prev_lists: Dict[int, List[np.ndarray]] = {idx: [] for idx in role_indices}
+            u_teacher_lists: Dict[int, List[np.ndarray]] = {idx: [] for idx in role_indices}
+            z_teacher_lists: Dict[int, List[np.ndarray]] = {idx: [] for idx in role_indices}
+            u_prev_exec: Dict[int, np.ndarray] = {idx: np.zeros((act_dim,), dtype=np.float32) for idx in role_indices}
+            hidden_states = {idx: student.init_hidden(batch_size=1, device=device) for idx in role_indices}
 
             for _t in range(max_steps):
-                xhat_rel_np, sigma_np, u_prev_feat_np = _ukf_student_features_from_env(env, u_prev_np)
                 full_obs_np = _full_obs_from_env(env)
-                u_teacher_np = _teacher_action_env(
-                    teacher_policy=teacher_policy,
-                    full_obs=full_obs_np,
-                    device=device,
-                    act_scale=act_scale,
-                    distill_role=distill_role,
-                )
-                future_rel_np = _future_rel_traj_from_env(
-                    env,
-                    teacher_policy=teacher_policy,
-                    distill_role=distill_role,
-                    attacker_mode=attacker_mode,
-                    rule_ctrl=rule_ctrl,
-                    opponent_policy=opponent_policy,
-                    device=device,
-                    act_scale=act_scale,
-                    lookahead_H=lookahead_H,
-                    reward_mode_for_step=reward_mode_for_step,
-                )
-                z_teacher_np = _teacher_intent_label(
-                    teacher_intent=teacher_intent,
-                    future_rel_np=future_rel_np,
-                    latent_dim=latent_dim,
-                    device=device,
-                )
 
-                xhat_rel_t = torch.as_tensor(xhat_rel_np, dtype=torch.float32, device=device).view(1, -1)
-                sigma_t = torch.as_tensor(sigma_np, dtype=torch.float32, device=device).view(1, -1)
-                u_prev_t = torch.as_tensor(u_prev_feat_np, dtype=torch.float32, device=device).view(1, -1)
-                with torch.no_grad():
-                    u_pred_t, _z_hat_t, hidden_next = student.step(xhat_rel_t, sigma_t, u_prev_t, hidden)
-                u_pred_np = u_pred_t[0].detach().cpu().numpy().astype(np.float32)
-                hidden = hidden_next
-
-                use_teacher = random.random() < beta
-                a_exec = u_teacher_np if use_teacher else u_pred_np
-                a_opp_exec = _opponent_action_env(
-                    env=env,
-                    distill_role=distill_role,
-                    attacker_mode=attacker_mode,
-                    rule_ctrl=rule_ctrl,
-                    opponent_policy=opponent_policy,
-                    device=device,
-                    act_scale=act_scale,
-                )
                 if distill_role == "def":
-                    a1_env, aA_env = a_exec, a_opp_exec
+                    idx = 0
+                    xhat_rel_np, sigma_np, u_prev_feat_np = _ukf_student_features_from_env(
+                        env,
+                        u_prev_exec[idx],
+                        distill_role=distill_role,
+                        attacker_idx=idx,
+                    )
+                    u_teacher_np = _teacher_action_env(
+                        teacher_policy=teacher_policy,
+                        full_obs=full_obs_np,
+                        device=device,
+                        act_scale=act_scale,
+                        distill_role=distill_role,
+                        D=D,
+                        Na=Na,
+                        attacker_idx=idx,
+                    )
+                    future_rel_np = _future_rel_traj_from_env(
+                        env,
+                        teacher_policy=teacher_policy,
+                        distill_role=distill_role,
+                        attacker_mode=attacker_mode,
+                        rule_ctrl=rule_ctrl,
+                        opponent_policy=opponent_policy,
+                        device=device,
+                        act_scale=act_scale,
+                        lookahead_H=lookahead_H,
+                        reward_mode_for_step=reward_mode_for_step,
+                        D=D,
+                        Na=Na,
+                        attacker_idx=idx,
+                    )
+                    z_teacher_np = _teacher_intent_label(
+                        teacher_intent=teacher_intent,
+                        future_rel_np=future_rel_np,
+                        latent_dim=latent_dim,
+                        device=device,
+                    )
+
+                    xhat_rel_t = torch.as_tensor(xhat_rel_np, dtype=torch.float32, device=device).view(1, -1)
+                    sigma_t = torch.as_tensor(sigma_np, dtype=torch.float32, device=device).view(1, -1)
+                    u_prev_t = torch.as_tensor(u_prev_feat_np, dtype=torch.float32, device=device).view(1, -1)
+                    with torch.no_grad():
+                        u_pred_t, _z_hat_t, hidden_next = student.step(
+                            xhat_rel_t,
+                            sigma_t,
+                            u_prev_t,
+                            hidden_states[idx],
+                        )
+                    u_pred_np = u_pred_t[0].detach().cpu().numpy().astype(np.float32)
+                    hidden_states[idx] = hidden_next
+
+                    use_teacher = random.random() < beta
+                    a_exec = u_teacher_np if use_teacher else u_pred_np
+                    a_opp_exec = _opponent_action_env(
+                        env=env,
+                        distill_role=distill_role,
+                        attacker_mode=attacker_mode,
+                        rule_ctrl=rule_ctrl,
+                        opponent_policy=opponent_policy,
+                        device=device,
+                        act_scale=act_scale,
+                        D=D,
+                        Na=Na,
+                    )
+
+                    _, _, _, done, _ = env.step(
+                        a1_env=a_exec,
+                        aA_env=a_opp_exec,
+                        reward_mode=reward_mode_for_step,
+                    )
+
+                    xhat_lists[idx].append(np.asarray(xhat_rel_np, dtype=np.float32).reshape(-1))
+                    sig_lists[idx].append(np.asarray(sigma_np, dtype=np.float32).reshape(-1))
+                    u_prev_lists[idx].append(np.asarray(u_prev_feat_np, dtype=np.float32).reshape(-1))
+                    u_teacher_lists[idx].append(np.asarray(u_teacher_np, dtype=np.float32).reshape(-1))
+                    z_teacher_lists[idx].append(np.asarray(z_teacher_np, dtype=np.float32).reshape(-1))
+                    u_prev_exec[idx] = np.asarray(a_exec, dtype=np.float32).reshape(-1)
                 else:
-                    a1_env, aA_env = a_opp_exec, a_exec
+                    a_def_exec = _opponent_action_env(
+                        env=env,
+                        distill_role=distill_role,
+                        attacker_mode=attacker_mode,
+                        rule_ctrl=rule_ctrl,
+                        opponent_policy=opponent_policy,
+                        device=device,
+                        act_scale=act_scale,
+                        D=D,
+                        Na=Na,
+                    )
+                    a_att_exec = np.zeros((Na, act_dim), dtype=np.float32)
 
-                _, _, _, done, _ = env.step(
-                    a1_env=a1_env,
-                    aA_env=aA_env,
-                    reward_mode=reward_mode_for_step,
-                )
+                    for idx in role_indices:
+                        xhat_rel_np, sigma_np, u_prev_feat_np = _ukf_student_features_from_env(
+                            env,
+                            u_prev_exec[idx],
+                            distill_role=distill_role,
+                            attacker_idx=idx,
+                        )
+                        u_teacher_np = _teacher_action_env(
+                            teacher_policy=teacher_policy,
+                            full_obs=full_obs_np,
+                            device=device,
+                            act_scale=act_scale,
+                            distill_role=distill_role,
+                            D=D,
+                            Na=Na,
+                            attacker_idx=idx,
+                        )
+                        future_rel_np = _future_rel_traj_from_env(
+                            env,
+                            teacher_policy=teacher_policy,
+                            distill_role=distill_role,
+                            attacker_mode=attacker_mode,
+                            rule_ctrl=rule_ctrl,
+                            opponent_policy=opponent_policy,
+                            device=device,
+                            act_scale=act_scale,
+                            lookahead_H=lookahead_H,
+                            reward_mode_for_step=reward_mode_for_step,
+                            D=D,
+                            Na=Na,
+                            attacker_idx=idx,
+                        )
+                        z_teacher_np = _teacher_intent_label(
+                            teacher_intent=teacher_intent,
+                            future_rel_np=future_rel_np,
+                            latent_dim=latent_dim,
+                            device=device,
+                        )
 
-                xhat_list.append(np.asarray(xhat_rel_np, dtype=np.float32).reshape(-1))
-                sig_list.append(np.asarray(sigma_np, dtype=np.float32).reshape(-1))
-                u_prev_list.append(np.asarray(u_prev_feat_np, dtype=np.float32).reshape(-1))
-                u_teacher_list.append(np.asarray(u_teacher_np, dtype=np.float32).reshape(-1))
-                z_teacher_list.append(np.asarray(z_teacher_np, dtype=np.float32).reshape(-1))
+                        xhat_rel_t = torch.as_tensor(xhat_rel_np, dtype=torch.float32, device=device).view(1, -1)
+                        sigma_t = torch.as_tensor(sigma_np, dtype=torch.float32, device=device).view(1, -1)
+                        u_prev_t = torch.as_tensor(u_prev_feat_np, dtype=torch.float32, device=device).view(1, -1)
+                        with torch.no_grad():
+                            u_pred_t, _z_hat_t, hidden_next = student.step(
+                                xhat_rel_t,
+                                sigma_t,
+                                u_prev_t,
+                                hidden_states[idx],
+                            )
+                        u_pred_np = u_pred_t[0].detach().cpu().numpy().astype(np.float32)
+                        hidden_states[idx] = hidden_next
 
-                u_prev_np = np.asarray(a_exec, dtype=np.float32).reshape(-1)
+                        use_teacher = random.random() < beta
+                        a_exec = u_teacher_np if use_teacher else u_pred_np
+                        a_att_exec[idx] = a_exec
+
+                        xhat_lists[idx].append(np.asarray(xhat_rel_np, dtype=np.float32).reshape(-1))
+                        sig_lists[idx].append(np.asarray(sigma_np, dtype=np.float32).reshape(-1))
+                        u_prev_lists[idx].append(np.asarray(u_prev_feat_np, dtype=np.float32).reshape(-1))
+                        u_teacher_lists[idx].append(np.asarray(u_teacher_np, dtype=np.float32).reshape(-1))
+                        z_teacher_lists[idx].append(np.asarray(z_teacher_np, dtype=np.float32).reshape(-1))
+
+                    step_att = a_att_exec[0] if Na == 1 else a_att_exec
+                    _, _, _, done, _ = env.step(
+                        a1_env=a_def_exec,
+                        aA_env=step_att,
+                        reward_mode=reward_mode_for_step,
+                    )
+                    for idx in role_indices:
+                        u_prev_exec[idx] = np.asarray(a_att_exec[idx], dtype=np.float32).reshape(-1)
 
                 if done:
                     break
 
-            if xhat_list:
-                new_episodes.append(
-                    DAggerEpisode(
-                        xhat_rel=torch.as_tensor(np.stack(xhat_list), dtype=torch.float32, device=device),
-                        sigma=torch.as_tensor(np.stack(sig_list), dtype=torch.float32, device=device),
-                        u_prev=torch.as_tensor(np.stack(u_prev_list), dtype=torch.float32, device=device),
-                        u_teacher=torch.as_tensor(np.stack(u_teacher_list), dtype=torch.float32, device=device),
-                        z_teacher=torch.as_tensor(np.stack(z_teacher_list), dtype=torch.float32, device=device),
+            for idx in role_indices:
+                if xhat_lists[idx]:
+                    new_episodes.append(
+                        DAggerEpisode(
+                            xhat_rel=torch.as_tensor(np.stack(xhat_lists[idx]), dtype=torch.float32, device=device),
+                            sigma=torch.as_tensor(np.stack(sig_lists[idx]), dtype=torch.float32, device=device),
+                            u_prev=torch.as_tensor(np.stack(u_prev_lists[idx]), dtype=torch.float32, device=device),
+                            u_teacher=torch.as_tensor(np.stack(u_teacher_lists[idx]), dtype=torch.float32, device=device),
+                            z_teacher=torch.as_tensor(np.stack(z_teacher_lists[idx]), dtype=torch.float32, device=device),
+                        )
                     )
-                )
 
         dataset.extend(new_episodes)
         if max_dataset_episodes is not None and len(dataset) > max_dataset_episodes:
@@ -943,7 +1205,7 @@ def distill_from_teacher_modern(
 
     """
     cfg_mod = copy.deepcopy(cfg)
-    cfg_mod["use_ukf"] = True
+    cfg_mod["use_ukf"] = (_num_attackers(cfg_mod) == 1)
     cfg_mod["_distill_save_method"] = "modern"
     cfg_mod.setdefault("distill_paper_action_loss", "mse")
     cfg_mod.setdefault("distill_paper_intent_loss", "mse")

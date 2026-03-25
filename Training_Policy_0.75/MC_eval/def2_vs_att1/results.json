@@ -1,0 +1,132 @@
+{
+  "num_trials": 4800,
+  "passes": 4611,
+  "success_rate": 0.960625,
+  "defender_pass_rate": 0.960625,
+  "policy_role": "def",
+  "opponent_source": "policy",
+  "policy_primary_metric": {
+    "name": "defender_capture_pass_rate",
+    "value": 0.960625
+  },
+  "success_rate_ci_wilson": {
+    "alpha": 0.05,
+    "lo": 0.954744608476777,
+    "hi": 0.9657687011122464
+  },
+  "config_module": "config_rl",
+  "base_cfg_source": "run_manifest:Training_Policy_0.75/run_manifest.json",
+  "run_manifest": "Training_Policy_0.75/run_manifest.json",
+  "grid_mode": "cartesian",
+  "auto_shell_grid": true,
+  "shell_fracs": "0.2,0.4,0.6,0.8",
+  "points_per_shell": 40,
+  "include_center": false,
+  "multi_att_mode": "worst",
+  "timing_sec": {
+    "total": 103.83227276802063,
+    "trial_loop": 103.62549924850464
+  },
+  "outcome_breakdown": {
+    "counts": {
+      "defender_capture": 4611,
+      "defender_success": 0,
+      "attacker_hit_oi": 8,
+      "defender_crashed_wall": 0,
+      "attacker_crashed_wall": 0,
+      "defender_hit_oi": 0,
+      "collision_but_not_success": 0,
+      "timeout_no_capture": 181,
+      "capture_required_not_met": 0,
+      "rollout_error": 0,
+      "unclassified_failure": 0
+    },
+    "proportions": {
+      "defender_capture": 0.960625,
+      "defender_success": 0.0,
+      "attacker_hit_oi": 0.0016666666666666668,
+      "defender_crashed_wall": 0.0,
+      "attacker_crashed_wall": 0.0,
+      "defender_hit_oi": 0.0,
+      "collision_but_not_success": 0.0,
+      "timeout_no_capture": 0.03770833333333334,
+      "capture_required_not_met": 0.0,
+      "rollout_error": 0.0,
+      "unclassified_failure": 0.0
+    }
+  },
+  "notes": [
+    "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
+    "If num_attackers>1 we run separate episodes def vs att_j and aggregate by --multi_att_mode.",
+    "When zero_sum_reward.mode is enabled and collision_radius_m > 0, PASS means the defender captures the attacker before any attacker hit or invalid termination/keepout event.",
+    "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
+    "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
+    "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
+    "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
+    "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_att1.attacker_hit_rate for attacker-side comparisons."
+  ],
+  "metrics_att1": {
+    "min_rel_dist": {
+      "mean": 0.7129660024328989,
+      "q00": 0.012681161654571803,
+      "q25": 0.23573466568566123,
+      "q50": 0.37930044748246494,
+      "q75": 0.5634446020908428,
+      "q100": 15.725148299199612
+    },
+    "min_att_center": {
+      "mean": 6.064052488077726,
+      "q00": 0.5085100639844472,
+      "q25": 4.575575516745925,
+      "q50": 5.847133997158757,
+      "q75": 7.280052751160884,
+      "q100": 15.063753277172996
+    },
+    "attacker_hit_rate": 0.0,
+    "collision_rate": 0.960625,
+    "att_term_rate": 0.0,
+    "def_term_rate": 0.0,
+    "oi_viol_def_rate": 0.0,
+    "oi_viol_att_rate": 0.0016666666666666668,
+    "udef_mean": {
+      "mean": 2.719271270187194,
+      "q00": 1.7904793108268011,
+      "q25": 2.566355292957039,
+      "q50": 2.724403410287652,
+      "q75": 2.8735105600901223,
+      "q100": 3.4065438913691355
+    },
+    "uatt_mean": {
+      "mean": 2.9671590413534763,
+      "q00": 2.0791741836164572,
+      "q25": 2.8109942999862847,
+      "q50": 2.997191319906597,
+      "q75": 3.1773236458513585,
+      "q100": 3.464080676400923
+    },
+    "rollout_setup_sec": {
+      "mean": 0.004059184767878227,
+      "q00": 0.0038101100362837315,
+      "q25": 0.003896873240591958,
+      "q50": 0.0039582985045854,
+      "q75": 0.004040393978357315,
+      "q100": 0.21409602096537128
+    },
+    "rollout_simulation_sec": {
+      "mean": 0.01606898674709858,
+      "q00": 0.007505645975470543,
+      "q25": 0.014043427727301605,
+      "q50": 0.015709546976722777,
+      "q75": 0.01756204551202245,
+      "q100": 0.09477084100944921
+    },
+    "rollout_total_sec": {
+      "mean": 0.020128171514976808,
+      "q00": 0.011487848998513073,
+      "q25": 0.018009970255661756,
+      "q50": 0.019710848515387625,
+      "q75": 0.021578156229224987,
+      "q100": 0.3088668619748205
+    }
+  }
+}
