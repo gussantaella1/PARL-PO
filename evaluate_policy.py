@@ -996,7 +996,7 @@ def _save_outcome_histogram(
     ax.set_yticks(range(len(present)))
     ax.set_yticklabels([pretty[k] for k in present])
     ax.set_xlim(0.0, max(values) * 1.15 if values else 1.0)
-    ax.set_xlabel("Proportion of trials")
+    ax.set_xlabel("Proportion of trials (-)")
     ax.set_title("Trial Outcome Breakdown")
     ax.grid(True, axis="x", alpha=0.3)
 
@@ -1288,8 +1288,8 @@ def _save_start_plots(
 
     def _decorate(ax, plane: str, title: str, xlabel: str, ylabel: str):
         ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel(ylabel)
+        ax.set_xlabel(f"{xlabel} (m)")
+        ax.set_ylabel(f"{ylabel} (m)")
         ax.grid(True, alpha=0.3)
 
         # Arena boundary
@@ -2205,10 +2205,10 @@ python evaluate_policy.py \
 python evaluate_policy.py \
   --def_ckpt_path Training_Policy_0.75_Collision/def1_teacher.pt \
   --att_ckpt_path Training_Policy_0.75_Collision/att1_teacher.pt \
-  --out_dir Training_Policy_0.75_Collision/MC_eval/def1_vs_att1
-  --auto_shell_grid
-  --grid_mode cartesian
-  --shell_fracs 0.2,0.4,0.6,0.8
+  --out_dir Training_Policy_0.75_Collision/MC_eval/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
   --points_per_shell 40
   
 
