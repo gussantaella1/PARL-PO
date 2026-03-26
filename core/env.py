@@ -117,7 +117,8 @@ class Env:
         self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
-        self.reward_from_belief = bool(cfg.get("reward_from_belief", False))
+        # `use_ukf` is the single switch for belief-based observations and rewards.
+        self.reward_from_belief = self.use_ukf
         self.belief_clip_factor = float(cfg.get("belief_clip_factor", 2.0))
         self.reset_ukf_on_diverge = bool(cfg.get("reset_ukf_on_diverge", True))
 
@@ -140,6 +141,7 @@ class Env:
 
         if self.use_ukf:
             ukf_cfg = cfg.get("ukf", {})
+            self._ukf_every = max(1, int(ukf_cfg.get("every", 1)))
 
             # Initial covariance P0
             pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * self.radius))
@@ -611,25 +613,26 @@ class Env:
 
         if self.use_ukf:
             self.ukf.predict(dt=self.dt, u=None, u_cov=None)
-            p_obs = p1
-            if self.D != 3:
-                raise RuntimeError("UKF bearing logic assumes D=3.")
-            R_wb = np.eye(3)
+            if (self.t % self._ukf_every) == 0:
+                p_obs = p1
+                if self.D != 3:
+                    raise RuntimeError("UKF bearing logic assumes D=3.")
+                R_wb = np.eye(3)
 
-            v_b = _body_bearing_from_world(p_obs, R_wb, p2)
-            az_true, el_true = _azel_from_body_vec(v_b)
-            z_true = np.array([az_true, el_true], float)
+                v_b = _body_bearing_from_world(p_obs, R_wb, p2)
+                az_true, el_true = _azel_from_body_vec(v_b)
+                z_true = np.array([az_true, el_true], float)
 
-            z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
-            z_meas = z_true + z_noise
+                z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
+                z_meas = z_true + z_noise
 
-            z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
-            innov = z_meas - z_hat_prior
-            innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
-            innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
-            meas_innov_sq = float(innov @ innov)
+                z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+                innov = z_meas - z_hat_prior
+                innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
+                innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
+                meas_innov_sq = float(innov @ innov)
 
-            self.ukf.update(z_meas, p_obs, R_wb)
+                self.ukf.update(z_meas, p_obs, R_wb)
 
             meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
             self._latest_meas_innov = meas_innov_sq
@@ -654,7 +657,6 @@ class Env:
         # d2 and rel2 are used by both rewards
         d2_raw = float(np.dot(p2_reward - self.center, p2_reward - self.center))
         d2 = d2_raw / (self.radius**2)
-        delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
         rel2 = float(np.dot((p2_reward - p1), (p2_reward - p1))) / (self.radius**2)
 
@@ -666,19 +668,13 @@ class Env:
             d1 = 0.0  # placeholder
 
         # ---- wall penalties: compute only what you need ----
-        wall1 = 0.0
-        wall2 = 0.0
-        center_keepout = 0.0
 
         rho1 = np.linalg.norm(p1 - self.center)/ self.radius
         rho2 = np.linalg.norm(p2_reward - self.center) / self.radius
 
         v_scale = self.radius / self.dt
 
-        #Defender vars
-        #             
-        # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
-        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+        #Defender vars             
 
         # defender radial velocity
         rhat1 = (p1 - self.center)
@@ -762,64 +758,7 @@ class Env:
         #Visualize what strategies 
         # Off policy methods 
 
-        if use_security:
-
-            k_time = 0.001
-
-            g = (
-                #Both agents: TBoth terms
-                self.k_pos * d2
-                # + k_time
-            )
-
-            if self.use_fuel:
-                # eff_def = thrust_def / (self.Tmax_def + 1e-9)
-                # eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
-                # g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
-                burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
-                burn_frac_att = (mdot_att_all[0] * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
-                g += - self.k_eff_def * burn_frac_def + self.k_eff_att * burn_frac_att
-
-            # terminal handling must also be zero-sum. Colissions make it symmetrical
-
-            shared_termination = 0.0
-
-            if done:
-                # Example: encode hit_target / collision / oob into g so the sign flip is consistent
-                # if collision:
-                #     g += self.collision_penalty_def
-                if att_hit_target or def_hit_target:
-                    g -= self.target_hit_reward_penalty
-                elif collision:
-                    shared_termination += self.collision_penalty
-                elif oob1:
-                    g -= self.wall_penalty
-                elif oob2_any:
-                    g += self.wall_penalty
-
-                elif self.use_fuel:
-                    if fuel_depleted_def:
-                        g -= self.fuel_depletion_penalty
-                    if fuel_depleted_att:
-                        g += self.fuel_depletion_penalty
-
-                # If you want attacker “success” to matter, it should reduce defender g,
-                # which automatically increases attacker reward via -g.
-
-
-            # if done and collision:
-            #     shared_termination += self.collision_penalty
-
-            if need_def:
-                r1 = g - shared_termination
-            if need_att:
-                r2 = -g - shared_termination
-
-            # if done and oob1:
-            #     if need_def: 
-            #         r1 -= self.wallK
-
-        elif use_zero_sum:
+        if use_zero_sum:
 
             dist_rel = np.linalg.norm(p2_reward - p1)
             dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self.radius

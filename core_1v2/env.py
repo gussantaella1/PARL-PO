@@ -117,7 +117,8 @@ class Env:
         self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
-        self.reward_from_belief = bool(cfg.get("reward_from_belief", False))
+        # `use_ukf` is the single switch for belief-based observations and rewards.
+        self.reward_from_belief = self.use_ukf
         self.belief_clip_factor = float(cfg.get("belief_clip_factor", 2.0))
         self.reset_ukf_on_diverge = bool(cfg.get("reset_ukf_on_diverge", True))
 
@@ -129,6 +130,7 @@ class Env:
             raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
 
         self.ukf = None
+        self.ukfs = []
         self._latest_meas_innov = 0.0
         self._latest_meas_trP   = 0.0
 
@@ -140,6 +142,7 @@ class Env:
 
         if self.use_ukf:
             ukf_cfg = cfg.get("ukf", {})
+            self._ukf_every = max(1, int(ukf_cfg.get("every", 1)))
 
             # Initial covariance P0
             pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * self.radius))
@@ -239,12 +242,13 @@ class Env:
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
 
-    def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
-        if (not self.use_ukf) or (self.ukf is None):
+    def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray, attacker_idx: int = 0):
+        if (not self.use_ukf) or attacker_idx >= len(self.ukfs):
             return p2_true, v2_true
 
-        p2_bel = self.ukf.x[:self.D].copy()
-        v2_bel = self.ukf.x[self.D:2*self.D].copy()
+        ukf = self.ukfs[attacker_idx]
+        p2_bel = ukf.x[:self.D].copy()
+        v2_bel = ukf.x[self.D:2*self.D].copy()
 
         r_est = np.linalg.norm(p2_bel - self.center)
         r_max = self.belief_clip_factor * self.radius
@@ -258,13 +262,22 @@ class Env:
                 v2_bel = v2_true.copy()
 
             if self.reset_ukf_on_diverge:
-                self.ukf.x[:self.D] = p2_true
-                self.ukf.x[self.D:2*self.D] = v2_true
-                self.ukf.P = self._ukf_P0.copy()
+                ukf.x[:self.D] = p2_true
+                ukf.x[self.D:2*self.D] = v2_true
+                ukf.P = self._ukf_P0.copy()
                 p2_bel = p2_true.copy()
                 v2_bel = v2_true.copy()
 
         return p2_bel, v2_bel
+
+    def _belief_states(self, pA_true_list, vA_true_list):
+        pA_bel = []
+        vA_bel = []
+        for k, (p_true, v_true) in enumerate(zip(pA_true_list, vA_true_list)):
+            p_bel, v_bel = self._belief_state(p_true, v_true, attacker_idx=k)
+            pA_bel.append(p_bel)
+            vA_bel.append(v_bel)
+        return pA_bel, vA_bel
 
     def _select_reward_attacker(self, pA_list, vA_list):
         center_dists = np.asarray([np.linalg.norm(pA - self.center) for pA in pA_list], dtype=float)
@@ -485,43 +498,48 @@ class Env:
         p1, v1, pA_list, vA_list = self._unpack(self.state)
         threat_idx, p2, v2, att_center_dists = self._select_reward_attacker(pA_list, vA_list)
 
-        # ---- UKF init (only supported for 1 attacker right now) ----
-        if self.use_ukf and self.num_attackers != 1:
-            raise NotImplementedError("UKF currently only implemented for num_attackers=1")
-
+        self.ukfs = []
         if self.use_ukf:
-            pos_noise = np.random.normal(
-                scale=self._ukf_init_pos_std,
-                size=p2.shape
-            )
-            vel_noise = np.random.normal(
-                scale=self._ukf_init_vel_std,
-                size=v2.shape
-            )
-            p2_est = p2 + pos_noise
-            v2_est = v2 + vel_noise
-            x0_ukf = np.concatenate([p2_est, v2_est])
+            for pA_true, vA_true in zip(pA_list, vA_list):
+                pos_noise = np.random.normal(
+                    scale=self._ukf_init_pos_std,
+                    size=pA_true.shape
+                )
+                vel_noise = np.random.normal(
+                    scale=self._ukf_init_vel_std,
+                    size=vA_true.shape
+                )
+                pA_est = pA_true + pos_noise
+                vA_est = vA_true + vel_noise
+                x0_ukf = np.concatenate([pA_est, vA_est])
 
-            self.ukf = AgentUKF(
-                x0=x0_ukf,
-                P0=self._ukf_P0.copy(),
-                Q=self._ukf_Q.copy(),
-                R=self._ukf_R.copy(),
-                dt=self.dt,
-                dyn='hcw',
-                hcw=self.cfg.get("hcw", {}),
-            )
+                self.ukfs.append(
+                    AgentUKF(
+                        x0=x0_ukf,
+                        P0=self._ukf_P0.copy(),
+                        Q=self._ukf_Q.copy(),
+                        R=self._ukf_R.copy(),
+                        dt=self.dt,
+                        dyn='hcw',
+                        hcw=self.cfg.get("hcw", {}),
+                    )
+                )
 
             self._latest_meas_innov = 0.0
-            self._latest_meas_trP   = float(np.trace(self.ukf.P[0:3, 0:3]))
+            if self.ukfs:
+                self._latest_meas_trP = float(np.mean([np.trace(ukf.P[0:3, 0:3]) for ukf in self.ukfs]))
+            else:
+                self._latest_meas_trP = 0.0
         else:
-            self.ukf = None
+            self.ukfs = []
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
+        self.ukf = self.ukfs[0] if len(self.ukfs) == 1 else None
 
         # ---- initialize d2_prev using the same geometry mode as step rewards ----
-        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
-            p2_geom, _ = self._belief_state(p2, v2)
+        if self.reward_from_belief and self.use_ukf and self.ukfs:
+            pA_geom_list, _ = self._belief_states(pA_list, vA_list)
+            _, p2_geom, _, _ = self._select_reward_attacker(pA_geom_list, vA_list)
         else:
             p2_geom = p2
 
@@ -618,28 +636,34 @@ class Env:
         meas_trPpos   = 0.0
 
         if self.use_ukf:
-            self.ukf.predict(dt=self.dt, u=None, u_cov=None)
             p_obs = p1
             if self.D != 3:
                 raise RuntimeError("UKF bearing logic assumes D=3.")
             R_wb = np.eye(3)
 
-            v_b = _body_bearing_from_world(p_obs, R_wb, p2)
-            az_true, el_true = _azel_from_body_vec(v_b)
-            z_true = np.array([az_true, el_true], float)
+            innov_vals = []
+            trP_vals = []
+            for ukf, pA_true in zip(self.ukfs, pA_list):
+                ukf.predict(dt=self.dt, u=None, u_cov=None)
+                if (self.t % self._ukf_every) == 0:
+                    v_b = _body_bearing_from_world(p_obs, R_wb, pA_true)
+                    az_true, el_true = _azel_from_body_vec(v_b)
+                    z_true = np.array([az_true, el_true], float)
 
-            z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
-            z_meas = z_true + z_noise
+                    z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
+                    z_meas = z_true + z_noise
 
-            z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
-            innov = z_meas - z_hat_prior
-            innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
-            innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
-            meas_innov_sq = float(innov @ innov)
+                    z_hat_prior = ukf.h(ukf.x.copy(), p_obs, R_wb)
+                    innov = z_meas - z_hat_prior
+                    innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
+                    innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
+                    innov_vals.append(float(innov @ innov))
 
-            self.ukf.update(z_meas, p_obs, R_wb)
+                    ukf.update(z_meas, p_obs, R_wb)
+                trP_vals.append(float(np.trace(ukf.P[0:3, 0:3])))
 
-            meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
+            meas_innov_sq = float(np.mean(innov_vals)) if innov_vals else 0.0
+            meas_trPpos = float(np.mean(trP_vals)) if trP_vals else 0.0
             self._latest_meas_innov = meas_innov_sq
             self._latest_meas_trP   = meas_trPpos
         else:
@@ -653,8 +677,13 @@ class Env:
         # else:
         #     p2_geom = p2
 
-        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
-            p2_reward, v2_reward = self._belief_state(p2, v2)
+        if self.reward_from_belief and self.use_ukf and self.ukfs:
+            pA_reward_list, vA_reward_list = self._belief_states(pA_list, vA_list)
+            threat_idx, p2_reward, v2_reward, _ = self._select_reward_attacker(pA_reward_list, vA_reward_list)
+            p2 = pA_list[threat_idx]
+            v2 = vA_list[threat_idx]
+            a2_cmd = aA_cmd[threat_idx]
+            a2_real = aA_real[threat_idx]
         else:
             p2_reward, v2_reward = p2, v2
 
@@ -901,8 +930,8 @@ class Env:
         d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
         d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
         d2_belief_norm = None
-        if self.use_ukf and (self.ukf is not None):
-            p2_belief, _ = self._belief_state(p2, v2)
+        if self.use_ukf and self.ukfs:
+            p2_belief, _ = self._belief_state(p2, v2, attacker_idx=threat_idx)
             d2_belief_norm = float(np.dot(p2_belief - self.center, p2_belief - self.center)) / (self.radius**2)
 
         info = {
@@ -955,12 +984,8 @@ class Env:
 
         # For now, rule attackers don't use obs; obs is defender-centric.
         # We stack all attacker info.
-        if self.use_ukf and (self.ukf is not None) and self.num_attackers == 1:
-            # existing UKF path for single attacker
-            p2_obs = self.ukf.x[:self.D]
-            v2_obs = self.ukf.x[self.D:2*self.D]
-            pA_obs = [p2_obs]
-            vA_obs = [v2_obs]
+        if self.use_ukf and self.ukfs:
+            pA_obs, vA_obs = self._belief_states(pA_list, vA_list)
         else:
             pA_obs = pA_list
             vA_obs = vA_list

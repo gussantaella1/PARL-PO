@@ -737,7 +737,6 @@ def train_with_distill(
 
     role_lower = "defender" if train_role == "def" else "attacker"
     cfg_teacher = config_for_train(attacker_mode=attacker_mode, train_role=train_role)
-    cfg_teacher["use_ukf"] = False
 
     if extra_train_cfg is not None:
         cfg_teacher.update(extra_train_cfg)

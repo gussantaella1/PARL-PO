@@ -133,22 +133,25 @@ COMMON: Dict[str, Any] = {
 
 # ---------- Kalman / measurement subconfig ----------
 ARENA_R = float(COMMON["arena"]["r"])
+SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
     "use_ukf": False,
     "use_meas_reward": True,
     "meas_innov_coef": 0.0,   # start at 0, then slowly crank up
     "meas_cov_coef": 0.0,
+    "sensor_noise_default": SENSOR_NOISE_DEFAULT_DEG,
     "ukf": {
-        "sigma_az": np.deg2rad(0.5),
-        "sigma_el": np.deg2rad(0.5),
+        "sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
+        "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
+        "every": 1,
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
         "init_pos_std": 0.2 * ARENA_R,
         "init_vel_std": 0.01,
         "Q_scale": 1e-5,
     },
-    "reward_from_belief": True,   # NEW: toggle
+    "reward_from_belief": True,   # compatibility field; env now keys belief rewards off use_ukf
 
     "belief_clip_factor": 2.0,
 

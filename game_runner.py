@@ -10,7 +10,7 @@ import numpy as np
 from paper_baseline_runner import _build_step_plant_single, _identity_R, _p3
 from rl_infer import RLPolicyDiff
 from rl_infer_1v2 import RLPolicy_Multi
-from ukf_estimator import KF_CV
+from ukf_estimator import KF_CV, _azel_from_body_vec, _body_bearing_from_world
 
 
 def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
@@ -229,9 +229,54 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
 
+    dyn_name = str(cfg.get("dynamics", "hcw")).lower()
     use_ukf = bool(cfg.get("use_ukf", False))
+    if use_ukf and dyn_name != "hcw":
+        print("[warn] UKF in this runner is HCW-only; disabling use_ukf for non-HCW dynamics.")
+        use_ukf = False
+
+    def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        xD = np.asarray(xD, dtype=np.float32).reshape(-1)
+        if D == 3:
+            return xD.astype(np.float32)
+        return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
+
+    def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
+        if D == 3:
+            return x6.astype(np.float32)
+        return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
+
+    ukf_cfg = cfg.get("ukf", {}) if use_ukf else {}
+    ukf_list = []
+    xA_est_list = [xA.copy() for xA in xA_list]
     if use_ukf:
-        print("[warn] UKF eval path is only implemented for num_attackers == 1 in game_runner; disabling use_ukf.")
+        sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
+        sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
+        meas_every = max(1, int(ukf_cfg.get("every", 1)))
+        pos_std0 = float(ukf_cfg.get("init_pos_std", 0.2 * arena_r))
+        vel_std0 = float(ukf_cfg.get("init_vel_std", 0.01))
+        Q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
+
+        P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
+        Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
+        Rm = np.diag([sigma_az**2, sigma_el**2])
+        hcw_params = cfg.get("hcw", {})
+
+        for j in range(Na):
+            xA6 = _x6_from_xD(xA_list[j])
+            ukf_j = KF_CV(
+                np.r_[xA6[:3], xA6[3:6]],
+                P0,
+                Q,
+                Rm,
+                dt,
+                kind="ukf",
+                dyn="hcw",
+                hcw=hcw_params,
+            )
+            ukf_list.append(ukf_j)
+            xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
 
     pol = RLPolicy_Multi(cfg, device=cfg.get("device", "cpu"))
     din_def, din_att = pol.verify_ckpt_compat()
@@ -354,7 +399,8 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
 
     t_roll0 = time.perf_counter()
     for k in range(steps):
-        obs = build_train_obs(xD, xA_list, m_def, m_att)
+        obs_xA = xA_est_list if (use_ukf and ukf_list) else xA_list
+        obs = build_train_obs(xD, obs_xA, m_def, m_att)
         uD_cmd = np.clip(
             np.asarray(pol.act_def_obs(obs, deterministic=deterministic), dtype=np.float32),
             -umax,
@@ -423,6 +469,21 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         xD = step_plant_single(xD, uD_real, k)
         for j in range(Na):
             xA_list[j] = step_plant_single(xA_list[j], uA_real[j], k)
+
+        if use_ukf and ukf_list:
+            p_obs = xD[:D]
+            R_wb = np.eye(3)
+            for j in range(Na):
+                ukf_j = ukf_list[j]
+                ukf_j.predict(dt=dt, u=None, u_cov=None)
+                if ((k + 1) % meas_every) == 0:
+                    pA_true = xA_list[j][:D]
+                    v_b = _body_bearing_from_world(p_obs, R_wb, pA_true)
+                    az_true, el_true = _azel_from_body_vec(v_b)
+                    z_true = np.array([az_true, el_true], float)
+                    z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=ukf_j.R)
+                    ukf_j.update(z_true + z_noise, p_obs, R_wb)
+                xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
 
         if use_fuel:
             fuel_frac_all[0].append(float(np.clip((m_def - mdry_def) / (m0_def - mdry_def + 1e-9), 0.0, 1.0)))
@@ -715,7 +776,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         Q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
 
         who = str(ukf_cfg.get("who", "both")).lower()
-        meas_every = int(ukf_cfg.get("every", 1))
+        meas_every = max(1, int(ukf_cfg.get("every", 1)))
 
         P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
         Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
@@ -926,7 +987,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         x2_for_def_obs = x2_est if (use_ukf and ukf12 is not None) else x2
 
         obs_def = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
-        obs_att = build_train_obs(x1, x2, m_def, m_att)
+        obs_att = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
         sigma_feat = build_student_sigma_feat()
 
         u1_cmd = np.clip(

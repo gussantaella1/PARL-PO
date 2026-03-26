@@ -26,9 +26,10 @@ from paper_baseline_runner import (
 from rl_infer import RLPolicyDiff
 from rl_infer_1v2 import RLPolicy_Multi
 from ukf_estimator import KF_CV
+from core.controllers import AttackerRuleController
 
 
-SUPPORTED_BASELINE_OPPONENTS = ("paper", "game_theory", "ipopt")
+SUPPORTED_BASELINE_OPPONENTS = ("paper", "game_theory", "ipopt", "rule")
 
 
 def _project_box(u: np.ndarray, umax: float) -> np.ndarray:
@@ -459,6 +460,36 @@ def _ipopt_best_response(
     return _restore_action_shape(_unflatten_actions(sol, D, nA)), dbg
 
 
+def _rule_best_response(
+    *,
+    cfg: Dict[str, Any],
+    baseline_role: str,
+    xD: np.ndarray,
+    xA_list: List[np.ndarray],
+) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    if baseline_role != "att":
+        raise ValueError("opponent_baseline='rule' is only supported for attacker-side baselines.")
+
+    ctrl = AttackerRuleController(cfg)
+    pD = np.asarray(xD[:ctrl.D], dtype=np.float32)
+    vD = np.asarray(xD[ctrl.D:2 * ctrl.D], dtype=np.float32)
+    u_list = []
+    for xA in xA_list:
+        xA = np.asarray(xA, dtype=np.float32)
+        pA = xA[:ctrl.D]
+        vA = xA[ctrl.D:2 * ctrl.D]
+        u_list.append(np.asarray(ctrl.act(pD, vD, pA, vA), dtype=np.float32))
+
+    dbg = {
+        "baseline": "rule",
+        "baseline_role": baseline_role,
+        "objective": "training_rule_controller",
+        "solver_family": "closed_form_rule",
+        "num_attackers": int(len(u_list)),
+    }
+    return _restore_action_shape(u_list), dbg
+
+
 def _solve_baseline_best_response(
     *,
     cfg: Dict[str, Any],
@@ -475,6 +506,13 @@ def _solve_baseline_best_response(
     ppo_obj,
     umax: float,
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    if opponent_baseline == "rule":
+        return _rule_best_response(
+            cfg=cfg,
+            baseline_role=baseline_role,
+            xD=xD,
+            xA_list=xA_list,
+        )
     if opponent_baseline == "paper":
         return _paper_best_response(
             cfg=cfg,
@@ -531,6 +569,8 @@ def _baseline_should_resolve(
     turn_len: int,
 ) -> bool:
     if k == 0:
+        return True
+    if opponent_baseline == "rule":
         return True
     if opponent_baseline == "paper":
         return (k % turn_len) == 0
@@ -1486,7 +1526,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                 opponent_baseline=opponent_baseline,
                 baseline_role=baseline_role,
                 xD=x1,
-                xA=x2,
+                xA_list=[x2],
                 fixed_u_policy=u_policy_cmd,
                 u_baseline_prev=u_baseline_prev,
                 k=k,
