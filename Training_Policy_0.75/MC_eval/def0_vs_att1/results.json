@@ -1,0 +1,262 @@
+{
+  "num_trials": 4800,
+  "passes": 1715,
+  "success_rate": 0.3572916666666667,
+  "defender_pass_rate": 0.3572916666666667,
+  "policy_role": "def",
+  "opponent_source": "policy",
+  "policy_primary_metric": {
+    "name": "defender_capture_pass_rate",
+    "value": 0.3572916666666667
+  },
+  "success_rate_ci_wilson": {
+    "alpha": 0.05,
+    "lo": 0.34385427922319933,
+    "hi": 0.3709572915282793
+  },
+  "config_module": "config_rl",
+  "base_cfg_source": "run_manifest:Training_Policy_0.75/run_manifest.json",
+  "run_manifest": "Training_Policy_0.75/run_manifest.json",
+  "grid_mode": "cartesian",
+  "auto_shell_grid": true,
+  "shell_fracs": "0.2,0.4,0.6,0.8",
+  "points_per_shell": 40,
+  "include_center": false,
+  "multi_att_mode": "worst",
+  "timing_sec": {
+    "total": 103.14393997192383,
+    "trial_loop": 102.65802383422852
+  },
+  "outcome_breakdown": {
+    "counts": {
+      "defender_capture": 1715,
+      "defender_success": 0,
+      "attacker_hit_oi": 2896,
+      "defender_crashed_wall": 0,
+      "attacker_crashed_wall": 0,
+      "defender_hit_oi": 0,
+      "collision_but_not_success": 0,
+      "timeout_no_capture": 189,
+      "capture_required_not_met": 0,
+      "rollout_error": 0,
+      "unclassified_failure": 0
+    },
+    "proportions": {
+      "defender_capture": 0.3572916666666667,
+      "defender_success": 0.0,
+      "attacker_hit_oi": 0.6033333333333334,
+      "defender_crashed_wall": 0.0,
+      "attacker_crashed_wall": 0.0,
+      "defender_hit_oi": 0.0,
+      "collision_but_not_success": 0.0,
+      "timeout_no_capture": 0.039375,
+      "capture_required_not_met": 0.0,
+      "rollout_error": 0.0,
+      "unclassified_failure": 0.0
+    }
+  },
+  "notes": [
+    "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
+    "For num_attackers>1, evaluation runs one joint rollout per trial and extracts attacker-specific metrics from the shared trajectory.",
+    "When zero_sum_reward.mode is enabled and collision_radius_m > 0, PASS means the defender captures the attacker before any attacker hit or invalid termination/keepout event.",
+    "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
+    "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
+    "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
+    "If attacker grid rows only provide att1_* and num_attackers>1, evaluation deterministically expands them into attacker-team rows.",
+    "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
+    "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_trial.attacker_hit_any_rate for attacker-side comparisons."
+  ],
+  "metrics_trial": {
+    "min_rel_dist": {
+      "mean": 1.6806248042279135,
+      "q00": 0.08149592204682758,
+      "q25": 0.6579401989931126,
+      "q50": 0.999642207778157,
+      "q75": 1.958338884892199,
+      "q100": 14.737837809119055
+    },
+    "min_att_center": {
+      "mean": 2.9049165348362633,
+      "q00": 0.404373920073763,
+      "q25": 0.7316418059055327,
+      "q50": 0.9172589699144283,
+      "q75": 5.376976489869916,
+      "q100": 14.168958225280573
+    },
+    "attacker_hit_any_rate": 0.0,
+    "collision_any_rate": 0.3572916666666667,
+    "att_term_any_rate": 0.0,
+    "def_term_any_rate": 0.0,
+    "oi_viol_def_any_rate": 0.0,
+    "oi_viol_att_any_rate": 0.6033333333333334,
+    "rollout_error_any_rate": 0.0,
+    "udef_mean": {
+      "mean": 3.1370226919502167,
+      "q00": 2.088113426447268,
+      "q25": 2.990495285489622,
+      "q50": 3.2028106826606795,
+      "q75": 3.343898300477157,
+      "q100": 3.4641015509006206
+    },
+    "uatt_mean": {
+      "mean": 2.9121489144127084,
+      "q00": 2.0721701495781892,
+      "q25": 2.7196576027843116,
+      "q50": 2.9384036989151214,
+      "q75": 3.1242638780314835,
+      "q100": 3.463962913322809
+    },
+    "rollout_num_steps": {
+      "mean": 31.585208333333334,
+      "q00": 13.0,
+      "q25": 26.0,
+      "q50": 32.0,
+      "q75": 36.0,
+      "q100": 90.0
+    },
+    "rollout_setup_sec": {
+      "mean": 0.004136686352806767,
+      "q00": 0.0037978409964125603,
+      "q25": 0.003971313504735008,
+      "q50": 0.0039992884994717315,
+      "q75": 0.0040367112451349385,
+      "q100": 0.15591149998363107
+    },
+    "rollout_setup_sec_per_step": {
+      "mean": 0.00013917074906071372,
+      "q00": 4.463280007864038e-05,
+      "q25": 0.00011110208374204693,
+      "q50": 0.0001253607028957049,
+      "q75": 0.00015740714938146995,
+      "q100": 0.005376258620125209
+    },
+    "rollout_simulation_sec": {
+      "mean": 0.01654867334225249,
+      "q00": 0.00644782799645327,
+      "q25": 0.013134985762008,
+      "q50": 0.01638423599069938,
+      "q75": 0.018475832752301358,
+      "q100": 0.1486128690012265
+    },
+    "rollout_simulation_sec_per_step": {
+      "mean": 0.0005259672488801775,
+      "q00": 0.0004794888679354795,
+      "q25": 0.0004963258961188932,
+      "q50": 0.000499056707028233,
+      "q75": 0.0005043239003996237,
+      "q100": 0.005124581689697465
+    },
+    "rollout_total_sec": {
+      "mean": 0.020685359695059257,
+      "q00": 0.010291287006111816,
+      "q25": 0.017175027016492095,
+      "q50": 0.020422226501978002,
+      "q75": 0.02251469049951993,
+      "q100": 0.3045243689848576
+    },
+    "rollout_total_sec_per_step": {
+      "mean": 0.0006651379979408913,
+      "q00": 0.0005349899467546493,
+      "q25": 0.0006107503781095147,
+      "q50": 0.0006312191853506312,
+      "q75": 0.0006618429472313658,
+      "q100": 0.010500840309822675
+    }
+  },
+  "metrics_att1": {
+    "min_rel_dist": {
+      "mean": 1.6806248042279135,
+      "q00": 0.08149592204682758,
+      "q25": 0.6579401989931126,
+      "q50": 0.999642207778157,
+      "q75": 1.958338884892199,
+      "q100": 14.737837809119055
+    },
+    "min_att_center": {
+      "mean": 2.9049165348362633,
+      "q00": 0.404373920073763,
+      "q25": 0.7316418059055327,
+      "q50": 0.9172589699144283,
+      "q75": 5.376976489869916,
+      "q100": 14.168958225280573
+    },
+    "attacker_hit_rate": 0.0,
+    "collision_rate": 0.3572916666666667,
+    "att_term_rate": 0.0,
+    "def_term_rate": 0.0,
+    "oi_viol_def_rate": 0.0,
+    "oi_viol_att_rate": 0.6033333333333334,
+    "udef_mean": {
+      "mean": 3.1370226919502167,
+      "q00": 2.088113426447268,
+      "q25": 2.990495285489622,
+      "q50": 3.2028106826606795,
+      "q75": 3.343898300477157,
+      "q100": 3.4641015509006206
+    },
+    "uatt_mean": {
+      "mean": 2.9121489144127084,
+      "q00": 2.0721701495781892,
+      "q25": 2.7196576027843116,
+      "q50": 2.9384036989151214,
+      "q75": 3.1242638780314835,
+      "q100": 3.463962913322809
+    },
+    "rollout_num_steps": {
+      "mean": 31.585208333333334,
+      "q00": 13.0,
+      "q25": 26.0,
+      "q50": 32.0,
+      "q75": 36.0,
+      "q100": 90.0
+    },
+    "rollout_setup_sec": {
+      "mean": 0.004136686352806767,
+      "q00": 0.0037978409964125603,
+      "q25": 0.003971313504735008,
+      "q50": 0.0039992884994717315,
+      "q75": 0.0040367112451349385,
+      "q100": 0.15591149998363107
+    },
+    "rollout_setup_sec_per_step": {
+      "mean": 0.00013917074906071372,
+      "q00": 4.463280007864038e-05,
+      "q25": 0.00011110208374204693,
+      "q50": 0.0001253607028957049,
+      "q75": 0.00015740714938146995,
+      "q100": 0.005376258620125209
+    },
+    "rollout_simulation_sec": {
+      "mean": 0.01654867334225249,
+      "q00": 0.00644782799645327,
+      "q25": 0.013134985762008,
+      "q50": 0.01638423599069938,
+      "q75": 0.018475832752301358,
+      "q100": 0.1486128690012265
+    },
+    "rollout_simulation_sec_per_step": {
+      "mean": 0.0005259672488801775,
+      "q00": 0.0004794888679354795,
+      "q25": 0.0004963258961188932,
+      "q50": 0.000499056707028233,
+      "q75": 0.0005043239003996237,
+      "q100": 0.005124581689697465
+    },
+    "rollout_total_sec": {
+      "mean": 0.020685359695059257,
+      "q00": 0.010291287006111816,
+      "q25": 0.017175027016492095,
+      "q50": 0.020422226501978002,
+      "q75": 0.02251469049951993,
+      "q100": 0.3045243689848576
+    },
+    "rollout_total_sec_per_step": {
+      "mean": 0.0006651379979408913,
+      "q00": 0.0005349899467546493,
+      "q25": 0.0006107503781095147,
+      "q50": 0.0006312191853506312,
+      "q75": 0.0006618429472313658,
+      "q100": 0.010500840309822675
+    }
+  }
+}
