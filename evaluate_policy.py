@@ -2200,17 +2200,33 @@ python evaluate_policy.py \
 
 """
 
+#Policy
+"""
+  
+python evaluate_policy.py \
+--def_ckpt_path Training_Policy_0.75/def0_teacher.pt \
+--att_ckpt_path Training_Policy_0.75/att1_teacher.pt \  
+--out_dir Training_Policy_0.75/MC_eval/def0_vs_att1 \  
+--auto_shell_grid  \
+--grid_mode cartesian  \ 
+--shell_fracs 0.2,0.4,0.6,0.8 \ 
+--points_per_shell 40 \
+--x0_vel_jitter 0.5
 """
 
+#Rule
+"""
 python evaluate_policy.py \
-  --def_ckpt_path Training_Policy_0.75_Collision/def1_teacher.pt \
-  --att_ckpt_path Training_Policy_0.75_Collision/att1_teacher.pt \
-  --out_dir Training_Policy_0.75_Collision/MC_eval/def1_vs_att1 \
+  --run_dir Training_Policy_0.75 \
+  --def_ckpt_path Training_Policy_0.75/def0_teacher.pt \
+  --policy_role def \
+  --opponent_source rule \
+  --out_dir Training_Policy_0.75/MC_eval/def0_vs_rule_attacker \
   --auto_shell_grid \
   --grid_mode cartesian \
   --shell_fracs 0.2,0.4,0.6,0.8 \
-  --points_per_shell 40
-  
+  --points_per_shell 40 \
+  --x0_vel_jitter 0.5
 
 """
 
