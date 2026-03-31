@@ -618,7 +618,7 @@ def train(cfg: Dict[str, Any]):
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
             print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
             print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
-            if cfg.get("use_ukf", False):
+            if cfg.get("use_kf", False):
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
 
@@ -633,7 +633,7 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("policy/def_std_mean", stdD, gs)
                 writer.add_scalar("lr/def_policy", lr_pi, gs)
                 writer.add_scalar("lr/def_value", lr_vf, gs)
-                if cfg.get("use_ukf", False):
+                if cfg.get("use_kf", False):
                     writer.add_scalar("ukf/meas_innov_sq_mean", meas_innov_mean, gs)
                     writer.add_scalar("ukf/trP_pos_mean", trP_mean, gs)
 
@@ -781,7 +781,7 @@ def train_with_distill(
 
     if DISTILL:
         cfg_student = config_for_train(attacker_mode=attacker_mode, train_role=train_role)
-        cfg_student["use_ukf"] = int(cfg_student.get("num_attackers", 1)) == 1
+        cfg_student["use_kf"] = int(cfg_student.get("num_attackers", 1)) == 1
         cfg_student["seed"] = cfg_teacher["seed"] + 1
         if extra_train_cfg is not None:
             cfg_student.update(extra_train_cfg)

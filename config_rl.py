@@ -132,11 +132,11 @@ COMMON: Dict[str, Any] = {
 
 # ---------- Kalman / measurement subconfig ----------
 ARENA_R = float(COMMON["arena"]["r"])
-SENSOR_NOISE_DEFAULT_DEG = 0.75
+SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_ukf": True,
-    "use_meas_reward": True,
+    "use_kf": False,
+    "estimator_kind": "ukf",
     "meas_innov_coef": 0.0,   # start at 0, then slowly crank up
     "meas_cov_coef": 0.0,
 
@@ -144,14 +144,30 @@ KF_COMMON: Dict[str, Any] = {
     "ukf": {
         "sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
-        "every": 1,
+        "every": 2,
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
+        "action_access": "none",  # ground_truth | measured | none
+        "action_meas_std": 0.1 * float(COMMON["umax"]),  # used when action_access == "measured"
         "init_pos_std": 0.2 * ARENA_R,
         "init_vel_std": 0.01,
+        "init_mean_pos_std": 0.0,
+        "init_mean_vel_std": 0.0,
         "Q_scale": 1e-5,
+        "accel_std0": 2.0,
+        "init_mean_accel_std": 0.0,
+        "accel_Q_scale": 1e-4,
+        "center_sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
+        "center_sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
+        "center_pos_std0": 0.2 * ARENA_R,
+        "center_vel_std0": 0.01,
+        "center_init_pos_std": 0.2 * ARENA_R,
+        "center_init_vel_std": 0.01,
+        "center_init_mean_pos_std": 0.0,
+        "center_init_mean_vel_std": 0.0,
+        "center_Q_scale": 1e-5,
     },
-    "reward_from_belief": True,   # compatibility field; env now keys belief rewards off use_ukf
+    "reward_from_belief": True,   # compatibility field; env now keys belief rewards off the estimator toggle
 
     "belief_clip_factor": 2.0,
 
@@ -198,6 +214,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
+    "reward_type": "zero_sum",
+    # "reward_type": "zero_sum_ukf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
@@ -226,7 +244,7 @@ TRAIN: Dict[str, Any] = {
 
     # Vectorized rollout & logging
 
-    #Current config
+    #Base config
     "num_envs": 256,   #Was 256
     "steps_per_env": 512, #Was 512  
     "total_updates": 1000,   #Was 2000
@@ -245,8 +263,25 @@ TRAIN: Dict[str, Any] = {
     "fuel_depletion_penalty": 5.0,
     "collision_radius_m": 0.75,            # meters
 
-    # "k_pos": 0.05, #Was 0.05
-    # "k_dock": 0.5,
+    # UKF config:
+
+    # "num_envs": 64,   #Was 256
+    # "steps_per_env": 512, #Was 512  
+    # "total_updates": 1000,   #Was 2000
+    # "train_epochs": 3, #Was 3
+    # "minibatch_size": 1024,  #Was 8192
+    # "log_every": 10,
+    # "entropy_coef": 0.01,
+
+    # "k_pos": 0.1, #Was 0.05
+    # "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
+
+    # "gamma": 0.992, #Was 0.995
+    # "target_hit_reward_penalty": 10.0,
+    # "collision_penalty": 10.0,
+    # "wall_penalty": 2.5,
+    # "fuel_depletion_penalty": 5.0,
+    # "collision_radius_m": 0.75,            # meters
 
 
     # #Long training (new)
@@ -259,30 +294,6 @@ TRAIN: Dict[str, Any] = {
     # "entropy_coef": 0.01,
     # "k_pos": 0.04, #Was 0.05
     # "gamma": 0.998, #Was 0.999
-
-    # #Amy Zhang email config
-    # "num_envs": 128,   #Was 64 
-    # "steps_per_env": 256, #Was 512  
-    # "total_updates": 1000,   #Was 2000
-    # "train_epochs": 5, #Was 3
-    # "minibatch_size": 4096,  #Was 8192
-    # "entropy_coef": 0.01,
-    # "k_pos": 0.04,
-    # "gamma": 0.998, #Was 0.999
-    # "target_hit_reward_penalty": 5.0,
-    # "collision_penalty": 5.0,
-    # "wall_penalty": 5.0,
-
-
-
-    #Long training (old)
-    # "num_envs": 64,   
-    # "steps_per_env": 512,   
-    # "total_updates": 2000,   
-    # "train_epochs": 3,
-    # "minibatch_size": 8192,  
-    # "log_every": 10,
-    # "entropy_coef": 0.02,
 
     #Short training
     # "num_envs": 8,          
@@ -298,7 +309,7 @@ TRAIN: Dict[str, Any] = {
     #Test training
     # "num_envs": 1,          
     # "steps_per_env": 256,    
-    # "total_updates": 100, 
+    # "total_updates": 20, 
     # "train_epochs": 3,
     # "minibatch_size": 1024,  
     # "log_every": 10,

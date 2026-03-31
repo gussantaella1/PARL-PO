@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import os
 
-from ukf_estimator import AgentUKF, _body_bearing_from_world, _azel_from_body_vec
+from ukf_estimator import KF_CV, _body_bearing_from_world, _azel_from_body_vec
 from config_rl import build_dyn
 from core.utils import set_seed
 
@@ -113,25 +113,46 @@ class Env:
 
 
         # ---- UKF / measurement model knobs ----
-        self.use_ukf          = bool(cfg.get("use_ukf", False))
-        self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
+        reward_type = str(
+            cfg.get(
+                "reward_type",
+                "zero_sum_ukf" if bool(cfg.get("use_zero_sum_ukf", False)) else "zero_sum",
+            )
+        ).strip().lower()
+        if reward_type not in {"zero_sum", "zero_sum_ukf"}:
+            raise ValueError(
+                f"Unsupported reward_type='{reward_type}'. Expected 'zero_sum' or 'zero_sum_ukf'."
+            )
+        self.reward_type = reward_type
+        self.use_zero_sum_ukf = (self.reward_type == "zero_sum_ukf")
+
+        self.use_kf           = bool(cfg.get("use_kf", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
-        # `use_ukf` is the single switch for belief-based observations and rewards.
-        self.reward_from_belief = self.use_ukf
+        # `use_kf` is the estimator toggle.
         self.belief_clip_factor = float(cfg.get("belief_clip_factor", 2.0))
         self.reset_ukf_on_diverge = bool(cfg.get("reset_ukf_on_diverge", True))
+        self._estimator_cfg = dict(cfg.get("ukf", {}))
+        self.estimator_kind = self._normalize_estimator_kind(cfg.get("estimator_kind", "ukf"))
+        self.estimator_label = self.estimator_kind.upper()
+        self._estimator_dyn = None
 
         #Fuel config
         fuel = cfg.get("fuel", {})
         self.use_fuel = bool(fuel.get("enable"))
 
-        if self.use_ukf and self.D != 3:
-            raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
+        if self.use_kf and self.D != 3:
+            raise ValueError("Bearing-only estimator currently implemented for D=3 only.")
 
         self.ukf = None
+        self.att_ukf = None
         self._latest_meas_innov = 0.0
         self._latest_meas_trP   = 0.0
+        self._latest_att_meas_innov = 0.0
+        self._latest_att_meas_trP   = 0.0
+        self._ukf_action_access = "ground_truth"
+        self._kf_control_meas_std = np.zeros(3, dtype=float)
+        self._ukf_state_dim = 6
 
         self.record_ic_history = bool(cfg.get("record_ic_history", False))
         self.max_ic_history = int(cfg.get("max_ic_history", 200000))
@@ -139,34 +160,63 @@ class Env:
         self.ic_history_def = []
         self.ic_history_att = []
 
-        if self.use_ukf:
-            ukf_cfg = cfg.get("ukf", {})
+        if self.use_kf:
+            ukf_cfg = self._estimator_cfg
             self._ukf_every = max(1, int(ukf_cfg.get("every", 1)))
+            self._estimator_dyn = self._resolve_estimator_dynamics()
 
             # Initial covariance P0
             pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * self.radius))
             vel_std0 = float(ukf_cfg.get("vel_std0", 0.01))
-            P0 = np.diag(
-                [pos_std0**2, pos_std0**2, pos_std0**2,
-                 vel_std0**2, vel_std0**2, vel_std0**2]
-            )
-
-            # Process noise Q (simple isotropic default)
             q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
-            Q = q_scale * np.eye(6, dtype=float)
 
             # Measurement noise R (az, el)
             sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
             sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
             Rm = np.diag([sigma_az**2, sigma_el**2])
 
+            # Legacy init stds are kept for compatibility, but the UKF mean
+            # now uses separate init_mean_* knobs so P0 and mean perturbation
+            # are not conflated.
+            self._ukf_init_pos_std = float(ukf_cfg.get("init_pos_std", pos_std0))
+            self._ukf_init_vel_std = float(ukf_cfg.get("init_vel_std", vel_std0))
+            self._ukf_init_mean_pos_std = float(ukf_cfg.get("init_mean_pos_std", 0.0))
+            self._ukf_init_mean_vel_std = float(ukf_cfg.get("init_mean_vel_std", 0.0))
+            self._ukf_action_access = self._normalize_kf_action_access(
+                ukf_cfg.get("action_access", "ground_truth")
+            )
+            self._kf_control_meas_std = self._normalize_kf_control_noise_std(
+                ukf_cfg.get("action_meas_std", 0.1 * max(abs(float(cfg.get("umax", 1.0))), 1e-3))
+            )
+            self._ukf_state_dim = 6
+            accel_std0 = float(ukf_cfg.get("accel_std0", max(abs(float(cfg.get("umax", 1.0))), 1e-3)))
+            accel_q_scale = float(ukf_cfg.get("accel_Q_scale", q_scale))
+            self._ukf_init_mean_accel_std = float(ukf_cfg.get("init_mean_accel_std", 0.0))
+
+            if self._ukf_state_dim == 9:
+                P0 = np.diag(
+                    [pos_std0**2, pos_std0**2, pos_std0**2,
+                     vel_std0**2, vel_std0**2, vel_std0**2,
+                     accel_std0**2, accel_std0**2, accel_std0**2]
+                )
+                Q = np.diag(
+                    [q_scale, q_scale, q_scale,
+                     q_scale, q_scale, q_scale,
+                     accel_q_scale, accel_q_scale, accel_q_scale]
+                )
+            else:
+                P0 = np.diag(
+                    [pos_std0**2, pos_std0**2, pos_std0**2,
+                     vel_std0**2, vel_std0**2, vel_std0**2]
+                )
+                Q = q_scale * np.eye(6, dtype=float)
+
             self._ukf_P0 = P0
             self._ukf_Q  = Q
             self._ukf_R  = Rm
 
-            # Keep some init stds around for reset-time randomization
-            self._ukf_init_pos_std = float(ukf_cfg.get("init_pos_std", pos_std0))
-            self._ukf_init_vel_std = float(ukf_cfg.get("init_vel_std", vel_std0))
+        if self.use_zero_sum_ukf and not self.use_kf:
+            raise ValueError("reward_type='zero_sum_ukf' requires the estimator to be enabled.")
 
         if self.use_fuel:
             self.k_eff_def = float(cfg.get("k_eff_def"))
@@ -242,7 +292,7 @@ class Env:
         self.opp_domain = str(mode)
 
     def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
-        if (not self.use_ukf) or (self.ukf is None):
+        if (not self.use_kf) or (self.ukf is None):
             return p2_true, v2_true
 
         p2_bel = self.ukf.x[:self.D].copy()
@@ -262,11 +312,111 @@ class Env:
             if self.reset_ukf_on_diverge:
                 self.ukf.x[:self.D] = p2_true
                 self.ukf.x[self.D:2*self.D] = v2_true
+                if self.ukf.x.size > 2 * self.D:
+                    self.ukf.x[2*self.D:] = 0.0
                 self.ukf.P = self._ukf_P0.copy()
                 p2_bel = p2_true.copy()
                 v2_bel = v2_true.copy()
 
         return p2_bel, v2_bel
+
+    def _attacker_belief_state(self, p1_true: np.ndarray, v1_true: np.ndarray):
+        if (not self.use_kf) or (self.att_ukf is None):
+            return p1_true, v1_true
+
+        p1_bel = self.att_ukf.x[:self.D].copy()
+        v1_bel = self.att_ukf.x[self.D:2*self.D].copy()
+
+        r_est = np.linalg.norm(p1_bel - self.center)
+        r_max = self.belief_clip_factor * self.radius
+
+        if (not np.isfinite(r_est)) or (r_est > r_max):
+            if np.isfinite(r_est) and r_est > 1e-9:
+                direction = (p1_bel - self.center) / r_est
+                p1_bel = self.center + direction * r_max
+            else:
+                p1_bel = p1_true.copy()
+                v1_bel = v1_true.copy()
+
+            if self.reset_ukf_on_diverge:
+                self.att_ukf.x[:self.D] = p1_true
+                self.att_ukf.x[self.D:2*self.D] = v1_true
+                if self.att_ukf.x.size > 2 * self.D:
+                    self.att_ukf.x[2*self.D:] = 0.0
+                self.att_ukf.P = self._ukf_P0.copy()
+                p1_bel = p1_true.copy()
+                v1_bel = v1_true.copy()
+
+        return p1_bel, v1_bel
+
+    def _center_belief(self) -> np.ndarray:
+        return self.center.copy()
+
+    def _normalize_kf_action_access(self, mode: Any) -> str:
+        key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+        if key == "groundtruth":
+            key = "ground_truth"
+        if key == "inferred":
+            key = "measured"
+        valid = {"ground_truth", "measured", "none"}
+        if key not in valid:
+            raise ValueError(f"Unsupported estimator action_access='{mode}'. Expected one of {sorted(valid)}.")
+        return key
+
+    def _normalize_kf_control_noise_std(self, noise_std: Any) -> np.ndarray:
+        arr = np.asarray(noise_std, dtype=float)
+        if arr.ndim == 0:
+            std = np.full(3, float(arr), dtype=float)
+        else:
+            arr = arr.reshape(-1)
+            if arr.size != 3:
+                raise ValueError(
+                    f"Expected estimator action_meas_std to be a scalar or length-3 sequence, got shape {arr.shape}."
+                )
+            std = arr.astype(float)
+        return np.maximum(std, 0.0)
+
+    def _normalize_estimator_kind(self, kind: Any) -> str:
+        key = str(kind).strip().lower()
+        valid = {"ukf", "ekf"}
+        if key not in valid:
+            raise ValueError(f"Unsupported estimator_kind='{kind}'. Expected one of {sorted(valid)}.")
+        return key
+
+    def _resolve_estimator_dynamics(self) -> str:
+        dyn_name = str(self.cfg.get("dynamics", "hcw")).strip().lower()
+        if dyn_name != "hcw":
+            raise ValueError(
+                f"{self.estimator_label} estimator currently requires cfg['dynamics']='hcw'; got '{dyn_name}'."
+            )
+        return "hcw"
+
+    def _make_estimator(self, x0_est: np.ndarray):
+        return KF_CV(
+            x0=x0_est,
+            P0=self._ukf_P0.copy(),
+            Q=self._ukf_Q.copy(),
+            R=self._ukf_R.copy(),
+            dt=self.dt,
+            kind=self.estimator_kind,
+            dyn=self._estimator_dyn,
+            hcw=self.cfg.get("hcw", {}),
+        )
+
+    def _kf_predict_control(self, ground_truth_u: np.ndarray | None):
+        if ground_truth_u is None:
+            return None, None
+        u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
+        if self._ukf_action_access == "ground_truth":
+            return u_true, None
+        if self._ukf_action_access == "measured":
+            noise = np.random.normal(loc=0.0, scale=self._kf_control_meas_std, size=3)
+            u_meas = u_true + noise
+            umax = float(self.cfg.get("umax", np.inf))
+            if np.isfinite(umax):
+                u_meas = np.clip(u_meas, -umax, umax)
+            return u_meas, np.diag(self._kf_control_meas_std**2)
+        return None, None
 
     def reset(self) -> np.ndarray:
         self.t = 0
@@ -477,42 +627,65 @@ class Env:
         p2 = pA_list[0]
         v2 = vA_list[0]
 
-        # ---- UKF init (only supported for 1 attacker right now) ----
-        if self.use_ukf and self.num_attackers != 1:
-            raise NotImplementedError("UKF currently only implemented for num_attackers=1")
+        # ---- estimator init (only supported for 1 attacker right now) ----
+        if self.use_kf and self.num_attackers != 1:
+            raise NotImplementedError(f"{self.estimator_label} currently only implemented for num_attackers=1")
 
-        if self.use_ukf:
+        if self.use_kf:
             pos_noise = np.random.normal(
-                scale=self._ukf_init_pos_std,
+                scale=self._ukf_init_mean_pos_std,
                 size=p2.shape
             )
             vel_noise = np.random.normal(
-                scale=self._ukf_init_vel_std,
+                scale=self._ukf_init_mean_vel_std,
                 size=v2.shape
             )
             p2_est = p2 + pos_noise
             v2_est = v2 + vel_noise
-            x0_ukf = np.concatenate([p2_est, v2_est])
+            if self._ukf_state_dim == 9:
+                accel_noise = np.random.normal(
+                    scale=self._ukf_init_mean_accel_std,
+                    size=(3,),
+                )
+                x0_ukf = np.concatenate([p2_est, v2_est, accel_noise])
+            else:
+                x0_ukf = np.concatenate([p2_est, v2_est])
 
-            self.ukf = AgentUKF(
-                x0=x0_ukf,
-                P0=self._ukf_P0.copy(),
-                Q=self._ukf_Q.copy(),
-                R=self._ukf_R.copy(),
-                dt=self.dt,
-                dyn='hcw',
-                hcw=self.cfg.get("hcw", {}),
+            self.ukf = self._make_estimator(x0_ukf)
+
+            p1_pos_noise = np.random.normal(
+                scale=self._ukf_init_mean_pos_std,
+                size=p1.shape
             )
+            p1_vel_noise = np.random.normal(
+                scale=self._ukf_init_mean_vel_std,
+                size=v1.shape
+            )
+            if self._ukf_state_dim == 9:
+                p1_accel_noise = np.random.normal(
+                    scale=self._ukf_init_mean_accel_std,
+                    size=(3,),
+                )
+                x0_att_ukf = np.concatenate([p1 + p1_pos_noise, v1 + p1_vel_noise, p1_accel_noise])
+            else:
+                x0_att_ukf = np.concatenate([p1 + p1_pos_noise, v1 + p1_vel_noise])
+            self.att_ukf = self._make_estimator(x0_att_ukf)
 
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = float(np.trace(self.ukf.P[0:3, 0:3]))
+            self._latest_att_meas_innov = 0.0
+            self._latest_att_meas_trP = float(np.trace(self.att_ukf.P[0:3, 0:3]))
+
         else:
             self.ukf = None
+            self.att_ukf = None
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
+            self._latest_att_meas_innov = 0.0
+            self._latest_att_meas_trP = 0.0
 
         # ---- initialize d2_prev using the same geometry mode as step rewards ----
-        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
+        if self.use_kf and (self.ukf is not None):
             p2_geom, _ = self._belief_state(p2, v2)
         else:
             p2_geom = p2
@@ -610,9 +783,12 @@ class Env:
         # ---- UKF (only if enabled; you can also gate this further if you want) ----
         meas_innov_sq = 0.0
         meas_trPpos   = 0.0
+        att_meas_innov_sq = 0.0
+        att_meas_trPpos = 0.0
 
-        if self.use_ukf:
-            self.ukf.predict(dt=self.dt, u=None, u_cov=None)
+        if self.use_kf:
+            u12_predict, u12_cov = self._kf_predict_control(a2_real)
+            self.ukf.predict(dt=self.dt, u=u12_predict, u_cov=u12_cov)
             if (self.t % self._ukf_every) == 0:
                 p_obs = p1
                 if self.D != 3:
@@ -637,21 +813,54 @@ class Env:
             meas_trPpos = float(np.trace(self.ukf.P[0:3, 0:3]))
             self._latest_meas_innov = meas_innov_sq
             self._latest_meas_trP   = meas_trPpos
+
+            if self.att_ukf is not None:
+                u21_predict, u21_cov = self._kf_predict_control(a1_real)
+                self.att_ukf.predict(dt=self.dt, u=u21_predict, u_cov=u21_cov)
+                if (self.t % self._ukf_every) == 0:
+                    p_obs = p2
+                    if self.D != 3:
+                        raise RuntimeError("UKF bearing logic assumes D=3.")
+                    R_wb = np.eye(3)
+
+                    v_b_att = _body_bearing_from_world(p_obs, R_wb, p1)
+                    az_att_true, el_att_true = _azel_from_body_vec(v_b_att)
+                    z_att_true = np.array([az_att_true, el_att_true], float)
+
+                    z_att_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
+                    z_att_meas = z_att_true + z_att_noise
+
+                    z_att_hat_prior = self.att_ukf.h(self.att_ukf.x.copy(), p_obs, R_wb)
+                    att_innov = z_att_meas - z_att_hat_prior
+                    att_innov[0] = (att_innov[0] + np.pi) % (2*np.pi) - np.pi
+                    att_innov[1] = (att_innov[1] + np.pi) % (2*np.pi) - np.pi
+                    att_meas_innov_sq = float(att_innov @ att_innov)
+
+                    self.att_ukf.update(z_att_meas, p_obs, R_wb)
+
+                att_meas_trPpos = float(np.trace(self.att_ukf.P[0:3, 0:3]))
+                self._latest_att_meas_innov = att_meas_innov_sq
+                self._latest_att_meas_trP = att_meas_trPpos
+            else:
+                self._latest_att_meas_innov = 0.0
+                self._latest_att_meas_trP = 0.0
         else:
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
+            self._latest_att_meas_innov = 0.0
+            self._latest_att_meas_trP = 0.0
 
-        # # ---- choose geometry p2_geom (belief if UKF on, else truth) ----
-        # if self.use_ukf and (self.ukf is not None):
-        #     p2_geom = self.ukf.x[:self.D].copy()
-        #     # (keep your sanity clip logic here if you want)
-        # else:
-        #     p2_geom = p2
+        use_zero_sum_ukf = (self.reward_type == "zero_sum_ukf")
+        use_zero_sum = (self.reward_type == "zero_sum")
 
-        if self.reward_from_belief and self.use_ukf and (self.ukf is not None):
-            p2_reward, v2_reward = self._belief_state(p2, v2)
+        # Keep the original game objective for the UKF zero-sum mode: the policy acts
+        # from belief-space observations, but the task reward is still computed on truth.
+        if use_zero_sum_ukf:
+            p2_reward, v2_reward = p2, v2
         else:
             p2_reward, v2_reward = p2, v2
+
+        center_reward = self.center
 
         # ---- shared geometry needed by whichever reward(s) we compute ----
         # d2 and rel2 are used by both rewards
@@ -751,31 +960,70 @@ class Env:
         r1 = 0.0
         r2 = 0.0
 
-        use_security = False
-        use_zero_sum = True
-
-
         #Visualize what strategies 
         # Off policy methods 
 
         if use_zero_sum:
-
-            dist_rel = np.linalg.norm(p2_reward - p1)
-            dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self.radius
-
+            if self.use_kf:
+                raise RuntimeError("use_zero_sum requires use_kf=False.")
             g = (
                 self.k_pos * d2
-                # - (self.k_dock) * dock_gap                
-                # - (self.k_pos/1.5) * rel2
-                # + k_time
             )
 
             # Control effort: defender pays for actuation directly in g, attacker sees the
             # sign-flipped version through r_att = -g.
             # g += - self.lD * a1n2 + self.lA * a2n2
 
-            # if self.use_ukf and self.use_meas_reward:
-            #     g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
+            if self.use_fuel:
+                # eff_def = thrust_def / (self.Tmax_def + 1e-9)
+                # eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
+                # g += - self.k_eff_def * eff_def + self.k_eff_att * eff_att
+                burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
+                burn_frac_att = (mdot_att_all[0] * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
+                g += - self.k_eff_def * burn_frac_def + self.k_eff_att * burn_frac_att
+
+
+            if done:
+                # Example: encode hit_target / collision / oob into g so the sign flip is consistent
+                # if collision:
+                #     g += self.collision_penalty_def
+                if collision:
+                    g += self.collision_penalty
+                elif att_hit_target or def_hit_target:
+                    g -= self.target_hit_reward_penalty
+                elif oob1:
+                    g -= self.wall_penalty
+                elif oob2_any:
+                    g += self.wall_penalty
+
+                elif self.use_fuel:
+                    if fuel_depleted_def:
+                        g -= self.fuel_depletion_penalty
+                    if fuel_depleted_att:
+                        g += self.fuel_depletion_penalty
+
+                # If you want attacker “success” to matter, it should reduce defender g,
+                # which automatically increases attacker reward via -g.
+
+
+            # if done and collision:
+            #     shared_termination += self.collision_penalty
+
+            if need_def:
+                r1 = g 
+            if need_att:
+                r2 = -g
+
+        elif use_zero_sum_ukf:
+            if not self.use_kf:
+                raise RuntimeError("use_zero_sum_ukf requires use_kf=True.")
+            g = (
+                self.k_pos * d2
+            )
+
+            # Control effort: defender pays for actuation directly in g, attacker sees the
+            # sign-flipped version through r_att = -g.
+            # g += - self.lD * a1n2 + self.lA * a2n2
 
             if self.use_fuel:
                 # eff_def = thrust_def / (self.Tmax_def + 1e-9)
@@ -819,9 +1067,10 @@ class Env:
 
 
             
+            
 
         else:
-            raise("Failed")
+            raise RuntimeError("Unsupported reward configuration.")
 
 
         # track d2_prev based on the geometry used for reward (same as your current logic)
@@ -832,10 +1081,17 @@ class Env:
         d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
         d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
         d2_belief_norm = None
-        if self.use_ukf and (self.ukf is not None):
+        p2_est_err_norm = None
+        if self.use_kf and (self.ukf is not None):
             p2_belief, _ = self._belief_state(p2, v2)
             d2_belief_norm = float(np.dot(p2_belief - self.center, p2_belief - self.center)) / (self.radius**2)
-
+            p2_est_err_norm = float(np.dot(p2_belief - p2, p2_belief - p2)) / (self.radius**2)
+        d1_belief_norm = None
+        p1_est_err_norm = None
+        if self.use_kf and (self.att_ukf is not None):
+            p1_belief, _ = self._attacker_belief_state(p1, v1)
+            d1_belief_norm = float(np.dot(p1_belief - self.center, p1_belief - self.center)) / (self.radius**2)
+            p1_est_err_norm = float(np.dot(p1_belief - p1, p1_belief - p1)) / (self.radius**2)
         info = {
             "t": self.t,
             "d2_norm": d2,                 # whatever you used for reward (belief if UKF)
@@ -852,11 +1108,19 @@ class Env:
 
         }
 
-        if self.use_ukf:
+        if self.use_kf:
             info["meas_innov_sq"] = meas_innov_sq
             info["ukf_trPpos"] = meas_trPpos
+            info["att_meas_innov_sq"] = att_meas_innov_sq
+            info["att_ukf_trPpos"] = att_meas_trPpos
             if d2_belief_norm is not None:
                 info["d2_belief_norm"] = d2_belief_norm
+            if p2_est_err_norm is not None:
+                info["p2_est_err_norm"] = p2_est_err_norm
+            if d1_belief_norm is not None:
+                info["d1_belief_norm"] = d1_belief_norm
+            if p1_est_err_norm is not None:
+                info["p1_est_err_norm"] = p1_est_err_norm
 
         if self.use_fuel:
             fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
@@ -878,13 +1142,10 @@ class Env:
 
 
 
-    def _obs(self) -> np.ndarray:
+    def _obs_def(self) -> np.ndarray:
         p1, v1, pA_list, vA_list = self._unpack(self.state)
 
-        # For now, rule attackers don't use obs; obs is defender-centric.
-        # We stack all attacker info.
-        if self.use_ukf and (self.ukf is not None) and self.num_attackers == 1:
-            # existing UKF path for single attacker
+        if self.use_kf and (self.ukf is not None) and self.num_attackers == 1:
             p2_obs = self.ukf.x[:self.D]
             v2_obs = self.ukf.x[self.D:2*self.D]
             pA_obs = [p2_obs]
@@ -893,13 +1154,15 @@ class Env:
             pA_obs = pA_list
             vA_obs = vA_list
 
+        center_obs = self.center.copy()
+
         # build obs = [p1c, pA1c, ..., pANc, rel1, ..., relN, v1, vA1, ..., vAN]
-        p1c = p1 - self.center
+        p1c = p1 - center_obs
         parts = [p1c]
 
         # positions (centered)
         for pA in pA_obs:
-            parts.append(pA - self.center)
+            parts.append(pA - center_obs)
 
         # relative positions
         for pA in pA_obs:
@@ -923,6 +1186,34 @@ class Env:
 
         obs = np.concatenate(parts).astype(np.float32)
         return obs
+
+    def _obs_att(self) -> np.ndarray:
+        p1, v1, pA_list, vA_list = self._unpack(self.state)
+        p2 = pA_list[0]
+        v2 = vA_list[0]
+
+        if self.use_kf and (self.att_ukf is not None) and self.num_attackers == 1:
+            p1_obs, v1_obs = self._attacker_belief_state(p1, v1)
+        else:
+            p1_obs, v1_obs = p1, v1
+
+        center_obs = self.center.copy()
+        p1c = p1_obs - center_obs
+        parts = [p1c, p2 - center_obs, p2 - p1_obs, v1_obs, v2]
+
+        if self.use_fuel:
+            fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
+            fuel_frac_att = (self.m_att[0] - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
+            parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
+            parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
+
+        return np.concatenate(parts).astype(np.float32)
+
+    def get_obs_pair(self):
+        return self._obs_def(), self._obs_att()
+
+    def _obs(self) -> np.ndarray:
+        return self._obs_def()
 
 
 
@@ -1102,16 +1393,28 @@ class VecEnv:
         for e in self.envs:
             e.set_opp_domain(_sample_opp_domain(e.cfg))
 
-        o = [e.reset() for e in self.envs]
-        self.obs = np.stack(o, axis=0)
+        self._refresh_obs(reset_envs=True)
+
+    def _refresh_obs(self, reset_envs: bool = False):
+        obs_def = []
+        obs_att = []
+        for e in self.envs:
+            if reset_envs:
+                e.reset()
+            o_def, o_att = e.get_obs_pair()
+            obs_def.append(o_def)
+            obs_att.append(o_att)
+        self.obs_def = np.stack(obs_def, axis=0)
+        self.obs_att = np.stack(obs_att, axis=0)
+        self.obs = self.obs_def
 
     def reset(self):
-        o = [e.reset() for e in self.envs]
-        self.obs = np.stack(o, axis=0)
+        self._refresh_obs(reset_envs=True)
         return self.obs
 
     def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
         obs_next = []
+        obs_att_next = []
         r1, r2, done, info = [], [], [], []
         for i, e in enumerate(self.envs):
             o, R1, R2, d, inf = e.step(a1_env[i], aA_env[i], reward_mode=reward_mode)
@@ -1120,9 +1423,13 @@ class VecEnv:
                 if e.opp_resample == "episode":
                     e.set_opp_domain(_sample_opp_domain(e.cfg))
                 o = e.reset()
-            obs_next.append(o)
+            o_def, o_att = e.get_obs_pair()
+            obs_next.append(o_def)
+            obs_att_next.append(o_att)
             r1.append(R1); r2.append(R2); done.append(d); info.append(inf)
-        self.obs = np.stack(obs_next, axis=0)
+        self.obs_def = np.stack(obs_next, axis=0)
+        self.obs_att = np.stack(obs_att_next, axis=0)
+        self.obs = self.obs_def
         return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
 
 

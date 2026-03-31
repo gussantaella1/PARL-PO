@@ -157,6 +157,20 @@ def plot_training_metrics(
         ax.legend()
         figs.append(("distances", fig))
 
+    # 2b) Estimator errors
+    err_keys = [k for k in ["p2_est_err_mean", "p1_est_err_mean"] if k in metrics]
+    if err_keys:
+        fig = plt.figure()
+        ax = plt.gca()
+        _plot_if(ax, "p2_est_err_mean", "Defender estimator RMS pos err on attacker (m)")
+        _plot_if(ax, "p1_est_err_mean", "Attacker estimator RMS pos err on defender (m)")
+        ax.set_xlabel("Update")
+        ax.set_ylabel("RMS position error (m)")
+        ax.set_title(f"{title} — Estimator Errors" if title else "Estimator Errors")
+        ax.grid(True)
+        ax.legend()
+        figs.append(("ukf_errors", fig))
+
     # 3) Learning rates
     if ("lr_pi" in metrics) or ("lr_vf" in metrics):
         fig = plt.figure()
@@ -183,7 +197,7 @@ def plot_training_metrics(
         ax.legend()
         figs.append(("policy_stats", fig))
 
-    # 5) UKF stats
+    # 5) Estimator stats
     if ("meas_innov_mean" in metrics) or ("ukf_trPpos_mean" in metrics):
         fig = plt.figure()
         ax = plt.gca()
@@ -191,7 +205,7 @@ def plot_training_metrics(
         _plot_if(ax, "ukf_trPpos_mean", "ukf_trPpos_mean (trace(P_pos))")
         ax.set_xlabel("Update")
         ax.set_ylabel("Value")
-        ax.set_title(f"{title} — UKF stats" if title else "UKF stats")
+        ax.set_title(f"{title} — Estimator stats" if title else "Estimator stats")
         ax.grid(True)
         ax.legend()
         figs.append(("ukf_stats", fig))
@@ -515,4 +529,3 @@ def plot_ic_used_from_npz(
         out_path=out_path,
         show=show,
     )
-

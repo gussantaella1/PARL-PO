@@ -121,17 +121,22 @@ class AgentUKF:
     UKF with selectable linear dynamics:
       - dyn='cv'  : constant-velocity (legacy)
       - dyn='hcw' : HCW relative motion (needs dt and hcw params)
-    State: x=[px,py,pz,vx,vy,vz], u=[ax,ay,az]
+    State:
+      - 6D: x=[px,py,pz,vx,vy,vz]
+      - 9D: x=[px,py,pz,vx,vy,vz,ax,ay,az]
+    External control input u=[ax,ay,az] remains optional.
     """
     def __init__(self, x0, P0, Q, R, dt,
                  alpha=1e-3, beta=2.0, kappa=0.0,
                  dyn='cv', hcw=None):
-        self.x  = np.asarray(x0, float).reshape(6)
+        self.x  = np.asarray(x0, float).reshape(-1)
+        if self.x.size not in (6, 9):
+            raise ValueError(f"AgentUKF expects 6D or 9D state, got {self.x.size}.")
         self.P  = _psd_enforce(np.asarray(P0, float))
         self.Q  = _psd_enforce(np.asarray(Q,  float))
         self.R  = _psd_enforce(np.asarray(R,  float))
         self.dt = float(dt)
-        self.n  = 6
+        self.n  = int(self.x.size)
 
         lam, Wm0, Wmi, Wc0, Wci, c = _ukf_weights(self.n, alpha, beta, kappa)
         self._Wm0, self._Wmi, self._Wc0, self._Wci, self._c = Wm0, Wmi, Wc0, Wci, c
@@ -149,7 +154,8 @@ class AgentUKF:
     # ---- CV matrices (legacy) ----
     def F(self, dt=None):
         if dt is None: dt = self.dt
-        F = np.eye(6); F[0,3]=dt; F[1,4]=dt; F[2,5]=dt
+        F = np.eye(6)
+        F[0,3]=dt; F[1,4]=dt; F[2,5]=dt
         return F
 
     def B_accel(self, dt=None):
@@ -158,6 +164,30 @@ class AgentUKF:
         B[0:3, 0:3] = 0.5 * (dt**2) * np.eye(3)
         B[3:6, 0:3] = dt * np.eye(3)
         return B
+
+    def linear_dynamics_mats(self, dt=None):
+        if dt is None:
+            dt = self.dt
+        if self._dyn == 'hcw':
+            if dt != self.dt or self._Ad is None:
+                n = hcw_mean_motion(self._hcw_params)
+                Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+                Ad6 = as_numpy_const(Ad_mx)
+                Bd6 = as_numpy_const(Bd_mx)
+            else:
+                Ad6, Bd6 = self._Ad, self._Bd
+        else:
+            Ad6, Bd6 = self.F(dt), self.B_accel(dt)
+
+        if self.n == 6:
+            return Ad6, Bd6
+
+        A = np.eye(9)
+        A[:6, :6] = Ad6
+        A[:6, 6:9] = Bd6
+        B = np.zeros((9, 3))
+        B[:6, :] = Bd6
+        return A, B
 
     # ---- measurement model (bearing in observer BODY frame) ----
     def h(self, x, p_obs, R_wb):
@@ -177,24 +207,11 @@ class AgentUKF:
                     raise ValueError("u in body frame but R_wb_tgt is None")
                 u_world = R_wb_tgt.T @ u_world
 
-        if self._dyn == 'hcw':
-            # ensure Ad/Bd match requested dt
-            if dt != self.dt or self._Ad is None:
-                n = hcw_mean_motion(self._hcw_params)
-                Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
-                Ad_np, Bd_np = as_numpy_const(Ad_mx), as_numpy_const(Bd_mx)
-            else:
-                Ad_np, Bd_np = self._Ad, self._Bd
-            x_next = Ad_np @ x
-            if u_world is not None:
-                x_next = x_next + Bd_np @ u_world
-            return x_next
-        else:  # 'cv'
-            F = self.F(dt)
-            x_next = F @ x
-            if u_world is not None:
-                x_next = x_next + self.B_accel(dt) @ u_world
-            return x_next
+        A, B = self.linear_dynamics_mats(dt)
+        x_next = A @ x
+        if u_world is not None:
+            x_next = x_next + B @ u_world
+        return x_next
 
     # ---- UKF time update ----
     def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
@@ -225,10 +242,7 @@ class AgentUKF:
         # add input uncertainty if provided
         if u_cov is not None:
             U = _psd_enforce(np.asarray(u_cov, float))
-            if self._dyn == 'hcw':
-                Bd = self._Bd           # already matches dt above
-            else:
-                Bd = self.B_accel(dt)
+            _, Bd = self.linear_dynamics_mats(dt)
             P_pred += Bd @ U @ Bd.T
 
         self.x = x_pred
@@ -248,7 +262,7 @@ class AgentUKF:
 
         # innovation & cross-cov
         S   = self.R.copy()
-        Pxz = np.zeros((6, 2))
+        Pxz = np.zeros((self.n, 2))
 
         dz0 = Zsig[0] - z_pred
         dz0[0] = _normalize_angle(dz0[0]); dz0[1] = _normalize_angle(dz0[1])
@@ -287,20 +301,34 @@ def KF_CV(x0, P0, Q, R, dt,
           kind: str = "ukf",
           dyn: str = "cv",
           hcw: dict | None = None,
-          **kwargs) -> AgentUKF:
+          **kwargs):
     """
     Backwards-compatible helper so older code can do:
         KF_CV(x0, P0, Q, R, dt, kind="ukf", dyn="hcw", hcw=hcw_params)
-
-    We ignore `kind` (we only implement a UKF) and just construct AgentUKF.
+        KF_CV(x0, P0, Q, R, dt, kind="ekf", dyn="hcw", hcw=hcw_params)
     """
+    kind = (kind or "ukf").lower()
     dyn = (dyn or "cv").lower()
+    if kind == "ekf":
+        from ekf_estimator import AgentEKF
+
+        return AgentEKF(
+            x0=x0,
+            P0=P0,
+            Q=Q,
+            R=R,
+            dt=dt,
+            dyn=dyn,
+            hcw=hcw,
+        )
+
     return AgentUKF(
         x0=x0,
         P0=P0,
         Q=Q,
         R=R,
         dt=dt,
-        dyn=dyn,      # 'cv' or 'hcw'
+        dyn=dyn,
         hcw=hcw,
+        **kwargs,
     )

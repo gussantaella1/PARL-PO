@@ -89,7 +89,8 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "def_ckpt_path": None,
     "att_ckpt_path": None,
     "deterministic": False,
-    "use_ukf": False,
+    "use_kf": False,
+    "estimator_kind": None,
     "x0_pos_jitter": None,
     "x0_vel_jitter": None,
     "dynamics": None,
@@ -1497,7 +1498,9 @@ def main():
         help="Opponent controller used in evaluation. 'policy' preserves the current policy-vs-policy rollout path.",
     )
     ap.add_argument("--deterministic", action="store_true", help="Force rl_eval_deterministic=True")
-    ap.add_argument("--use_ukf", action="store_true", help="Force use_ukf=True")
+    ap.add_argument("--use_kf", action="store_true", help="Force use_kf=True")
+    ap.add_argument("--estimator_kind", choices=["ukf", "ekf"], default=None,
+                    help="Force the enabled estimator kind. Setting this also enables the estimator.")
     ap.add_argument("--x0_pos_jitter", type=float, default=None)
     ap.add_argument("--x0_vel_jitter", type=float, default=None)
 
@@ -1603,8 +1606,11 @@ def main():
 
     if args.deterministic:
         cfg0["rl_eval_deterministic"] = True
-    if args.use_ukf:
-        cfg0["use_ukf"] = True
+    if args.use_kf:
+        cfg0["use_kf"] = True
+    if args.estimator_kind is not None:
+        cfg0["use_kf"] = True
+        cfg0["estimator_kind"] = str(args.estimator_kind)
 
     if args.x0_pos_jitter is not None or args.x0_vel_jitter is not None:
         cfg0.setdefault("x0_jitter", {})
@@ -1619,9 +1625,12 @@ def main():
     D = int(cfg0.get("D", 3))
     num_attackers = max(1, int(cfg0.get("num_attackers", 1)))
     dyn_name = str(cfg0.get("dynamics", "hcw"))
+    use_kf = bool(cfg0.get("use_kf", False))
+    estimator_kind = str(cfg0.get("estimator_kind", "ukf"))
     log(f"[eval] cfg summary: D={D} num_attackers={num_attackers} dynamics={dyn_name}")
     log(f"[eval] ckpts: def={cfg0.get('def_ckpt_path', None)} att={cfg0.get('att_ckpt_path', None)} "
-        f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} use_ukf={cfg0.get('use_ukf', False)}")
+        f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} "
+        f"use_kf={use_kf} estimator_kind={estimator_kind}")
     log(f"[eval] matchup: policy_role={args.policy_role} opponent_source={args.opponent_source}")
 
     # ---------------------------

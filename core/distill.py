@@ -494,17 +494,20 @@ def _ukf_student_features_from_env(
     For num_attackers>1 the env does not provide a UKF, so we fall back to the
     current observation with zero covariance features.
     """
-    obs = env._obs().astype(np.float32)
+    if distill_role == "att" and hasattr(env, "_obs_att"):
+        obs = env._obs_att().astype(np.float32)
+    else:
+        obs = env._obs().astype(np.float32)
     D = int(env.D)
     Na = int(getattr(env, "num_attackers", 1))
 
-    if distill_role == "att":
+    if distill_role == "att" and Na > 1:
         obs = _permute_obs_np(obs, D, Na, attacker_idx)
 
     xhat_rel = _relative_state_from_obs(obs, D, Na)
     sigma_dim = xhat_rel.size * (xhat_rel.size + 1) // 2
 
-    if getattr(env, "use_ukf", False) and getattr(env, "ukf", None) is not None and Na == 1:
+    if getattr(env, "use_kf", False) and getattr(env, "ukf", None) is not None and Na == 1:
         P = np.asarray(env.ukf.P, dtype=np.float32)
         P_rel = P[: 2 * D, : 2 * D]
         iu = np.triu_indices(2 * D)
@@ -732,7 +735,7 @@ def distill_from_teacher_paper_recurrent(
 
     cfg = copy.deepcopy(cfg)
     Na = _num_attackers(cfg)
-    cfg["use_ukf"] = (Na == 1)
+    cfg["use_kf"] = (Na == 1)
     if Na > 1:
         print(
             "[distill] num_attackers>1: UKF is unavailable, so distillation uses direct env observations "
@@ -1205,7 +1208,7 @@ def distill_from_teacher_modern(
 
     """
     cfg_mod = copy.deepcopy(cfg)
-    cfg_mod["use_ukf"] = (_num_attackers(cfg_mod) == 1)
+    cfg_mod["use_kf"] = (_num_attackers(cfg_mod) == 1)
     cfg_mod["_distill_save_method"] = "modern"
     cfg_mod.setdefault("distill_paper_action_loss", "mse")
     cfg_mod.setdefault("distill_paper_intent_loss", "mse")

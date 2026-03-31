@@ -161,6 +161,10 @@ def _act_from_opponent_policy_mix(
         out[mask] = a
     return out
 
+
+def _role_obs_batch(role: str, obs_def: torch.Tensor, obs_att: torch.Tensor) -> torch.Tensor:
+    return obs_def if role == "def" else obs_att
+
 def train(cfg: Dict[str, Any]):
 
 
@@ -211,7 +215,7 @@ def train(cfg: Dict[str, Any]):
     log_every = int(cfg.get("log_every"))
 
     vec = VecEnv(make_env, num_envs)
-    obs_dim = vec.obs.shape[1]
+    obs_dim = vec.obs_def.shape[1]
     act_dim = int(cfg["D"])
 
     ppo = PPO(obs_dim, act_dim, cfg, device=device)
@@ -283,6 +287,8 @@ def train(cfg: Dict[str, Any]):
         "d1_mean": [],          # defender true distance
         "d2_mean": [],          # attacker belief distance (what obs sees)
         "d2_true_mean": [],     # attacker true distance
+        "p2_est_err_mean": [],  # defender-side UKF RMS position error
+        "p1_est_err_mean": [],  # attacker-side UKF RMS position error
         "meas_innov_mean": [],  # optional
         "ukf_trPpos_mean": [],  # optional
         "lr_pi": [],
@@ -364,7 +370,8 @@ def train(cfg: Dict[str, Any]):
             bufA = None
 
 
-        o = torch.as_tensor(vec.obs, dtype=torch.float32, device=device)
+        o_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
+        o_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
         ep_ret_def = np.zeros(num_envs, dtype=np.float64)
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
@@ -372,6 +379,8 @@ def train(cfg: Dict[str, Any]):
         d1_true_acc = 0.0
         d2_true_acc = 0.0
         d2_belief_acc = 0.0
+        p2_est_err_acc = 0.0
+        p1_est_err_acc = 0.0
         meas_innov_acc = 0.0
         trP_acc = 0.0
         info_count = 0
@@ -391,25 +400,31 @@ def train(cfg: Dict[str, Any]):
         for _ in range(steps_per_env):
             with torch.no_grad():
                 if train_role == "def":
-                    a1, lp1, v1 = ppo.act(o, who="def", deterministic=False)
+                    a1, lp1, v1 = ppo.act(o_def, who="def", deterministic=False)
                     if opp_policy_mix is not None:
                         a2 = _act_from_opponent_policy_mix(
-                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
+                            _role_obs_batch(opp_policy_mix["opp_role"], o_def, o_att),
+                            opp_policy_mix,
+                            mix_active_idx,
+                            ppo.act_scale,
                         )
-                        lp2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
-                        v2 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        lp2 = torch.zeros(num_envs, dtype=o_att.dtype, device=device)
+                        v2 = torch.zeros(num_envs, dtype=o_att.dtype, device=device)
                     else:
-                        a2, lp2, v2 = ppo.act(o, who="att", deterministic=True)
+                        a2, lp2, v2 = ppo.act(o_att, who="att", deterministic=True)
                 elif train_role == "att":
                     if opp_policy_mix is not None:
                         a1 = _act_from_opponent_policy_mix(
-                            o, opp_policy_mix, mix_active_idx, ppo.act_scale
+                            _role_obs_batch(opp_policy_mix["opp_role"], o_def, o_att),
+                            opp_policy_mix,
+                            mix_active_idx,
+                            ppo.act_scale,
                         )
-                        lp1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
-                        v1 = torch.zeros(num_envs, dtype=o.dtype, device=device)
+                        lp1 = torch.zeros(num_envs, dtype=o_def.dtype, device=device)
+                        v1 = torch.zeros(num_envs, dtype=o_def.dtype, device=device)
                     else:
-                        a1, lp1, v1 = ppo.act(o, who="def", deterministic=True)
-                    a2, lp2, v2 = ppo.act(o, who="att", deterministic=False)
+                        a1, lp1, v1 = ppo.act(o_def, who="def", deterministic=True)
+                    a2, lp2, v2 = ppo.act(o_att, who="att", deterministic=False)
                 else:
                     raise ValueError(f"Unknown train_role={train_role!r}")
 
@@ -431,14 +446,15 @@ def train(cfg: Dict[str, Any]):
             )
 
 
-            o2 = torch.as_tensor(o2_np, dtype=torch.float32, device=device)
+            o2_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
+            o2_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
             r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
             r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
             d  = torch.as_tensor(d_np,  dtype=torch.float32, device=device)
 
-            bufD.add(o.detach(), a1.detach(), lp1.detach(), v1.detach(), r1, d)
+            bufD.add(o_def.detach(), a1.detach(), lp1.detach(), v1.detach(), r1, d)
             if bufA is not None:
-                bufA.add(o.detach(), a2.detach(), lp2.detach(), v2.detach(), r2, d)
+                bufA.add(o_att.detach(), a2.detach(), lp2.detach(), v2.detach(), r2, d)
 
 
             if train_role == "def":
@@ -447,7 +463,8 @@ def train(cfg: Dict[str, Any]):
             if train_role == "att":
                 ep_ret_att += r2_np
             
-            o = o2
+            o_def = o2_def
+            o_att = o2_att
 
             if opp_policy_mix is not None:
                 mix_counts_update.update(int(i) for i in mix_active_idx.tolist())
@@ -478,6 +495,11 @@ def train(cfg: Dict[str, Any]):
                     d2_belief_acc += inf["d2_true_norm"]
                 elif "d2_norm" in inf:
                     d2_belief_acc += inf["d2_norm"]
+
+                if "p2_est_err_norm" in inf:
+                    p2_est_err_acc += inf["p2_est_err_norm"]
+                if "p1_est_err_norm" in inf:
+                    p1_est_err_acc += inf["p1_est_err_norm"]
 
                 if "meas_innov_sq" in inf:
                     meas_innov_acc += inf["meas_innov_sq"]
@@ -511,12 +533,12 @@ def train(cfg: Dict[str, Any]):
 
 
         with torch.no_grad():
-            next_v_def = ppo.def_net.value(o)
+            next_v_def = ppo.def_net.value(o_def)
         bufD.finalize(next_v_def)
 
         if bufA is not None:
             with torch.no_grad():
-                next_v_att = ppo.att_net.value(o)
+                next_v_att = ppo.att_net.value(o_att)
             bufA.finalize(next_v_att)
 
         # ---- choose what to update ----
@@ -583,10 +605,13 @@ def train(cfg: Dict[str, Any]):
                 d1_true_mean = np.sqrt(d1_true_acc / info_count) * R
                 d2_true_mean = np.sqrt(d2_true_acc / info_count) * R
                 d2_belief_mean = np.sqrt(d2_belief_acc / info_count) * R
+                p2_est_err_mean = np.sqrt(p2_est_err_acc / info_count) * R
+                p1_est_err_mean = np.sqrt(p1_est_err_acc / info_count) * R
                 meas_innov_mean = meas_innov_acc / info_count
                 trP_mean = trP_acc / info_count
             else:
                 d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
+                p2_est_err_mean = p1_est_err_mean = 0.0
                 meas_innov_mean = trP_mean = 0.0
 
 
@@ -675,6 +700,8 @@ def train(cfg: Dict[str, Any]):
             metrics["d1_mean"].append(d1_true_mean)
             metrics["d2_mean"].append(d2_belief_mean)
             metrics["d2_true_mean"].append(d2_true_mean)
+            metrics["p2_est_err_mean"].append(p2_est_err_mean)
+            metrics["p1_est_err_mean"].append(p1_est_err_mean)
             metrics["meas_innov_mean"].append(meas_innov_mean)
             metrics["ukf_trPpos_mean"].append(trP_mean)
 
@@ -693,8 +720,10 @@ def train(cfg: Dict[str, Any]):
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
             print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
             print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
-            if cfg.get("use_ukf", False):
+            if cfg.get("use_kf", False):
+                estimator_label = str(cfg.get("estimator_kind", "ukf")).upper()
                 print(f"   approx belief <||p2-center||> ≈ {d2_belief_mean:.3f}")
+                print(f"   {estimator_label} RMS pos err: def->att={p2_est_err_mean:.3f}, att->def={p1_est_err_mean:.3f}")
                 print(f"   meas_innov_mean={meas_innov_mean:.3e},  trPpos_mean={trP_mean:.3e}")
 
             if cfg.get("fuel", {}).get("enable", False):
@@ -719,6 +748,8 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("dist/def_true_p1_to_center_m", d1_true_mean, gs)
                 writer.add_scalar("dist/att_true_p2_to_center_m", d2_true_mean, gs)
                 writer.add_scalar("dist/att_belief_p2_to_center_m", d2_belief_mean, gs)
+                writer.add_scalar("ukf/p2_est_err_rms_m", p2_est_err_mean, gs)
+                writer.add_scalar("ukf/p1_est_err_rms_m", p1_est_err_mean, gs)
 
                 # ===== Policy stats =====
                 writer.add_scalar("policy/def_mu_abs_mean", muD, gs)
@@ -729,7 +760,7 @@ def train(cfg: Dict[str, Any]):
                 writer.add_scalar("lr/def_value",  lr_vf, gs)
 
                 # ===== UKF stats (if enabled) =====
-                if cfg.get("use_ukf", False):
+                if cfg.get("use_kf", False):
                     writer.add_scalar("ukf/meas_innov_sq_mean", meas_innov_mean, gs)
                     writer.add_scalar("ukf/trP_pos_mean", trP_mean, gs)
 
@@ -946,7 +977,7 @@ def train_with_distill(
             attacker_mode=attacker_mode,
             train_role=train_role,
         )
-        cfg_student["use_ukf"] = True
+        cfg_student["use_kf"] = True
         cfg_student["seed"] = cfg_teacher["seed"] + 1
 
         if extra_train_cfg is not None:

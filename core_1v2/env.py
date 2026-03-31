@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import os
 
-from ukf_estimator import AgentUKF, _body_bearing_from_world, _azel_from_body_vec
+from ukf_estimator import KF_CV, _body_bearing_from_world, _azel_from_body_vec
 from config_rl_1v2 import build_dyn
 from core.utils import set_seed
 
@@ -113,26 +113,32 @@ class Env:
 
 
         # ---- UKF / measurement model knobs ----
-        self.use_ukf          = bool(cfg.get("use_ukf", False))
+        self.use_kf           = bool(cfg.get("use_kf", False))
         self.use_meas_reward  = bool(cfg.get("use_meas_reward", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
         self.meas_cov_coef    = float(cfg.get("meas_cov_coef"))    # weight on trace(P_pos)
-        # `use_ukf` is the single switch for belief-based observations and rewards.
-        self.reward_from_belief = self.use_ukf
+        # `use_kf` is the estimator toggle.
+        self.reward_from_belief = self.use_kf
         self.belief_clip_factor = float(cfg.get("belief_clip_factor", 2.0))
         self.reset_ukf_on_diverge = bool(cfg.get("reset_ukf_on_diverge", True))
+        self._estimator_cfg = dict(cfg.get("ukf", {}))
+        self.estimator_kind = self._normalize_estimator_kind(cfg.get("estimator_kind", "ukf"))
+        self.estimator_label = self.estimator_kind.upper()
+        self._estimator_dyn = None
 
         #Fuel config
         fuel = cfg.get("fuel", {})
         self.use_fuel = bool(fuel.get("enable"))
 
-        if self.use_ukf and self.D != 3:
-            raise ValueError("UKF / bearing-only measurement currently implemented for D=3 only.")
+        if self.use_kf and self.D != 3:
+            raise ValueError("Bearing-only estimator currently implemented for D=3 only.")
 
         self.ukf = None
         self.ukfs = []
         self._latest_meas_innov = 0.0
         self._latest_meas_trP   = 0.0
+        self._ukf_action_access = "ground_truth"
+        self._kf_control_meas_std = np.zeros(3, dtype=float)
 
         self.record_ic_history = bool(cfg.get("record_ic_history", False))
         self.max_ic_history = int(cfg.get("max_ic_history", 200000))
@@ -140,9 +146,10 @@ class Env:
         self.ic_history_def = []
         self.ic_history_att = []
 
-        if self.use_ukf:
-            ukf_cfg = cfg.get("ukf", {})
+        if self.use_kf:
+            ukf_cfg = self._estimator_cfg
             self._ukf_every = max(1, int(ukf_cfg.get("every", 1)))
+            self._estimator_dyn = self._resolve_estimator_dynamics()
 
             # Initial covariance P0
             pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * self.radius))
@@ -168,6 +175,12 @@ class Env:
             # Keep some init stds around for reset-time randomization
             self._ukf_init_pos_std = float(ukf_cfg.get("init_pos_std", pos_std0))
             self._ukf_init_vel_std = float(ukf_cfg.get("init_vel_std", vel_std0))
+            self._ukf_action_access = self._normalize_kf_action_access(
+                ukf_cfg.get("action_access", "ground_truth")
+            )
+            self._kf_control_meas_std = self._normalize_kf_control_noise_std(
+                ukf_cfg.get("action_meas_std", 0.1 * max(abs(float(cfg.get("umax", 1.0))), 1e-3))
+            )
 
         if self.use_fuel:
             self.k_eff_def = float(cfg.get("k_eff_def"))
@@ -242,8 +255,74 @@ class Env:
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
 
+    def _normalize_estimator_kind(self, kind: Any) -> str:
+        key = str(kind).strip().lower()
+        valid = {"ukf", "ekf"}
+        if key not in valid:
+            raise ValueError(f"Unsupported estimator_kind='{kind}'. Expected one of {sorted(valid)}.")
+        return key
+
+    def _normalize_kf_action_access(self, mode: Any) -> str:
+        key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+        if key == "groundtruth":
+            key = "ground_truth"
+        if key == "inferred":
+            key = "measured"
+        valid = {"ground_truth", "measured", "none"}
+        if key not in valid:
+            raise ValueError(f"Unsupported estimator action_access='{mode}'. Expected one of {sorted(valid)}.")
+        return key
+
+    def _normalize_kf_control_noise_std(self, noise_std: Any) -> np.ndarray:
+        arr = np.asarray(noise_std, dtype=float)
+        if arr.ndim == 0:
+            std = np.full(3, float(arr), dtype=float)
+        else:
+            arr = arr.reshape(-1)
+            if arr.size != 3:
+                raise ValueError(
+                    f"Expected estimator action_meas_std to be a scalar or length-3 sequence, got shape {arr.shape}."
+                )
+            std = arr.astype(float)
+        return np.maximum(std, 0.0)
+
+    def _resolve_estimator_dynamics(self) -> str:
+        dyn_name = str(self.cfg.get("dynamics", "hcw")).strip().lower()
+        if dyn_name != "hcw":
+            raise ValueError(
+                f"{self.estimator_label} estimator currently requires cfg['dynamics']='hcw'; got '{dyn_name}'."
+            )
+        return "hcw"
+
+    def _make_estimator(self, x0_est: np.ndarray):
+        return KF_CV(
+            x0=x0_est,
+            P0=self._ukf_P0.copy(),
+            Q=self._ukf_Q.copy(),
+            R=self._ukf_R.copy(),
+            dt=self.dt,
+            kind=self.estimator_kind,
+            dyn=self._estimator_dyn,
+            hcw=self.cfg.get("hcw", {}),
+        )
+
+    def _kf_predict_control(self, ground_truth_u: np.ndarray | None):
+        if ground_truth_u is None:
+            return None, None
+        u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
+        if self._ukf_action_access == "ground_truth":
+            return u_true, None
+        if self._ukf_action_access == "measured":
+            noise = np.random.normal(loc=0.0, scale=self._kf_control_meas_std, size=3)
+            u_meas = u_true + noise
+            umax = float(self.cfg.get("umax", np.inf))
+            if np.isfinite(umax):
+                u_meas = np.clip(u_meas, -umax, umax)
+            return u_meas, np.diag(self._kf_control_meas_std**2)
+        return None, None
+
     def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray, attacker_idx: int = 0):
-        if (not self.use_ukf) or attacker_idx >= len(self.ukfs):
+        if (not self.use_kf) or attacker_idx >= len(self.ukfs):
             return p2_true, v2_true
 
         ukf = self.ukfs[attacker_idx]
@@ -499,7 +578,7 @@ class Env:
         threat_idx, p2, v2, att_center_dists = self._select_reward_attacker(pA_list, vA_list)
 
         self.ukfs = []
-        if self.use_ukf:
+        if self.use_kf:
             for pA_true, vA_true in zip(pA_list, vA_list):
                 pos_noise = np.random.normal(
                     scale=self._ukf_init_pos_std,
@@ -514,15 +593,7 @@ class Env:
                 x0_ukf = np.concatenate([pA_est, vA_est])
 
                 self.ukfs.append(
-                    AgentUKF(
-                        x0=x0_ukf,
-                        P0=self._ukf_P0.copy(),
-                        Q=self._ukf_Q.copy(),
-                        R=self._ukf_R.copy(),
-                        dt=self.dt,
-                        dyn='hcw',
-                        hcw=self.cfg.get("hcw", {}),
-                    )
+                    self._make_estimator(x0_ukf)
                 )
 
             self._latest_meas_innov = 0.0
@@ -537,7 +608,7 @@ class Env:
         self.ukf = self.ukfs[0] if len(self.ukfs) == 1 else None
 
         # ---- initialize d2_prev using the same geometry mode as step rewards ----
-        if self.reward_from_belief and self.use_ukf and self.ukfs:
+        if self.reward_from_belief and self.use_kf and self.ukfs:
             pA_geom_list, _ = self._belief_states(pA_list, vA_list)
             _, p2_geom, _, _ = self._select_reward_attacker(pA_geom_list, vA_list)
         else:
@@ -635,7 +706,7 @@ class Env:
         meas_innov_sq = 0.0
         meas_trPpos   = 0.0
 
-        if self.use_ukf:
+        if self.use_kf:
             p_obs = p1
             if self.D != 3:
                 raise RuntimeError("UKF bearing logic assumes D=3.")
@@ -643,8 +714,9 @@ class Env:
 
             innov_vals = []
             trP_vals = []
-            for ukf, pA_true in zip(self.ukfs, pA_list):
-                ukf.predict(dt=self.dt, u=None, u_cov=None)
+            for ukf, pA_true, aA_true in zip(self.ukfs, pA_list, aA_real):
+                u_pred, u_cov = self._kf_predict_control(aA_true)
+                ukf.predict(dt=self.dt, u=u_pred, u_cov=u_cov)
                 if (self.t % self._ukf_every) == 0:
                     v_b = _body_bearing_from_world(p_obs, R_wb, pA_true)
                     az_true, el_true = _azel_from_body_vec(v_b)
@@ -670,14 +742,7 @@ class Env:
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = 0.0
 
-        # # ---- choose geometry p2_geom (belief if UKF on, else truth) ----
-        # if self.use_ukf and (self.ukf is not None):
-        #     p2_geom = self.ukf.x[:self.D].copy()
-        #     # (keep your sanity clip logic here if you want)
-        # else:
-        #     p2_geom = p2
-
-        if self.reward_from_belief and self.use_ukf and self.ukfs:
+        if self.reward_from_belief and self.use_kf and self.ukfs:
             pA_reward_list, vA_reward_list = self._belief_states(pA_list, vA_list)
             threat_idx, p2_reward, v2_reward, _ = self._select_reward_attacker(pA_reward_list, vA_reward_list)
             p2 = pA_list[threat_idx]
@@ -872,9 +937,6 @@ class Env:
             # sign-flipped version through r_att = -g.
             # g += - self.lD * a1n2 + self.lA * a2n2
 
-            # if self.use_ukf and self.use_meas_reward:
-            #     g -= (self.meas_innov_coef * meas_innov_sq) + (self.meas_cov_coef * meas_trPpos)
-
             if self.use_fuel:
                 # eff_def = thrust_def / (self.Tmax_def + 1e-9)
                 # eff_att = thrust_att_all[0] / (self.Tmax_att + 1e-9)
@@ -930,7 +992,7 @@ class Env:
         d1_true_norm = float(np.dot(p1 - self.center, p1 - self.center)) / (self.radius**2)
         d2_true_norm = float(np.dot(p2 - self.center, p2 - self.center)) / (self.radius**2)
         d2_belief_norm = None
-        if self.use_ukf and self.ukfs:
+        if self.use_kf and self.ukfs:
             p2_belief, _ = self._belief_state(p2, v2, attacker_idx=threat_idx)
             d2_belief_norm = float(np.dot(p2_belief - self.center, p2_belief - self.center)) / (self.radius**2)
 
@@ -952,7 +1014,7 @@ class Env:
 
         }
 
-        if self.use_ukf:
+        if self.use_kf:
             info["meas_innov_sq"] = meas_innov_sq
             info["ukf_trPpos"] = meas_trPpos
             if d2_belief_norm is not None:
@@ -984,7 +1046,7 @@ class Env:
 
         # For now, rule attackers don't use obs; obs is defender-centric.
         # We stack all attacker info.
-        if self.use_ukf and self.ukfs:
+        if self.use_kf and self.ukfs:
             pA_obs, vA_obs = self._belief_states(pA_list, vA_list)
         else:
             pA_obs = pA_list

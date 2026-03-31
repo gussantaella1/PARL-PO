@@ -20,6 +20,61 @@ def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
     return np.array([u[0], u[1], 0.0], dtype=float)
 
 
+def _normalize_kf_action_access(mode: Any) -> str:
+    key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+    if key == "groundtruth":
+        key = "ground_truth"
+    if key == "inferred":
+        key = "measured"
+    valid = {"ground_truth", "measured", "none"}
+    if key not in valid:
+        raise ValueError(f"Unsupported estimator action_access='{mode}'. Expected one of {sorted(valid)}.")
+    return key
+
+
+def _normalize_kf_control_noise_std(noise_std: Any, default_std: float) -> np.ndarray:
+    arr = np.asarray(noise_std if noise_std is not None else default_std, dtype=float)
+    if arr.ndim == 0:
+        std = np.full(3, float(arr), dtype=float)
+    else:
+        arr = arr.reshape(-1)
+        if arr.size != 3:
+            raise ValueError(
+                f"Expected estimator action_meas_std to be a scalar or length-3 sequence, got shape {arr.shape}."
+            )
+        std = arr.astype(float)
+    return np.maximum(std, 0.0)
+
+
+def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
+    kind = cfg.get("estimator_kind", "ukf")
+    key = str(kind).strip().lower()
+    if key not in {"ukf", "ekf"}:
+        raise ValueError(f"Unsupported estimator_kind='{kind}'. Expected 'ukf' or 'ekf'.")
+    return key
+
+
+def _kf_predict_control(
+    action_access: str,
+    ground_truth_u: np.ndarray | None,
+    control_meas_std: np.ndarray | None = None,
+    control_limit: float | None = None,
+):
+    if ground_truth_u is None:
+        return None, None
+    u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
+    if action_access == "ground_truth":
+        return u_true, None
+    if action_access == "measured":
+        std = np.asarray(control_meas_std if control_meas_std is not None else np.zeros(3), dtype=float).reshape(3)
+        noise = np.random.normal(loc=0.0, scale=std, size=3)
+        u_meas = u_true + noise
+        if control_limit is not None and np.isfinite(control_limit):
+            u_meas = np.clip(u_meas, -control_limit, control_limit)
+        return u_meas, np.diag(std**2)
+    return None, None
+
+
 def _pack_multi_agent_rollout(
     *,
     plan_hist_all,
@@ -230,10 +285,11 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     center = np.asarray(center_from_dyn, dtype=np.float32)
 
     dyn_name = str(cfg.get("dynamics", "hcw")).lower()
-    use_ukf = bool(cfg.get("use_ukf", False))
-    if use_ukf and dyn_name != "hcw":
-        print("[warn] UKF in this runner is HCW-only; disabling use_ukf for non-HCW dynamics.")
-        use_ukf = False
+    use_kf = bool(cfg.get("use_kf", False))
+    estimator_kind = _normalize_estimator_kind(cfg)
+    if use_kf and dyn_name != "hcw":
+        print(f"[warn] {estimator_kind.upper()} in this runner is HCW-only; disabling estimator for non-HCW dynamics.")
+        use_kf = False
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
@@ -247,36 +303,59 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             return x6.astype(np.float32)
         return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
 
-    ukf_cfg = cfg.get("ukf", {}) if use_ukf else {}
+    ukf_cfg = dict(cfg.get("ukf", {}))
+    if not use_kf:
+        ukf_cfg = {}
     ukf_list = []
     xA_est_list = [xA.copy() for xA in xA_list]
-    if use_ukf:
+    if use_kf:
         sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
         sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
         meas_every = max(1, int(ukf_cfg.get("every", 1)))
-        pos_std0 = float(ukf_cfg.get("init_pos_std", 0.2 * arena_r))
-        vel_std0 = float(ukf_cfg.get("init_vel_std", 0.01))
+        ukf_action_access = _normalize_kf_action_access(ukf_cfg.get("action_access", "ground_truth"))
+        ukf_control_meas_std = _normalize_kf_control_noise_std(
+            ukf_cfg.get("action_meas_std", 0.1 * max(abs(umax), 1e-3)),
+            default_std=0.1 * max(abs(umax), 1e-3),
+        )
+        ukf_state_dim = 6
+        pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * arena_r))
+        vel_std0 = float(ukf_cfg.get("vel_std0", 0.01))
+        init_mean_pos_std = float(ukf_cfg.get("init_mean_pos_std", 0.0))
+        init_mean_vel_std = float(ukf_cfg.get("init_mean_vel_std", 0.0))
+        init_mean_accel_std = float(ukf_cfg.get("init_mean_accel_std", 0.0))
         Q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
+        accel_std0 = float(ukf_cfg.get("accel_std0", max(abs(umax), 1e-3)))
+        accel_q_scale = float(ukf_cfg.get("accel_Q_scale", Q_scale))
 
-        P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
-        Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
+        if ukf_state_dim == 9:
+            P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3 + [accel_std0**2] * 3)
+            Q = np.diag([Q_scale] * 6 + [accel_q_scale] * 3)
+        else:
+            P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
+            Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
         Rm = np.diag([sigma_az**2, sigma_el**2])
         hcw_params = cfg.get("hcw", {})
 
         for j in range(Na):
             xA6 = _x6_from_xD(xA_list[j])
+            xA6_mean = xA6.copy()
+            xA6_mean[:3] += np.random.normal(0.0, init_mean_pos_std, size=3)
+            xA6_mean[3:6] += np.random.normal(0.0, init_mean_vel_std, size=3)
+            xA0 = xA6_mean
             ukf_j = KF_CV(
-                np.r_[xA6[:3], xA6[3:6]],
+                xA0,
                 P0,
                 Q,
                 Rm,
                 dt,
-                kind="ukf",
+                kind=estimator_kind,
                 dyn="hcw",
                 hcw=hcw_params,
             )
             ukf_list.append(ukf_j)
             xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
+    else:
+        ukf_action_access = "ground_truth"
 
     pol = RLPolicy_Multi(cfg, device=cfg.get("device", "cpu"))
     din_def, din_att = pol.verify_ckpt_compat()
@@ -399,7 +478,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
 
     t_roll0 = time.perf_counter()
     for k in range(steps):
-        obs_xA = xA_est_list if (use_ukf and ukf_list) else xA_list
+        obs_xA = xA_est_list if (use_kf and ukf_list) else xA_list
         obs = build_train_obs(xD, obs_xA, m_def, m_att)
         uD_cmd = np.clip(
             np.asarray(pol.act_def_obs(obs, deterministic=deterministic), dtype=np.float32),
@@ -470,12 +549,18 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         for j in range(Na):
             xA_list[j] = step_plant_single(xA_list[j], uA_real[j], k)
 
-        if use_ukf and ukf_list:
+        if use_kf and ukf_list:
             p_obs = xD[:D]
             R_wb = np.eye(3)
             for j in range(Na):
                 ukf_j = ukf_list[j]
-                ukf_j.predict(dt=dt, u=None, u_cov=None)
+                u_pred, u_cov = _kf_predict_control(
+                    ukf_action_access,
+                    _u3_from_action(uA_real[j], D),
+                    control_meas_std=ukf_control_meas_std,
+                    control_limit=umax,
+                )
+                ukf_j.predict(dt=dt, u=u_pred, u_cov=u_cov)
                 if ((k + 1) % meas_every) == 0:
                     pA_true = xA_list[j][:D]
                     v_b = _body_bearing_from_world(p_obs, R_wb, pA_true)
@@ -704,7 +789,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         return obs
 
     def build_student_sigma_feat():
-        if use_ukf and (ukf12 is not None):
+        if use_kf and (ukf12 is not None):
             P = np.asarray(ukf12.P, dtype=np.float32)
             P_rel = P[: 2 * D, : 2 * D]
             iu = np.triu_indices(2 * D)
@@ -758,41 +843,67 @@ def run_rhc_with_rl_and_collect_frames_3d(
         return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
 
     # -------------------- optional UKFs (HCW-only) --------------------
-    use_ukf = bool(cfg.get("use_ukf", False))
-    if use_ukf and dyn_name != "hcw":
-        print("[warn] UKF in this runner is HCW-only; disabling use_ukf for non-HCW dynamics.")
-        use_ukf = False
+    use_kf = bool(cfg.get("use_kf", False))
+    estimator_kind = _normalize_estimator_kind(cfg)
+    if use_kf and dyn_name != "hcw":
+        print(f"[warn] {estimator_kind.upper()} in this runner is HCW-only; disabling estimator for non-HCW dynamics.")
+        use_kf = False
 
     est_hist = None
     x2_est = x2.copy()
+    x1_est = x1.copy()
 
-    if use_ukf:
-        ukf_cfg = cfg.get("ukf", {})
+    if use_kf:
+        ukf_cfg = dict(cfg.get("ukf", {}))
 
         sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
         sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
-        pos_std0 = float(ukf_cfg.get("init_pos_std", 0.2 * arena_r))
-        vel_std0 = float(ukf_cfg.get("init_vel_std", 0.01))
+        ukf_action_access = _normalize_kf_action_access(ukf_cfg.get("action_access", "ground_truth"))
+        ukf_control_meas_std = _normalize_kf_control_noise_std(
+            ukf_cfg.get("action_meas_std", 0.1 * max(abs(umax), 1e-3)),
+            default_std=0.1 * max(abs(umax), 1e-3),
+        )
+        ukf_state_dim = 6
+        pos_std0 = float(ukf_cfg.get("pos_std0", 0.2 * arena_r))
+        vel_std0 = float(ukf_cfg.get("vel_std0", 0.01))
+        init_mean_pos_std = float(ukf_cfg.get("init_mean_pos_std", 0.0))
+        init_mean_vel_std = float(ukf_cfg.get("init_mean_vel_std", 0.0))
+        init_mean_accel_std = float(ukf_cfg.get("init_mean_accel_std", 0.0))
         Q_scale = float(ukf_cfg.get("Q_scale", 1e-5))
+        accel_std0 = float(ukf_cfg.get("accel_std0", max(abs(umax), 1e-3)))
+        accel_q_scale = float(ukf_cfg.get("accel_Q_scale", Q_scale))
 
         who = str(ukf_cfg.get("who", "both")).lower()
         meas_every = max(1, int(ukf_cfg.get("every", 1)))
 
-        P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
-        Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
+        if ukf_state_dim == 9:
+            P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3 + [accel_std0**2] * 3)
+            Q = np.diag([Q_scale] * 6 + [accel_q_scale] * 3)
+        else:
+            P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
+            Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
         Rm = np.diag([sigma_az**2, sigma_el**2])
         hcw_params = cfg.get("hcw", {})
 
         x2_6 = _x6_from_xD(x2)
         x1_6 = _x6_from_xD(x1)
 
+        x2_6_mean = x2_6.copy()
+        x1_6_mean = x1_6.copy()
+        x2_6_mean[:3] += np.random.normal(0.0, init_mean_pos_std, size=3)
+        x2_6_mean[3:6] += np.random.normal(0.0, init_mean_vel_std, size=3)
+        x1_6_mean[:3] += np.random.normal(0.0, init_mean_pos_std, size=3)
+        x1_6_mean[3:6] += np.random.normal(0.0, init_mean_vel_std, size=3)
+        x2_ukf0 = x2_6_mean
+        x1_ukf0 = x1_6_mean
+
         ukf12 = (
-            KF_CV(np.r_[x2_6[:3], x2_6[3:6]], P0, Q, Rm, dt, kind="ukf", dyn="hcw", hcw=hcw_params)
+            KF_CV(x2_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
             if who in ("both", "1->2")
             else None
         )
         ukf21 = (
-            KF_CV(np.r_[x1_6[:3], x1_6[3:6]], P0, Q, Rm, dt, kind="ukf", dyn="hcw", hcw=hcw_params)
+            KF_CV(x1_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
             if who in ("both", "2->1")
             else None
         )
@@ -806,10 +917,12 @@ def run_rhc_with_rl_and_collect_frames_3d(
         if ukf21 is not None:
             est_hist["est21_xyz"] = [ukf21.x[:3].copy()]
             est_hist["meas21_azel"] = [None]
+            x1_est = _xD_from_x6(np.r_[ukf21.x[:3], ukf21.x[3:6]]).astype(np.float32)
 
         meas_std_az, meas_std_el = sigma_az, sigma_el
     else:
         ukf12 = ukf21 = None
+        ukf_action_access = "ground_truth"
         meas_every = 1
         meas_std_az = meas_std_el = None
 
@@ -984,10 +1097,11 @@ def run_rhc_with_rl_and_collect_frames_3d(
     t_roll0 = time.perf_counter()
     for k in range(steps):
         # 1) build observations and query policies ONCE
-        x2_for_def_obs = x2_est if (use_ukf and ukf12 is not None) else x2
+        x2_for_def_obs = x2_est if (use_kf and ukf12 is not None) else x2
+        x1_for_att_obs = x1_est if (use_kf and ukf21 is not None) else x1
 
         obs_def = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
-        obs_att = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
+        obs_att = build_train_obs(x1_for_att_obs, x2, m_def, m_att)
         sigma_feat = build_student_sigma_feat()
 
         u1_cmd = np.clip(
@@ -1055,7 +1169,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         x2 = step_plant_single(x2, u2_real, k)
 
         # 5) UKF estimation (HCW-only)
-        if use_ukf and est_hist is not None:
+        if use_kf and est_hist is not None:
             idx = len(exec_xyz1)
             take = (idx % meas_every) == 0
 
@@ -1065,7 +1179,13 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 return p
 
             if ukf12 is not None:
-                ukf12.predict(dt, u=_u3(u2_real), u_cov=None)
+                u12_pred, u12_cov = _kf_predict_control(
+                    ukf_action_access,
+                    _u3(u2_real),
+                    control_meas_std=ukf_control_meas_std,
+                    control_limit=umax,
+                )
+                ukf12.predict(dt, u=u12_pred, u_cov=u12_cov)
                 if take:
                     p_obs = _to3_pos(x1)
                     p_tgt = _to3_pos(x2)
@@ -1081,7 +1201,13 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 est_hist["est12_xyz"].append(ukf12.x[:3].copy())
 
             if ukf21 is not None:
-                ukf21.predict(dt, u=_u3(u1_real), u_cov=None)
+                u21_pred, u21_cov = _kf_predict_control(
+                    ukf_action_access,
+                    _u3(u1_real),
+                    control_meas_std=ukf_control_meas_std,
+                    control_limit=umax,
+                )
+                ukf21.predict(dt, u=u21_pred, u_cov=u21_cov)
                 if take:
                     p_obs = _to3_pos(x2)
                     p_tgt = _to3_pos(x1)
@@ -1098,6 +1224,8 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
             if ukf12 is not None:
                 x2_est = _xD_from_x6(np.r_[ukf12.x[:3], ukf12.x[3:6]]).astype(np.float32)
+            if ukf21 is not None:
+                x1_est = _xD_from_x6(np.r_[ukf21.x[:3], ukf21.x[3:6]]).astype(np.float32)
 
         # 6) fuel traces
         if use_fuel:

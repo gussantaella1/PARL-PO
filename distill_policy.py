@@ -77,7 +77,7 @@ def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
     )
     cfg["distill"] = True
     cfg["distill_method"] = run_cfg["distill_method"]
-    cfg["use_ukf"] = True
+    cfg["use_kf"] = True
 
     if run_cfg.get("def_ckpt_path") is not None:
         cfg["def_ckpt_path"] = run_cfg["def_ckpt_path"]

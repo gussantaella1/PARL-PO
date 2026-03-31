@@ -2,6 +2,8 @@
 from __future__ import annotations
 import numpy as np
 
+from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+
 # -------------------------------
 # Helpers 
 # -------------------------------
@@ -44,11 +46,18 @@ def _azel_from_body_vec(vb: np.ndarray):
 
 class AgentEKF:
     """
-    Extended Kalman Filter for a target with constant-velocity dynamics observed by an agent.
-    State:   x = [px, py, pz, vx, vy, vz]^T   (world frame)
-    Process: x_{k+1} = F(dt) x_k + B(dt)*u_k + w_k
-             where u is acceleration (world by default; or 'body' with R_wb_tgt).
-    Meas:    z = [az, el]^T (bearing in OBSERVER BODY frame)
+    Extended Kalman Filter with selectable linear dynamics observed by an agent.
+
+    State:
+      - 6D: x = [px, py, pz, vx, vy, vz]^T
+      - 9D: x = [px, py, pz, vx, vy, vz, ax, ay, az]^T
+
+    Process:
+      - dyn='cv'  : constant-velocity with optional external accel input u
+      - dyn='hcw' : HCW relative motion with optional external accel input u
+
+    Meas:
+      z = [az, el]^T (bearing in OBSERVER BODY frame)
 
     API mirrors AgentUKF:
         ekf.predict(dt)
@@ -57,13 +66,25 @@ class AgentEKF:
         ekf.predict(dt, u=u_world, u_cov=Sigma_u)
         ekf.update(z, p_obs, R_wb)
     """
-    def __init__(self, x0, P0, Q, R, dt):
-        self.x  = np.asarray(x0, float).reshape(6)
+    def __init__(self, x0, P0, Q, R, dt, dyn='cv', hcw=None):
+        self.x  = np.asarray(x0, float).reshape(-1)
+        if self.x.size not in (6, 9):
+            raise ValueError(f"AgentEKF expects 6D or 9D state, got {self.x.size}.")
         self.P  = _psd_enforce(np.asarray(P0, float))
         self.Q  = _psd_enforce(np.asarray(Q,  float))
         self.R  = _psd_enforce(np.asarray(R,  float))
         self.dt = float(dt)
-        self.n  = 6
+        self.n  = int(self.x.size)
+
+        self._dyn = (dyn or 'cv').lower()
+        self._hcw_params = (hcw or {})
+        self._Ad = None
+        self._Bd = None
+        if self._dyn == 'hcw':
+            n = hcw_mean_motion(self._hcw_params)
+            Ad_mx, Bd_mx = hcw_discrete_mats(n, self.dt)
+            self._Ad = as_numpy_const(Ad_mx)
+            self._Bd = as_numpy_const(Bd_mx)
 
     # ----- linear CV dynamics -----
     def F(self, dt=None):
@@ -80,13 +101,37 @@ class AgentEKF:
         B[3:6, 0:3] = dt * np.eye(3)
         return B
 
+    def linear_dynamics_mats(self, dt=None):
+        if dt is None:
+            dt = self.dt
+        if self._dyn == 'hcw':
+            if dt != self.dt or self._Ad is None:
+                n = hcw_mean_motion(self._hcw_params)
+                Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+                Ad6 = as_numpy_const(Ad_mx)
+                Bd6 = as_numpy_const(Bd_mx)
+            else:
+                Ad6, Bd6 = self._Ad, self._Bd
+        else:
+            Ad6, Bd6 = self.F(dt), self.B_accel(dt)
+
+        if self.n == 6:
+            return Ad6, Bd6
+
+        A = np.eye(9)
+        A[:6, :6] = Ad6
+        A[:6, 6:9] = Bd6
+        B = np.zeros((9, 3))
+        B[:6, :] = Bd6
+        return A, B
+
     def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
         """
-        Deterministic dynamics: x+ = F x + B u  (if u provided).
+        Deterministic dynamics: x+ = A x + B u  (if u provided).
         If u_frame='body', convert u_body -> u_world using R_wb_tgt (world->body).
         """
-        F = self.F(dt)
-        x_next = F @ x
+        A, B = self.linear_dynamics_mats(dt)
+        x_next = A @ x
         if u is not None:
             u = np.asarray(u, float).reshape(3)
             if u_frame == 'body':
@@ -94,7 +139,7 @@ class AgentEKF:
                     raise ValueError("u given in 'body' frame but R_wb_tgt is None")
                 # body -> world: v_w = R_wb^T v_b
                 u = np.asarray(R_wb_tgt, float).T @ u
-            x_next = x_next + self.B_accel(dt) @ u
+            x_next = x_next + B @ u
         return x_next
 
     # ----- measurement -----
@@ -106,7 +151,7 @@ class AgentEKF:
 
     def H_pos(self, x, p_obs, R_wb):
         """
-        Jacobian H wrt state x = [p; v]. Only depends on position (first 3 cols).
+        Jacobian H wrt state x. Only depends on position (first 3 cols).
         We derive d(az,el)/dx using chain rule:
           r = p - p_obs
           b_w = r / ||r||
@@ -156,10 +201,9 @@ class AgentEKF:
         # chain: dz/dp = DzDb @ J_bwr
         H_p = DzDb @ J_bwr  # (2x3)
 
-        # full H wrt x = [p; v]
-        H = np.zeros((2, 6))
+        # full H wrt x; extra state dimensions have zero measurement sensitivity
+        H = np.zeros((2, self.n))
         H[:, :3] = H_p
-        # H[:, 3:] = 0
         return H
 
     # ----- EKF steps -----
@@ -171,19 +215,25 @@ class AgentEKF:
         if dt is None:
             dt = self.dt
 
+        if self._dyn == 'hcw' and (self._Ad is None or dt != self.dt):
+            n = hcw_mean_motion(self._hcw_params)
+            Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
+            self._Ad = as_numpy_const(Ad_mx)
+            self._Bd = as_numpy_const(Bd_mx)
+
         # state
         self.x = self.f(self.x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt)
 
         # covariance
-        Fd = self.F(dt)
-        Pp = Fd @ self.P @ Fd.T + self.Q
+        Ad, Bd = self.linear_dynamics_mats(dt)
+        Pp = Ad @ self.P @ Ad.T + self.Q
 
         if u_cov is not None:
-            Bu = self.B_accel(dt)
             U  = _psd_enforce(np.asarray(u_cov, float))
-            Pp += Bu @ U @ Bu.T
+            Pp += Bd @ U @ Bd.T
 
         self.P = _psd_enforce(_symmetrize(Pp))
+        self.dt = dt
 
     def update(self, z, p_obs, R_wb):
         """
