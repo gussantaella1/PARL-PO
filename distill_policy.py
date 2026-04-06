@@ -17,12 +17,13 @@ from core.distill import distill_from_teacher
 DISTILL_RUN: Dict[str, Any] = {
     # Required paths
     "teacher_ckpt": "Training_Policy/def1_teacher.pt",
-    "out_path": "Distillation_Tester/def1_ukf_student_manual_modern.pt",
+    "out_path": "Distillation_Tester/def1_kf_student_manual_modern.pt",
     "metrics_out": "Distillation_Tester/distill_metrics_def1_student_manual_modern.npz",
 
     # Basic role/mode selection
     "train_role": "def",          # "def" or "att"
     "attacker_mode": "rule",      # "rule" or "rl"
+    "estimator_kind": "ukf",      # "ukf" or "ekf"
     # "distill_method": "paper_recurrent",   # "modern" or "paper_recurrent"
 
     "distill_method": "paper_recurrent",
@@ -78,6 +79,7 @@ def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
     cfg["distill"] = True
     cfg["distill_method"] = run_cfg["distill_method"]
     cfg["use_kf"] = True
+    cfg["estimator_kind"] = str(run_cfg.get("estimator_kind", cfg.get("estimator_kind", "ukf")))
 
     if run_cfg.get("def_ckpt_path") is not None:
         cfg["def_ckpt_path"] = run_cfg["def_ckpt_path"]
@@ -110,6 +112,7 @@ def main() -> None:
                 "attacker_mode": cfg["attacker_mode"],
                 "distill_method": cfg["distill_method"],
                 "distill_collection_mode": cfg.get("distill_collection_mode"),
+                "estimator_kind": cfg.get("estimator_kind"),
                 "device": cfg["device"],
             },
             indent=2,

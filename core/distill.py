@@ -480,7 +480,7 @@ def _true_relative_state_from_env(
     return _relative_state_from_obs(full_obs, D, Na)
 
 
-def _ukf_student_features_from_env(
+def _kf_student_features_from_env(
     env,
     u_prev: np.ndarray,
     *,
@@ -491,7 +491,7 @@ def _ukf_student_features_from_env(
     Student-side input at one timestep:
       xhat_rel_t, Sigma_t, u_{t-1}
 
-    For num_attackers>1 the env does not provide a UKF, so we fall back to the
+    For num_attackers>1 the env does not provide a single-agent estimator, so we fall back to the
     current observation with zero covariance features.
     """
     if distill_role == "att" and hasattr(env, "_obs_att"):
@@ -730,15 +730,16 @@ def _teacher_intent_label(
 def distill_from_teacher_paper_recurrent(
     cfg: Dict[str, Any],
     teacher_ckpt_path: str,
-    out_path: str = "ppo_def_ukf_distilled.pt",
+    out_path: str = "ppo_def_kf_distilled.pt",
 ):
 
     cfg = copy.deepcopy(cfg)
     Na = _num_attackers(cfg)
     cfg["use_kf"] = (Na == 1)
+    estimator_label = str(cfg.get("estimator_kind", "ukf")).upper()
     if Na > 1:
         print(
-            "[distill] num_attackers>1: UKF is unavailable, so distillation uses direct env observations "
+            f"[distill] num_attackers>1: {estimator_label} is unavailable, so distillation uses direct env observations "
             "with zero covariance features."
         )
 
@@ -873,7 +874,7 @@ def distill_from_teacher_paper_recurrent(
         "train_dataset_episodes": [],
     }
 
-    print(f"=== Distillation: {method_label} recurrent UKF student with latent intent supervision ===")
+    print(f"=== Distillation: {method_label} recurrent {estimator_label} student with latent intent supervision ===")
     print(f"teacher_ckpt={teacher_ckpt_path}")
     print(f"distill_role={distill_role}")
     print(f"attacker_mode={attacker_mode}")
@@ -909,7 +910,7 @@ def distill_from_teacher_paper_recurrent(
 
                 if distill_role == "def":
                     idx = 0
-                    xhat_rel_np, sigma_np, u_prev_feat_np = _ukf_student_features_from_env(
+                    xhat_rel_np, sigma_np, u_prev_feat_np = _kf_student_features_from_env(
                         env,
                         u_prev_exec[idx],
                         distill_role=distill_role,
@@ -1001,7 +1002,7 @@ def distill_from_teacher_paper_recurrent(
                     a_att_exec = np.zeros((Na, act_dim), dtype=np.float32)
 
                     for idx in role_indices:
-                        xhat_rel_np, sigma_np, u_prev_feat_np = _ukf_student_features_from_env(
+                        xhat_rel_np, sigma_np, u_prev_feat_np = _kf_student_features_from_env(
                             env,
                             u_prev_exec[idx],
                             distill_role=distill_role,
@@ -1194,13 +1195,13 @@ def distill_from_teacher_paper_recurrent(
 def distill_from_teacher_modern(
     cfg: Dict[str, Any],
     teacher_ckpt_path: str,
-    out_path: str = "ppo_def_ukf_distilled.pt",
+    out_path: str = "ppo_def_kf_distilled.pt",
 ):
     """
     Paper-faithful modern distillation path.
 
     This follows the UC Berkeley student setup:
-      - UKF relative-state mean + covariance inputs
+      - estimator relative-state mean + covariance inputs
       - previous executed action as part of the recurrent encoder input
       - 1-layer LSTM latent-intent encoder
       - teacher latent supervision from future relative trajectories
@@ -1230,7 +1231,8 @@ def distill_from_teacher_modern(
         )
     cfg_mod["distill_collection_mode"] = "dagger"
 
-    print("[distill] modern mode: paper-faithful recurrent UKF student with latent intent supervision.")
+    estimator_label = str(cfg_mod.get("estimator_kind", "ukf")).upper()
+    print(f"[distill] modern mode: paper-faithful recurrent {estimator_label} student with latent intent supervision.")
     return distill_from_teacher_paper_recurrent(
         cfg_mod,
         teacher_ckpt_path,
@@ -1241,7 +1243,7 @@ def distill_from_teacher_modern(
 def distill_from_teacher(
     cfg: Dict[str, Any],
     teacher_ckpt_path: str,
-    out_path: str = "ppo_def_ukf_distilled.pt",
+    out_path: str = "ppo_def_kf_distilled.pt",
 ):
     method = str(cfg.get("distill_method", "modern")).lower()
     if method in {"modern", "default", "paper_modern", "berkeley"}:

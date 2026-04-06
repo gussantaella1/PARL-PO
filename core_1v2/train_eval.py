@@ -786,18 +786,26 @@ def train_with_distill(
         if extra_train_cfg is not None:
             cfg_student.update(extra_train_cfg)
 
+        student_estimator_kind = str(
+            cfg_teacher.get("estimator_kind", cfg_student.get("estimator_kind", "ukf"))
+        ).lower()
+        cfg_student["estimator_kind"] = student_estimator_kind
+
         build_dyn(cfg_student)
 
         if cfg_student["device"] == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(f"[{phase_name.upper()} STUDENT] device='cuda' but CUDA not available.")
 
         print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
-        student_out = os.path.join(out_dir, f"{phase_name}_ukf_student.pt")
+        student_out = os.path.join(out_dir, f"{phase_name}_kf_student.pt")
         distill_t0 = time.perf_counter()
         student, metrics_student = distill_from_teacher(cfg_student, teacher_ckpt, out_path=student_out)
         distill_duration_s = float(time.perf_counter() - distill_t0)
 
-        print(f"[{phase_name.upper()} STUDENT] Distilled UKF student saved to {student_out}")
+        print(
+            f"[{phase_name.upper()} STUDENT] "
+            f"Distilled {student_estimator_kind.upper()} student saved to {student_out}"
+        )
         print(f"[{phase_name.upper()} STUDENT] Distillation time: {distill_duration_s:.3f} s")
 
         distill_metrics_path = os.path.join(out_dir, f"distill_metrics_{phase_name}_student.npz")

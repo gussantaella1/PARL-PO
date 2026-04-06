@@ -116,15 +116,15 @@ class Env:
         reward_type = str(
             cfg.get(
                 "reward_type",
-                "zero_sum_ukf" if bool(cfg.get("use_zero_sum_ukf", False)) else "zero_sum",
+                "zero_sum_kf" if bool(cfg.get("use_zero_sum_kf", False)) else "zero_sum",
             )
         ).strip().lower()
-        if reward_type not in {"zero_sum", "zero_sum_ukf"}:
+        if reward_type not in {"zero_sum", "zero_sum_kf"}:
             raise ValueError(
-                f"Unsupported reward_type='{reward_type}'. Expected 'zero_sum' or 'zero_sum_ukf'."
+                f"Unsupported reward_type='{reward_type}'. Expected 'zero_sum' or 'zero_sum_kf'."
             )
         self.reward_type = reward_type
-        self.use_zero_sum_ukf = (self.reward_type == "zero_sum_ukf")
+        self.use_zero_sum_kf = (self.reward_type == "zero_sum_kf")
 
         self.use_kf           = bool(cfg.get("use_kf", False))
         self.meas_innov_coef  = float(cfg.get("meas_innov_coef"))  # weight on innovation^2
@@ -215,8 +215,8 @@ class Env:
             self._ukf_Q  = Q
             self._ukf_R  = Rm
 
-        if self.use_zero_sum_ukf and not self.use_kf:
-            raise ValueError("reward_type='zero_sum_ukf' requires the estimator to be enabled.")
+        if self.use_zero_sum_kf and not self.use_kf:
+            raise ValueError("reward_type='zero_sum_kf' requires the estimator to be enabled.")
 
         if self.use_fuel:
             self.k_eff_def = float(cfg.get("k_eff_def"))
@@ -850,12 +850,12 @@ class Env:
             self._latest_att_meas_innov = 0.0
             self._latest_att_meas_trP = 0.0
 
-        use_zero_sum_ukf = (self.reward_type == "zero_sum_ukf")
+        use_zero_sum_kf = (self.reward_type == "zero_sum_kf")
         use_zero_sum = (self.reward_type == "zero_sum")
 
         # Keep the original game objective for the UKF zero-sum mode: the policy acts
         # from belief-space observations, but the task reward is still computed on truth.
-        if use_zero_sum_ukf:
+        if use_zero_sum_kf:
             p2_reward, v2_reward = p2, v2
         else:
             p2_reward, v2_reward = p2, v2
@@ -1014,9 +1014,9 @@ class Env:
             if need_att:
                 r2 = -g
 
-        elif use_zero_sum_ukf:
+        elif use_zero_sum_kf:
             if not self.use_kf:
-                raise RuntimeError("use_zero_sum_ukf requires use_kf=True.")
+                raise RuntimeError("use_zero_sum_kf requires use_kf=True.")
             g = (
                 self.k_pos * d2
             )

@@ -135,20 +135,20 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": False,
-    "estimator_kind": "ukf",
-    "meas_innov_coef": 0.0,   # start at 0, then slowly crank up
-    "meas_cov_coef": 0.0,
+    "use_kf": True,
+    "estimator_kind": "ekf",
+    "meas_innov_coef": 1.0,  
+    "meas_cov_coef": 0.02,
 
     "sensor_noise_default": SENSOR_NOISE_DEFAULT_DEG,
     "ukf": {
         "sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
-        "every": 2,
+        "every": 1,
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
-        "action_access": "none",  # ground_truth | measured | none
-        "action_meas_std": 0.1 * float(COMMON["umax"]),  # used when action_access == "measured"
+        "action_access": "measured",  # ground_truth | measured | none
+        "action_meas_std": 0.5 * float(COMMON["umax"]),  # used when action_access == "measured"
         "init_pos_std": 0.2 * ARENA_R,
         "init_vel_std": 0.01,
         "init_mean_pos_std": 0.0,
@@ -214,8 +214,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    "reward_type": "zero_sum",
-    # "reward_type": "zero_sum_ukf",
+    # "reward_type": "zero_sum",
+    "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
