@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-03-20T17:45:35.120155+00:00",
+  "created_utc": "2026-04-08T05:40:57.388418+00:00",
   "out_dir": "Training_Policy",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
@@ -38,6 +38,7 @@
         "cz": 0.0,
         "r": 20.0
       },
+      "normalize_pos_obs": false,
       "arena_terminate_margin": 1.0,
       "soft_wall_start": 0.5,
       "umax": 2.0,
@@ -106,18 +107,36 @@
         "solver": "path",
         "executable": "/home/gs34433/Research/path_5/ampl/pathampl"
       },
-      "use_ukf": false,
-      "use_meas_reward": true,
-      "meas_innov_coef": 0.0,
-      "meas_cov_coef": 0.0,
+      "use_kf": false,
+      "estimator_kind": "ekf",
+      "meas_innov_coef": 1.0,
+      "meas_cov_coef": 0.02,
+      "sensor_noise_default": 0.5,
       "ukf": {
         "sigma_az": 0.008726646259971648,
         "sigma_el": 0.008726646259971648,
+        "every": 1,
         "pos_std0": 4.0,
         "vel_std0": 0.01,
+        "action_access": "measured",
+        "action_meas_std": 1.0,
         "init_pos_std": 4.0,
         "init_vel_std": 0.01,
-        "Q_scale": 1e-05
+        "init_mean_pos_std": 0.0,
+        "init_mean_vel_std": 0.0,
+        "Q_scale": 1e-05,
+        "accel_std0": 2.0,
+        "init_mean_accel_std": 0.0,
+        "accel_Q_scale": 0.0001,
+        "center_sigma_az": 0.008726646259971648,
+        "center_sigma_el": 0.008726646259971648,
+        "center_pos_std0": 4.0,
+        "center_vel_std0": 0.01,
+        "center_init_pos_std": 4.0,
+        "center_init_vel_std": 0.01,
+        "center_init_mean_pos_std": 0.0,
+        "center_init_mean_vel_std": 0.0,
+        "center_Q_scale": 1e-05
       },
       "reward_from_belief": true,
       "belief_clip_factor": 2.0,
@@ -162,6 +181,7 @@
         "show_meas": true,
         "meas_len": 20.0
       },
+      "reward_type": "zero_sum",
       "save_best_ckpt": true,
       "save_last_ckpt": true,
       "scale_invariant": true,
@@ -242,7 +262,19 @@
       "train_role": "rl"
     },
     "final_outputs": {
-      "def0": null,
+      "def0": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 48.66648186270339,
+        "teacher_best_update": 710,
+        "teacher_best_ckpt_path": "Training_Policy/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
       "att1": {
         "train_role": "att",
         "teacher_ckpt": "Training_Policy/att1_teacher.pt",
@@ -300,8 +332,36 @@
   },
   "stages": [
     {
+      "name": "PHASE0_train_def0",
+      "start_utc": "2026-04-08T05:40:57.389989+00:00",
+      "meta": {
+        "phase_name": "def0",
+        "attacker_mode": "rule",
+        "extra_train_cfg": {
+          "gamma": 0.991,
+          "hit_buffer_def": 0.25
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 48.66648186270339,
+        "teacher_best_update": 710,
+        "teacher_best_ckpt_path": "Training_Policy/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-04-08T07:45:54.608207+00:00",
+      "duration_s": 7497.218218317023
+    },
+    {
       "name": "PHASE1_train_att1",
-      "start_utc": "2026-03-20T17:45:35.129566+00:00",
+      "start_utc": "2026-04-08T07:46:06.894364+00:00",
       "meta": {
         "phase_name": "att1",
         "attacker_mode": "rl",
@@ -356,12 +416,12 @@
         "distill_duration_s": null
       },
       "status": "ok",
-      "end_utc": "2026-03-20T19:11:30.469083+00:00",
-      "duration_s": 5155.339508853998
+      "end_utc": "2026-04-08T09:33:22.953805+00:00",
+      "duration_s": 6436.059436924988
     },
     {
       "name": "PHASE2_train_def1",
-      "start_utc": "2026-03-20T19:13:08.043825+00:00",
+      "start_utc": "2026-04-08T09:34:59.738115+00:00",
       "meta": {
         "phase_name": "def1",
         "attacker_mode": "rl",
@@ -415,12 +475,12 @@
         "distill_duration_s": null
       },
       "status": "ok",
-      "end_utc": "2026-03-20T20:40:52.514737+00:00",
-      "duration_s": 5264.47088606999
+      "end_utc": "2026-04-08T11:25:02.962291+00:00",
+      "duration_s": 6603.224168574903
     },
     {
       "name": "PHASE3_train_att2",
-      "start_utc": "2026-03-20T20:42:40.385495+00:00",
+      "start_utc": "2026-04-08T11:26:50.719081+00:00",
       "meta": {
         "phase_name": "att2",
         "attacker_mode": "rl",
@@ -499,12 +559,12 @@
         "distill_duration_s": null
       },
       "status": "ok",
-      "end_utc": "2026-03-20T22:15:23.739451+00:00",
-      "duration_s": 5563.353946064002
+      "end_utc": "2026-04-08T13:21:08.761168+00:00",
+      "duration_s": 6858.042050949996
     },
     {
       "name": "PHASE4_train_def2",
-      "start_utc": "2026-03-20T22:18:01.656433+00:00",
+      "start_utc": "2026-04-08T13:23:47.678022+00:00",
       "meta": {
         "phase_name": "def2",
         "attacker_mode": "rl",
@@ -582,8 +642,8 @@
         "distill_duration_s": null
       },
       "status": "ok",
-      "end_utc": "2026-03-20T23:52:10.799230+00:00",
-      "duration_s": 5649.142784053998
+      "end_utc": "2026-04-08T15:19:57.656172+00:00",
+      "duration_s": 6969.978140270105
     }
   ]
 }

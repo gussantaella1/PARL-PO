@@ -58,6 +58,7 @@ COMMON: Dict[str, Any] = {
 
     # Arena
     "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
+    "normalize_pos_obs": False,
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 
@@ -135,7 +136,7 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": True,
+    "use_kf": False,
     "estimator_kind": "ekf",
     "meas_innov_coef": 1.0,  
     "meas_cov_coef": 0.02,
@@ -147,7 +148,7 @@ KF_COMMON: Dict[str, Any] = {
         "every": 1,
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
-        "action_access": "measured",  # ground_truth | measured | none
+        "action_access": "ground_truth",  # ground_truth | measured | none
         "action_meas_std": 0.5 * float(COMMON["umax"]),  # used when action_access == "measured"
         "init_pos_std": 0.2 * ARENA_R,
         "init_vel_std": 0.01,
@@ -214,8 +215,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    # "reward_type": "zero_sum",
-    "reward_type": "zero_sum_kf",
+    "reward_type": "zero_sum",
+    # "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,

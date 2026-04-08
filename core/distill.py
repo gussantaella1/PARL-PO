@@ -441,15 +441,17 @@ def _full_obs_from_env(env) -> np.ndarray:
     """
     p1, v1, pA_list, vA_list = env._unpack(env.state)
     c = env.center
+    pos_scale = 1.0 / max(float(env.radius), 1e-9) if bool(getattr(env, "normalize_pos_obs", False)) else 1.0
+    vel_scale = float(getattr(env, "_vel_obs_scale", 1.0))
 
-    parts = [p1 - c]
+    parts = [(p1 - c) * pos_scale]
     for pA in pA_list:
-        parts.append(pA - c)
+        parts.append((pA - c) * pos_scale)
     for pA in pA_list:
-        parts.append(pA - p1)
-    parts.append(v1)
+        parts.append((pA - p1) * pos_scale)
+    parts.append(v1 * vel_scale)
     for vA in vA_list:
-        parts.append(vA)
+        parts.append(vA * vel_scale)
 
     if getattr(env, "use_fuel", False):
         fdef = (env.m_def - env.mdry_def) / (env.m0_def - env.mdry_def + 1e-9)

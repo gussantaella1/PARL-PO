@@ -40,6 +40,9 @@ class Env:
             raise ValueError("Only 'sphere' arena is implemented.")
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
+        self.normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
+        self._pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self._vel_obs_scale = (self.dt / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -1053,23 +1056,25 @@ class Env:
             vA_obs = vA_list
 
         # build obs = [p1c, pA1c, ..., pANc, rel1, ..., relN, v1, vA1, ..., vAN]
-        p1c = p1 - self.center
+        pos_scale = self._pos_obs_scale
+        vel_scale = self._vel_obs_scale
+        p1c = (p1 - self.center) * pos_scale
         parts = [p1c]
 
         # positions (centered)
         for pA in pA_obs:
-            parts.append(pA - self.center)
+            parts.append((pA - self.center) * pos_scale)
 
         # relative positions
         for pA in pA_obs:
-            parts.append(pA - p1)
+            parts.append((pA - p1) * pos_scale)
 
         # defender vel
-        parts.append(v1)
+        parts.append(v1 * vel_scale)
 
         # attacker vels
         for vA in vA_obs:
-            parts.append(vA)
+            parts.append(vA * vel_scale)
 
         # Defender and attacker fuel:
 

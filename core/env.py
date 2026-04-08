@@ -40,6 +40,9 @@ class Env:
             raise ValueError("Only 'sphere' arena is implemented.")
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
+        self.normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
+        self._pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self._vel_obs_scale = (self.dt / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -1155,25 +1158,27 @@ class Env:
             vA_obs = vA_list
 
         center_obs = self.center.copy()
+        pos_scale = self._pos_obs_scale
+        vel_scale = self._vel_obs_scale
 
         # build obs = [p1c, pA1c, ..., pANc, rel1, ..., relN, v1, vA1, ..., vAN]
-        p1c = p1 - center_obs
+        p1c = (p1 - center_obs) * pos_scale
         parts = [p1c]
 
         # positions (centered)
         for pA in pA_obs:
-            parts.append(pA - center_obs)
+            parts.append((pA - center_obs) * pos_scale)
 
         # relative positions
         for pA in pA_obs:
-            parts.append(pA - p1)
+            parts.append((pA - p1) * pos_scale)
 
         # defender vel
-        parts.append(v1)
+        parts.append(v1 * vel_scale)
 
         # attacker vels
         for vA in vA_obs:
-            parts.append(vA)
+            parts.append(vA * vel_scale)
 
         # Defender and attacker fuel:
 
@@ -1198,8 +1203,10 @@ class Env:
             p1_obs, v1_obs = p1, v1
 
         center_obs = self.center.copy()
-        p1c = p1_obs - center_obs
-        parts = [p1c, p2 - center_obs, p2 - p1_obs, v1_obs, v2]
+        pos_scale = self._pos_obs_scale
+        vel_scale = self._vel_obs_scale
+        p1c = (p1_obs - center_obs) * pos_scale
+        parts = [p1c, (p2 - center_obs) * pos_scale, (p2 - p1_obs) * pos_scale, v1_obs * vel_scale, v2 * vel_scale]
 
         if self.use_fuel:
             fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)

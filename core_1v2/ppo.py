@@ -33,6 +33,10 @@ class PPO:
         self.freeze_attacker = bool(cfg.get("freeze_attacker", False))
         self.D = int(cfg["D"])
         self.Na = int(cfg.get("num_attackers", 1))
+        arena_r = float(cfg.get("arena", {}).get("r", 1.0))
+        normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
+        self._rule_obs_pos_scale = (1.0 / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
+        self._rule_obs_vel_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
 
         self.def_net = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
         self.def_opt = optim.Adam(
@@ -94,12 +98,16 @@ class PPO:
             vA = ob[:, off:off + Na * D].reshape(B, Na, D)
 
             center = self.rule_ctrl.center
+            pos_scale = self._rule_obs_pos_scale
+            vel_scale = self._rule_obs_vel_scale
             acts = np.zeros((B, Na, D), dtype=np.float32)
             for i in range(B):
-                p1 = p1c[i] + center
+                p1 = (p1c[i] / pos_scale) + center
+                v1_i = v1[i] / vel_scale
                 for k in range(Na):
-                    p2 = pA_c[i, k] + center
-                    acts[i, k] = self.rule_ctrl.act(p1, v1[i], p2, vA[i, k]).astype(np.float32)
+                    p2 = (pA_c[i, k] / pos_scale) + center
+                    v2 = vA[i, k] / vel_scale
+                    acts[i, k] = self.rule_ctrl.act(p1, v1_i, p2, v2).astype(np.float32)
 
             a_t = torch.as_tensor(acts, dtype=obs_batch.dtype, device=obs_batch.device)
             if Na == 1:

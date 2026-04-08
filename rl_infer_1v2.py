@@ -74,6 +74,10 @@ class RLPolicy_Multi:
             ],
             dtype=np.float32,
         )[: self.D]
+        self.radius = float(ar.get("r", 1.0))
+        self.normalize_pos_obs = bool(self.cfg.get("normalize_pos_obs", False))
+        self.pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self.vel_obs_scale = (float(self.cfg.get("dt", 1.0)) / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
 
         def _pick(cfg, keys, default):
             for k in keys:
@@ -198,9 +202,10 @@ class RLPolicy_Multi:
         off += D
         vA  = [obs_np[off + k*D: off + (k+1)*D] for k in range(Na)]
 
-        p1 = p1c + c
-        pk = pAc[attacker_idx] + c
-        vk = vA[attacker_idx]
+        p1 = (p1c / self.pos_obs_scale) + c
+        pk = (pAc[attacker_idx] / self.pos_obs_scale) + c
+        v1 = v1 / self.vel_obs_scale
+        vk = vA[attacker_idx] / self.vel_obs_scale
 
         u = self.rule_ctrl.act(p1, v1, pk, vk)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)

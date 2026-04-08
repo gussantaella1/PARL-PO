@@ -87,6 +87,10 @@ def _kf_predict_control(
     return None, None
 
 
+def _normalize_angle(a: float) -> float:
+    return (float(a) + np.pi) % (2.0 * np.pi) - np.pi
+
+
 def _project_box(u: np.ndarray, umax: float) -> np.ndarray:
     return np.clip(np.asarray(u, dtype=float), -float(umax), float(umax))
 
@@ -831,16 +835,16 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     ) -> np.ndarray:
         pD = xD_vec[:D]
         vD = xD_vec[D:2 * D]
-        parts: List[np.ndarray] = [pD - center]
+        parts: List[np.ndarray] = [(pD - center) * pos_obs_scale]
 
         for xA_vec in xA_vecs:
-            parts.append(xA_vec[:D] - center)
+            parts.append((xA_vec[:D] - center) * pos_obs_scale)
         for xA_vec in xA_vecs:
-            parts.append(xA_vec[:D] - pD)
+            parts.append((xA_vec[:D] - pD) * pos_obs_scale)
 
-        parts.append(vD)
+        parts.append(vD * vel_obs_scale)
         for xA_vec in xA_vecs:
-            parts.append(xA_vec[D:2 * D])
+            parts.append(xA_vec[D:2 * D] * vel_obs_scale)
 
         if use_fuel:
             fuel_frac_def = (m_def_cur - mdry_def) / (m0_def - mdry_def + 1e-9)
@@ -855,6 +859,9 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
 
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
+    arena_r = float(cfg.get("arena", {}).get("r", 1.0))
+    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
 
     use_kf = bool(cfg.get("use_kf", False))
     estimator_kind = _normalize_estimator_kind(cfg)
@@ -1331,11 +1338,11 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         v2 = x2_vec[D:2 * D]
 
         parts = [
-            p1 - center,
-            p2 - center,
-            (p2 - p1),
-            v1,
-            v2,
+            (p1 - center) * pos_obs_scale,
+            (p2 - center) * pos_obs_scale,
+            (p2 - p1) * pos_obs_scale,
+            v1 * vel_obs_scale,
+            v2 * vel_obs_scale,
         ]
 
         if use_fuel:
@@ -1351,6 +1358,9 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
 
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
+    arena_r = float(cfg.get("arena", {}).get("r", 1.0))
+    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
 
     def _u3(uD: np.ndarray):
         uD = np.asarray(uD, float).reshape(-1)
@@ -1439,11 +1449,15 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         if ukf12 is not None:
             est_hist["est12_xyz"] = [ukf12.x[:3].copy()]
             est_hist["meas12_azel"] = [None]
+            est_hist["meas12_innov_sq"] = [float("nan")]
+            est_hist["trP12_pos"] = [float(np.trace(ukf12.P[:3, :3]))]
             x2_est = _xD_from_x6(np.r_[ukf12.x[:3], ukf12.x[3:6]]).astype(np.float32)
 
         if ukf21 is not None:
             est_hist["est21_xyz"] = [ukf21.x[:3].copy()]
             est_hist["meas21_azel"] = [None]
+            est_hist["meas21_innov_sq"] = [float("nan")]
+            est_hist["trP21_pos"] = [float(np.trace(ukf21.P[:3, :3]))]
             x1_est = _xD_from_x6(np.r_[ukf21.x[:3], ukf21.x[3:6]]).astype(np.float32)
 
         meas_std_az, meas_std_el = sigma_az, sigma_el
@@ -1705,6 +1719,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                     control_limit=umax,
                 )
                 ukf12.predict(dt, u=u12_pred, u_cov=u12_cov)
+                innov_sq = float("nan")
                 if take:
                     p_obs = _to3_pos(x1)
                     p_tgt = _to3_pos(x2)
@@ -1713,10 +1728,17 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                     az = np.arctan2(d[1], d[0]) + np.random.randn() * meas_std_az
                     el = np.arctan2(d[2], np.sqrt(max(d[0] ** 2 + d[1] ** 2, 1e-18))) + np.random.randn() * meas_std_el
                     z = np.array([az, el], float)
+                    z_hat = ukf12.h(ukf12.x.copy(), p_obs=p_obs, R_wb=_identity_R())
+                    innov = z - z_hat
+                    innov[0] = _normalize_angle(innov[0])
+                    innov[1] = _normalize_angle(innov[1])
+                    innov_sq = float(innov @ innov)
                     ukf12.update(z, p_obs=p_obs, R_wb=_identity_R())
                     est_hist["meas12_azel"].append((p_obs.copy(), z.copy()))
                 else:
                     est_hist["meas12_azel"].append(None)
+                est_hist["meas12_innov_sq"].append(innov_sq)
+                est_hist["trP12_pos"].append(float(np.trace(ukf12.P[:3, :3])))
                 est_hist["est12_xyz"].append(ukf12.x[:3].copy())
 
             if ukf21 is not None:
@@ -1727,6 +1749,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                     control_limit=umax,
                 )
                 ukf21.predict(dt, u=u21_pred, u_cov=u21_cov)
+                innov_sq = float("nan")
                 if take:
                     p_obs = _to3_pos(x2)
                     p_tgt = _to3_pos(x1)
@@ -1735,10 +1758,17 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                     az = np.arctan2(d[1], d[0]) + np.random.randn() * meas_std_az
                     el = np.arctan2(d[2], np.sqrt(max(d[0] ** 2 + d[1] ** 2, 1e-18))) + np.random.randn() * meas_std_el
                     z = np.array([az, el], float)
+                    z_hat = ukf21.h(ukf21.x.copy(), p_obs=p_obs, R_wb=_identity_R())
+                    innov = z - z_hat
+                    innov[0] = _normalize_angle(innov[0])
+                    innov[1] = _normalize_angle(innov[1])
+                    innov_sq = float(innov @ innov)
                     ukf21.update(z, p_obs=p_obs, R_wb=_identity_R())
                     est_hist["meas21_azel"].append((p_obs.copy(), z.copy()))
                 else:
                     est_hist["meas21_azel"].append(None)
+                est_hist["meas21_innov_sq"].append(innov_sq)
+                est_hist["trP21_pos"].append(float(np.trace(ukf21.P[:3, :3])))
                 est_hist["est21_xyz"].append(ukf21.x[:3].copy())
 
             if ukf12 is not None:

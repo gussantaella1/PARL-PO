@@ -59,6 +59,7 @@ COMMON: Dict[str, Any] = {
 
     # Arena
     "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
+    "normalize_pos_obs": True,
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 

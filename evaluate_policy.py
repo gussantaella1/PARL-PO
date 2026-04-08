@@ -367,6 +367,84 @@ def _quantiles(x: np.ndarray, qs=(0.0, 0.25, 0.5, 0.75, 1.0)) -> Dict[str, float
     return {f"q{int(100*q):02d}": float(v) for q, v in zip(qs, vals)}
 
 
+def _numeric_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
+    x = np.asarray(vals, dtype=float).reshape(-1)
+    x = x[np.isfinite(x)]
+    n = int(x.size)
+    if n == 0:
+        return {
+            "n": 0,
+            "mean": float("nan"),
+            "std": float("nan"),
+            "std_sample": float("nan"),
+            "stderr": float("nan"),
+            **_quantiles(x),
+        }
+
+    std = float(np.std(x, ddof=0))
+    std_sample = float(np.std(x, ddof=1)) if n > 1 else float("nan")
+    stderr = float(std / np.sqrt(n))
+    return {
+        "n": n,
+        "mean": float(np.mean(x)),
+        "std": std,
+        "std_sample": std_sample,
+        "stderr": stderr,
+        **_quantiles(x),
+    }
+
+
+def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[str, Any]:
+    x = np.asarray(vals, dtype=float).reshape(-1)
+    x = x[np.isfinite(x)]
+    if x.size:
+        x = np.clip(np.rint(x), 0.0, 1.0)
+
+    n = int(x.size)
+    if n == 0:
+        nan = float("nan")
+        return {
+            "n": 0,
+            "successes": 0,
+            "failures": 0,
+            "rate": nan,
+            "mean": nan,
+            "stderr": nan,
+            "ci_wilson": {"alpha": float(alpha), "lo": nan, "hi": nan},
+        }
+
+    k = int(np.sum(x))
+    p = float(k / n)
+    lo, hi = wilson_ci(k, n, alpha=float(alpha))
+    stderr = float(np.sqrt(p * (1.0 - p) / n))
+    return {
+        "n": n,
+        "successes": k,
+        "failures": n - k,
+        "rate": p,
+        "mean": p,
+        "stderr": stderr,
+        "ci_wilson": {"alpha": float(alpha), "lo": float(lo), "hi": float(hi)},
+    }
+
+
+def _binary_ci_errorbars(stats: Dict[str, Any]) -> Tuple[float, float]:
+    mean = float(stats.get("mean", float("nan")))
+    ci = stats.get("ci_wilson", {}) or {}
+    lo = float(ci.get("lo", float("nan")))
+    hi = float(ci.get("hi", float("nan")))
+    if not (np.isfinite(mean) and np.isfinite(lo) and np.isfinite(hi)):
+        return float("nan"), float("nan")
+    return max(0.0, mean - lo), max(0.0, hi - mean)
+
+
+def _event_time_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
+    x = np.asarray(vals, dtype=float).reshape(-1)
+    x = x[np.isfinite(x)]
+    x = x[x >= 0.0]
+    return _numeric_summary_from_values(x)
+
+
 def _cli_option_strings(argv: List[str]) -> set[str]:
     present: set[str] = set()
     for tok in argv[1:]:
@@ -951,6 +1029,7 @@ def _classify_trial_outcome(row: Dict[str, Any]) -> str:
 def _save_outcome_histogram(
     out_dir: Path,
     trial_rows: List[Dict[str, Any]],
+    alpha: float = 0.05,
 ) -> Dict[str, Any]:
     import matplotlib.pyplot as plt
 
@@ -991,20 +1070,46 @@ def _save_outcome_histogram(
         present = labels
 
     values = [counts[k] / float(n) for k in present]
+    stats = {
+        k: _binary_summary_from_values(
+            np.asarray([1.0 if _classify_trial_outcome(row) == k else 0.0 for row in trial_rows], dtype=float),
+            alpha=float(alpha),
+        )
+        for k in labels
+    }
+    left_errs = [ _binary_ci_errorbars(stats[k])[0] for k in present ]
+    right_errs = [ _binary_ci_errorbars(stats[k])[1] for k in present ]
     fig_h = max(4.0, 0.55 * len(present) + 1.5)
     fig, ax = plt.subplots(figsize=(9, fig_h))
-    bars = ax.barh(range(len(present)), values, color="steelblue", edgecolor="black")
+    bars = ax.barh(
+        range(len(present)),
+        values,
+        xerr=np.asarray([left_errs, right_errs], dtype=float),
+        color="steelblue",
+        edgecolor="black",
+        ecolor="black",
+        capsize=4,
+    )
     ax.set_yticks(range(len(present)))
     ax.set_yticklabels([pretty[k] for k in present])
-    ax.set_xlim(0.0, max(values) * 1.15 if values else 1.0)
-    ax.set_xlabel("Proportion of trials (-)")
-    ax.set_title("Trial Outcome Breakdown")
+    xmax = max((v + r) for v, r in zip(values, right_errs)) if values else 1.0
+    ax.set_xlim(0.0, max(1.0, xmax * 1.15))
+    ci_pct = int(round((1.0 - float(alpha)) * 100.0))
+    ax.set_xlabel(f"Proportion of trials (-), error bars = Wilson {ci_pct}% CI")
+    ax.set_title("Trial Outcome Breakdown With Confidence Intervals")
     ax.grid(True, axis="x", alpha=0.3)
 
     for idx, (bar, key) in enumerate(zip(bars, present)):
         v = values[idx]
-        ax.text(v + 0.01 * max(1.0, max(values)), bar.get_y() + bar.get_height() / 2.0,
-                f"{counts[key]}/{n} ({v:.1%})", va="center", fontsize=9)
+        lo = float(stats[key]["ci_wilson"]["lo"])
+        hi = float(stats[key]["ci_wilson"]["hi"])
+        ax.text(
+            v + right_errs[idx] + 0.01 * max(1.0, xmax),
+            bar.get_y() + bar.get_height() / 2.0,
+            f"{counts[key]}/{n} ({v:.1%}, {ci_pct}% CI [{lo:.1%}, {hi:.1%}])",
+            va="center",
+            fontsize=9,
+        )
 
     fig.tight_layout()
     fig.savefig(out_dir / "outcome_hist.png", dpi=180)
@@ -1013,6 +1118,7 @@ def _save_outcome_histogram(
     return {
         "counts": counts,
         "proportions": {k: counts[k] / float(n) for k in labels},
+        "proportion_stats": stats,
     }
 
 
@@ -1169,6 +1275,18 @@ def _extract_single_attacker_rollout(out: Dict[str, Any], attacker_idx: int) -> 
     }
     if u_cmd_norm_all is not None:
         single["u_cmd_norm_all"] = u_cmd_norm_all
+    for key in [
+        "est12_xyz",
+        "est21_xyz",
+        "meas12_azel",
+        "meas21_azel",
+        "meas12_innov_sq",
+        "meas21_innov_sq",
+        "trP12_pos",
+        "trP21_pos",
+    ]:
+        if key in out:
+            single[key] = out.get(key)
     return single
 
 
@@ -1201,6 +1319,53 @@ def _mean_metric(per_att_metrics: List[Dict[str, Any]], key: str) -> float:
         if np.isfinite(v):
             vals.append(v)
     return float(np.mean(vals)) if vals else float("nan")
+
+
+def _extract_kf_trial_metrics(out: Dict[str, Any], D: int) -> Dict[str, Any]:
+    metrics: Dict[str, Any] = {}
+
+    def _pos_err_metrics(est_key: str, true_key: str, prefix: str) -> None:
+        est = np.asarray(out.get(est_key, []), dtype=float)
+        true = np.asarray(out.get(true_key, []), dtype=float)
+        if est.ndim != 2 or true.ndim != 2 or est.size == 0 or true.size == 0:
+            return
+        n = min(len(est), len(true))
+        if n <= 0:
+            return
+        err = np.linalg.norm(est[:n, :3] - true[:n, :3], axis=1)
+        if err.size == 0:
+            return
+        metrics[f"{prefix}_pos_err_mean"] = float(np.mean(err))
+        metrics[f"{prefix}_pos_err_rms"] = float(np.sqrt(np.mean(err ** 2)))
+        metrics[f"{prefix}_pos_err_max"] = float(np.max(err))
+        metrics[f"{prefix}_pos_err_final"] = float(err[-1])
+
+    def _measurement_metrics(meas_key: str, innov_key: str, trp_key: str, prefix: str) -> None:
+        meas = out.get(meas_key, None)
+        if isinstance(meas, list):
+            n_total = max(0, len(meas) - 1)
+            n_obs = int(sum(m is not None for m in meas))
+            metrics[f"{prefix}_meas_count"] = n_obs
+            metrics[f"{prefix}_meas_fraction"] = float(n_obs / max(1, n_total)) if n_total > 0 else float("nan")
+
+        innov = np.asarray(out.get(innov_key, []), dtype=float).reshape(-1)
+        innov = innov[np.isfinite(innov)]
+        if innov.size:
+            metrics[f"{prefix}_meas_innov_sq_mean"] = float(np.mean(innov))
+            metrics[f"{prefix}_meas_innov_sq_max"] = float(np.max(innov))
+
+        trp = np.asarray(out.get(trp_key, []), dtype=float).reshape(-1)
+        trp = trp[np.isfinite(trp)]
+        if trp.size:
+            metrics[f"{prefix}_trPpos_mean"] = float(np.mean(trp))
+            metrics[f"{prefix}_trPpos_final"] = float(trp[-1])
+
+    _pos_err_metrics("est12_xyz", "exec2_xyz", "kf_def_att")
+    _pos_err_metrics("est21_xyz", "exec1_xyz", "kf_att_def")
+    _measurement_metrics("meas12_azel", "meas12_innov_sq", "trP12_pos", "kf_def_att")
+    _measurement_metrics("meas21_azel", "meas21_innov_sq", "trP21_pos", "kf_att_def")
+    metrics["kf_enabled_rollout"] = int(bool(metrics))
+    return metrics
 
 
 def _aggregate_trial_metrics(per_att_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1253,6 +1418,7 @@ def _save_start_plots(
     cmap: str = "viridis",
     edge_lw: float = 0.7,
     marker_size: float = 45.0,
+    alpha: float = 0.05,
 ) -> None:
     import matplotlib.pyplot as plt
 
@@ -1302,12 +1468,89 @@ def _save_start_plots(
 
         _set_equal(ax)
 
+    def _coords(arr: np.ndarray, plane: str) -> Tuple[np.ndarray, np.ndarray]:
+        if plane == "xy":
+            return arr[:, 0], arr[:, 1]
+        if plane == "xz":
+            return arr[:, 0], arr[:, 2]
+        raise ValueError(f"unknown plane={plane}")
+
+    def _plot_cloud_spread(ax, plane: str):
+        x_def, y_def = _coords(starts_def, plane)
+        datasets: List[Tuple[str, np.ndarray, np.ndarray]] = [("def_start", x_def, y_def)]
+        for j, sa in enumerate(starts_atts):
+            if sa.size == 0:
+                continue
+            x_att, y_att = _coords(sa, plane)
+            datasets.append((f"att{j+1}_start", x_att, y_att))
+
+        for label, xs, ys in datasets:
+            x_mean = float(np.mean(xs))
+            y_mean = float(np.mean(ys))
+            x_std = float(np.std(xs, ddof=0))
+            y_std = float(np.std(ys, ddof=0))
+            ax.errorbar(
+                x_mean,
+                y_mean,
+                xerr=x_std,
+                yerr=y_std,
+                fmt="o",
+                markersize=6,
+                capsize=4,
+                elinewidth=1.2,
+                label=f"{label} mean +/-1 SD",
+            )
+
+        _decorate(ax, plane, f"Start Spread (mean +/-1 SD, {plane.upper()})", "x", plane[1])
+        ax.legend(fontsize=8)
+
+    def _plot_rate_uncertainty(
+        ax,
+        pts: np.ndarray,
+        rate_stats: List[Dict[str, Any]],
+        title: str,
+    ) -> None:
+        if pts.size == 0 or not rate_stats:
+            ax.set_title(title)
+            ax.set_xlabel("Start radius (m)")
+            ax.set_ylabel("Pass rate")
+            ax.text(0.5, 0.5, "No aggregated points", ha="center", va="center", transform=ax.transAxes)
+            ax.grid(True, alpha=0.3)
+            return
+
+        radii = np.linalg.norm(pts - center[None, :], axis=1)
+        means = np.asarray([s["mean"] for s in rate_stats], dtype=float)
+        lower_errs = np.asarray([_binary_ci_errorbars(s)[0] for s in rate_stats], dtype=float)
+        upper_errs = np.asarray([_binary_ci_errorbars(s)[1] for s in rate_stats], dtype=float)
+        counts = np.asarray([s["n"] for s in rate_stats], dtype=int)
+        order = np.argsort(radii)
+        ci_pct = int(round((1.0 - float(alpha)) * 100.0))
+        ax.errorbar(
+            radii[order],
+            means[order],
+            yerr=np.asarray([lower_errs[order], upper_errs[order]], dtype=float),
+            fmt="o",
+            linestyle="none",
+            capsize=3,
+            color="tab:blue",
+            ecolor="tab:gray",
+            alpha=0.9,
+        )
+        if len(order) <= 25:
+            for r, m, c in zip(radii[order], means[order], counts[order]):
+                ax.annotate(f"n={int(c)}", (float(r), float(m)), xytext=(4, 4), textcoords="offset points", fontsize=7)
+        ax.set_ylim(-0.05, 1.05)
+        ax.set_xlabel("Start radius (m)")
+        ax.set_ylabel(f"Pass rate with Wilson {ci_pct}% CI")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+
     # -------------------------
     # 1) Plain coverage plots
     # -------------------------
     # XY
-    fig, ax = plt.subplots()
-    ax.scatter(
+    fig, (ax_cov, ax_spread) = plt.subplots(1, 2, figsize=(13, 5.5))
+    ax_cov.scatter(
         starts_def[:, 0], starts_def[:, 1],
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw,
@@ -1316,21 +1559,22 @@ def _save_start_plots(
     for j, sa in enumerate(starts_atts):
         if sa.size == 0:
             continue
-        ax.scatter(
+        ax_cov.scatter(
             sa[:, 0], sa[:, 1],
             marker="o", s=marker_size,
             edgecolors="k", linewidths=edge_lw,
             label=f"att{j+1}_start"
         )
-    _decorate(ax, "xy", "Evaluated Starting Positions (XY)", "x", "y")
-    ax.legend()
+    _decorate(ax_cov, "xy", "Evaluated Starting Positions (XY)", "x", "y")
+    ax_cov.legend()
+    _plot_cloud_spread(ax_spread, "xy")
     fig.tight_layout()
     fig.savefig(out_dir / "starts_xy.png", dpi=180)
     plt.close(fig)
 
     # XZ
-    fig, ax = plt.subplots()
-    ax.scatter(
+    fig, (ax_cov, ax_spread) = plt.subplots(1, 2, figsize=(13, 5.5))
+    ax_cov.scatter(
         starts_def[:, 0], starts_def[:, 2],
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw,
@@ -1339,14 +1583,15 @@ def _save_start_plots(
     for j, sa in enumerate(starts_atts):
         if sa.size == 0:
             continue
-        ax.scatter(
+        ax_cov.scatter(
             sa[:, 0], sa[:, 2],
             marker="o", s=marker_size,
             edgecolors="k", linewidths=edge_lw,
             label=f"att{j+1}_start"
         )
-    _decorate(ax, "xz", "Evaluated Starting Positions (XZ)", "x", "z")
-    ax.legend()
+    _decorate(ax_cov, "xz", "Evaluated Starting Positions (XZ)", "x", "z")
+    ax_cov.legend()
+    _plot_cloud_spread(ax_spread, "xz")
     fig.tight_layout()
     fig.savefig(out_dir / "starts_xz.png", dpi=180)
     plt.close(fig)
@@ -1359,16 +1604,14 @@ def _save_start_plots(
 
 
 
-    def_counts: Dict[Tuple[float, float, float], List[int]] = {}
-    att_counts: Dict[Tuple[float, float, float], List[int]] = {}
+    def_passes: Dict[Tuple[float, float, float], List[int]] = {}
+    att_passes: Dict[Tuple[float, float, float], List[int]] = {}
 
     for r in trial_rows:
         p = int(r.get("pass_trial", 0))
         kd = _key([r["def_x"], r["def_y"], r["def_z"]])
 
-        def_counts.setdefault(kd, [0, 0])
-        def_counts[kd][0] += p
-        def_counts[kd][1] += 1
+        def_passes.setdefault(kd, []).append(p)
 
         n_att_row = max(1, int(r.get("num_attackers", 1)))
         for j in range(n_att_row):
@@ -1378,76 +1621,186 @@ def _save_start_plots(
             if any(np.isnan(float(v)) for v in (ax, ay, az)):
                 continue
             ka = _key([ax, ay, az])
-            att_counts.setdefault(ka, [0, 0])
-            att_counts[ka][0] += p
-            att_counts[ka][1] += 1
+            att_passes.setdefault(ka, []).append(p)
 
-    def_pts = np.array(list(def_counts.keys()), dtype=float)
-    def_rates = np.array([def_counts[k][0] / max(1, def_counts[k][1]) for k in def_counts], dtype=float)
+    def_pts = np.array(list(def_passes.keys()), dtype=float)
+    def_rate_stats = [
+        _binary_summary_from_values(np.asarray(def_passes[k], dtype=float), alpha=float(alpha))
+        for k in def_passes
+    ]
+    def_rates = np.array([s["mean"] for s in def_rate_stats], dtype=float)
 
-    att_pts = np.array(list(att_counts.keys()), dtype=float)
-    att_rates = np.array([att_counts[k][0] / max(1, att_counts[k][1]) for k in att_counts], dtype=float)
+    att_pts = np.array(list(att_passes.keys()), dtype=float)
+    att_rate_stats = [
+        _binary_summary_from_values(np.asarray(att_passes[k], dtype=float), alpha=float(alpha))
+        for k in att_passes
+    ]
+    att_rates = np.array([s["mean"] for s in att_rate_stats], dtype=float)
 
 
     # Defender success XY
-    fig, ax = plt.subplots()
-    sc = ax.scatter(
+    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    sc = ax_map.scatter(
         def_pts[:, 0], def_pts[:, 1],
         c=def_rates, cmap=cmap,
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw
     )
-    _decorate(ax, "xy", "Defender start: pass rate over attacker starts (XY)", "x", "y")
-    cbar = fig.colorbar(sc, ax=ax)
+    _decorate(ax_map, "xy", "Defender start: pass rate over attacker starts (XY)", "x", "y")
+    cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
+    _plot_rate_uncertainty(ax_err, def_pts, def_rate_stats, "Defender start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "def_success_xy.png", dpi=180)
     plt.close(fig)
 
     # Defender success XZ
-    fig, ax = plt.subplots()
-    sc = ax.scatter(
+    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    sc = ax_map.scatter(
         def_pts[:, 0], def_pts[:, 2],
         c=def_rates, cmap=cmap,
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw
     )
-    _decorate(ax, "xz", "Defender start: pass rate over attacker starts (XZ)", "x", "z")
-    cbar = fig.colorbar(sc, ax=ax)
+    _decorate(ax_map, "xz", "Defender start: pass rate over attacker starts (XZ)", "x", "z")
+    cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
+    _plot_rate_uncertainty(ax_err, def_pts, def_rate_stats, "Defender start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "def_success_xz.png", dpi=180)
     plt.close(fig)
 
     # Attacker success XY
-    fig, ax = plt.subplots()
-    sc = ax.scatter(
+    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    sc = ax_map.scatter(
         att_pts[:, 0], att_pts[:, 1],
         c=att_rates, cmap=cmap,
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw
     )
-    _decorate(ax, "xy", "Attacker start: pass rate over defender starts (XY)", "x", "y")
-    cbar = fig.colorbar(sc, ax=ax)
+    _decorate(ax_map, "xy", "Attacker start: pass rate over defender starts (XY)", "x", "y")
+    cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
+    _plot_rate_uncertainty(ax_err, att_pts, att_rate_stats, "Attacker start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "att_success_xy.png", dpi=180)
     plt.close(fig)
 
     # Attacker success XZ
-    fig, ax = plt.subplots()
-    sc = ax.scatter(
+    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    sc = ax_map.scatter(
         att_pts[:, 0], att_pts[:, 2],
         c=att_rates, cmap=cmap,
         marker="o", s=marker_size,
         edgecolors="k", linewidths=edge_lw
     )
-    _decorate(ax, "xz", "Attacker start: pass rate over defender starts (XZ)", "x", "z")
-    cbar = fig.colorbar(sc, ax=ax)
+    _decorate(ax_map, "xz", "Attacker start: pass rate over defender starts (XZ)", "x", "z")
+    cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
+    _plot_rate_uncertainty(ax_err, att_pts, att_rate_stats, "Attacker start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "att_success_xz.png", dpi=180)
     plt.close(fig)
+
+
+def _save_kf_eval_plots(
+    out_dir: Path,
+    trial_rows: List[Dict[str, Any]],
+    estimator_label: str,
+) -> List[str]:
+    import matplotlib.pyplot as plt
+
+    def _vals(name: str) -> np.ndarray:
+        vals = []
+        for row in trial_rows:
+            try:
+                v = float(row.get(name, float("nan")))
+            except Exception:
+                continue
+            if np.isfinite(v):
+                vals.append(v)
+        return np.asarray(vals, dtype=float)
+
+    def _save_summary_barplot(filename: str, title: str, items: List[Tuple[str, str]]) -> Optional[str]:
+        labels: List[str] = []
+        means: List[float] = []
+        stds: List[float] = []
+        ns: List[int] = []
+        for key, label in items:
+            vals = _vals(key)
+            if vals.size == 0:
+                continue
+            labels.append(label)
+            means.append(float(np.mean(vals)))
+            stds.append(float(np.std(vals, ddof=0)))
+            ns.append(int(vals.size))
+        if not labels:
+            return None
+
+        fig_h = max(4.0, 0.6 * len(labels) + 1.5)
+        fig, ax = plt.subplots(figsize=(9, fig_h))
+        bars = ax.barh(
+            range(len(labels)),
+            means,
+            xerr=stds,
+            color="steelblue",
+            edgecolor="black",
+            ecolor="black",
+            capsize=4,
+        )
+        ax.set_yticks(range(len(labels)))
+        ax.set_yticklabels(labels)
+        ax.set_title(title)
+        ax.set_xlabel("Mean across trials, error bars = +/-1 SD")
+        ax.grid(True, axis="x", alpha=0.3)
+        xmax = max((m + s) for m, s in zip(means, stds)) if means else 1.0
+        ax.set_xlim(0.0, max(1.0, xmax * 1.15))
+        for idx, bar in enumerate(bars):
+            ax.text(
+                means[idx] + stds[idx] + 0.01 * max(1.0, xmax),
+                bar.get_y() + bar.get_height() / 2.0,
+                f"{means[idx]:.3g} +/- {stds[idx]:.3g} (n={ns[idx]})",
+                va="center",
+                fontsize=9,
+            )
+        fig.tight_layout()
+        path = out_dir / filename
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return str(path)
+
+    written: List[str] = []
+    err_plot = _save_summary_barplot(
+        "ukf_errors.png",
+        f"{estimator_label} Evaluation Error Metrics",
+        [
+            ("kf_def_att_pos_err_rms", "Def->att RMS pos err (m)"),
+            ("kf_att_def_pos_err_rms", "Att->def RMS pos err (m)"),
+            ("kf_def_att_pos_err_final", "Def->att final pos err (m)"),
+            ("kf_att_def_pos_err_final", "Att->def final pos err (m)"),
+            ("kf_def_att_pos_err_max", "Def->att max pos err (m)"),
+            ("kf_att_def_pos_err_max", "Att->def max pos err (m)"),
+        ],
+    )
+    if err_plot is not None:
+        written.append(err_plot)
+
+    stats_plot = _save_summary_barplot(
+        "ukf_stats.png",
+        f"{estimator_label} Evaluation Estimator Stats",
+        [
+            ("kf_def_att_meas_innov_sq_mean", "Def->att meas innov sq mean"),
+            ("kf_att_def_meas_innov_sq_mean", "Att->def meas innov sq mean"),
+            ("kf_def_att_trPpos_mean", "Def->att tr(P_pos) mean"),
+            ("kf_att_def_trPpos_mean", "Att->def tr(P_pos) mean"),
+            ("kf_def_att_meas_fraction", "Def->att measurement fraction"),
+            ("kf_att_def_meas_fraction", "Att->def measurement fraction"),
+        ],
+    )
+    if stats_plot is not None:
+        written.append(stats_plot)
+
+    return written
 
 
 # ------------------------- main -------------------------
@@ -1912,6 +2265,7 @@ def main():
                 try:
                     out_j = _extract_single_attacker_rollout(out, j)
                     m = _compute_trial_metrics(cfg_run, out_j)
+                    m.update(_extract_kf_trial_metrics(out_j, D))
                     rollout_steps = _rollout_num_steps(out_j)
                     m["rollout_num_steps"] = int(rollout_steps)
                     for timing_key in ("setup", "simulation", "total"):
@@ -2022,26 +2376,44 @@ def main():
 
 
 
-    outcome_breakdown = _save_outcome_histogram(out_dir, trial_rows)
+    outcome_breakdown = _save_outcome_histogram(out_dir, trial_rows, alpha=float(args.alpha))
 
     def _metric_summary(name: str) -> Dict[str, float]:
         vals = _col(name)
-        return {
-            "mean": float(np.nanmean(vals)) if vals.size else float("nan"),
-            **_quantiles(vals),
-        }
+        return _numeric_summary_from_values(vals)
+
+
+    def _rate_value_and_stats(name: str) -> Tuple[float, Dict[str, Any]]:
+        stats = _binary_summary_from_values(_col(name), alpha=float(args.alpha))
+        return float(stats["mean"]), stats
+
+
+    def _event_time_summary(name: str) -> Dict[str, float]:
+        return _event_time_summary_from_values(_col(name))
 
 
     def _attacker_metric_block(prefix: str) -> Dict[str, Any]:
+        attacker_hit_rate, attacker_hit_rate_stats = _rate_value_and_stats(f"{prefix}_attacker_hit")
+        collision_rate, collision_rate_stats = _rate_value_and_stats(f"{prefix}_collided")
+        att_term_rate, att_term_rate_stats = _rate_value_and_stats(f"{prefix}_att_term")
+        def_term_rate, def_term_rate_stats = _rate_value_and_stats(f"{prefix}_def_term")
+        oi_viol_def_rate, oi_viol_def_rate_stats = _rate_value_and_stats(f"{prefix}_oi_viol_def")
+        oi_viol_att_rate, oi_viol_att_rate_stats = _rate_value_and_stats(f"{prefix}_oi_viol_att")
         return {
             "min_rel_dist": _metric_summary(f"{prefix}_min_rel_dist"),
             "min_att_center": _metric_summary(f"{prefix}_min_att_center"),
-            "attacker_hit_rate": float(np.mean(_col(f"{prefix}_attacker_hit"))) if _col(f"{prefix}_attacker_hit").size else float("nan"),
-            "collision_rate": float(np.mean(_col(f"{prefix}_collided"))) if _col(f"{prefix}_collided").size else float("nan"),
-            "att_term_rate": float(np.mean(_col(f"{prefix}_att_term"))) if _col(f"{prefix}_att_term").size else float("nan"),
-            "def_term_rate": float(np.mean(_col(f"{prefix}_def_term"))) if _col(f"{prefix}_def_term").size else float("nan"),
-            "oi_viol_def_rate": float(np.mean(_col(f"{prefix}_oi_viol_def"))) if _col(f"{prefix}_oi_viol_def").size else float("nan"),
-            "oi_viol_att_rate": float(np.mean(_col(f"{prefix}_oi_viol_att"))) if _col(f"{prefix}_oi_viol_att").size else float("nan"),
+            "attacker_hit_rate": attacker_hit_rate,
+            "attacker_hit_rate_stats": attacker_hit_rate_stats,
+            "collision_rate": collision_rate,
+            "collision_rate_stats": collision_rate_stats,
+            "att_term_rate": att_term_rate,
+            "att_term_rate_stats": att_term_rate_stats,
+            "def_term_rate": def_term_rate,
+            "def_term_rate_stats": def_term_rate_stats,
+            "oi_viol_def_rate": oi_viol_def_rate,
+            "oi_viol_def_rate_stats": oi_viol_def_rate_stats,
+            "oi_viol_att_rate": oi_viol_att_rate,
+            "oi_viol_att_rate_stats": oi_viol_att_rate_stats,
             "udef_mean": _metric_summary(f"{prefix}_udef_mean"),
             "uatt_mean": _metric_summary(f"{prefix}_uatt_mean"),
             "rollout_num_steps": _metric_summary(f"{prefix}_rollout_num_steps"),
@@ -2051,10 +2423,44 @@ def main():
             "rollout_simulation_sec_per_step": _metric_summary(f"{prefix}_rollout_simulation_sec_per_step"),
             "rollout_total_sec": _metric_summary(f"{prefix}_rollout_total_sec"),
             "rollout_total_sec_per_step": _metric_summary(f"{prefix}_rollout_total_sec_per_step"),
+            "t_collide_given_collision": _event_time_summary(f"{prefix}_t_collide"),
+            "t_att_hit_given_hit": _event_time_summary(f"{prefix}_t_att_hit"),
+            "t_att_term_given_att_term": _event_time_summary(f"{prefix}_t_att_term"),
+            "t_def_term_given_def_term": _event_time_summary(f"{prefix}_t_def_term"),
+            "t_oi_viol_def_given_oi_viol_def": _event_time_summary(f"{prefix}_t_oi_viol_def"),
+            "t_oi_viol_att_given_oi_viol_att": _event_time_summary(f"{prefix}_t_oi_viol_att"),
+            "kf_enabled_rollout_rate": _rate_value_and_stats(f"{prefix}_kf_enabled_rollout")[0],
+            "kf_enabled_rollout_rate_stats": _rate_value_and_stats(f"{prefix}_kf_enabled_rollout")[1],
+            "kf_def_att_pos_err_mean": _metric_summary(f"{prefix}_kf_def_att_pos_err_mean"),
+            "kf_def_att_pos_err_rms": _metric_summary(f"{prefix}_kf_def_att_pos_err_rms"),
+            "kf_def_att_pos_err_max": _metric_summary(f"{prefix}_kf_def_att_pos_err_max"),
+            "kf_def_att_pos_err_final": _metric_summary(f"{prefix}_kf_def_att_pos_err_final"),
+            "kf_att_def_pos_err_mean": _metric_summary(f"{prefix}_kf_att_def_pos_err_mean"),
+            "kf_att_def_pos_err_rms": _metric_summary(f"{prefix}_kf_att_def_pos_err_rms"),
+            "kf_att_def_pos_err_max": _metric_summary(f"{prefix}_kf_att_def_pos_err_max"),
+            "kf_att_def_pos_err_final": _metric_summary(f"{prefix}_kf_att_def_pos_err_final"),
+            "kf_def_att_meas_count": _metric_summary(f"{prefix}_kf_def_att_meas_count"),
+            "kf_def_att_meas_fraction": _metric_summary(f"{prefix}_kf_def_att_meas_fraction"),
+            "kf_def_att_meas_innov_sq_mean": _metric_summary(f"{prefix}_kf_def_att_meas_innov_sq_mean"),
+            "kf_def_att_trPpos_mean": _metric_summary(f"{prefix}_kf_def_att_trPpos_mean"),
+            "kf_att_def_meas_count": _metric_summary(f"{prefix}_kf_att_def_meas_count"),
+            "kf_att_def_meas_fraction": _metric_summary(f"{prefix}_kf_att_def_meas_fraction"),
+            "kf_att_def_meas_innov_sq_mean": _metric_summary(f"{prefix}_kf_att_def_meas_innov_sq_mean"),
+            "kf_att_def_trPpos_mean": _metric_summary(f"{prefix}_kf_att_def_trPpos_mean"),
         }
 
 
+    success_rate_summary = _binary_summary_from_values(np.asarray([float(r.get("pass_trial", 0)) for r in trial_rows], dtype=float), alpha=float(args.alpha))
     trial_attacker_hit_vals = _col("trial_attacker_hit_any")
+    attacker_primary_summary = _binary_summary_from_values(trial_attacker_hit_vals, alpha=float(args.alpha))
+    trial_attacker_hit_rate, trial_attacker_hit_rate_stats = _rate_value_and_stats("trial_attacker_hit_any")
+    trial_collision_any_rate, trial_collision_any_rate_stats = _rate_value_and_stats("trial_collided_any")
+    trial_att_term_any_rate, trial_att_term_any_rate_stats = _rate_value_and_stats("trial_att_term_any")
+    trial_def_term_any_rate, trial_def_term_any_rate_stats = _rate_value_and_stats("trial_def_term_any")
+    trial_oi_viol_def_any_rate, trial_oi_viol_def_any_rate_stats = _rate_value_and_stats("trial_oi_viol_def_any")
+    trial_oi_viol_att_any_rate, trial_oi_viol_att_any_rate_stats = _rate_value_and_stats("trial_oi_viol_att_any")
+    trial_rollout_error_any_rate, trial_rollout_error_any_rate_stats = _rate_value_and_stats("trial_rollout_error_any")
+    trial_kf_enabled_rate, trial_kf_enabled_rate_stats = _rate_value_and_stats("att1_kf_enabled_rollout")
     primary_metric_name = "defender_capture_pass_rate" if args.policy_role == "def" else (
         "attacker_hit_any_rate" if num_attackers > 1 else "attacker_hit_rate"
     )
@@ -2066,12 +2472,16 @@ def main():
         "num_trials": n,
         "passes": k,
         "success_rate": float(sr),
+        "success_rate_stderr": float(success_rate_summary["stderr"]),
+        "success_rate_summary": success_rate_summary,
         "defender_pass_rate": float(sr),
+        "defender_pass_rate_summary": success_rate_summary,
         "policy_role": args.policy_role,
         "opponent_source": args.opponent_source,
         "policy_primary_metric": {
             "name": primary_metric_name,
             "value": primary_metric_value,
+            "summary": success_rate_summary if args.policy_role == "def" else attacker_primary_summary,
         },
         "success_rate_ci_wilson": {"alpha": float(args.alpha), "lo": float(lo), "hi": float(hi)},
         "config_module": args.config_module,
@@ -2102,13 +2512,22 @@ def main():
         "metrics_trial": {
             "min_rel_dist": _metric_summary("trial_min_rel_dist"),
             "min_att_center": _metric_summary("trial_min_att_center"),
-            "attacker_hit_any_rate": float(np.mean(_col("trial_attacker_hit_any"))) if _col("trial_attacker_hit_any").size else float("nan"),
-            "collision_any_rate": float(np.mean(_col("trial_collided_any"))) if _col("trial_collided_any").size else float("nan"),
-            "att_term_any_rate": float(np.mean(_col("trial_att_term_any"))) if _col("trial_att_term_any").size else float("nan"),
-            "def_term_any_rate": float(np.mean(_col("trial_def_term_any"))) if _col("trial_def_term_any").size else float("nan"),
-            "oi_viol_def_any_rate": float(np.mean(_col("trial_oi_viol_def_any"))) if _col("trial_oi_viol_def_any").size else float("nan"),
-            "oi_viol_att_any_rate": float(np.mean(_col("trial_oi_viol_att_any"))) if _col("trial_oi_viol_att_any").size else float("nan"),
-            "rollout_error_any_rate": float(np.mean(_col("trial_rollout_error_any"))) if _col("trial_rollout_error_any").size else float("nan"),
+            "attacker_hit_any_rate": trial_attacker_hit_rate,
+            "attacker_hit_any_rate_stats": trial_attacker_hit_rate_stats,
+            "collision_any_rate": trial_collision_any_rate,
+            "collision_any_rate_stats": trial_collision_any_rate_stats,
+            "att_term_any_rate": trial_att_term_any_rate,
+            "att_term_any_rate_stats": trial_att_term_any_rate_stats,
+            "def_term_any_rate": trial_def_term_any_rate,
+            "def_term_any_rate_stats": trial_def_term_any_rate_stats,
+            "oi_viol_def_any_rate": trial_oi_viol_def_any_rate,
+            "oi_viol_def_any_rate_stats": trial_oi_viol_def_any_rate_stats,
+            "oi_viol_att_any_rate": trial_oi_viol_att_any_rate,
+            "oi_viol_att_any_rate_stats": trial_oi_viol_att_any_rate_stats,
+            "rollout_error_any_rate": trial_rollout_error_any_rate,
+            "rollout_error_any_rate_stats": trial_rollout_error_any_rate_stats,
+            "kf_enabled_rollout_rate": trial_kf_enabled_rate,
+            "kf_enabled_rollout_rate_stats": trial_kf_enabled_rate_stats,
             "udef_mean": _metric_summary("trial_udef_mean"),
             "uatt_mean": _metric_summary("trial_uatt_mean"),
             "rollout_num_steps": _metric_summary("trial_rollout_num_steps"),
@@ -2118,6 +2537,28 @@ def main():
             "rollout_simulation_sec_per_step": _metric_summary("trial_rollout_simulation_sec_per_step"),
             "rollout_total_sec": _metric_summary("trial_rollout_total_sec"),
             "rollout_total_sec_per_step": _metric_summary("trial_rollout_total_sec_per_step"),
+            "t_collide_given_collision": _event_time_summary("trial_t_collide"),
+            "t_att_hit_given_hit": _event_time_summary("trial_t_att_hit"),
+            "t_att_term_given_att_term": _event_time_summary("trial_t_att_term"),
+            "t_def_term_given_def_term": _event_time_summary("trial_t_def_term"),
+            "t_oi_viol_def_given_oi_viol_def": _event_time_summary("trial_t_oi_viol_def"),
+            "t_oi_viol_att_given_oi_viol_att": _event_time_summary("trial_t_oi_viol_att"),
+            "kf_def_att_pos_err_mean": _metric_summary("att1_kf_def_att_pos_err_mean"),
+            "kf_def_att_pos_err_rms": _metric_summary("att1_kf_def_att_pos_err_rms"),
+            "kf_def_att_pos_err_max": _metric_summary("att1_kf_def_att_pos_err_max"),
+            "kf_def_att_pos_err_final": _metric_summary("att1_kf_def_att_pos_err_final"),
+            "kf_att_def_pos_err_mean": _metric_summary("att1_kf_att_def_pos_err_mean"),
+            "kf_att_def_pos_err_rms": _metric_summary("att1_kf_att_def_pos_err_rms"),
+            "kf_att_def_pos_err_max": _metric_summary("att1_kf_att_def_pos_err_max"),
+            "kf_att_def_pos_err_final": _metric_summary("att1_kf_att_def_pos_err_final"),
+            "kf_def_att_meas_count": _metric_summary("att1_kf_def_att_meas_count"),
+            "kf_def_att_meas_fraction": _metric_summary("att1_kf_def_att_meas_fraction"),
+            "kf_def_att_meas_innov_sq_mean": _metric_summary("att1_kf_def_att_meas_innov_sq_mean"),
+            "kf_def_att_trPpos_mean": _metric_summary("att1_kf_def_att_trPpos_mean"),
+            "kf_att_def_meas_count": _metric_summary("att1_kf_att_def_meas_count"),
+            "kf_att_def_meas_fraction": _metric_summary("att1_kf_att_def_meas_fraction"),
+            "kf_att_def_meas_innov_sq_mean": _metric_summary("att1_kf_att_def_meas_innov_sq_mean"),
+            "kf_att_def_trPpos_mean": _metric_summary("att1_kf_att_def_trPpos_mean"),
         },
     }
     for j in range(num_attackers):
@@ -2173,7 +2614,15 @@ def main():
         starts_atts=starts_att_arrs,
         trial_rows=trial_rows,
         cmap="coolwarm",          # or whatever you want
+        alpha=float(args.alpha),
     )
+
+    kf_plot_paths: List[str] = []
+    if use_kf:
+        kf_plot_paths = _save_kf_eval_plots(out_dir, trial_rows, estimator_kind.upper())
+        if kf_plot_paths:
+            results["kf_plot_files"] = [str(Path(p).name) for p in kf_plot_paths]
+            (out_dir / "results.json").write_text(json.dumps(results, indent=2))
 
     log(f"[eval] DONE | trials={n} passes={k} success_rate={sr:.3f} CI={lo:.3f}..{hi:.3f}")
     log(f"[eval] wrote: {out_dir/'results.json'}")
@@ -2182,6 +2631,8 @@ def main():
     log(f"[eval] wrote: {out_dir/'clean_non_hit_non_term_cases.csv'} ({len(clean_resolution_rows)} rows)")
     log(f"[eval] wrote: {out_dir/'starts_xy.png'}")
     log(f"[eval] wrote: {out_dir/'starts_xz.png'}")
+    for p in kf_plot_paths:
+        log(f"[eval] wrote: {p}")
     log(f"[eval] total_time={time.time() - t_global0:.3f}s")
 
 
@@ -2221,6 +2672,23 @@ python evaluate_policy.py \
 --shell_fracs 0.2,0.4,0.6,0.8 \ 
 --points_per_shell 40 \
 --x0_vel_jitter 0.5
+"""
+
+# KF setting on:
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_0.75_EKF_BC_GT \
+  --def_ckpt_path Training_Policy_0.75_EKF_BC_GT/def0_teacher.pt \
+  --att_ckpt_path Training_Policy_0.75_EKF_BC_GT/att1_teacher.pt \
+  --out_dir Training_Policy_0.75_EKF_BC_GT/MC_eval/def0_vs_att1 \
+  --use_kf \
+  --estimator_kind ekf \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --points_per_shell 40 \
+  --x0_vel_jitter 0.5
 """
 
 #Rule

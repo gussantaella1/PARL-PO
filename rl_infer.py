@@ -112,6 +112,10 @@ class RLPolicyDiff:
             ],
             dtype=np.float32,
         )[: self.D]
+        self.radius = float(ar.get("r", 1.0))
+        self.normalize_pos_obs = bool(self.cfg.get("normalize_pos_obs", False))
+        self.pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self.vel_obs_scale = (float(self.cfg.get("dt", 1.0)) / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
 
         # ==================== DEFENDER (always RL) ====================
         self.def_ckpt = None
@@ -455,8 +459,10 @@ class RLPolicyDiff:
         v1 = obs_np[3 * D : 4 * D]
         v2 = obs_np[4 * D : 5 * D]
 
-        p1 = p1c + c
-        p2 = p2c + c
+        p1 = (p1c / self.pos_obs_scale) + c
+        p2 = (p2c / self.pos_obs_scale) + c
+        v1 = v1 / self.vel_obs_scale
+        v2 = v2 / self.vel_obs_scale
 
         u = self.rule_ctrl.act(p1, v1, p2, v2)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)

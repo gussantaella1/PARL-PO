@@ -14,6 +14,7 @@ from core.utils import atanh, squash_action, logprob_squashed
 # =============================================================
 class PPO:
     def __init__(self, obs_dim: int, act_dim: int, cfg: Dict[str, Any], device="cpu"):
+        self.cfg       = cfg
         self.device    = device
         self.clip_eps  = cfg["clip_eps"]
         self.ent_coef  = cfg["entropy_coef"]
@@ -27,6 +28,8 @@ class PPO:
         self.v_clip_eps = 0.2
 
         self.attacker_mode = cfg.get("attacker_mode", "rule")
+        self.num_attackers = int(cfg.get("num_attackers", 1))
+        self.D = int(cfg["D"])
 
         self.freeze_defender = bool(cfg.get("freeze_defender", False))
         self.freeze_attacker = bool(cfg.get("freeze_attacker", False))  # optional symmetry
@@ -68,6 +71,11 @@ class PPO:
             self.att_base_lrs = None
             self.rule_ctrl = AttackerRuleController(cfg)
 
+        arena_r = float(cfg.get("arena", {}).get("r", 1.0))
+        normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
+        self._rule_obs_pos_scale = (1.0 / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
+        self._rule_obs_vel_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
+
     @torch.no_grad()
     def act(self, obs_batch: torch.Tensor, who: str, deterministic: bool = False):
         """
@@ -78,26 +86,12 @@ class PPO:
         val:     (B,)
         """
         B = obs_batch.shape[0]
-        D = int(self.act_scale * 0 + obs_batch.shape[-1] // 5)  # not used except sanity
-        D = obs_batch.shape[-1] // 5  # true D from obs layout
-        Na = int(getattr(self, "num_attackers", 1) or 1)
-        # Better: read Na from cfg once and store it:
-        # in PPO.__init__: self.num_attackers = int(cfg.get("num_attackers", 1))
-        # then use that here. We'll fallback if missing.
-        if hasattr(self, "cfg"):
-            Na = int(self.cfg.get("num_attackers", Na))
-        elif hasattr(self, "num_attackers"):
-            Na = int(self.num_attackers)
+        D = self.D
+        Na = self.num_attackers
 
         # -------- RULE ATTACKER --------
         if who == "att" and self.attacker_mode == "rule":
             # obs layout: [p1c, pA1c..pANc, rel1..relN, v1, vA1..vAN]
-            # We must parse based on Na.
-            D = int(self.act_scale * 0 + obs_batch.shape[-1])  # noop keep torch happy
-            D = int((obs_batch.shape[1]) // (2 + 2*Na + 1 + Na))  # not reliable
-            # Instead use cfg D (robust):
-            D = int(self.def_net.layer.D) if hasattr(self.def_net, "layer") else int(obs_batch.shape[1] // 5)
-
             ob = obs_batch.detach().cpu().numpy()
             # parse p1c
             p1c = ob[:, 0:D]
@@ -110,9 +104,7 @@ class PPO:
                 off += D
 
             # rel blocks (Na)
-            rels = []
             for k in range(Na):
-                rels.append(ob[:, off:off + D])
                 off += D
 
             # v1
@@ -126,14 +118,17 @@ class PPO:
                 off += D
 
             center = self.rule_ctrl.center
+            pos_scale = self._rule_obs_pos_scale
+            vel_scale = self._rule_obs_vel_scale
 
             acts = []
             for i in range(B):
-                p1 = p1c[i] + center
+                p1 = (p1c[i] / pos_scale) + center
+                v1_i = v1[i] / vel_scale
                 # recover absolute attackers:
-                pA_list = [pA_c[k][i] + center for k in range(Na)]
-                vA_list = [vA[k][i] for k in range(Na)]
-                uA = self.rule_ctrl.act_multi(p1, v1[i], pA_list, vA_list)  # (Na, D)
+                pA_list = [(pA_c[k][i] / pos_scale) + center for k in range(Na)]
+                vA_list = [vA[k][i] / vel_scale for k in range(Na)]
+                uA = self.rule_ctrl.act_multi(p1, v1_i, pA_list, vA_list)  # (Na, D)
                 acts.append(uA)
 
             a_np = np.stack(acts, axis=0)  # (B, Na, D)
