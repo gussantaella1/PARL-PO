@@ -92,47 +92,29 @@ class PPO:
         # -------- RULE ATTACKER --------
         if who == "att" and self.attacker_mode == "rule":
             # obs layout: [p1c, pA1c..pANc, rel1..relN, v1, vA1..vAN]
-            ob = obs_batch.detach().cpu().numpy()
-            # parse p1c
-            p1c = ob[:, 0:D]
+            p1c = obs_batch[:, 0:D]
             off = D
 
-            # pA centered (Na blocks)
-            pA_c = []
-            for k in range(Na):
-                pA_c.append(ob[:, off:off + D])
-                off += D
+            pA_c = obs_batch[:, off:off + Na * D].reshape(B, Na, D)
+            off += Na * D
 
-            # rel blocks (Na)
-            for k in range(Na):
-                off += D
+            # Skip relative-position blocks; the rule controller only needs absolute state.
+            off += Na * D
 
-            # v1
-            v1 = ob[:, off:off + D]
+            v1 = obs_batch[:, off:off + D]
             off += D
+            vA = obs_batch[:, off:off + Na * D].reshape(B, Na, D)
 
-            # vA blocks (Na)
-            vA = []
-            for k in range(Na):
-                vA.append(ob[:, off:off + D])
-                off += D
+            center = torch.as_tensor(self.rule_ctrl.center, dtype=obs_batch.dtype, device=obs_batch.device)
+            pos_scale = float(self._rule_obs_pos_scale)
+            vel_scale = float(self._rule_obs_vel_scale)
 
-            center = self.rule_ctrl.center
-            pos_scale = self._rule_obs_pos_scale
-            vel_scale = self._rule_obs_vel_scale
+            p1 = (p1c / pos_scale) + center
+            pA = (pA_c / pos_scale) + center
+            v1_abs = v1 / vel_scale
+            vA_abs = vA / vel_scale
 
-            acts = []
-            for i in range(B):
-                p1 = (p1c[i] / pos_scale) + center
-                v1_i = v1[i] / vel_scale
-                # recover absolute attackers:
-                pA_list = [(pA_c[k][i] / pos_scale) + center for k in range(Na)]
-                vA_list = [vA[k][i] / vel_scale for k in range(Na)]
-                uA = self.rule_ctrl.act_multi(p1, v1_i, pA_list, vA_list)  # (Na, D)
-                acts.append(uA)
-
-            a_np = np.stack(acts, axis=0)  # (B, Na, D)
-            a_t = torch.as_tensor(a_np, dtype=obs_batch.dtype, device=obs_batch.device)
+            a_t = self.rule_ctrl.act_multi_batch_torch(p1, v1_abs, pA, vA_abs)
 
             zero = torch.zeros(B, dtype=obs_batch.dtype, device=obs_batch.device)
             return a_t, zero, zero

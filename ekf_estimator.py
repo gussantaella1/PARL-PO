@@ -66,7 +66,20 @@ class AgentEKF:
         ekf.predict(dt, u=u_world, u_cov=Sigma_u)
         ekf.update(z, p_obs, R_wb)
     """
-    def __init__(self, x0, P0, Q, R, dt, dyn='cv', hcw=None):
+    _GLOBAL_LINEARIZATION_CACHE = {}
+
+    def __init__(
+        self,
+        x0,
+        P0,
+        Q,
+        R,
+        dt,
+        dyn='cv',
+        hcw=None,
+        jacobian_mode='exact',
+        linearization_group='default',
+    ):
         self.x  = np.asarray(x0, float).reshape(-1)
         if self.x.size not in (6, 9):
             raise ValueError(f"AgentEKF expects 6D or 9D state, got {self.x.size}.")
@@ -78,6 +91,8 @@ class AgentEKF:
 
         self._dyn = (dyn or 'cv').lower()
         self._hcw_params = (hcw or {})
+        self._jacobian_mode = self._normalize_jacobian_mode(jacobian_mode)
+        self._linearization_group = str(linearization_group)
         self._Ad = None
         self._Bd = None
         if self._dyn == 'hcw':
@@ -85,6 +100,22 @@ class AgentEKF:
             Ad_mx, Bd_mx = hcw_discrete_mats(n, self.dt)
             self._Ad = as_numpy_const(Ad_mx)
             self._Bd = as_numpy_const(Bd_mx)
+
+    def _normalize_jacobian_mode(self, mode):
+        key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
+        if key in {"frozen_first", "frozen_global"}:
+            return "frozen"
+        valid = {"exact", "frozen"}
+        if key not in valid:
+            raise ValueError(f"Unsupported EKF jacobian_mode='{mode}'. Expected one of {sorted(valid)}.")
+        return key
+
+    @classmethod
+    def clear_global_linearization_cache(cls):
+        cls._GLOBAL_LINEARIZATION_CACHE.clear()
+
+    def _global_linearization_key(self):
+        return (self._linearization_group, self.n, self._dyn, float(self.dt))
 
     # ----- linear CV dynamics -----
     def F(self, dt=None):
@@ -206,6 +237,29 @@ class AgentEKF:
         H[:, :3] = H_p
         return H
 
+    def _compute_measurement_linearization(self, x_ref, p_obs, R_wb):
+        H = self.H_pos(x_ref, p_obs, R_wb)
+        offset = self.h(x_ref, p_obs, R_wb) - H @ x_ref
+        return {
+            "H": H,
+            "offset": offset,
+        }
+
+    def _get_measurement_linearization(self, x, p_obs, R_wb):
+        if self._jacobian_mode == "exact":
+            return None
+
+        key = self._global_linearization_key()
+        if key not in self._GLOBAL_LINEARIZATION_CACHE:
+            self._GLOBAL_LINEARIZATION_CACHE[key] = self._compute_measurement_linearization(x, p_obs, R_wb)
+        return self._GLOBAL_LINEARIZATION_CACHE[key]
+
+    def measurement_prediction(self, p_obs, R_wb):
+        linearization = self._get_measurement_linearization(self.x, p_obs, R_wb)
+        if linearization is None:
+            return self.h(self.x, p_obs, R_wb)
+        return linearization["H"] @ self.x + linearization["offset"]
+
     # ----- EKF steps -----
     def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
         """
@@ -240,14 +294,16 @@ class AgentEKF:
         Bearing (az, el) update in observer BODY frame.
         """
         z = np.asarray(z, float).reshape(2)
-        # predicted measurement
-        z_pred = self.h(self.x, p_obs, R_wb)
+        linearization = self._get_measurement_linearization(self.x, p_obs, R_wb)
+        if linearization is None:
+            z_pred = self.h(self.x, p_obs, R_wb)
+            H = self.H_pos(self.x, p_obs, R_wb)
+        else:
+            H = linearization["H"]
+            z_pred = H @ self.x + linearization["offset"]
         # innovation (angle wrap)
         y = z - z_pred
         y[0] = _normalize_angle(y[0]); y[1] = _normalize_angle(y[1])
-
-        # Jacobian
-        H = self.H_pos(self.x, p_obs, R_wb)
 
         # innovation cov and Kalman gain
         S = H @ self.P @ H.T + self.R

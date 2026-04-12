@@ -136,7 +136,7 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": False,
+    "use_kf": True,
     "estimator_kind": "ekf",
     "meas_innov_coef": 1.0,  
     "meas_cov_coef": 0.02,
@@ -146,10 +146,11 @@ KF_COMMON: Dict[str, Any] = {
         "sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "every": 1,
+        "ekf_jacobian_mode": "exact",  # "exact" | "frozen"
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
-        "action_access": "ground_truth",  # ground_truth | measured | none
-        "action_meas_std": 0.5 * float(COMMON["umax"]),  # used when action_access == "measured"
+        "action_access": "measured",  # ground_truth | measured | none
+        "action_meas_std": 0.25 * float(COMMON["umax"]),  # used when action_access == "measured"
         "init_pos_std": 0.2 * ARENA_R,
         "init_vel_std": 0.01,
         "init_mean_pos_std": 0.0,
@@ -215,8 +216,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    "reward_type": "zero_sum",
-    # "reward_type": "zero_sum_kf",
+    # "reward_type": "zero_sum",
+    "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
@@ -253,6 +254,9 @@ TRAIN: Dict[str, Any] = {
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
     "entropy_coef": 0.01,
+    "vec_backend": "torch",  # "sync" | "subproc" | "torch"
+    "vec_workers": None,     # only used when vec_backend == "subproc"
+    "mp_start_method": None, # auto-selects a multiprocessing start method
 
     "k_pos": 0.1, #Was 0.05
     "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
@@ -389,6 +393,7 @@ TRAIN: Dict[str, Any] = {
     "use_tensorboard": True,
     "tb_logdir": "runs",
     "tb_run_name": "ppo_diffgame_def",  # customize per experiment
+    "tb_run_prefix": None,
 
 
     "episodes_per_iter": 8,

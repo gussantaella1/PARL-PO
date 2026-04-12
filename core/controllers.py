@@ -1,6 +1,7 @@
 from typing import Any, Dict, List
 
 import numpy as np
+import torch
 # =============================================================
 # Rule-based Attacker Controller
 # =============================================================
@@ -139,6 +140,59 @@ class AttackerRuleController:
         for p2, v2 in zip(pA_list, vA_list):
             u_list.append(self.act(p1, v1, p2, v2))
         return np.stack(u_list, axis=0).astype(np.float32)
+
+    def _torch_params(self, device: torch.device, dtype: torch.dtype):
+        center = torch.as_tensor(self.center, device=device, dtype=dtype)
+        Ad = torch.as_tensor(self.Ad, device=device, dtype=dtype)
+        K = torch.as_tensor(self.K, device=device, dtype=dtype)
+        return center, Ad, K
+
+    def act_multi_batch_torch(
+        self,
+        p1: torch.Tensor,
+        v1: torch.Tensor,
+        pA: torch.Tensor,
+        vA: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Batched torch implementation of the rule controller.
+
+        Parameters
+        ----------
+        p1, v1 : (B, D)
+            Defender positions/velocities.
+        pA, vA : (B, Na, D)
+            Attacker positions/velocities.
+
+        Returns
+        -------
+        actions : (B, Na, D)
+        """
+        center, Ad, K = self._torch_params(p1.device, p1.dtype)
+
+        B, Na, D = pA.shape
+        x2 = torch.cat([pA, vA], dim=-1)  # (B, Na, 2D)
+        E2 = torch.matmul(x2, Ad.transpose(0, 1))[..., :D] - center
+        uc = -torch.matmul(E2, K.transpose(0, 1))
+
+        r = pA - p1[:, None, :]
+        dist = torch.linalg.vector_norm(r, dim=-1, keepdim=True).clamp_min(1e-9)
+        r_hat = r / dist
+        repulse_mag = self.repulse_gain / dist.square()
+        ur = torch.where(
+            dist < self.min_sep,
+            self.umax * r_hat,
+            repulse_mag * r_hat,
+        )
+
+        w_center_eff = torch.where(
+            dist < self.min_sep,
+            torch.zeros_like(dist),
+            torch.full_like(dist, self.w_center),
+        )
+
+        u = w_center_eff * uc + self.w_avoid * ur - self.w_damp * vA
+        return torch.clamp(u, -self.umax, +self.umax)
 
 
     # def act_single(self,

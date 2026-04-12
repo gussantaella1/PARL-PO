@@ -1,3 +1,4 @@
+import copy
 import gc
 import os
 import time
@@ -10,7 +11,7 @@ import torch
 from config_rl import build_dyn, config_for_train
 from core.buffers import RolloutBuffer
 from core.distill import distill_from_teacher
-from core.env import Env, VecEnv, collect_ic_history_from_vecenv
+from core.env import Env, SubprocVecEnv, TorchVecEnv, VecEnv, collect_ic_history_from_vecenv
 from core.models import ActorCriticDiff
 from core.plotting import make_tb_writer
 from core.ppo import PPO
@@ -165,11 +166,57 @@ def _act_from_opponent_policy_mix(
 def _role_obs_batch(role: str, obs_def: torch.Tensor, obs_att: torch.Tensor) -> torch.Tensor:
     return obs_def if role == "def" else obs_att
 
+
+def _deep_merge_dict(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge_dict(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def _make_vec_env(cfg: Dict[str, Any], num_envs: int, device: str):
+    backend = str(cfg.get("vec_backend", "sync")).lower()
+    if backend == "sync":
+        return VecEnv(lambda: Env(cfg), num_envs)
+    if backend == "subproc":
+        return SubprocVecEnv(
+            cfg,
+            num_envs,
+            num_workers=cfg.get("vec_workers"),
+            start_method=cfg.get("mp_start_method"),
+        )
+    if backend == "torch":
+        return TorchVecEnv(cfg, num_envs, device=device)
+    raise ValueError(f"Unknown vec_backend={backend!r}. Expected 'sync', 'subproc', or 'torch'.")
+
+
+def _set_vec_attr(vec, name: str, value: Any):
+    if hasattr(vec, "set_attr"):
+        vec.set_attr(name, value)
+        return
+    for env in vec.envs:
+        setattr(env, name, value)
+
+
+def _tb_run_name(cfg: Dict[str, Any], phase_name: str, suffix: str) -> str:
+    prefix = cfg.get("tb_run_prefix") or cfg.get("tb_run_name")
+    if not prefix:
+        checkpoint_dir = cfg.get("checkpoint_dir") or "training_run"
+        prefix = os.path.basename(os.path.abspath(checkpoint_dir))
+    return f"{prefix}_{phase_name}_{suffix}"
+
 def train(cfg: Dict[str, Any]):
-
-
-
     set_seed(cfg["seed"])
+    if bool(cfg.get("use_kf", False)) and str(cfg.get("estimator_kind", "ukf")).lower() == "ekf":
+        ekf_mode = str(cfg.get("ukf", {}).get("ekf_jacobian_mode", "exact")).strip().lower().replace("-", "_")
+        if ekf_mode != "exact":
+            from ekf_estimator import AgentEKF
+
+            AgentEKF.clear_global_linearization_cache()
+
     device = cfg["device"]
 
     writer = None
@@ -206,17 +253,21 @@ def train(cfg: Dict[str, Any]):
     if checkpoint_dir is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
 
-    def make_env():
-        return Env(cfg)
-
     num_envs = int(cfg.get("num_envs"))
     steps_per_env = int(cfg.get("steps_per_env"))
     total_updates = int(cfg.get("total_updates"))
     log_every = int(cfg.get("log_every"))
 
-    vec = VecEnv(make_env, num_envs)
+    vec = _make_vec_env(cfg, num_envs, device)
+    vec_is_torch = bool(getattr(vec, "torch_backend", False))
     obs_dim = vec.obs_def.shape[1]
     act_dim = int(cfg["D"])
+
+    print(
+        "[train] rollout backend="
+        f"{str(cfg.get('vec_backend', 'sync')).lower()} "
+        f"(num_envs={num_envs}, vec_workers={cfg.get('vec_workers', 'n/a')})"
+    )
 
     ppo = PPO(obs_dim, act_dim, cfg, device=device)
 
@@ -293,6 +344,10 @@ def train(cfg: Dict[str, Any]):
         "ukf_trPpos_mean": [],  # optional
         "lr_pi": [],
         "lr_vf": [],
+        "rollout_time_s": [],
+        "optim_time_s": [],
+        "update_time_s": [],
+        "env_steps_per_sec": [],
     }
 
     if cfg.get("fuel", {}).get("enable", False):
@@ -358,8 +413,7 @@ def train(cfg: Dict[str, Any]):
         # Linear anneal multiplier from 1.0 → min_anneal for k_cent
         center_frac = upd / max(1, total_updates)
         k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
-        for e in vec.envs:
-            e.k_cent = def_center_base * k_cent_mul
+        _set_vec_attr(vec, "k_cent", def_center_base * k_cent_mul)
 
         # Buffers
         bufD = RolloutBuffer(obs_dim, act_dim, num_envs, steps_per_env, device)
@@ -370,8 +424,12 @@ def train(cfg: Dict[str, Any]):
             bufA = None
 
 
-        o_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
-        o_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
+        if vec_is_torch:
+            o_def = vec.obs_def.to(device=device, dtype=torch.float32)
+            o_att = vec.obs_att.to(device=device, dtype=torch.float32)
+        else:
+            o_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
+            o_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
         ep_ret_def = np.zeros(num_envs, dtype=np.float64)
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
@@ -397,6 +455,7 @@ def train(cfg: Dict[str, Any]):
             mdot_att_acc = 0.0
             fuel_info_count = 0
 
+        t_rollout0 = time.perf_counter()
         for _ in range(steps_per_env):
             with torch.no_grad():
                 if train_role == "def":
@@ -428,29 +487,41 @@ def train(cfg: Dict[str, Any]):
                 else:
                     raise ValueError(f"Unknown train_role={train_role!r}")
 
+            if vec_is_torch:
+                _, r1_step, r2_step, d_step, infos = vec.step(
+                    a1,
+                    a2,
+                    reward_mode=reward_mode,
+                )
+                o2_def = vec.obs_def.to(device=device, dtype=torch.float32)
+                o2_att = vec.obs_att.to(device=device, dtype=torch.float32)
+                r1 = r1_step.to(device=device, dtype=torch.float32)
+                r2 = r2_step.to(device=device, dtype=torch.float32)
+                d = d_step.to(device=device, dtype=torch.float32)
+                r1_np = r1.detach().cpu().numpy()
+                r2_np = r2.detach().cpu().numpy()
+                d_np = d.detach().cpu().numpy()
+            else:
+                a1_np = a1.cpu().numpy()
+                a2_np = a2.cpu().numpy()
+                # normalize shapes to what Env expects:
+                # - if attacker RL: (B, D) ok
+                # - if rule attacker: (B, Na, D) ok
+                # - if rule attacker but produced (B, D): expand to (B,1,D)
+                if a2_np.ndim == 2 and cfg.get("attacker_mode", "rule") == "rule" and cfg.get("num_attackers", 1) == 1:
+                    a2_np = a2_np[:, None, :]
 
-            a1_np = a1.cpu().numpy()
+                _, r1_np, r2_np, d_np, infos = vec.step(
+                    a1_np,
+                    a2_np,
+                    reward_mode=reward_mode,
+                )
 
-            a2_np = a2.cpu().numpy()
-            # normalize shapes to what Env expects:
-            # - if attacker RL: (B, D) ok
-            # - if rule attacker: (B, Na, D) ok
-            # - if rule attacker but produced (B, D): expand to (B,1,D)
-            if a2_np.ndim == 2 and cfg.get("attacker_mode", "rule") == "rule" and cfg.get("num_attackers", 1) == 1:
-                a2_np = a2_np[:, None, :]
-
-            o2_np, r1_np, r2_np, d_np, infos = vec.step(
-                a1_np,
-                a2_np,
-                reward_mode=reward_mode,
-            )
-
-
-            o2_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
-            o2_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
-            r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
-            r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
-            d  = torch.as_tensor(d_np,  dtype=torch.float32, device=device)
+                o2_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
+                o2_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
+                r1 = torch.as_tensor(r1_np, dtype=torch.float32, device=device)
+                r2 = torch.as_tensor(r2_np, dtype=torch.float32, device=device)
+                d = torch.as_tensor(d_np, dtype=torch.float32, device=device)
 
             bufD.add(o_def.detach(), a1.detach(), lp1.detach(), v1.detach(), r1, d)
             if bufA is not None:
@@ -529,8 +600,7 @@ def train(cfg: Dict[str, Any]):
 
             global_env_step += num_envs
 
-
-
+        rollout_time_s = float(time.perf_counter() - t_rollout0)
 
         with torch.no_grad():
             next_v_def = ppo.def_net.value(o_def)
@@ -542,6 +612,7 @@ def train(cfg: Dict[str, Any]):
             bufA.finalize(next_v_att)
 
         # ---- choose what to update ----
+        t_optim0 = time.perf_counter()
         if train_role == "def":
             ppo.update_defender_only(bufD)
 
@@ -552,6 +623,9 @@ def train(cfg: Dict[str, Any]):
 
         else:
             raise ValueError(f"Unknown train_role={train_role!r}")
+        optim_time_s = float(time.perf_counter() - t_optim0)
+        update_time_s = rollout_time_s + optim_time_s
+        env_steps_per_sec = float(num_envs * steps_per_env) / max(update_time_s, 1e-9)
         
         #explicit cleanup (place it right here)
         # del bufD
@@ -659,8 +733,9 @@ def train(cfg: Dict[str, Any]):
 
 
             # grab learning rates (assuming two param groups: policy+logstd and value)
-            lr_pi = ppo.def_opt.param_groups[0]["lr"]
-            lr_vf = ppo.def_opt.param_groups[-1]["lr"]
+            active_opt = ppo.def_opt if train_role == "def" else ppo.att_opt
+            lr_pi = active_opt.param_groups[0]["lr"]
+            lr_vf = active_opt.param_groups[-1]["lr"]
 
             if cfg.get("fuel", {}).get("enable", False):
                 if fuel_info_count > 0:
@@ -707,6 +782,10 @@ def train(cfg: Dict[str, Any]):
 
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
+            metrics["rollout_time_s"].append(rollout_time_s)
+            metrics["optim_time_s"].append(optim_time_s)
+            metrics["update_time_s"].append(update_time_s)
+            metrics["env_steps_per_sec"].append(env_steps_per_sec)
             if opp_policy_mix is not None:
                 total_mix = max(1, sum(mix_counts_update.values()))
                 mix_summary = []
@@ -717,7 +796,12 @@ def train(cfg: Dict[str, Any]):
                 print("opp mix usage:", ", ".join(mix_summary))
 
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
-            print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(f"   [{train_role}] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(
+                f"   timing: rollout={rollout_time_s:.3f}s  "
+                f"optim={optim_time_s:.3f}s  total={update_time_s:.3f}s  "
+                f"steps/s={env_steps_per_sec:.1f}"
+            )
             print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
             print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
             if cfg.get("use_kf", False):
@@ -758,6 +842,16 @@ def train(cfg: Dict[str, Any]):
                 # ===== Learning rates =====
                 writer.add_scalar("lr/def_policy", lr_pi, gs)
                 writer.add_scalar("lr/def_value",  lr_vf, gs)
+                writer.add_scalar(f"lr/{train_role}_policy", lr_pi, gs)
+                writer.add_scalar(f"lr/{train_role}_value",  lr_vf, gs)
+                writer.add_scalar("lr/policy", lr_pi, gs)
+                writer.add_scalar("lr/value", lr_vf, gs)
+
+                # ===== Throughput =====
+                writer.add_scalar("timing/rollout_s", rollout_time_s, gs)
+                writer.add_scalar("timing/optim_s", optim_time_s, gs)
+                writer.add_scalar("timing/update_s", update_time_s, gs)
+                writer.add_scalar("timing/env_steps_per_sec", env_steps_per_sec, gs)
 
                 # ===== UKF stats (if enabled) =====
                 if cfg.get("use_kf", False):
@@ -811,6 +905,10 @@ def train(cfg: Dict[str, Any]):
     try:
         del bufA
     except: pass
+    try:
+        vec.close()
+    except Exception:
+        pass
     try:
         del vec
     except: pass
@@ -916,7 +1014,7 @@ def train_with_distill(
         train_role=train_role,
     )
     if extra_train_cfg is not None:
-        cfg_teacher.update(extra_train_cfg)
+        cfg_teacher = _deep_merge_dict(cfg_teacher, extra_train_cfg)
 
     # if cfg_teacher["train_ic_mode"] == "random_shell_advantage":
     #     if train_role == "att": 
@@ -944,6 +1042,8 @@ def train_with_distill(
 
     cfg_teacher["checkpoint_dir"] = out_dir
     cfg_teacher["checkpoint_prefix"] = phase_name + "_teacher"
+    if cfg_teacher.get("use_tensorboard", False):
+        cfg_teacher["tb_run_name"] = _tb_run_name(cfg_teacher, phase_name, "teacher")
 
     ppo_teacher, metrics_teacher, ckpt_info = train(cfg_teacher)
 
@@ -981,7 +1081,7 @@ def train_with_distill(
         cfg_student["seed"] = cfg_teacher["seed"] + 1
 
         if extra_train_cfg is not None:
-            cfg_student.update(extra_train_cfg)
+            cfg_student = _deep_merge_dict(cfg_student, extra_train_cfg)
 
         student_estimator_kind = str(
             cfg_teacher.get("estimator_kind", cfg_student.get("estimator_kind", "ukf"))
@@ -996,6 +1096,8 @@ def train_with_distill(
             )
 
         print(f"[{phase_name.upper()} STUDENT] Using device: {cfg_student['device']}")
+        if cfg_student.get("use_tensorboard", False):
+            cfg_student["tb_run_name"] = _tb_run_name(cfg_student, phase_name, "student")
 
         student_out = os.path.join(out_dir, f"{phase_name}_kf_student.pt")
         distill_t0 = time.perf_counter()

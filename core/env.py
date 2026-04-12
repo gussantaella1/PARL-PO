@@ -1,6 +1,7 @@
 from typing import Any, Callable, Dict, List
 
 import copy
+import multiprocessing as mp
 import numpy as np
 import torch
 import os
@@ -139,6 +140,7 @@ class Env:
         self.estimator_kind = self._normalize_estimator_kind(cfg.get("estimator_kind", "ukf"))
         self.estimator_label = self.estimator_kind.upper()
         self._estimator_dyn = None
+        self._ekf_jacobian_mode = str(self._estimator_cfg.get("ekf_jacobian_mode", "exact"))
 
         #Fuel config
         fuel = cfg.get("fuel", {})
@@ -394,7 +396,11 @@ class Env:
             )
         return "hcw"
 
-    def _make_estimator(self, x0_est: np.ndarray):
+    def _make_estimator(self, x0_est: np.ndarray, linearization_group: str = "default"):
+        estimator_kwargs = {}
+        if self.estimator_kind == "ekf":
+            estimator_kwargs["jacobian_mode"] = self._ekf_jacobian_mode
+            estimator_kwargs["linearization_group"] = linearization_group
         return KF_CV(
             x0=x0_est,
             P0=self._ukf_P0.copy(),
@@ -404,6 +410,7 @@ class Env:
             kind=self.estimator_kind,
             dyn=self._estimator_dyn,
             hcw=self.cfg.get("hcw", {}),
+            **estimator_kwargs,
         )
 
     def _kf_predict_control(self, ground_truth_u: np.ndarray | None):
@@ -654,7 +661,7 @@ class Env:
             else:
                 x0_ukf = np.concatenate([p2_est, v2_est])
 
-            self.ukf = self._make_estimator(x0_ukf)
+            self.ukf = self._make_estimator(x0_ukf, linearization_group="defender_observer")
 
             p1_pos_noise = np.random.normal(
                 scale=self._ukf_init_mean_pos_std,
@@ -672,7 +679,7 @@ class Env:
                 x0_att_ukf = np.concatenate([p1 + p1_pos_noise, v1 + p1_vel_noise, p1_accel_noise])
             else:
                 x0_att_ukf = np.concatenate([p1 + p1_pos_noise, v1 + p1_vel_noise])
-            self.att_ukf = self._make_estimator(x0_att_ukf)
+            self.att_ukf = self._make_estimator(x0_att_ukf, linearization_group="attacker_observer")
 
             self._latest_meas_innov = 0.0
             self._latest_meas_trP   = float(np.trace(self.ukf.P[0:3, 0:3]))
@@ -805,7 +812,11 @@ class Env:
                 z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
                 z_meas = z_true + z_noise
 
-                z_hat_prior = self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+                z_hat_prior = (
+                    self.ukf.measurement_prediction(p_obs, R_wb)
+                    if hasattr(self.ukf, "measurement_prediction")
+                    else self.ukf.h(self.ukf.x.copy(), p_obs, R_wb)
+                )
                 innov = z_meas - z_hat_prior
                 innov[0] = (innov[0] + np.pi) % (2*np.pi) - np.pi
                 innov[1] = (innov[1] + np.pi) % (2*np.pi) - np.pi
@@ -833,7 +844,11 @@ class Env:
                     z_att_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=self._ukf_R)
                     z_att_meas = z_att_true + z_att_noise
 
-                    z_att_hat_prior = self.att_ukf.h(self.att_ukf.x.copy(), p_obs, R_wb)
+                    z_att_hat_prior = (
+                        self.att_ukf.measurement_prediction(p_obs, R_wb)
+                        if hasattr(self.att_ukf, "measurement_prediction")
+                        else self.att_ukf.h(self.att_ukf.x.copy(), p_obs, R_wb)
+                    )
                     att_innov = z_att_meas - z_att_hat_prior
                     att_innov[0] = (att_innov[0] + np.pi) % (2*np.pi) - np.pi
                     att_innov[1] = (att_innov[1] + np.pi) % (2*np.pi) - np.pi
@@ -1391,6 +1406,8 @@ class Env:
 # Vectorized env (single-process)
 # =============================================================
 class VecEnv:
+    torch_backend = False
+
     def __init__(self, make_env: Callable[[], Env], num_envs: int):
         self.envs: List[Env] = [make_env() for _ in range(num_envs)]
         self.num_envs = num_envs
@@ -1419,6 +1436,10 @@ class VecEnv:
         self._refresh_obs(reset_envs=True)
         return self.obs
 
+    def set_attr(self, name: str, value: Any):
+        for e in self.envs:
+            setattr(e, name, value)
+
     def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
         obs_next = []
         obs_att_next = []
@@ -1439,6 +1460,702 @@ class VecEnv:
         self.obs = self.obs_def
         return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
 
+    def close(self):
+        return None
+
+
+def _vec_chunk_sizes(num_envs: int, num_workers: int) -> List[int]:
+    num_workers = max(1, min(int(num_workers), int(num_envs)))
+    base, rem = divmod(int(num_envs), num_workers)
+    sizes = []
+    for idx in range(num_workers):
+        size = base + (1 if idx < rem else 0)
+        if size > 0:
+            sizes.append(size)
+    return sizes
+
+
+def _subproc_start_method(start_method: str | None) -> str:
+    if start_method is not None:
+        return str(start_method)
+
+    available = mp.get_all_start_methods()
+    if "fork" in available:
+        return "fork"
+    if "forkserver" in available:
+        return "forkserver"
+    return "spawn"
+
+
+def _subproc_vec_worker(conn, cfg: Dict[str, Any], num_envs: int, worker_idx: int):
+    vec = None
+    try:
+        cfg_local = copy.deepcopy(cfg)
+        base_seed = int(cfg_local.get("seed", 0))
+        set_seed(base_seed + 100_003 * int(worker_idx) + 17)
+        vec = VecEnv(lambda: Env(cfg_local), int(num_envs))
+
+        while True:
+            cmd, payload = conn.recv()
+
+            if cmd == "get_obs":
+                conn.send((vec.obs_def, vec.obs_att))
+            elif cmd == "reset":
+                vec.reset()
+                conn.send((vec.obs_def, vec.obs_att))
+            elif cmd == "step_full":
+                a1_env, aA_env, reward_mode = payload
+                _, r1, r2, done, info = vec.step(a1_env, aA_env, reward_mode=reward_mode)
+                conn.send((vec.obs_def, vec.obs_att, r1, r2, done, info))
+            elif cmd == "set_attr":
+                name, value = payload
+                vec.set_attr(name, value)
+                conn.send(True)
+            elif cmd == "get_ic_history":
+                conn.send(collect_ic_history_from_vecenv(vec))
+            elif cmd == "close":
+                conn.send(True)
+                break
+            else:
+                raise ValueError(f"Unknown SubprocVecEnv worker command: {cmd!r}")
+    except EOFError:
+        pass
+    finally:
+        try:
+            if vec is not None:
+                vec.close()
+        finally:
+            conn.close()
+
+
+class SubprocVecEnv:
+    torch_backend = False
+
+    def __init__(
+        self,
+        cfg: Dict[str, Any],
+        num_envs: int,
+        num_workers: int | None = None,
+        start_method: str | None = None,
+    ):
+        self.cfg = copy.deepcopy(cfg)
+        self.num_envs = int(num_envs)
+        requested_workers = num_workers
+        if requested_workers is None:
+            cpu_count = os.cpu_count() or 1
+            requested_workers = min(self.num_envs, max(1, cpu_count // 2))
+        self.chunk_sizes = _vec_chunk_sizes(self.num_envs, int(requested_workers))
+        self.num_workers = len(self.chunk_sizes)
+        self.start_method = _subproc_start_method(start_method)
+        self._closed = False
+
+        ctx = mp.get_context(self.start_method)
+        self._conns = []
+        self._procs = []
+
+        for worker_idx, chunk_size in enumerate(self.chunk_sizes):
+            parent_conn, child_conn = ctx.Pipe()
+            proc = ctx.Process(
+                target=_subproc_vec_worker,
+                args=(child_conn, self.cfg, chunk_size, worker_idx),
+                daemon=True,
+            )
+            proc.start()
+            child_conn.close()
+            self._conns.append(parent_conn)
+            self._procs.append(proc)
+
+        self._refresh_obs(reset_envs=False)
+
+    def _refresh_obs(self, reset_envs: bool = False):
+        cmd = "reset" if reset_envs else "get_obs"
+        for conn in self._conns:
+            conn.send((cmd, None))
+
+        obs_pairs = [conn.recv() for conn in self._conns]
+        self.obs_def = np.concatenate([pair[0] for pair in obs_pairs], axis=0)
+        self.obs_att = np.concatenate([pair[1] for pair in obs_pairs], axis=0)
+        self.obs = self.obs_def
+        return self.obs
+
+    def reset(self):
+        return self._refresh_obs(reset_envs=True)
+
+    def set_attr(self, name: str, value: Any):
+        for conn in self._conns:
+            conn.send(("set_attr", (name, value)))
+        for conn in self._conns:
+            conn.recv()
+
+    def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
+        if self._closed:
+            raise RuntimeError("SubprocVecEnv is already closed.")
+
+        split_idx = np.cumsum(self.chunk_sizes[:-1], dtype=int)
+        a1_chunks = np.split(np.asarray(a1_env), split_idx, axis=0)
+        aA_chunks = np.split(np.asarray(aA_env), split_idx, axis=0)
+
+        for conn, a1_chunk, aA_chunk in zip(self._conns, a1_chunks, aA_chunks):
+            conn.send(("step_full", (a1_chunk, aA_chunk, reward_mode)))
+
+        results = [conn.recv() for conn in self._conns]
+        self.obs_def = np.concatenate([res[0] for res in results], axis=0)
+        self.obs_att = np.concatenate([res[1] for res in results], axis=0)
+        self.obs = self.obs_def
+
+        r1 = np.concatenate([res[2] for res in results], axis=0)
+        r2 = np.concatenate([res[3] for res in results], axis=0)
+        done = np.concatenate([res[4] for res in results], axis=0)
+        info = [item for res in results for item in res[5]]
+        return self.obs, r1, r2, done, info
+
+    def collect_ic_history(self):
+        for conn in self._conns:
+            conn.send(("get_ic_history", None))
+
+        collected = [conn.recv() for conn in self._conns]
+        D = int(self.cfg.get("D", 3))
+
+        def_all = [d for d, _ in collected if d.shape[0] > 0]
+        att_all = [a for _, a in collected if a.shape[0] > 0]
+
+        def_pos = np.concatenate(def_all, axis=0) if def_all else np.zeros((0, D), dtype=np.float32)
+        att_pos = np.concatenate(att_all, axis=0) if att_all else np.zeros((0, D), dtype=np.float32)
+        return def_pos, att_pos
+
+    def close(self):
+        if self._closed:
+            return None
+
+        for conn in self._conns:
+            try:
+                conn.send(("close", None))
+            except (BrokenPipeError, EOFError):
+                pass
+
+        for conn in self._conns:
+            try:
+                conn.recv()
+            except (BrokenPipeError, EOFError):
+                pass
+            finally:
+                conn.close()
+
+        for proc in self._procs:
+            proc.join(timeout=1.0)
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=1.0)
+
+        self._closed = True
+        return None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def _opp_mode_code(mode: str) -> int:
+    key = str(mode)
+    if key == "none":
+        return 1
+    if key == "weak":
+        return 2
+    return 0
+
+
+class TorchVecEnv:
+    """
+    Batched single-process torch rollout backend.
+
+    The main dynamics, rewards, terminations, and observation assembly stay batched
+    on torch tensors. Optional per-env reset sampling and estimator updates still use
+    the existing Env helpers so behavior remains aligned with the scalar environment.
+    """
+
+    torch_backend = True
+
+    def __init__(self, cfg: Dict[str, Any], num_envs: int, device: str | torch.device):
+        self.cfg = copy.deepcopy(cfg)
+        self.num_envs = int(num_envs)
+        self.device = torch.device(device)
+        self.envs: List[Env] = [Env(copy.deepcopy(cfg)) for _ in range(self.num_envs)]
+
+        if not self.envs:
+            raise ValueError("TorchVecEnv requires at least one environment.")
+
+        base = self.envs[0]
+        self.D = int(base.D)
+        self.num_attackers = int(base.num_attackers)
+        if self.num_attackers != 1:
+            raise NotImplementedError("TorchVecEnv currently supports num_attackers=1 only.")
+
+        self.dtype = torch.float32
+        self.radius = float(base.radius)
+        self.dt = float(base.dt)
+        self.margin = float(base.margin)
+        self.soft_wall = float(base.soft_wall)
+        self.k_pos = float(base.k_pos)
+        self.u_lo = float(base.u_lo)
+        self.u_hi = float(base.u_hi)
+        self.oi_radius_norm = float(base.oi_radius_norm)
+        self.hit_buffer_def = float(base.hit_buffer_def)
+        self.hit_buffer_att = float(base.hit_buffer_att)
+        self.collision_radius_m = float(base.collision_radius_m)
+        self.wall_penalty = float(base.wall_penalty)
+        self.target_hit_reward_penalty = float(base.target_hit_reward_penalty)
+        self.collision_penalty = float(base.collision_penalty)
+        self.fuel_depletion_penalty = float(base.fuel_depletion_penalty)
+        self.use_kf = bool(base.use_kf)
+        self.use_fuel = bool(base.use_fuel)
+        self.reward_type = str(base.reward_type)
+        self.pos_obs_scale = float(base._pos_obs_scale)
+        self.vel_obs_scale = float(base._vel_obs_scale)
+        self.reset_ukf_on_diverge = bool(base.reset_ukf_on_diverge)
+
+        self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
+        self.Ad_t = torch.as_tensor(base.Ad, dtype=self.dtype, device=self.device)
+        self.Bd_t = torch.as_tensor(base.Bd, dtype=self.dtype, device=self.device)
+
+        if self.use_fuel:
+            self.k_eff_def = float(base.k_eff_def)
+            self.k_eff_att = float(base.k_eff_att)
+            self.g0 = float(base.g0)
+            self.m0_def = float(base.m0_def)
+            self.mdry_def = float(base.mdry_def)
+            self.Tmax_def = float(base.Tmax_def)
+            self.Isp_def = float(base.Isp_def)
+            self.m0_att = float(base.m0_att)
+            self.mdry_att = float(base.mdry_att)
+            self.Tmax_att = float(base.Tmax_att)
+            self.Isp_att = float(base.Isp_att)
+
+        self.state_t = torch.zeros((self.num_envs, 4 * self.D), dtype=self.dtype, device=self.device)
+        self._t_steps = torch.zeros((self.num_envs,), dtype=torch.int64, device=self.device)
+        self._opp_mode_codes = torch.zeros((self.num_envs,), dtype=torch.int64, device=self.device)
+        self._weak_scale_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self._weak_noise_std_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+
+        if self.use_fuel:
+            self.m_def_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+            self.m_att_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+
+        for env in self.envs:
+            env.set_opp_domain(_sample_opp_domain(env.cfg))
+
+        self.obs_def = None
+        self.obs_att = None
+        self.obs = None
+        self.reset()
+
+    def _sync_slot_from_env(self, idx: int):
+        env = self.envs[idx]
+        self.state_t[idx] = torch.as_tensor(np.asarray(env.state, dtype=np.float32), dtype=self.dtype, device=self.device)
+        self._t_steps[idx] = int(env.t)
+        self._opp_mode_codes[idx] = _opp_mode_code(env.opp_domain)
+        self._weak_scale_t[idx] = float(env.weak_scale)
+        self._weak_noise_std_t[idx] = float(env.weak_noise_std)
+
+        if self.use_fuel:
+            self.m_def_t[idx] = float(env.m_def)
+            self.m_att_t[idx] = float(env.m_att[0])
+
+    def _sync_from_envs(self, indices: List[int] | None = None):
+        if indices is None:
+            indices = list(range(self.num_envs))
+        for idx in indices:
+            self._sync_slot_from_env(int(idx))
+
+    def _split_state(self):
+        D = self.D
+        x1 = self.state_t[:, : 2 * D]
+        x2 = self.state_t[:, 2 * D : 4 * D]
+        return x1[:, :D], x1[:, D:], x2[:, :D], x2[:, D:]
+
+    def _fuel_fractions(self):
+        fuel_frac_def = (self.m_def_t - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
+        fuel_frac_att = (self.m_att_t - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
+        return fuel_frac_def.clamp(0.0, 1.0), fuel_frac_att.clamp(0.0, 1.0)
+
+    def _refresh_obs(self):
+        p1, v1, p2, v2 = self._split_state()
+
+        if self.use_kf:
+            p1_np = p1.detach().cpu().numpy()
+            v1_np = v1.detach().cpu().numpy()
+            p2_np = p2.detach().cpu().numpy()
+            v2_np = v2.detach().cpu().numpy()
+
+            p2_obs_np = np.empty_like(p2_np)
+            v2_obs_np = np.empty_like(v2_np)
+            p1_obs_np = np.empty_like(p1_np)
+            v1_obs_np = np.empty_like(v1_np)
+
+            for i, env in enumerate(self.envs):
+                p2_obs_np[i], v2_obs_np[i] = env._belief_state(p2_np[i], v2_np[i])
+                p1_obs_np[i], v1_obs_np[i] = env._attacker_belief_state(p1_np[i], v1_np[i])
+
+            p2_obs = torch.as_tensor(p2_obs_np, dtype=self.dtype, device=self.device)
+            v2_obs = torch.as_tensor(v2_obs_np, dtype=self.dtype, device=self.device)
+            p1_obs = torch.as_tensor(p1_obs_np, dtype=self.dtype, device=self.device)
+            v1_obs = torch.as_tensor(v1_obs_np, dtype=self.dtype, device=self.device)
+        else:
+            p2_obs, v2_obs = p2, v2
+            p1_obs, v1_obs = p1, v1
+
+        p1c_def = (p1 - self.center_t) * self.pos_obs_scale
+        p2c_def = (p2_obs - self.center_t) * self.pos_obs_scale
+        rel_def = (p2_obs - p1) * self.pos_obs_scale
+        obs_def_parts = [
+            p1c_def,
+            p2c_def,
+            rel_def,
+            v1 * self.vel_obs_scale,
+            v2_obs * self.vel_obs_scale,
+        ]
+
+        p1c_att = (p1_obs - self.center_t) * self.pos_obs_scale
+        p2c_att = (p2 - self.center_t) * self.pos_obs_scale
+        rel_att = (p2 - p1_obs) * self.pos_obs_scale
+        obs_att_parts = [
+            p1c_att,
+            p2c_att,
+            rel_att,
+            v1_obs * self.vel_obs_scale,
+            v2 * self.vel_obs_scale,
+        ]
+
+        if self.use_fuel:
+            fuel_frac_def, fuel_frac_att = self._fuel_fractions()
+            obs_def_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
+            obs_att_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
+
+        self.obs_def = torch.cat(obs_def_parts, dim=-1).to(dtype=self.dtype)
+        self.obs_att = torch.cat(obs_att_parts, dim=-1).to(dtype=self.dtype)
+        self.obs = self.obs_def
+        return self.obs
+
+    def reset(self):
+        for env in self.envs:
+            env.reset()
+        self._sync_from_envs()
+        self._refresh_obs()
+        return self.obs
+
+    def set_attr(self, name: str, value: Any):
+        for env in self.envs:
+            setattr(env, name, value)
+
+    def _apply_propulsion_batch(
+        self,
+        a_cmd: torch.Tensor,
+        m: torch.Tensor,
+        m_dry: float,
+        Tmax: float,
+        Isp: float,
+    ):
+        alive = m > (m_dry + 1e-9)
+        F_req = a_cmd * m[:, None]
+        F_req_norm = torch.linalg.vector_norm(F_req, dim=-1)
+
+        scale = torch.ones_like(F_req_norm)
+        over = F_req_norm > Tmax
+        scale = torch.where(over, Tmax / (F_req_norm + 1e-9), scale)
+        F = F_req * scale[:, None]
+        F = torch.where(alive[:, None], F, torch.zeros_like(F))
+
+        a_real = F / torch.clamp(m[:, None], min=1e-9)
+        thrust_norm = torch.linalg.vector_norm(F, dim=-1)
+        mdot = thrust_norm / (Isp * self.g0)
+        m_next = torch.where(alive, torch.clamp(m - mdot * self.dt, min=m_dry), torch.full_like(m, m_dry))
+        fuel_depleted = m_next <= (m_dry + 1e-9)
+        return a_real, m_next, fuel_depleted, thrust_norm, mdot
+
+    def step(self, a1_env, aA_env, reward_mode: str = "both"):
+        need_def = reward_mode in ("def", "both")
+        need_att = reward_mode in ("att", "both")
+
+        a1_cmd = torch.as_tensor(a1_env, dtype=self.dtype, device=self.device).reshape(self.num_envs, self.D)
+        aA_cmd = torch.as_tensor(aA_env, dtype=self.dtype, device=self.device)
+        if aA_cmd.ndim == 3:
+            if aA_cmd.shape[1] != 1:
+                raise NotImplementedError("TorchVecEnv currently supports a single attacker only.")
+            a2_cmd = aA_cmd[:, 0, :]
+        else:
+            a2_cmd = aA_cmd.reshape(self.num_envs, self.D)
+
+        none_mask = self._opp_mode_codes == 1
+        weak_mask = self._opp_mode_codes == 2
+
+        a1_cmd = a1_cmd.clone()
+        if torch.any(none_mask):
+            a1_cmd[none_mask] = 0.0
+        if torch.any(weak_mask):
+            a1_cmd[weak_mask] = self._weak_scale_t[weak_mask, None] * a1_cmd[weak_mask]
+            weak_noise = self._weak_noise_std_t[weak_mask]
+            if torch.any(weak_noise > 0.0):
+                a1_cmd[weak_mask] = a1_cmd[weak_mask] + weak_noise[:, None] * torch.randn_like(a1_cmd[weak_mask])
+
+        a1_cmd = torch.clamp(a1_cmd, self.u_lo, self.u_hi)
+        a2_cmd = torch.clamp(a2_cmd, self.u_lo, self.u_hi)
+
+        if self.use_fuel:
+            a1_real, self.m_def_t, fuel_depleted_def, thrust_def, mdot_def = self._apply_propulsion_batch(
+                a1_cmd, self.m_def_t, self.mdry_def, self.Tmax_def, self.Isp_def
+            )
+            a2_real, self.m_att_t, fuel_depleted_att, thrust_att, mdot_att = self._apply_propulsion_batch(
+                a2_cmd, self.m_att_t, self.mdry_att, self.Tmax_att, self.Isp_att
+            )
+        else:
+            a1_real = a1_cmd
+            a2_real = a2_cmd
+            fuel_depleted_def = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            fuel_depleted_att = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+            thrust_def = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+            thrust_att = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+            mdot_def = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+            mdot_att = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+
+        x1 = self.state_t[:, : 2 * self.D]
+        x2 = self.state_t[:, 2 * self.D : 4 * self.D]
+        x1n = torch.matmul(x1, self.Ad_t.transpose(0, 1)) + torch.matmul(a1_real, self.Bd_t.transpose(0, 1))
+        if torch.any(none_mask):
+            x1n = torch.where(none_mask[:, None], x1, x1n)
+        x2n = torch.matmul(x2, self.Ad_t.transpose(0, 1)) + torch.matmul(a2_real, self.Bd_t.transpose(0, 1))
+        self.state_t = torch.cat([x1n, x2n], dim=-1)
+        self._t_steps = self._t_steps + 1
+
+        p1, v1, p2, v2 = self._split_state()
+
+        meas_innov = np.zeros((self.num_envs,), dtype=np.float32)
+        meas_trP = np.zeros((self.num_envs,), dtype=np.float32)
+        att_meas_innov = np.zeros((self.num_envs,), dtype=np.float32)
+        att_meas_trP = np.zeros((self.num_envs,), dtype=np.float32)
+
+        if self.use_kf:
+            p1_np = p1.detach().cpu().numpy()
+            v1_np = v1.detach().cpu().numpy()
+            p2_np = p2.detach().cpu().numpy()
+            v2_np = v2.detach().cpu().numpy()
+            a1_real_np = a1_real.detach().cpu().numpy()
+            a2_real_np = a2_real.detach().cpu().numpy()
+            t_np = self._t_steps.detach().cpu().numpy()
+
+            for i, env in enumerate(self.envs):
+                env.t = int(t_np[i])
+                u12_predict, u12_cov = env._kf_predict_control(a2_real_np[i])
+                env.ukf.predict(dt=env.dt, u=u12_predict, u_cov=u12_cov)
+                if (env.t % env._ukf_every) == 0:
+                    p_obs = p1_np[i]
+                    R_wb = np.eye(3)
+                    v_b = _body_bearing_from_world(p_obs, R_wb, p2_np[i])
+                    az_true, el_true = _azel_from_body_vec(v_b)
+                    z_true = np.array([az_true, el_true], float)
+                    z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=env._ukf_R)
+                    z_meas = z_true + z_noise
+                    z_hat_prior = (
+                        env.ukf.measurement_prediction(p_obs, R_wb)
+                        if hasattr(env.ukf, "measurement_prediction")
+                        else env.ukf.h(env.ukf.x.copy(), p_obs, R_wb)
+                    )
+                    innov = z_meas - z_hat_prior
+                    innov[0] = (innov[0] + np.pi) % (2 * np.pi) - np.pi
+                    innov[1] = (innov[1] + np.pi) % (2 * np.pi) - np.pi
+                    meas_innov[i] = float(innov @ innov)
+                    env.ukf.update(z_meas, p_obs, R_wb)
+                meas_trP[i] = float(np.trace(env.ukf.P[0:3, 0:3]))
+                env._latest_meas_innov = float(meas_innov[i])
+                env._latest_meas_trP = float(meas_trP[i])
+
+                if env.att_ukf is not None:
+                    u21_predict, u21_cov = env._kf_predict_control(a1_real_np[i])
+                    env.att_ukf.predict(dt=env.dt, u=u21_predict, u_cov=u21_cov)
+                    if (env.t % env._ukf_every) == 0:
+                        p_obs = p2_np[i]
+                        R_wb = np.eye(3)
+                        v_b_att = _body_bearing_from_world(p_obs, R_wb, p1_np[i])
+                        az_att_true, el_att_true = _azel_from_body_vec(v_b_att)
+                        z_att_true = np.array([az_att_true, el_att_true], float)
+                        z_att_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=env._ukf_R)
+                        z_att_meas = z_att_true + z_att_noise
+                        z_att_hat_prior = (
+                            env.att_ukf.measurement_prediction(p_obs, R_wb)
+                            if hasattr(env.att_ukf, "measurement_prediction")
+                            else env.att_ukf.h(env.att_ukf.x.copy(), p_obs, R_wb)
+                        )
+                        att_innov = z_att_meas - z_att_hat_prior
+                        att_innov[0] = (att_innov[0] + np.pi) % (2 * np.pi) - np.pi
+                        att_innov[1] = (att_innov[1] + np.pi) % (2 * np.pi) - np.pi
+                        att_meas_innov[i] = float(att_innov @ att_innov)
+                        env.att_ukf.update(z_att_meas, p_obs, R_wb)
+                    att_meas_trP[i] = float(np.trace(env.att_ukf.P[0:3, 0:3]))
+                    env._latest_att_meas_innov = float(att_meas_innov[i])
+                    env._latest_att_meas_trP = float(att_meas_trP[i])
+                else:
+                    env._latest_att_meas_innov = 0.0
+                    env._latest_att_meas_trP = 0.0
+
+        center_delta_def = p1 - self.center_t
+        center_delta_att = p2 - self.center_t
+        d1_true_norm = center_delta_def.square().sum(dim=-1) / (self.radius ** 2)
+        d2_true_norm = center_delta_att.square().sum(dim=-1) / (self.radius ** 2)
+        rel2 = (p2 - p1).square().sum(dim=-1) / (self.radius ** 2)
+
+        rho1 = torch.linalg.vector_norm(center_delta_def, dim=-1) / self.radius
+        rho2 = torch.linalg.vector_norm(center_delta_att, dim=-1) / self.radius
+
+        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
+        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
+        att_hit_target = (self.oi_radius_norm > 0.0) & (rho2 <= thresh_att)
+        def_hit_target = (self.oi_radius_norm > 0.0) & (rho1 <= thresh_def)
+        hit_target = att_hit_target | def_hit_target
+
+        collision = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
+        if self.collision_radius_m > 0.0:
+            collision = torch.linalg.vector_norm(p2 - p1, dim=-1) <= self.collision_radius_m
+
+        oob1 = rho1 >= self.margin
+        oob2_any = rho2 >= self.margin
+
+        if torch.any(none_mask):
+            oob1 = torch.where(none_mask, torch.zeros_like(oob1), oob1)
+            def_hit_target = torch.where(none_mask, torch.zeros_like(def_hit_target), def_hit_target)
+            collision = torch.where(none_mask, torch.zeros_like(collision), collision)
+            hit_target = torch.where(none_mask, att_hit_target, hit_target)
+
+        done = oob1 | oob2_any | hit_target | collision
+        if self.use_fuel:
+            done = done | fuel_depleted_att | fuel_depleted_def
+
+        if self.reward_type == "zero_sum" and self.use_kf:
+            raise RuntimeError("use_zero_sum requires use_kf=False.")
+        if self.reward_type == "zero_sum_kf" and not self.use_kf:
+            raise RuntimeError("use_zero_sum_kf requires use_kf=True.")
+
+        g = self.k_pos * d2_true_norm
+        if self.use_fuel:
+            burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
+            burn_frac_att = (mdot_att * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
+            g = g - self.k_eff_def * burn_frac_def + self.k_eff_att * burn_frac_att
+
+        if torch.any(done):
+            terminal_delta = torch.zeros_like(g)
+            terminal_delta = torch.where(collision, terminal_delta + self.collision_penalty, terminal_delta)
+            still_open = ~collision
+            terminal_delta = torch.where(still_open & (att_hit_target | def_hit_target), terminal_delta - self.target_hit_reward_penalty, terminal_delta)
+            still_open = still_open & ~(att_hit_target | def_hit_target)
+            terminal_delta = torch.where(still_open & oob1, terminal_delta - self.wall_penalty, terminal_delta)
+            still_open = still_open & ~oob1
+            terminal_delta = torch.where(still_open & oob2_any, terminal_delta + self.wall_penalty, terminal_delta)
+            if self.use_fuel:
+                still_open = still_open & ~oob2_any
+                terminal_delta = torch.where(still_open & fuel_depleted_def, terminal_delta - self.fuel_depletion_penalty, terminal_delta)
+                still_open = still_open & ~fuel_depleted_def
+                terminal_delta = torch.where(still_open & fuel_depleted_att, terminal_delta + self.fuel_depletion_penalty, terminal_delta)
+            g = g + terminal_delta
+
+        r1 = g if need_def else torch.zeros_like(g)
+        r2 = -g if need_att else torch.zeros_like(g)
+
+        d2_belief_norm = None
+        p2_est_err_norm = None
+        d1_belief_norm = None
+        p1_est_err_norm = None
+        if self.use_kf:
+            p1_np = p1.detach().cpu().numpy()
+            v1_np = v1.detach().cpu().numpy()
+            p2_np = p2.detach().cpu().numpy()
+            v2_np = v2.detach().cpu().numpy()
+            d2_belief_norm = np.zeros((self.num_envs,), dtype=np.float32)
+            p2_est_err_norm = np.zeros((self.num_envs,), dtype=np.float32)
+            d1_belief_norm = np.zeros((self.num_envs,), dtype=np.float32)
+            p1_est_err_norm = np.zeros((self.num_envs,), dtype=np.float32)
+            for i, env in enumerate(self.envs):
+                p2_belief, _ = env._belief_state(p2_np[i], v2_np[i])
+                d2_belief_norm[i] = float(np.dot(p2_belief - env.center, p2_belief - env.center)) / (env.radius ** 2)
+                p2_est_err_norm[i] = float(np.dot(p2_belief - p2_np[i], p2_belief - p2_np[i])) / (env.radius ** 2)
+                if env.att_ukf is not None:
+                    p1_belief, _ = env._attacker_belief_state(p1_np[i], v1_np[i])
+                    d1_belief_norm[i] = float(np.dot(p1_belief - env.center, p1_belief - env.center)) / (env.radius ** 2)
+                    p1_est_err_norm[i] = float(np.dot(p1_belief - p1_np[i], p1_belief - p1_np[i])) / (env.radius ** 2)
+
+        d2_np = d2_true_norm.detach().cpu().numpy()
+        rel2_np = rel2.detach().cpu().numpy()
+        d1_true_np = d1_true_norm.detach().cpu().numpy()
+        d2_true_np = d2_true_norm.detach().cpu().numpy()
+        oob1_np = oob1.detach().cpu().numpy()
+        oob2_np = oob2_any.detach().cpu().numpy()
+        hit_target_np = hit_target.detach().cpu().numpy()
+        collision_np = collision.detach().cpu().numpy()
+        t_np = self._t_steps.detach().cpu().numpy()
+
+        fuel_frac_def_np = None
+        fuel_frac_att_np = None
+        thrust_def_np = None
+        thrust_att_np = None
+        mdot_def_np = None
+        mdot_att_np = None
+        if self.use_fuel:
+            fuel_frac_def_np = self._fuel_fractions()[0].detach().cpu().numpy()
+            fuel_frac_att_np = self._fuel_fractions()[1].detach().cpu().numpy()
+            thrust_def_np = thrust_def.detach().cpu().numpy()
+            thrust_att_np = thrust_att.detach().cpu().numpy()
+            mdot_def_np = mdot_def.detach().cpu().numpy()
+            mdot_att_np = mdot_att.detach().cpu().numpy()
+
+        infos = []
+        for i in range(self.num_envs):
+            info = {
+                "t": int(t_np[i]),
+                "d2_norm": float(d2_np[i]),
+                "rel2_norm": float(rel2_np[i]),
+                "oob_def": bool(oob1_np[i]),
+                "oob_att": bool(oob2_np[i]),
+                "hit_target": bool(hit_target_np[i]),
+                "d1_true_norm": float(d1_true_np[i]),
+                "d2_true_norm": float(d2_true_np[i]),
+                "collision": bool(collision_np[i]),
+            }
+            if self.use_kf:
+                info["meas_innov_sq"] = float(meas_innov[i])
+                info["ukf_trPpos"] = float(meas_trP[i])
+                info["att_meas_innov_sq"] = float(att_meas_innov[i])
+                info["att_ukf_trPpos"] = float(att_meas_trP[i])
+                if d2_belief_norm is not None:
+                    info["d2_belief_norm"] = float(d2_belief_norm[i])
+                if p2_est_err_norm is not None:
+                    info["p2_est_err_norm"] = float(p2_est_err_norm[i])
+                if d1_belief_norm is not None:
+                    info["d1_belief_norm"] = float(d1_belief_norm[i])
+                if p1_est_err_norm is not None:
+                    info["p1_est_err_norm"] = float(p1_est_err_norm[i])
+            if self.use_fuel:
+                info["fuel_frac_def"] = float(np.clip(fuel_frac_def_np[i], 0.0, 1.0))
+                info["fuel_frac_att"] = float(np.clip(fuel_frac_att_np[i], 0.0, 1.0))
+                info["fuel_used_def"] = 1.0 - info["fuel_frac_def"]
+                info["fuel_used_att"] = 1.0 - info["fuel_frac_att"]
+                info["thrust_def"] = float(thrust_def_np[i])
+                info["thrust_att"] = float(thrust_att_np[i])
+                info["mdot_def"] = float(mdot_def_np[i])
+                info["mdot_att"] = float(mdot_att_np[i])
+            infos.append(info)
+
+        done_indices = torch.nonzero(done, as_tuple=False).flatten().detach().cpu().tolist()
+        for idx in done_indices:
+            env = self.envs[idx]
+            if env.opp_resample == "episode":
+                env.set_opp_domain(_sample_opp_domain(env.cfg))
+            env.reset()
+            self._sync_slot_from_env(idx)
+
+        self._refresh_obs()
+        return self.obs, r1, r2, done.to(dtype=self.dtype), infos
+
+    def close(self):
+        return None
+
 
 def collect_ic_history_from_vecenv(vec: VecEnv):
     """
@@ -1449,21 +2166,26 @@ def collect_ic_history_from_vecenv(vec: VecEnv):
     def_pos : (N, D)
     att_pos : (M, D)
     """
-    def_all = []
-    att_all = []
+    if hasattr(vec, "envs"):
+        def_all = []
+        att_all = []
 
-    for e in vec.envs:
-        d, a = e.get_ic_history_arrays()
-        if d.shape[0] > 0:
-            def_all.append(d)
-        if a.shape[0] > 0:
-            att_all.append(a)
+        for e in vec.envs:
+            d, a = e.get_ic_history_arrays()
+            if d.shape[0] > 0:
+                def_all.append(d)
+            if a.shape[0] > 0:
+                att_all.append(a)
 
-    D = vec.envs[0].D
-    def_pos = np.concatenate(def_all, axis=0) if len(def_all) > 0 else np.zeros((0, D), dtype=np.float32)
-    att_pos = np.concatenate(att_all, axis=0) if len(att_all) > 0 else np.zeros((0, D), dtype=np.float32)
+        D = vec.envs[0].D
+        def_pos = np.concatenate(def_all, axis=0) if len(def_all) > 0 else np.zeros((0, D), dtype=np.float32)
+        att_pos = np.concatenate(att_all, axis=0) if len(att_all) > 0 else np.zeros((0, D), dtype=np.float32)
+        return def_pos, att_pos
 
-    return def_pos, att_pos
+    if hasattr(vec, "collect_ic_history"):
+        return vec.collect_ic_history()
+
+    raise TypeError(f"Unsupported vec env type: {type(vec)!r}")
 
 
 def sample_ic_support(

@@ -320,6 +320,7 @@ def KF_CV(x0, P0, Q, R, dt,
             dt=dt,
             dyn=dyn,
             hcw=hcw,
+            **kwargs,
         )
 
     return AgentUKF(

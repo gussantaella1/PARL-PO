@@ -10,23 +10,14 @@ Key points
 - Single source of truth for config via: from config_rl import config_for_train, config_for_eval, build_dyn
 - Clean attacker swap: set cfg["attacker_mode"] to "rule" (default) or "rl"
 - Differentiable one-step ridge prior (DiffLS-style) blended into actor mean
-- Minimal, single-process VecEnv for reproducible, fixed-length rollouts
+- Runtime overrides for outputs, device, rollout sizing, and vectorized env backend
 """
 
 import os
-
-import numpy as np
+import argparse
 
 from config_rl import config_for_train
-from core.plotting import (
-    load_npz_metrics,
-    plot_compare_phases,
-    plot_ic_support_from_cfg,
-    plot_ic_used_from_npz,
-    plot_training_metrics,
-)
 from core.logger_utils import RunLogger
-from core.train_eval import train_with_distill
 
 
 
@@ -34,25 +25,159 @@ from core.train_eval import train_with_distill
 # Distillation based on https://arxiv.org/pdf/2308.16185
 
 
-    # =============================================================
+def _merge_dicts(base: dict, extra: dict) -> dict:
+    out = dict(base)
+    for key, value in extra.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _merge_dicts(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _parse_phase_list(text: str) -> set[int]:
+    phases = set()
+    for chunk in str(text).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        phase = int(chunk)
+        if phase not in {0, 1, 2, 3, 4}:
+            raise ValueError(f"Unsupported phase {phase}; expected values in {{0,1,2,3,4}}.")
+        phases.add(phase)
+    if not phases:
+        raise ValueError("At least one phase must be selected.")
+    return phases
+
+
+def _build_runtime_overrides(args, out_dir: str) -> dict:
+    overrides = {}
+
+    if args.device is not None:
+        overrides["device"] = args.device
+    if args.seed is not None:
+        overrides["seed"] = args.seed
+    if args.num_envs is not None:
+        overrides["num_envs"] = args.num_envs
+    if args.steps_per_env is not None:
+        overrides["steps_per_env"] = args.steps_per_env
+    if args.total_updates is not None:
+        overrides["total_updates"] = args.total_updates
+    if args.train_epochs is not None:
+        overrides["train_epochs"] = args.train_epochs
+    if args.minibatch_size is not None:
+        overrides["minibatch_size"] = args.minibatch_size
+    if args.log_every is not None:
+        overrides["log_every"] = args.log_every
+    if args.vec_backend is not None:
+        overrides["vec_backend"] = args.vec_backend
+    if args.vec_workers is not None:
+        overrides["vec_workers"] = args.vec_workers
+    if args.mp_start_method is not None:
+        overrides["mp_start_method"] = args.mp_start_method
+    if args.ekf_jacobian_mode is not None:
+        overrides.setdefault("ukf", {})
+        overrides["ukf"]["ekf_jacobian_mode"] = args.ekf_jacobian_mode
+    if args.disable_tensorboard:
+        overrides["use_tensorboard"] = False
+    elif args.tb_logdir is not None:
+        overrides["tb_logdir"] = args.tb_logdir
+
+    tb_prefix = args.tb_run_prefix
+    if tb_prefix is None:
+        tb_prefix = os.path.basename(os.path.abspath(out_dir)) or "training_run"
+    overrides["tb_run_prefix"] = tb_prefix
+
+    return overrides
+
+
+def _parse_args():
+    ap = argparse.ArgumentParser(
+        description="Run the staged PPO training loop with optional runtime overrides.",
+    )
+    ap.add_argument("--out_dir", default="Training_Policy", help="Directory for checkpoints, plots, and manifests.")
+    ap.add_argument("--phases", default="0,1,2,3,4", help="Comma-separated subset of phases to run.")
+    ap.add_argument("--device", default=None, help="Override training device, e.g. cuda, cuda:0, or cpu.")
+    ap.add_argument("--seed", type=int, default=None, help="Override the training seed.")
+    ap.add_argument("--num_envs", type=int, default=None, help="Override cfg['num_envs'].")
+    ap.add_argument("--steps_per_env", type=int, default=None, help="Override cfg['steps_per_env'].")
+    ap.add_argument("--total_updates", type=int, default=None, help="Override cfg['total_updates'].")
+    ap.add_argument("--train_epochs", type=int, default=None, help="Override cfg['train_epochs'].")
+    ap.add_argument("--minibatch_size", type=int, default=None, help="Override cfg['minibatch_size'].")
+    ap.add_argument("--log_every", type=int, default=None, help="Override cfg['log_every'].")
+    ap.add_argument("--vec_backend", choices=("sync", "subproc", "torch"), default=None, help="Rollout backend to use.")
+    ap.add_argument("--vec_workers", type=int, default=None, help="Worker-process count for subproc vectorization.")
+    ap.add_argument(
+        "--mp_start_method",
+        choices=("fork", "spawn", "forkserver"),
+        default=None,
+        help="Multiprocessing start method for the subproc vectorized env.",
+    )
+    ap.add_argument(
+        "--ekf_jacobian_mode",
+        choices=("exact", "frozen"),
+        default=None,
+        help="EKF measurement linearization mode when estimator_kind='ekf'.",
+    )
+    ap.add_argument("--tb_logdir", default=None, help="TensorBoard root directory.")
+    ap.add_argument(
+        "--tb_run_prefix",
+        default=None,
+        help="Prefix for TensorBoard run names. Phase and role suffixes are appended automatically.",
+    )
+    ap.add_argument("--disable_tensorboard", action="store_true", help="Disable TensorBoard logging for this run.")
+    return ap.parse_args()
+
+
+def _require_checkpoint(path: str, label: str):
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            f"Required checkpoint for {label} was not found: {path}. "
+            "Run the prerequisite phase first or point this run at the matching output directory."
+        )
+
+# =============================================================
 # Main: stepped training (Def₀ -> Att₁ -> Def₁) + defender distillation
 # =============================================================
 if __name__ == "__main__":
 
-    do_phase_0 = True
-    do_phase_1 = True
-    do_phase_2 = True
-    do_phase_3 = True
-    do_phase_4 = True
+    args = _parse_args()
+    selected_phases = _parse_phase_list(args.phases)
 
-    def0_teacher_ckpt = "Training_Policy/def0_teacher.pt"
-    att1_teacher_ckpt = "Training_Policy/att1_teacher.pt"
-    def1_teacher_ckpt = "Training_Policy/def1_teacher.pt"
-    att2_teacher_ckpt = "Training_Policy/att2_teacher.pt"
- 
+    from core.plotting import (
+        load_npz_metrics,
+        plot_compare_phases,
+        plot_ic_support_from_cfg,
+        plot_ic_used_from_npz,
+        plot_training_metrics,
+    )
+    from core.train_eval import train_with_distill
 
-    OUT_DIR = "Training_Policy"
+    do_phase_0 = 0 in selected_phases
+    do_phase_1 = 1 in selected_phases
+    do_phase_2 = 2 in selected_phases
+    do_phase_3 = 3 in selected_phases
+    do_phase_4 = 4 in selected_phases
+
+    OUT_DIR = args.out_dir
     os.makedirs(OUT_DIR, exist_ok=True)
+    runtime_overrides = _build_runtime_overrides(args, OUT_DIR)
+
+    def0_teacher_ckpt = os.path.join(OUT_DIR, "def0_teacher.pt")
+    att1_teacher_ckpt = os.path.join(OUT_DIR, "att1_teacher.pt")
+    def1_teacher_ckpt = os.path.join(OUT_DIR, "def1_teacher.pt")
+    att2_teacher_ckpt = os.path.join(OUT_DIR, "att2_teacher.pt")
+    def0_student_ckpt = None
+    att1_student_ckpt = None
+    def1_student_ckpt = None
+    att2_student_ckpt = None
+    def2_teacher_ckpt = os.path.join(OUT_DIR, "def2_teacher.pt")
+    def2_student_ckpt = None
+    def0_meta = None
+    att1_meta = None
+    def1_meta = None
+    att2_meta = None
+    def2_meta = None
 
     PLOTS_ROOT = os.path.join(OUT_DIR, "Plots")
     PLOTS_DEF0 = os.path.join(PLOTS_ROOT, "def0")
@@ -65,17 +190,13 @@ if __name__ == "__main__":
         os.makedirs(d, exist_ok=True)
 
     runlog = RunLogger(OUT_DIR, filename="run_manifest.json")
-
-    cfg_distillation = config_for_train(
-        attacker_mode="rl",   # attacker is RL now
-        train_role="att",     # PPO will only update attacker
-    )
-    DISTILL = cfg_distillation["distill"]
-
+    runlog.set_config("cli_args", vars(args))
+    runlog.set_config("runtime_overrides", runtime_overrides)
 
     cfg_training_log = config_for_train(
         attacker_mode="train",
         train_role="rl",
+        **runtime_overrides,
     )
 
     runlog.set_config("training config used", cfg_training_log)
@@ -91,10 +212,10 @@ if __name__ == "__main__":
     if do_phase_0 is True:
         print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
 
-        phase0_extra = {
+        phase0_extra = _merge_dicts(runtime_overrides, {
             "gamma": 0.991,
             "hit_buffer_def": 0.25,
-        }
+        })
         with runlog.stage(
             "PHASE0_train_def0",
             phase_name="def0",
@@ -147,7 +268,8 @@ if __name__ == "__main__":
     if do_phase_1 is True:
 
         print("\n===== PHASE 1: Train ATTACKER_1 vs frozen DEFENDER_0 =====")
-        phase1_extra = {
+        _require_checkpoint(def0_teacher_ckpt, "phase 1 defender opponent")
+        phase1_extra = _merge_dicts(runtime_overrides, {
             "def_ckpt_path": def0_teacher_ckpt,
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
@@ -169,7 +291,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "def0_full",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.5,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -177,7 +299,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.3,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -185,7 +307,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_very_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.2,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -194,7 +316,7 @@ if __name__ == "__main__":
                 ],
             },
 
-        }
+        })
 
         with runlog.stage(
             "PHASE1_train_att1",
@@ -246,7 +368,9 @@ if __name__ == "__main__":
     if do_phase_2 is True:
 
         print("\n===== PHASE 2: Train DEFENDER_1 vs frozen ATTACKER_1 =====")
-        phase2_extra = {"att_ckpt_path": att1_teacher_ckpt,
+        _require_checkpoint(def0_teacher_ckpt, "phase 2 defender initialization")
+        _require_checkpoint(att1_teacher_ckpt, "phase 2 attacker opponent")
+        phase2_extra = _merge_dicts(runtime_overrides, {"att_ckpt_path": att1_teacher_ckpt,
                         "def_ckpt_path": def0_teacher_ckpt,
                         "freeze_attacker": True,
                         # "gamma": 0.993,
@@ -259,7 +383,7 @@ if __name__ == "__main__":
                             "policies": [
                                 {
                                     "name": "att1_full",
-                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "path": att1_teacher_ckpt,
                                     "prob": 0.5,
                                     "action_scale": 1.0,
                                     "noise_std": 0.0,
@@ -267,7 +391,7 @@ if __name__ == "__main__":
                                 },
                                 {
                                     "name": "att1_weak",
-                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "path": att1_teacher_ckpt,
                                     "prob": 0.3,
                                     "action_scale": 0.25,
                                     "noise_std": 0.05,
@@ -275,7 +399,7 @@ if __name__ == "__main__":
                                 },
                                 {
                                     "name": "att1_very_weak",
-                                    "path": "Training_Policy/att1_teacher.pt",
+                                    "path": att1_teacher_ckpt,
                                     "prob": 0.2,
                                     "action_scale": 0.0,
                                     "noise_std": 0.0,
@@ -284,7 +408,7 @@ if __name__ == "__main__":
                             ],
                         },
 
-                        }
+                        })
 
         with runlog.stage(
             "PHASE2_train_def1",
@@ -336,7 +460,9 @@ if __name__ == "__main__":
     if do_phase_3 is True:
 
         print("\n===== PHASE 3: Train ATTACKER_2 vs frozen DEFENDER_1 =====")
-        phase3_extra = {
+        _require_checkpoint(def1_teacher_ckpt, "phase 3 defender opponent")
+        _require_checkpoint(def0_teacher_ckpt, "phase 3 opponent mixture")
+        phase3_extra = _merge_dicts(runtime_overrides, {
             "def_ckpt_path": def1_teacher_ckpt,
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
@@ -349,7 +475,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "def0_full",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.15,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -357,7 +483,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.15,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -365,7 +491,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def0_very_weak",
-                        "path": "Training_Policy/def0_teacher.pt",
+                        "path": def0_teacher_ckpt,
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -374,7 +500,7 @@ if __name__ == "__main__":
 
                     {
                         "name": "def1_full",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": def1_teacher_ckpt,
                         "prob": 0.3,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -382,7 +508,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def1_weak",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": def1_teacher_ckpt,
                         "prob": 0.2,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -390,7 +516,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "def1_very_weak",
-                        "path": "Training_Policy/def1_teacher.pt",
+                        "path": def1_teacher_ckpt,
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -399,7 +525,7 @@ if __name__ == "__main__":
                 ],
             },
 
-        }
+        })
 
         with runlog.stage(
             "PHASE3_train_att2",
@@ -450,7 +576,10 @@ if __name__ == "__main__":
     if do_phase_4 is True:
 
         print("\n===== PHASE 4: Train DEFENDER_2 vs frozen ATTACKER_2 =====")
-        phase4_extra = {
+        _require_checkpoint(def1_teacher_ckpt, "phase 4 defender initialization")
+        _require_checkpoint(att2_teacher_ckpt, "phase 4 attacker opponent")
+        _require_checkpoint(att1_teacher_ckpt, "phase 4 opponent mixture")
+        phase4_extra = _merge_dicts(runtime_overrides, {
             "att_ckpt_path": att2_teacher_ckpt,
             "def_ckpt_path": def1_teacher_ckpt,
             "freeze_attacker": True,
@@ -462,7 +591,7 @@ if __name__ == "__main__":
                 "policies": [
                     {
                         "name": "att1_full",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": att1_teacher_ckpt,
                         "prob": 0.15,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -470,7 +599,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": att1_teacher_ckpt,
                         "prob": 0.15,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -478,7 +607,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att1_very_weak",
-                        "path": "Training_Policy/att1_teacher.pt",
+                        "path": att1_teacher_ckpt,
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -487,7 +616,7 @@ if __name__ == "__main__":
 
                     {
                         "name": "att2_full",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": att2_teacher_ckpt,
                         "prob": 0.3,
                         "action_scale": 1.0,
                         "noise_std": 0.0,
@@ -495,7 +624,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att2_weak",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": att2_teacher_ckpt,
                         "prob": 0.2,
                         "action_scale": 0.25,
                         "noise_std": 0.05,
@@ -503,7 +632,7 @@ if __name__ == "__main__":
                     },
                     {
                         "name": "att2_very_weak",
-                        "path": "Training_Policy/att2_teacher.pt",
+                        "path": att2_teacher_ckpt,
                         "prob": 0.1,
                         "action_scale": 0.0,
                         "noise_std": 0.0,
@@ -514,7 +643,7 @@ if __name__ == "__main__":
 
 
             
-        }
+        })
 
         with runlog.stage(
             "PHASE4_train_def2",
@@ -703,3 +832,34 @@ if __name__ == "__main__":
         print(f"Defender_2 student:  {def2_student_ckpt if def2_student_ckpt else '(skipped)'}")
     else:
         print("Defender_2 training skipped")
+
+
+# One job assigned to a specific GPU
+"""
+CUDA_VISIBLE_DEVICES=0 python rl_loop.py --out_dir Training_Policy_gpu0
+"""
+
+# Multiple jobs
+"""
+CUDA_VISIBLE_DEVICES=0 python rl_loop.py --out_dir run_gpu0 &
+CUDA_VISIBLE_DEVICES=1 python rl_loop.py --out_dir run_gpu1 &
+wait
+"""
+
+# or 
+
+"""
+CUDA_VISIBLE_DEVICES=0 python rl_loop.py --out_dir run_gpu0 
+CUDA_VISIBLE_DEVICES=1 python rl_loop.py --out_dir run_gpu1 
+"""
+
+#Extra compute for a single job
+"""
+CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
+  --out_dir Training_Policy_heavier \
+  --vec_backend subproc \
+  --vec_workers 8 \
+  --num_envs 512 \
+  --minibatch_size 8192
+
+"""
