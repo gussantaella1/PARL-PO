@@ -2682,8 +2682,6 @@ python evaluate_policy.py \
   --def_ckpt_path Training_Policy_0.75_EKF_BC_GT/def0_teacher.pt \
   --att_ckpt_path Training_Policy_0.75_EKF_BC_GT/att1_teacher.pt \
   --out_dir Training_Policy_0.75_EKF_BC_GT/MC_eval/def0_vs_att1 \
-  --use_kf \
-  --estimator_kind ekf \
   --auto_shell_grid \
   --grid_mode cartesian \
   --shell_fracs 0.2,0.4,0.6,0.8 \
@@ -2705,6 +2703,20 @@ python evaluate_policy.py \
   --points_per_shell 40 \
   --x0_vel_jitter 0.5
 
+"""
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_0.75_EKF_BC_GT \
+  --def_ckpt_path Training_Policy_0.75_EKF_BC_GT/def0_teacher.pt \
+  --policy_role def \
+  --opponent_source rule \
+  --out_dir Training_Policy_0.75_EKF_BC_GT/MC_eval/def0_vs_rule_attacker \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --points_per_shell 40 \
+  --x0_vel_jitter 0.5
 """
 
 """
