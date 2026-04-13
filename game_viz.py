@@ -394,17 +394,19 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     handles_for_legend = []
 
     if not only_est:
-        plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1')
-        plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2')
-        exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1')
-        exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2')
-        dot1,     = ax.plot([], [], [], 'o',  ms=6, label='_nolegend_')
-        dot2,     = ax.plot([], [], [], 'o',  ms=6, label='_nolegend_')
+        plan1_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P1', color='blue')
+        plan2_ln, = ax.plot([], [], [], '--', lw=1, alpha=0.6, label='Plan P2', color='orange')
+        exe1_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P1', color='green')
+        exe2_ln,  = ax.plot([], [], [], '-',  lw=2, label='Exec P2', color='red')
+        dot1,     = ax.plot([], [], [], 'o',  ms=6, color='cyan', mec='k', mew=0.6, label='_nolegend_')
+        dot2,     = ax.plot([], [], [], 'o',  ms=6, color='orange', mec='k', mew=0.6, label='_nolegend_')
         handles_for_legend += [plan1_ln, plan2_ln, exe1_ln, exe2_ln]
 
     est12_ln, = ax.plot([], [], [], ':', lw=1.8, marker='x', ms=6, mew=1.0,
+                        color='blue',
                         label=('P2 est by P1' if (est_enabled and has_est12) else '_nolegend_'))
     est21_ln, = ax.plot([], [], [], ':', lw=1.8, marker='x', ms=6, mew=1.0,
+                        color='orange',
                         label=('P1 est by P2' if (est_enabled and has_est21) else '_nolegend_'))
     if est_enabled and has_est12: handles_for_legend.append(est12_ln)
     if est_enabled and has_est21: handles_for_legend.append(est21_ln)
