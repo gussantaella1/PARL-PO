@@ -345,7 +345,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     est21 = frames_dict.get('est21_xyz', [])
     has_est12 = bool(est12) and any(e is not None for e in est12)
     has_est21 = bool(est21) and any(e is not None for e in est21)
-    est_enabled = bool(cfg.get('est', {}).get('enabled', False))
+    est_enabled = bool(cfg.get('est', {}).get('enabled', False)) or has_est12 or has_est21
 
     only_est  = bool(cfg.get('viz', {}).get('only_est', False))
     show_meas = bool(cfg.get('viz', {}).get('show_meas', False))
