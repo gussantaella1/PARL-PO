@@ -518,43 +518,6 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         else:
             _set3d(est21_ln, [], [], [])
 
-        if (not only_est) and show_meas:
-            L_meas = float(viz_cfg.get("meas_len", cfg.get("camera", {}).get("far", 15.0)))
-
-            def _meas_ray(p_obs, R_wb, az, el, Lm):
-                c = np.cos(el)
-                v_b = np.array([c * np.cos(az), c * np.sin(az), np.sin(el)])
-                v_w = R_wb.T @ v_b
-                pF = p_obs + Lm * v_w
-                return p_obs, pF
-
-            if me12_ln is not None and f < len(frames_dict.get("meas12_azel", [])):
-                me12 = frames_dict.get("meas12_azel", [])
-                if me12[f] is not None:
-                    p_obs, z = me12[f]
-                    R1 = _R_exec(1, f)
-                    p0, pF = _meas_ray(np.asarray(p_obs, float), R1, float(z[0]), float(z[1]), L_meas)
-                    _set3d(me12_ln, [p0[0], pF[0]], [p0[1], pF[1]], [p0[2], pF[2]])
-                else:
-                    _set3d(me12_ln, [], [], [])
-            elif me12_ln is not None:
-                _set3d(me12_ln, [], [], [])
-
-            if me21_ln is not None and f < len(frames_dict.get("meas21_azel", [])):
-                me21 = frames_dict.get("meas21_azel", [])
-                if me21[f] is not None:
-                    p_obs, z = me21[f]
-                    R2 = _R_exec(2, f)
-                    p0, pF = _meas_ray(np.asarray(p_obs, float), R2, float(z[0]), float(z[1]), L_meas)
-                    _set3d(me21_ln, [p0[0], pF[0]], [p0[1], pF[1]], [p0[2], pF[2]])
-                else:
-                    _set3d(me21_ln, [], [], [])
-            elif me21_ln is not None:
-                _set3d(me21_ln, [], [], [])
-        else:
-            _set3d(me12_ln, [], [], [])
-            _set3d(me21_ln, [], [], [])
-
         # plan/exec
         if not only_est:
             if plan_hist1 and f < len(plan_hist1) and plan_hist1[f]:
