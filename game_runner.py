@@ -315,6 +315,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         ukf_cfg = {}
     ukf_list = []
     xA_est_list = [xA.copy() for xA in xA_list]
+    est_hist = None
     if use_kf:
         sigma_az = float(ukf_cfg.get("sigma_az", np.deg2rad(0.5)))
         sigma_el = float(ukf_cfg.get("sigma_el", np.deg2rad(0.5)))
@@ -361,6 +362,14 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             )
             ukf_list.append(ukf_j)
             xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
+
+        est_hist = {}
+        for j, ukf_j in enumerate(ukf_list):
+            key = j + 2
+            est_hist[f"est1{key}_xyz"] = [ukf_j.x[:3].copy()]
+            est_hist[f"meas1{key}_azel"] = [None]
+            est_hist[f"meas1{key}_innov_sq"] = [float("nan")]
+            est_hist[f"trP1{key}_pos"] = [float(np.trace(ukf_j.P[:3, :3]))]
     else:
         ukf_action_access = "ground_truth"
 
@@ -561,6 +570,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             R_wb = np.eye(3)
             for j in range(Na):
                 ukf_j = ukf_list[j]
+                key = j + 2
                 u_pred, u_cov = _kf_predict_control(
                     ukf_action_access,
                     _u3_from_action(uA_real[j], D),
@@ -568,13 +578,26 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
                     control_limit=umax,
                 )
                 ukf_j.predict(dt=dt, u=u_pred, u_cov=u_cov)
+                innov_sq = float("nan")
                 if ((k + 1) % meas_every) == 0:
                     pA_true = xA_list[j][:D]
                     v_b = _body_bearing_from_world(p_obs, R_wb, pA_true)
                     az_true, el_true = _azel_from_body_vec(v_b)
                     z_true = np.array([az_true, el_true], float)
                     z_noise = np.random.multivariate_normal(mean=np.zeros(2), cov=ukf_j.R)
-                    ukf_j.update(z_true + z_noise, p_obs, R_wb)
+                    z = z_true + z_noise
+                    z_hat = ukf_j.h(ukf_j.x.copy(), p_obs=p_obs, R_wb=R_wb)
+                    innov = z - z_hat
+                    innov[0] = _normalize_angle(innov[0])
+                    innov[1] = _normalize_angle(innov[1])
+                    innov_sq = float(innov @ innov)
+                    ukf_j.update(z, p_obs, R_wb)
+                    est_hist[f"meas1{key}_azel"].append((np.asarray(p_obs, float).copy(), z.copy()))
+                else:
+                    est_hist[f"meas1{key}_azel"].append(None)
+                est_hist[f"meas1{key}_innov_sq"].append(innov_sq)
+                est_hist[f"trP1{key}_pos"].append(float(np.trace(ukf_j.P[:3, :3])))
+                est_hist[f"est1{key}_xyz"].append(ukf_j.x[:3].copy())
                 xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
 
         if use_fuel:
@@ -604,7 +627,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         "total": float(t_fn1 - t_fn0),
     }
 
-    return _pack_multi_agent_rollout(
+    out = _pack_multi_agent_rollout(
         plan_hist_all=plan_hist_all,
         plan_att_all=plan_att_all,
         exec_xyz_all=exec_xyz_all,
@@ -622,6 +645,9 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         thrust_all=(thrust_all if use_fuel else None),
         mdot_all=(mdot_all if use_fuel else None),
     )
+    if est_hist is not None:
+        out.update(est_hist)
+    return out
 
 
 def run_rhc_with_rl_and_collect_frames_3d(
