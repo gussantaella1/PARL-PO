@@ -57,7 +57,7 @@ COMMON: Dict[str, Any] = {
     },
 
     # Arena
-    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
+    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 200.0},
     "normalize_pos_obs": False,
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
@@ -136,7 +136,7 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": True,
+    "use_kf": False,
     "estimator_kind": "ekf",
     "meas_innov_coef": 1.0,  
     "meas_cov_coef": 0.02,
@@ -248,7 +248,8 @@ TRAIN: Dict[str, Any] = {
 
     #Base config
     "num_envs": 256,   #Was 256
-    "steps_per_env": 512, #Was 512  
+    # "steps_per_env": 512, #Was 512  
+    "steps_per_env": 1024, #Was 512  
     "total_updates": 1000,   #Was 2000
     "train_epochs": 3, #Was 3
     "minibatch_size": 4096,  #Was 8192
