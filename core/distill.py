@@ -49,7 +49,9 @@ def _obs_dim_from_cfg(cfg: Dict[str, Any]) -> int:
     D = int(cfg["D"])
     Na = _num_attackers(cfg)
     fuel_dim = 2 if cfg.get("fuel", {}).get("enable", False) else 0
-    return (2 + 3 * Na) * D + fuel_dim
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    extra_dim = 1 if (Na == 1 and bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))) else 0
+    return (2 + 3 * Na) * D + fuel_dim + extra_dim
 
 
 def _permute_obs_np(obs: np.ndarray, D: int, Na: int, attacker_idx: int) -> np.ndarray:
@@ -441,8 +443,8 @@ def _full_obs_from_env(env) -> np.ndarray:
     """
     p1, v1, pA_list, vA_list = env._unpack(env.state)
     c = env.center
-    pos_scale = 1.0 / max(float(env.radius), 1e-9) if bool(getattr(env, "normalize_pos_obs", False)) else 1.0
-    vel_scale = float(getattr(env, "_vel_obs_scale", 1.0))
+    pos_scale = 1.0
+    vel_scale = 1.0
 
     parts = [(p1 - c) * pos_scale]
     for pA in pA_list:
@@ -458,6 +460,17 @@ def _full_obs_from_env(env) -> np.ndarray:
         fatt = (env.m_att[0] - env.mdry_att) / (env.m0_att - env.mdry_att + 1e-9)
         parts.append(np.array([np.clip(fdef, 0.0, 1.0)], dtype=np.float32))
         parts.append(np.array([np.clip(fatt, 0.0, 1.0)], dtype=np.float32))
+
+    radius_obs = None
+    radius_obs_fn = getattr(env, "_arena_radius_obs", None)
+    if callable(radius_obs_fn):
+        radius_obs = radius_obs_fn()
+    elif bool(getattr(env, "obs_include_arena_radius", False)):
+        denom = max(abs(float(getattr(env, "radius_obs_scale", 1.0))), 1e-9)
+        radius_obs = np.array([float(env.radius) / denom], dtype=np.float32)
+
+    if radius_obs is not None:
+        parts.append(np.asarray(radius_obs, dtype=np.float32).reshape(-1))
 
     return np.concatenate(parts).astype(np.float32)
 

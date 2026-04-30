@@ -57,13 +57,15 @@ COMMON: Dict[str, Any] = {
     },
 
     # Arena
-    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 200.0},
-    "normalize_pos_obs": False,
+    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 
     # Action bounds
-    "umax": 2.0,
+    # "umax": 2.0,
+    # "umax": 1.0,
+    "umax": 0.1,
+    # "umax": 0.01,
 
     # Initial conditions
     "x0": np.array([
@@ -147,6 +149,7 @@ KF_COMMON: Dict[str, Any] = {
         "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "every": 1,
         "ekf_jacobian_mode": "exact",  # "exact" | "frozen"
+        "ekf_use_torch": True,  # when True, EKF runs on cfg["device"] (e.g. "cuda")
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
         "action_access": "measured",  # ground_truth | measured | none
@@ -216,8 +219,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    # "reward_type": "zero_sum",
-    "reward_type": "zero_sum_kf",
+    "reward_type": "zero_sum",
+    # "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
@@ -247,10 +250,14 @@ TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
 
     #Base config
+    #"num_envs": 256,   #Was 256
     "num_envs": 256,   #Was 256
-    # "steps_per_env": 512, #Was 512  
-    "steps_per_env": 1024, #Was 512  
+    # "steps_per_env": 512*5, #Was 512  
+    # "steps_per_env": 2290,
+    "steps_per_env": 10240, #Was 512  
     "total_updates": 1000,   #Was 2000
+    # "total_updates": 2000,   #Was 2000
+    # "total_updates": 500,   #Was 2000
     "train_epochs": 3, #Was 3
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
@@ -259,58 +266,45 @@ TRAIN: Dict[str, Any] = {
     "vec_workers": None,     # only used when vec_backend == "subproc"
     "mp_start_method": None, # auto-selects a multiprocessing start method
 
-    "k_pos": 0.1, #Was 0.05
+    #Higher accelerations setting (2.0 m/s^2)
+    # "k_pos": 0.1,
+    # "gamma": 0.991, 
+    # "steps_per_env": 512,  
+    # "train_ic_vmax": 0.5,            # max |v| component at t=0
+    # "total_updates": 1000,   #Was 2000
+
+
+    #Lower acceleration setting (0.1 m/s^2)
+    "k_pos": 0.1/4.5,
+    "gamma": 0.991, 
+    "steps_per_env": 512*4.5,  
+    # "steps_per_env": 2048,  
+    "train_ic_vmax": 0.5/4.5,            # max |v| component at t=0
+    "total_updates": 1500,   #Was 2000
+
+    # "k_pos": 0.05, #Was 0.05
+    # "k_pos": 0.01, #Was 0.05
     "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
 
-    "gamma": 0.992, #Was 0.995
+
+    "normalize_reward": True,
+    "normalize_reward_geometry_power": 2,
+    "reward_normalize_radius_m": None,  # optional constant radius for reward normalization; None => use active arena radius
+    # "reward_normalize_radius_m": 20.0,  # optional constant radius for reward normalization; None => use active arena radius
+   
+   
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 10.0,
     "wall_penalty": 2.5,
     "fuel_depletion_penalty": 5.0,
     "collision_radius_m": 0.75,            # meters
 
-    # UKF config:
-
-    # "num_envs": 64,   #Was 256
-    # "steps_per_env": 512, #Was 512  
-    # "total_updates": 1000,   #Was 2000
-    # "train_epochs": 3, #Was 3
-    # "minibatch_size": 1024,  #Was 8192
-    # "log_every": 10,
-    # "entropy_coef": 0.01,
-
-    # "k_pos": 0.1, #Was 0.05
-    # "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
-
-    # "gamma": 0.992, #Was 0.995
-    # "target_hit_reward_penalty": 10.0,
-    # "collision_penalty": 10.0,
-    # "wall_penalty": 2.5,
+    #Termination penalties
+    # "target_hit_reward_penalty": 10.0*5,
+    # "collision_penalty": 10.0*5,
+    # "wall_penalty": 2.5*5,
     # "fuel_depletion_penalty": 5.0,
-    # "collision_radius_m": 0.75,            # meters
-
-
-    # #Long training (new)
-    # "num_envs": 128,   
-    # "steps_per_env": 512,   
-    # "total_updates": 1000,   
-    # "train_epochs": 3,
-    # "minibatch_size": 4096,  
-    # "log_every": 10,
-    # "entropy_coef": 0.01,
-    # "k_pos": 0.04, #Was 0.05
-    # "gamma": 0.998, #Was 0.999
-
-    #Short training
-    # "num_envs": 8,          
-    # "steps_per_env": 256,    
-    # "total_updates": 300, 
-    # "train_epochs": 10,
-    # "minibatch_size": 1024,  
-    # "log_every": 10,
-    # "entropy_coef": 0.01,
-    # "k_pos": 0.04,
-    # "gamma": 0.999,
+    # "collision_radius_m": 1.0,            # meters
 
     #Test training
     # "num_envs": 1,          
@@ -335,12 +329,18 @@ TRAIN: Dict[str, Any] = {
     "k_eff_def": 0.01,
     "k_eff_att": 0.01,
 
-    #Arena start positions config (relative to radius of arena)
+    # Arena start positions config.
+    # Fractional keys below are interpreted relative to arena["r"].
+    # Optional *_m overrides let you pin explicit shell bounds in meters.
     # "r_def_min": 0.0, #Default: 0.0
     # "r_def_max": 0.85, # Default: 0.5
+    # "r_def_min_m": 0.0,
+    # "r_def_max_m": 80.0,
 
     # "r_att_min": 0.0, #Default 0.4
     # "r_att_max": 0.95, #Default: 0.95
+    # "r_att_min_m": 20.0 * 0.3,
+    # "r_att_max_m": 99.0,
 
     "r_def_min": 0.0, #Default: 0.0
     "r_def_max": 0.8, # Default: 0.5
@@ -349,6 +349,8 @@ TRAIN: Dict[str, Any] = {
     "r_att_max": 0.95, #Default: 0.95
 
     "percent_advantage_defender": 1.0, 
+    # "percent_advantage_defender": 3.0, 
+
 
     # Other PPO hyperparams
     "gae_lambda": 0.95,
@@ -381,8 +383,57 @@ TRAIN: Dict[str, Any] = {
     # Training-only initial condition randomization
     # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell_advantage",  # or "fixed"
-    "train_ic_vmax": 0.5,            # max |v| component at t=0
     "train_min_sep": 2.0,             # min defender–attacker separation (m)
+    "arena_radius_knob": {
+        "enabled": False,
+        "append_to_obs": False,
+        "start_radius_m": 20.0,
+        "final_radius_m": 100.0,
+        "schedule": "staged",       # "linear" | "fixed" | "staged"
+        "schedule_fraction": 1.0,   # linear only: fraction of training spent reaching final_radius_m
+        "sample_mode": "fixed",     # "uniform" | "fixed"; fixed uses the exact active stage radius
+        "integer_only": True,       # rounds the sampled radius when sample_mode returns a single value
+        "stages": [
+            # Use exactly one scheme for the whole list:
+            # {"radius_m": 20.0, "fraction": 0.10},
+            # {"radius_m": 20.0, "updates": 400},
+            # {"radius_m": 25.0, "fraction": 0.10},
+            # {"radius_m": 30.0, "fraction": 0.10},
+            # {"radius_m": 40.0, "fraction": 0.10},
+            # {"radius_m": 50.0, "fraction": 0.10},
+            # {"radius_m": 60.0, "fraction": 0.10},
+            # {"radius_m": 70.0, "fraction": 0.10},
+            # {"radius_m": 80.0, "fraction": 0.10},
+            # {"radius_m": 90.0, "fraction": 0.10},
+            # {"radius_m": 100.0, "fraction": 0.10},
+
+            # {"radius_m": 20.0, "fraction": 0.40},
+            # {"radius_m": 30.0, "fraction": 0.075},
+            # {"radius_m": 40.0, "fraction": 0.075},
+            # {"radius_m": 50.0, "fraction": 0.075},
+            # {"radius_m": 60.0, "fraction": 0.075},
+            # {"radius_m": 70.0, "fraction": 0.075},
+            # {"radius_m": 80.0, "fraction": 0.075},
+            # {"radius_m": 90.0, "fraction": 0.075},
+            # {"radius_m": 100.0, "fraction": 0.075},
+
+            {"radius_m": 20.0, "updates": 400},
+            {"radius_m": 30.0, "updates": 400},
+            {"radius_m": 40.0, "updates": 400},
+            {"radius_m": 50.0, "updates": 400},
+            {"radius_m": 60.0, "updates": 400},
+            {"radius_m": 70.0, "updates": 400},
+            {"radius_m": 80.0, "updates": 400},
+            {"radius_m": 90.0, "updates": 400},
+            {"radius_m": 100.0, "updates": 400},
+
+
+
+            # {"radius_m": 20.0, "fraction": 0.50},
+            # {"radius_m": 100.0, "fraction": 0.50},
+        ],
+        "obs_scale": 1.0,          # divide appended radius feature by this value
+    },
 
     "prior_type": "ls",                 #ls, nash, none
     "prior_blend_att":        0.0,    # (optional) disable center prior for def

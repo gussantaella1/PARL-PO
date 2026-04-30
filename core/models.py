@@ -8,6 +8,11 @@ from core.utils import logprob_squashed, squash_action
 # =============================================================
 # DiffLS Layer & Actor-Critic
 # =============================================================
+def _obs_extra_dim_from_cfg(cfg: Dict[str, Any]) -> int:
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    return 1 if bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False))) else 0
+
+
 class DiffLSLayer(nn.Module):
     """
     Analytic one-step ridge prior using the SAME discrete dynamics as the env:
@@ -37,6 +42,7 @@ class DiffLSLayer(nn.Module):
         self.ridge = float(cfg.get("prior_ridge", 1e-2))
         self.use_fuel = bool(cfg.get("fuel", {}).get("enable", False))
         self.num_attackers = int(cfg.get("num_attackers", 1))
+        self.extra_obs_dim = _obs_extra_dim_from_cfg(cfg)
 
         if self.num_attackers != 1:
             raise NotImplementedError(
@@ -73,18 +79,19 @@ class DiffLSLayer(nn.Module):
         self.register_buffer("K", torch.tensor(np.linalg.solve(M, F.T), dtype=torch.float32))
         # K shape: (D, D), so u* = -K E
 
-        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0)
+        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0) + self.extra_obs_dim
 
     def _split_obs(self, obs: torch.Tensor):
         """
         Single-attacker observation parser.
 
         Returns:
-            p1c, p2c, rel, v1, v2, fdef, fatt
+            p1c, p2c, rel, v1, v2, fdef, fatt, extras
         where fdef/fatt are None if fuel is disabled.
         """
         D = self.D
-        expected = 5 * D + (2 if self.use_fuel else 0)
+        base_dim = 5 * D
+        expected = base_dim + (2 if self.use_fuel else 0) + self.extra_obs_dim
         if obs.shape[-1] != expected:
             raise ValueError(
                 f"Expected obs dim {expected}, got {obs.shape[-1]}. "
@@ -98,13 +105,15 @@ class DiffLSLayer(nn.Module):
         v2  = obs[:, 4*D:5*D]
 
         if self.use_fuel:
-            fdef = obs[:, 5*D:5*D+1]
-            fatt = obs[:, 5*D+1:5*D+2]
+            fdef = obs[:, base_dim:base_dim+1]
+            fatt = obs[:, base_dim+1:base_dim+2]
+            extras = obs[:, base_dim+2:]
         else:
             fdef = None
             fatt = None
+            extras = obs[:, base_dim:]
 
-        return p1c, p2c, rel, v1, v2, fdef, fatt
+        return p1c, p2c, rel, v1, v2, fdef, fatt, extras
 
     def _one_step_prior(self, p_c: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         """
@@ -117,16 +126,16 @@ class DiffLSLayer(nn.Module):
         return u
 
     def forward(self, obs: torch.Tensor, who: str):
-        p1c, p2c, rel, v1, v2, fdef, fatt = self._split_obs(obs)
+        p1c, p2c, rel, v1, v2, fdef, fatt, extras = self._split_obs(obs)
 
         u_def_prior = self._one_step_prior(p1c, v1)
         u_att_prior = self._one_step_prior(p2c, v2)
         u_prior = u_def_prior if who == "def" else u_att_prior
 
         if self.use_fuel:
-            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt], dim=-1)
+            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt, extras], dim=-1)
         else:
-            feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
+            feats = torch.cat([p1c, p2c, v1, v2, extras], dim=-1)
 
         return feats, u_prior
 
@@ -145,17 +154,19 @@ class NoPriorLayer(nn.Module):
         self.D = int(cfg["D"])
         self.use_fuel = bool(cfg.get("fuel", {}).get("enable", False))
         self.num_attackers = int(cfg.get("num_attackers", 1))
+        self.extra_obs_dim = _obs_extra_dim_from_cfg(cfg)
 
         if self.num_attackers != 1:
             raise NotImplementedError(
                 "NoPriorLayer currently supports only num_attackers=1."
             )
 
-        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0)
+        self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0) + self.extra_obs_dim
 
     def _split_obs(self, obs: torch.Tensor):
         D = self.D
-        expected = 5 * D + (2 if self.use_fuel else 0)
+        base_dim = 5 * D
+        expected = base_dim + (2 if self.use_fuel else 0) + self.extra_obs_dim
         if obs.shape[-1] != expected:
             raise ValueError(
                 f"Expected obs dim {expected}, got {obs.shape[-1]}. "
@@ -169,24 +180,26 @@ class NoPriorLayer(nn.Module):
         v2  = obs[:, 4*D:5*D]
 
         if self.use_fuel:
-            fdef = obs[:, 5*D:5*D+1]
-            fatt = obs[:, 5*D+1:5*D+2]
+            fdef = obs[:, base_dim:base_dim+1]
+            fatt = obs[:, base_dim+1:base_dim+2]
+            extras = obs[:, base_dim+2:]
         else:
             fdef = None
             fatt = None
+            extras = obs[:, base_dim:]
 
-        return p1c, p2c, rel, v1, v2, fdef, fatt
+        return p1c, p2c, rel, v1, v2, fdef, fatt, extras
 
     def forward(self, obs: torch.Tensor, who: str):
         B, D = obs.shape[0], self.D
         device, dtype = obs.device, obs.dtype
 
-        p1c, p2c, rel, v1, v2, fdef, fatt = self._split_obs(obs)
+        p1c, p2c, rel, v1, v2, fdef, fatt, extras = self._split_obs(obs)
 
         if self.use_fuel:
-            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt], dim=-1)
+            feats = torch.cat([p1c, p2c, v1, v2, fdef, fatt, extras], dim=-1)
         else:
-            feats = torch.cat([p1c, p2c, v1, v2], dim=-1)
+            feats = torch.cat([p1c, p2c, v1, v2, extras], dim=-1)
 
         u_prior = torch.zeros((B, D), device=device, dtype=dtype)
         return feats, u_prior

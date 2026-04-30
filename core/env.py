@@ -8,7 +8,7 @@ import os
 
 from ukf_estimator import KF_CV, _body_bearing_from_world, _azel_from_body_vec
 from config_rl import build_dyn
-from core.utils import set_seed
+from core.utils import resolve_start_radius_bounds, set_seed
 
 # =============================================================
 # Environment (2 agents under HCW; attacker may be rule-based)
@@ -41,9 +41,8 @@ class Env:
             raise ValueError("Only 'sphere' arena is implemented.")
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
-        self.normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
-        self._pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
-        self._vel_obs_scale = (self.dt / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self._pos_obs_scale = 1.0
+        self._vel_obs_scale = 1.0
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -85,6 +84,21 @@ class Env:
         # reward params
         self.k_pos = float(cfg.get("k_pos"))
         self.k_dock = float(cfg.get("k_dock"))
+        self.normalize_reward = bool(cfg.get("normalize_reward", True))
+        self.normalize_reward_geometry_power = int(cfg.get("normalize_reward_geometry_power", 2))
+        self.reward_normalize_radius_m = cfg.get("reward_normalize_radius_m", None)
+        if self.reward_normalize_radius_m is not None:
+            self.reward_normalize_radius_m = float(self.reward_normalize_radius_m)
+            if self.reward_normalize_radius_m <= 0.0:
+                raise ValueError(
+                    "reward_normalize_radius_m must be > 0 when provided, "
+                    f"got {self.reward_normalize_radius_m}."
+                )
+        if self.normalize_reward_geometry_power not in (1, 2):
+            raise ValueError(
+                "normalize_reward_geometry_power must be 1 or 2, "
+                f"got {self.normalize_reward_geometry_power}"
+            )
 
 
         self.lD    = float(cfg["effort_def"])
@@ -100,6 +114,16 @@ class Env:
 
         self.oi_radius = float(oi.get("r", 0.0))
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
+        reward_norm_radius = self._reward_normalization_radius()
+        self._reward_dist_scale = reward_norm_radius if self.normalize_reward else 1.0
+        self._reward_geom_scale = (
+            reward_norm_radius ** self.normalize_reward_geometry_power
+            if self.normalize_reward else 1.0
+        )
+        self._term_dist_scale = self.radius if self.normalize_reward else 1.0
+        self._soft_wall_term = self.soft_wall if self.normalize_reward else self.soft_wall * self.radius
+        self._oi_radius_term = self.oi_radius_norm if self.normalize_reward else self.oi_radius
+        self._arena_term_limit = self.margin if self.normalize_reward else self.margin * self.radius
 
 
         self.hit_buffer_def = float(cfg.get("hit_buffer_def"))
@@ -141,6 +165,7 @@ class Env:
         self.estimator_label = self.estimator_kind.upper()
         self._estimator_dyn = None
         self._ekf_jacobian_mode = str(self._estimator_cfg.get("ekf_jacobian_mode", "exact"))
+        self._ekf_use_torch = bool(self._estimator_cfg.get("ekf_use_torch", False))
 
         #Fuel config
         fuel = cfg.get("fuel", {})
@@ -293,8 +318,197 @@ class Env:
             if self.Tmax_att <= 0.0 or self.Isp_att <= 0.0:
                 raise ValueError("fuel.att: Tmax and Isp must be > 0")
 
+        radius_knob = dict(cfg.get("arena_radius_knob", {}) or {})
+        self.arena_radius_knob = radius_knob
+        self.arena_radius_knob_enabled = bool(radius_knob.get("enabled", False))
+        self.obs_include_arena_radius = bool(radius_knob.get("append_to_obs", self.arena_radius_knob_enabled))
+        self.radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
+        self.curriculum_progress = 0.0
+        self._arena_radius_stages: list[tuple[float, float]] | None = None
+        self._base_arena_radius = float(self.radius)
+        self._apply_arena_radius(self.radius)
+
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
+
+    def _reward_normalization_radius(self) -> float:
+        if self.reward_normalize_radius_m is not None:
+            return float(self.reward_normalize_radius_m)
+        return float(self.radius)
+
+    def _normalize_arena_radius_stages(self, raw_stages: Any) -> list[tuple[float, float]]:
+        if raw_stages is None:
+            return []
+        if not isinstance(raw_stages, (list, tuple)):
+            raise ValueError("arena_radius_knob['stages'] must be a list of stage specs.")
+
+        fraction_stages: list[tuple[float, float]] = []
+        update_stages: list[tuple[float, int]] = []
+        stage_units: str | None = None
+        for idx, stage in enumerate(raw_stages):
+            if isinstance(stage, dict):
+                radius = stage.get("radius_m", stage.get("radius", stage.get("r")))
+                fraction = stage.get("fraction", stage.get("frac", stage.get("share")))
+                updates = stage.get("updates", stage.get("update", stage.get("num_updates")))
+            elif isinstance(stage, (list, tuple)) and len(stage) == 2:
+                radius, fraction = stage
+                updates = None
+            else:
+                raise ValueError(
+                    "Each arena radius stage must be either "
+                    "{'radius_m': ..., 'fraction': ...}, "
+                    "{'radius_m': ..., 'updates': ...}, "
+                    "or a (radius, fraction) pair."
+                )
+
+            if radius is None:
+                raise ValueError(f"arena_radius_knob['stages'][{idx}] is missing radius.")
+
+            has_fraction = fraction is not None
+            has_updates = updates is not None
+            if has_fraction == has_updates:
+                raise ValueError(
+                    f"arena_radius_knob['stages'][{idx}] must specify exactly one of "
+                    "'fraction' or 'updates'."
+                )
+
+            radius = float(radius)
+            unit = "updates" if has_updates else "fraction"
+            if stage_units is None:
+                stage_units = unit
+            elif unit != stage_units:
+                raise ValueError(
+                    "arena_radius_knob['stages'] must use either fractions for all stages "
+                    "or updates for all stages; mixing is not supported."
+                )
+
+            if has_updates:
+                updates_val = float(updates)
+                updates_rounded = int(round(updates_val))
+                if updates_val <= 0.0 or abs(updates_val - updates_rounded) > 1e-9:
+                    raise ValueError(
+                        f"arena_radius_knob['stages'][{idx}] must have a positive integer "
+                        f"updates count, got {updates}."
+                    )
+                update_stages.append((radius, updates_rounded))
+            else:
+                fraction_val = float(fraction)
+                if fraction_val <= 0.0:
+                    raise ValueError(
+                        f"arena_radius_knob['stages'][{idx}] must have fraction > 0, got {fraction_val}."
+                    )
+                fraction_stages.append((radius, fraction_val))
+
+        if stage_units == "updates":
+            total_updates_cfg = int(self.cfg.get("total_updates", 0))
+            if total_updates_cfg <= 0:
+                raise ValueError(
+                    "arena_radius_knob stages specified with 'updates' require cfg['total_updates'] > 0."
+                )
+            total_updates_stages = sum(updates for _, updates in update_stages)
+            if total_updates_stages != total_updates_cfg:
+                raise ValueError(
+                    "arena_radius_knob['stages'] update counts must sum to "
+                    f"cfg['total_updates'] ({total_updates_cfg}), got {total_updates_stages}."
+                )
+            return [
+                (radius, updates / float(total_updates_cfg))
+                for radius, updates in update_stages
+            ]
+
+        total_fraction = sum(fraction for _, fraction in fraction_stages)
+        if total_fraction <= 0.0:
+            raise ValueError("arena_radius_knob['stages'] must have a positive total fraction.")
+
+        return [(radius, fraction / total_fraction) for radius, fraction in fraction_stages]
+
+    def _apply_arena_radius(self, radius: float):
+        self.radius = float(radius)
+        self._vel_obs_scale = 1.0
+        self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
+        reward_norm_radius = self._reward_normalization_radius()
+        self._reward_dist_scale = reward_norm_radius if self.normalize_reward else 1.0
+        self._reward_geom_scale = (
+            reward_norm_radius ** self.normalize_reward_geometry_power
+            if self.normalize_reward else 1.0
+        )
+        self._term_dist_scale = self.radius if self.normalize_reward else 1.0
+        self._soft_wall_term = self.soft_wall if self.normalize_reward else self.soft_wall * self.radius
+        self._oi_radius_term = self.oi_radius_norm if self.normalize_reward else self.oi_radius
+        self._arena_term_limit = self.margin if self.normalize_reward else self.margin * self.radius
+
+    def _arena_radius_schedule(self) -> str:
+        return str(self.arena_radius_knob.get("schedule", "linear")).strip().lower()
+
+    def _get_arena_radius_stages(self) -> list[tuple[float, float]]:
+        if self._arena_radius_stages is None:
+            self._arena_radius_stages = self._normalize_arena_radius_stages(
+                self.arena_radius_knob.get("stages")
+            )
+        return self._arena_radius_stages
+
+    def _staged_arena_radius(self) -> float:
+        stages = self._get_arena_radius_stages()
+        if not stages:
+            raise ValueError(
+                "arena_radius_knob schedule='staged' requires a non-empty 'stages' list."
+            )
+
+        progress = float(np.clip(self.curriculum_progress, 0.0, 1.0))
+        cumulative = 0.0
+        for idx, (radius, fraction) in enumerate(stages):
+            cumulative += fraction
+            if progress < cumulative or idx == (len(stages) - 1):
+                return radius
+
+        return stages[-1][0]
+
+    def _scheduled_arena_radius(self) -> float:
+        if not self.arena_radius_knob_enabled:
+            return self._base_arena_radius
+        start_radius = float(self.arena_radius_knob.get("start_radius_m", self._base_arena_radius))
+        final_radius = float(self.arena_radius_knob.get("final_radius_m", self._base_arena_radius))
+        schedule = self._arena_radius_schedule()
+        schedule_fraction = float(self.arena_radius_knob.get("schedule_fraction", 1.0))
+        schedule_fraction = max(schedule_fraction, 1e-9)
+        progress = float(np.clip(self.curriculum_progress, 0.0, 1.0))
+        progress = min(1.0, progress / schedule_fraction)
+        if schedule in ("fixed", "none", "off"):
+            return final_radius
+        if schedule in ("staged", "stage", "piecewise"):
+            return self._staged_arena_radius()
+        if schedule != "linear":
+            raise ValueError(f"Unknown arena_radius_knob schedule={schedule!r}")
+        return start_radius + progress * (final_radius - start_radius)
+
+    def _sample_arena_radius(self) -> float:
+        active_radius = self._scheduled_arena_radius()
+        if not self.arena_radius_knob_enabled:
+            return active_radius
+        start_radius = float(self.arena_radius_knob.get("start_radius_m", self._base_arena_radius))
+        sample_mode = str(self.arena_radius_knob.get("sample_mode", "uniform")).strip().lower()
+        integer_only = bool(self.arena_radius_knob.get("integer_only", False))
+        if sample_mode == "fixed":
+            return float(int(np.round(active_radius))) if integer_only else active_radius
+        if sample_mode != "uniform":
+            raise ValueError(f"Unknown arena_radius_knob sample_mode={sample_mode!r}")
+        lo = min(start_radius, active_radius)
+        hi = max(start_radius, active_radius)
+        if (hi - lo) <= 1e-9:
+            return float(int(np.round(hi))) if integer_only else hi
+        if integer_only:
+            lo_i = int(np.ceil(lo))
+            hi_i = int(np.floor(hi))
+            if hi_i < lo_i:
+                return float(int(np.round(active_radius)))
+            return float(np.random.randint(lo_i, hi_i + 1))
+        return float(np.random.uniform(lo, hi))
+
+    def _arena_radius_obs(self) -> np.ndarray | None:
+        if not self.obs_include_arena_radius:
+            return None
+        denom = max(abs(self.radius_obs_scale), 1e-9)
+        return np.array([self.radius / denom], dtype=np.float32)
 
     def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
         if (not self.use_kf) or (self.ukf is None):
@@ -381,6 +595,14 @@ class Env:
             std = arr.astype(float)
         return np.maximum(std, 0.0)
 
+    def _reward_geom_from_sqdist(self, sqdist: float) -> float:
+        sqdist = max(float(sqdist), 0.0)
+        if not self.normalize_reward:
+            return sqdist
+        if self.normalize_reward_geometry_power == 1:
+            return float(np.sqrt(sqdist)) / max(self._reward_dist_scale, 1e-9)
+        return sqdist / max(self._reward_geom_scale, 1e-9)
+
     def _normalize_estimator_kind(self, kind: Any) -> str:
         key = str(kind).strip().lower()
         valid = {"ukf", "ekf"}
@@ -401,6 +623,8 @@ class Env:
         if self.estimator_kind == "ekf":
             estimator_kwargs["jacobian_mode"] = self._ekf_jacobian_mode
             estimator_kwargs["linearization_group"] = linearization_group
+            estimator_kwargs["use_torch_backend"] = self._ekf_use_torch
+            estimator_kwargs["device"] = self.cfg.get("device", "cpu")
         return KF_CV(
             x0=x0_est,
             P0=self._ukf_P0.copy(),
@@ -430,6 +654,7 @@ class Env:
 
     def reset(self) -> np.ndarray:
         self.t = 0
+        self._apply_arena_radius(self._sample_arena_radius())
         mode = self.train_ic_mode
         Na = self.num_attackers
 
@@ -465,11 +690,8 @@ class Env:
             # r_def_min, r_def_max = 0.0, 0.5 * R
             # r_att_min, r_att_max = 0.4 * R, 0.95 * R
 
-            r_def_min = float(self.cfg.get("r_def_min")) * R  
-            r_def_max = float(self.cfg.get("r_def_max")) * R
-
-            r_att_min = float(self.cfg.get("r_att_min")) * R
-            r_att_max = float(self.cfg.get("r_att_max")) * R 
+            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
+            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
 
 
             # defender
@@ -521,11 +743,8 @@ class Env:
             percent_advantage_defender = self.cfg.get("percent_advantage_defender", 0.75)
             radial_margin = float(percent_advantage_defender*np.pi*2*oi_r) 
 
-            r_def_min = float(self.cfg.get("r_def_min")) * R
-            r_def_max = float(self.cfg.get("r_def_max")) * R
-
-            r_att_min = float(self.cfg.get("r_att_min")) * R
-            r_att_max = float(self.cfg.get("r_att_max")) * R
+            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
+            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
 
             r_att_min = max(r_att_min, radial_margin)
 
@@ -701,7 +920,7 @@ class Env:
             p2_geom = p2
 
         d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
-        self._d2_prev = d2_raw / (self.radius**2)
+        self._d2_prev = self._reward_geom_from_sqdist(d2_raw)
 
         if self.use_fuel:
             self.m_def = self.m0_def
@@ -883,23 +1102,24 @@ class Env:
         # ---- shared geometry needed by whichever reward(s) we compute ----
         # d2 and rel2 are used by both rewards
         d2_raw = float(np.dot(p2_reward - self.center, p2_reward - self.center))
-        d2 = d2_raw / (self.radius**2)
+        d2 = self._reward_geom_from_sqdist(d2_raw)
 
-        rel2 = float(np.dot((p2_reward - p1), (p2_reward - p1))) / (self.radius**2)
+        rel2_raw = float(np.dot((p2_reward - p1), (p2_reward - p1)))
+        rel2 = self._reward_geom_from_sqdist(rel2_raw)
 
         # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
         if need_def:
             d1_raw = float(np.dot(p1 - self.center, p1 - self.center))
-            d1 = d1_raw / (self.radius**2)
+            d1 = self._reward_geom_from_sqdist(d1_raw)
         else:
             d1 = 0.0  # placeholder
 
         # ---- wall penalties: compute only what you need ----
 
-        rho1 = np.linalg.norm(p1 - self.center)/ self.radius
-        rho2 = np.linalg.norm(p2_reward - self.center) / self.radius
+        rho1 = np.linalg.norm(p1 - self.center) / self._term_dist_scale
+        rho2 = np.linalg.norm(p2_reward - self.center) / self._term_dist_scale
 
-        v_scale = self.radius / self.dt
+        v_scale = (self._reward_dist_scale / self.dt) if self.normalize_reward else 1.0
 
         #Defender vars             
 
@@ -917,22 +1137,22 @@ class Env:
         v2n2 = float(np.dot(v2_reward, v2_reward)) / (v_scale**2)
         a2n2 = float(np.dot(a2_cmd, a2_cmd)) / (self.u_hi**2)
 
-        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+        wall2 = ((max(0.0, rho2 - self._soft_wall_term))**2) * self.wallK
 
         # ---- termination scenariosalways uses TRUE state ----
 
         # 1) Hitting target
         hit_target = False
 
-        rho_att = np.linalg.norm(p2 - self.center) / self.radius
-        rho_def = np.linalg.norm(p1 - self.center) / self.radius
+        rho_att = np.linalg.norm(p2 - self.center) / self._term_dist_scale
+        rho_def = np.linalg.norm(p1 - self.center) / self._term_dist_scale
 
-        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
-        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
+        thresh_def = (1.0 + self.hit_buffer_def) * self._oi_radius_term
+        thresh_att = (1.0 + self.hit_buffer_att) * self._oi_radius_term
 
 
-        att_hit_target = (self.oi_radius_norm > 0.0) and (rho_att <= thresh_att)
-        def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
+        att_hit_target = (self._oi_radius_term > 0.0) and (rho_att <= thresh_att)
+        def_hit_target = (self._oi_radius_term > 0.0) and (rho_def <= thresh_def)
 
 
         hit_target = att_hit_target or def_hit_target
@@ -950,11 +1170,11 @@ class Env:
         # 3) Exiting the arena
 
         # oob for ANY attacker
-        oob1 = (rho1 >= self.margin)
+        oob1 = (rho1 >= self._arena_term_limit)
         oob2_any = False
         for pA_true in pA_list:
-            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
-            if rhoA_true >= self.margin:
+            rhoA_true = np.linalg.norm(pA_true - self.center) / self._term_dist_scale
+            if rhoA_true >= self._arena_term_limit:
                 oob2_any = True
                 break
 
@@ -1117,6 +1337,7 @@ class Env:
             "oob_def": bool(oob1),
             "oob_att": bool(oob2_any),
             "hit_target": bool(hit_target),
+            "arena_radius_m": float(self.radius),
 
             # NEW: what your logger expects
             "d1_true_norm": d1_true_norm,
@@ -1173,27 +1394,25 @@ class Env:
             vA_obs = vA_list
 
         center_obs = self.center.copy()
-        pos_scale = self._pos_obs_scale
-        vel_scale = self._vel_obs_scale
 
         # build obs = [p1c, pA1c, ..., pANc, rel1, ..., relN, v1, vA1, ..., vAN]
-        p1c = (p1 - center_obs) * pos_scale
+        p1c = p1 - center_obs
         parts = [p1c]
 
         # positions (centered)
         for pA in pA_obs:
-            parts.append((pA - center_obs) * pos_scale)
+            parts.append(pA - center_obs)
 
         # relative positions
         for pA in pA_obs:
-            parts.append((pA - p1) * pos_scale)
+            parts.append(pA - p1)
 
         # defender vel
-        parts.append(v1 * vel_scale)
+        parts.append(v1)
 
         # attacker vels
         for vA in vA_obs:
-            parts.append(vA * vel_scale)
+            parts.append(vA)
 
         # Defender and attacker fuel:
 
@@ -1203,6 +1422,10 @@ class Env:
 
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
+
+        radius_obs = self._arena_radius_obs()
+        if radius_obs is not None:
+            parts.append(radius_obs)
 
         obs = np.concatenate(parts).astype(np.float32)
         return obs
@@ -1218,16 +1441,18 @@ class Env:
             p1_obs, v1_obs = p1, v1
 
         center_obs = self.center.copy()
-        pos_scale = self._pos_obs_scale
-        vel_scale = self._vel_obs_scale
-        p1c = (p1_obs - center_obs) * pos_scale
-        parts = [p1c, (p2 - center_obs) * pos_scale, (p2 - p1_obs) * pos_scale, v1_obs * vel_scale, v2 * vel_scale]
+        p1c = p1_obs - center_obs
+        parts = [p1c, p2 - center_obs, p2 - p1_obs, v1_obs, v2]
 
         if self.use_fuel:
             fuel_frac_def = (self.m_def - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
             fuel_frac_att = (self.m_att[0] - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
+
+        radius_obs = self._arena_radius_obs()
+        if radius_obs is not None:
+            parts.append(radius_obs)
 
         return np.concatenate(parts).astype(np.float32)
 
@@ -1701,6 +1926,14 @@ class TorchVecEnv:
         self.u_lo = float(base.u_lo)
         self.u_hi = float(base.u_hi)
         self.oi_radius_norm = float(base.oi_radius_norm)
+        self.normalize_reward = bool(base.normalize_reward)
+        self.normalize_reward_geometry_power = int(base.normalize_reward_geometry_power)
+        self.reward_dist_scale = float(base._reward_dist_scale)
+        self.reward_geom_scale = float(base._reward_geom_scale)
+        self.term_dist_scale = float(base._term_dist_scale)
+        self.soft_wall_term = float(base._soft_wall_term)
+        self.oi_radius_term = float(base._oi_radius_term)
+        self.arena_term_limit = float(base._arena_term_limit)
         self.hit_buffer_def = float(base.hit_buffer_def)
         self.hit_buffer_att = float(base.hit_buffer_att)
         self.collision_radius_m = float(base.collision_radius_m)
@@ -1711,8 +1944,8 @@ class TorchVecEnv:
         self.use_kf = bool(base.use_kf)
         self.use_fuel = bool(base.use_fuel)
         self.reward_type = str(base.reward_type)
-        self.pos_obs_scale = float(base._pos_obs_scale)
-        self.vel_obs_scale = float(base._vel_obs_scale)
+        self.obs_include_arena_radius = bool(base.obs_include_arena_radius)
+        self.radius_obs_scale = float(base.radius_obs_scale)
         self.reset_ukf_on_diverge = bool(base.reset_ukf_on_diverge)
 
         self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
@@ -1737,6 +1970,13 @@ class TorchVecEnv:
         self._opp_mode_codes = torch.zeros((self.num_envs,), dtype=torch.int64, device=self.device)
         self._weak_scale_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
         self._weak_noise_std_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.radius_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.reward_dist_scale_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.reward_geom_scale_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.term_dist_scale_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.soft_wall_term_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.oi_radius_term_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        self.arena_term_limit_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
         if self.use_fuel:
             self.m_def_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
@@ -1757,6 +1997,13 @@ class TorchVecEnv:
         self._opp_mode_codes[idx] = _opp_mode_code(env.opp_domain)
         self._weak_scale_t[idx] = float(env.weak_scale)
         self._weak_noise_std_t[idx] = float(env.weak_noise_std)
+        self.radius_t[idx] = float(env.radius)
+        self.reward_dist_scale_t[idx] = float(env._reward_dist_scale)
+        self.reward_geom_scale_t[idx] = float(env._reward_geom_scale)
+        self.term_dist_scale_t[idx] = float(env._term_dist_scale)
+        self.soft_wall_term_t[idx] = float(env._soft_wall_term)
+        self.oi_radius_term_t[idx] = float(env._oi_radius_term)
+        self.arena_term_limit_t[idx] = float(env._arena_term_limit)
 
         if self.use_fuel:
             self.m_def_t[idx] = float(env.m_def)
@@ -1805,32 +2052,38 @@ class TorchVecEnv:
             p2_obs, v2_obs = p2, v2
             p1_obs, v1_obs = p1, v1
 
-        p1c_def = (p1 - self.center_t) * self.pos_obs_scale
-        p2c_def = (p2_obs - self.center_t) * self.pos_obs_scale
-        rel_def = (p2_obs - p1) * self.pos_obs_scale
+        p1c_def = p1 - self.center_t
+        p2c_def = p2_obs - self.center_t
+        rel_def = p2_obs - p1
         obs_def_parts = [
             p1c_def,
             p2c_def,
             rel_def,
-            v1 * self.vel_obs_scale,
-            v2_obs * self.vel_obs_scale,
+            v1,
+            v2_obs,
         ]
 
-        p1c_att = (p1_obs - self.center_t) * self.pos_obs_scale
-        p2c_att = (p2 - self.center_t) * self.pos_obs_scale
-        rel_att = (p2 - p1_obs) * self.pos_obs_scale
+        p1c_att = p1_obs - self.center_t
+        p2c_att = p2 - self.center_t
+        rel_att = p2 - p1_obs
         obs_att_parts = [
             p1c_att,
             p2c_att,
             rel_att,
-            v1_obs * self.vel_obs_scale,
-            v2 * self.vel_obs_scale,
+            v1_obs,
+            v2,
         ]
 
         if self.use_fuel:
             fuel_frac_def, fuel_frac_att = self._fuel_fractions()
             obs_def_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
             obs_att_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
+
+        if self.obs_include_arena_radius:
+            denom = max(abs(self.radius_obs_scale), 1e-9)
+            radius_feat = (self.radius_t / denom)[:, None]
+            obs_def_parts.append(radius_feat)
+            obs_att_parts.append(radius_feat)
 
         self.obs_def = torch.cat(obs_def_parts, dim=-1).to(dtype=self.dtype)
         self.obs_att = torch.cat(obs_att_parts, dim=-1).to(dtype=self.dtype)
@@ -1999,25 +2252,39 @@ class TorchVecEnv:
 
         center_delta_def = p1 - self.center_t
         center_delta_att = p2 - self.center_t
-        d1_true_norm = center_delta_def.square().sum(dim=-1) / (self.radius ** 2)
-        d2_true_norm = center_delta_att.square().sum(dim=-1) / (self.radius ** 2)
-        rel2 = (p2 - p1).square().sum(dim=-1) / (self.radius ** 2)
+        radius_sq = torch.clamp(self.radius_t.square(), min=1e-9)
+        reward_dist_scale = torch.clamp(self.reward_dist_scale_t, min=1e-9)
+        reward_geom_scale = torch.clamp(self.reward_geom_scale_t, min=1e-9)
+        term_dist_scale = torch.clamp(self.term_dist_scale_t, min=1e-9)
+        d1_true_norm = center_delta_def.square().sum(dim=-1) / radius_sq
+        d2_true_norm = center_delta_att.square().sum(dim=-1) / radius_sq
+        d2_sq = center_delta_att.square().sum(dim=-1)
+        rel2_sq = (p2 - p1).square().sum(dim=-1)
+        if not self.normalize_reward:
+            d2_reward = d2_sq
+            rel2 = rel2_sq
+        elif self.normalize_reward_geometry_power == 1:
+            d2_reward = torch.sqrt(torch.clamp(d2_sq, min=0.0)) / reward_dist_scale
+            rel2 = torch.sqrt(torch.clamp(rel2_sq, min=0.0)) / reward_dist_scale
+        else:
+            d2_reward = d2_sq / reward_geom_scale
+            rel2 = rel2_sq / reward_geom_scale
 
-        rho1 = torch.linalg.vector_norm(center_delta_def, dim=-1) / self.radius
-        rho2 = torch.linalg.vector_norm(center_delta_att, dim=-1) / self.radius
+        rho1 = torch.linalg.vector_norm(center_delta_def, dim=-1) / term_dist_scale
+        rho2 = torch.linalg.vector_norm(center_delta_att, dim=-1) / term_dist_scale
 
-        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
-        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
-        att_hit_target = (self.oi_radius_norm > 0.0) & (rho2 <= thresh_att)
-        def_hit_target = (self.oi_radius_norm > 0.0) & (rho1 <= thresh_def)
+        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_term_t
+        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_term_t
+        att_hit_target = (self.oi_radius_term_t > 0.0) & (rho2 <= thresh_att)
+        def_hit_target = (self.oi_radius_term_t > 0.0) & (rho1 <= thresh_def)
         hit_target = att_hit_target | def_hit_target
 
         collision = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         if self.collision_radius_m > 0.0:
             collision = torch.linalg.vector_norm(p2 - p1, dim=-1) <= self.collision_radius_m
 
-        oob1 = rho1 >= self.margin
-        oob2_any = rho2 >= self.margin
+        oob1 = rho1 >= self.arena_term_limit_t
+        oob2_any = rho2 >= self.arena_term_limit_t
 
         if torch.any(none_mask):
             oob1 = torch.where(none_mask, torch.zeros_like(oob1), oob1)
@@ -2034,7 +2301,7 @@ class TorchVecEnv:
         if self.reward_type == "zero_sum_kf" and not self.use_kf:
             raise RuntimeError("use_zero_sum_kf requires use_kf=True.")
 
-        g = self.k_pos * d2_true_norm
+        g = self.k_pos * d2_reward
         if self.use_fuel:
             burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
             burn_frac_att = (mdot_att * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
@@ -2081,7 +2348,7 @@ class TorchVecEnv:
                     d1_belief_norm[i] = float(np.dot(p1_belief - env.center, p1_belief - env.center)) / (env.radius ** 2)
                     p1_est_err_norm[i] = float(np.dot(p1_belief - p1_np[i], p1_belief - p1_np[i])) / (env.radius ** 2)
 
-        d2_np = d2_true_norm.detach().cpu().numpy()
+        d2_np = d2_reward.detach().cpu().numpy()
         rel2_np = rel2.detach().cpu().numpy()
         d1_true_np = d1_true_norm.detach().cpu().numpy()
         d2_true_np = d2_true_norm.detach().cpu().numpy()
@@ -2090,6 +2357,7 @@ class TorchVecEnv:
         hit_target_np = hit_target.detach().cpu().numpy()
         collision_np = collision.detach().cpu().numpy()
         t_np = self._t_steps.detach().cpu().numpy()
+        radius_np = self.radius_t.detach().cpu().numpy()
 
         fuel_frac_def_np = None
         fuel_frac_att_np = None
@@ -2114,6 +2382,7 @@ class TorchVecEnv:
                 "oob_def": bool(oob1_np[i]),
                 "oob_att": bool(oob2_np[i]),
                 "hit_target": bool(hit_target_np[i]),
+                "arena_radius_m": float(radius_np[i]),
                 "d1_true_norm": float(d1_true_np[i]),
                 "d2_true_norm": float(d2_true_np[i]),
                 "collision": bool(collision_np[i]),
