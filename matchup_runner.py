@@ -66,6 +66,18 @@ def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
     return key
 
 
+def _ekf_factory_kwargs(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    if _normalize_estimator_kind(cfg) != "ekf":
+        return {}
+    ukf_cfg = cfg.get("ukf", {})
+    return {
+        "jacobian_mode": ukf_cfg.get("ekf_jacobian_mode", "exact"),
+        "linearization_group": linearization_group,
+        "use_torch_backend": bool(ukf_cfg.get("ekf_use_torch", False)),
+        "device": cfg.get("device", "cpu"),
+    }
+
+
 def _kf_predict_control(
     action_access: str,
     ground_truth_u: np.ndarray | None,
@@ -809,7 +821,12 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     use_obsnorm = bool(cfg.get("obsnorm", False))
     obs_mean = None
     obs_std = None
-    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0)
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    obs_include_arena_radius = bool(
+        (Na == 1) and radius_knob.get("append_to_obs", radius_knob.get("enabled", False))
+    )
+    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
+    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
 
     if use_obsnorm and "obs_stats" in cfg:
         import os
@@ -852,6 +869,10 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
+        if obs_include_arena_radius:
+            denom = max(abs(radius_obs_scale), 1e-9)
+            parts.append(np.array([arena_r / denom], dtype=np.float32))
+
         obs = np.concatenate(parts).astype(np.float32)
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
             obs = (obs - obs_mean) / (obs_std + 1e-8)
@@ -860,8 +881,8 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
-    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    pos_obs_scale = 1.0
+    vel_obs_scale = 1.0
 
     use_kf = bool(cfg.get("use_kf", False))
     estimator_kind = _normalize_estimator_kind(cfg)
@@ -1304,7 +1325,10 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     use_obsnorm = bool(cfg.get("obsnorm", False))
     obs_mean = None
     obs_std = None
-    obs_expected = 5 * D + (2 if use_fuel else 0)
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    obs_include_arena_radius = bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))
+    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
+    obs_expected = 5 * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
 
     if use_obsnorm and "obs_stats" in cfg:
         import os
@@ -1351,6 +1375,10 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
+        if obs_include_arena_radius:
+            denom = max(abs(radius_obs_scale), 1e-9)
+            parts.append(np.array([arena_r / denom], dtype=np.float32))
+
         obs = np.concatenate(parts).astype(np.float32)
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
             obs = (obs - obs_mean) / (obs_std + 1e-8)
@@ -1359,8 +1387,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
-    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    pos_obs_scale = 1.0
+    vel_obs_scale = 1.0
 
     def _u3(uD: np.ndarray):
         uD = np.asarray(uD, float).reshape(-1)
@@ -1435,12 +1463,32 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         x1_ukf0 = x1_6_mean
 
         ukf12 = (
-            KF_CV(x2_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
+            KF_CV(
+                x2_ukf0,
+                P0,
+                Q,
+                Rm,
+                dt,
+                kind=estimator_kind,
+                dyn="hcw",
+                hcw=hcw_params,
+                **_ekf_factory_kwargs(cfg, linearization_group="observer_1_to_2"),
+            )
             if who in ("both", "1->2")
             else None
         )
         ukf21 = (
-            KF_CV(x1_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
+            KF_CV(
+                x1_ukf0,
+                P0,
+                Q,
+                Rm,
+                dt,
+                kind=estimator_kind,
+                dyn="hcw",
+                hcw=hcw_params,
+                **_ekf_factory_kwargs(cfg, linearization_group="observer_2_to_1"),
+            )
             if who in ("both", "2->1")
             else None
         )

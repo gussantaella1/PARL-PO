@@ -19,6 +19,7 @@ __all__ = [
     "animate_rollout_3d_multi",
     "interactive_rollout_3d_multi",
     "plot_rollout_thrust_u_multi",
+    "plot_rollout_velocity_multi",
     "plot_rollout_center_distance_multi",
 ]
 
@@ -899,6 +900,18 @@ def plot_rollout_thrust_u_multi(frames_dict, cfg=None, agent: int = 1, show: boo
     if show:
         plt.show()
     return fig, ax
+
+
+def plot_rollout_velocity_multi(frames_dict, cfg=None, agent: int = 1, show: bool = True, title: str | None = None):
+    from game_viz import plot_rollout_velocity
+
+    return plot_rollout_velocity(
+        frames_dict,
+        cfg=cfg,
+        agent=agent,
+        title=title,
+        show=show,
+    )
 
 
 def plot_rollout_center_distance_multi(

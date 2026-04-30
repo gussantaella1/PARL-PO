@@ -20,6 +20,13 @@ def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
     return np.array([u[0], u[1], 0.0], dtype=float)
 
 
+def _v3_from_state(x: np.ndarray, D: int) -> np.ndarray:
+    x = np.asarray(x, float).reshape(-1)
+    v = np.zeros(3, dtype=float)
+    v[:D] = x[D:2 * D]
+    return v
+
+
 def _normalize_kf_action_access(mode: Any) -> str:
     key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
     if key == "groundtruth":
@@ -54,6 +61,18 @@ def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
     return key
 
 
+def _ekf_factory_kwargs(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    if _normalize_estimator_kind(cfg) != "ekf":
+        return {}
+    ukf_cfg = cfg.get("ukf", {})
+    return {
+        "jacobian_mode": ukf_cfg.get("ekf_jacobian_mode", "exact"),
+        "linearization_group": linearization_group,
+        "use_torch_backend": bool(ukf_cfg.get("ekf_use_torch", False)),
+        "device": cfg.get("device", "cpu"),
+    }
+
+
 def _kf_predict_control(
     action_access: str,
     ground_truth_u: np.ndarray | None,
@@ -84,6 +103,7 @@ def _pack_multi_agent_rollout(
     plan_hist_all,
     plan_att_all,
     exec_xyz_all,
+    vel_xyz_all,
     exec_att_all,
     phi_hist_all,
     fov_axis_hist,
@@ -103,6 +123,7 @@ def _pack_multi_agent_rollout(
         "plan_hist_all": plan_hist_all,
         "plan_att_all": plan_att_all,
         "exec_xyz_all": exec_xyz_all,
+        "vel_xyz_all": [np.asarray(v, dtype=float) for v in vel_xyz_all],
         "exec_att_all": exec_att_all,
         "phi_hist_all": phi_hist_all,
         "fov_axis_hist": fov_axis_hist,
@@ -120,6 +141,7 @@ def _pack_multi_agent_rollout(
         out[f"plan_hist{key}"] = plan_hist_all[idx]
         out[f"plan_att{key}"] = plan_att_all[idx]
         out[f"exec{key}_xyz"] = exec_xyz_all[idx]
+        out[f"vel{key}_xyz"] = np.asarray(vel_xyz_all[idx], dtype=float)
         out[f"exec_att{key}"] = exec_att_all[idx]
         out[f"phi_hist{key}"] = phi_hist_all[idx]
 
@@ -237,7 +259,12 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     use_obsnorm = bool(cfg.get("obsnorm", False))
     obs_mean = None
     obs_std = None
-    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0)
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    obs_include_arena_radius = bool(
+        (Na == 1) and radius_knob.get("append_to_obs", radius_knob.get("enabled", False))
+    )
+    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
+    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
 
     if use_obsnorm and "obs_stats" in cfg:
         import os
@@ -280,6 +307,10 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
+        if obs_include_arena_radius:
+            denom = max(abs(radius_obs_scale), 1e-9)
+            parts.append(np.array([arena_r / denom], dtype=np.float32))
+
         obs = np.concatenate(parts).astype(np.float32)
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
             obs = (obs - obs_mean) / (obs_std + 1e-8)
@@ -288,8 +319,8 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
-    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    pos_obs_scale = 1.0
+    vel_obs_scale = 1.0
 
     dyn_name = str(cfg.get("dynamics", "hcw")).lower()
     use_kf = bool(cfg.get("use_kf", False))
@@ -359,6 +390,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
                 kind=estimator_kind,
                 dyn="hcw",
                 hcw=hcw_params,
+                **_ekf_factory_kwargs(cfg, linearization_group=f"defender_to_attacker_{j}"),
             )
             ukf_list.append(ukf_j)
             xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
@@ -464,6 +496,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     plan_hist_all = [[] for _ in range(1 + Na)]
     plan_att_all = [[] for _ in range(1 + Na)]
     exec_xyz_all = [[] for _ in range(1 + Na)]
+    vel_xyz_all = [[] for _ in range(1 + Na)]
     exec_att_all = [[] for _ in range(1 + Na)]
     phi_hist_all = [[] for _ in range(1 + Na)]
     fov_axis_hist, fov_seen_mask = [], []
@@ -482,6 +515,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     all_states = [xD] + xA_list
     for idx, xs in enumerate(all_states):
         exec_xyz_all[idx].append(_p3(xs, D))
+        vel_xyz_all[idx].append(_v3_from_state(xs, D).copy())
         exec_att_all[idx].append({"R": I, "phi": 0.0})
         phi_hist_all[idx].append(0.0)
     fov_axis_hist.append(None)
@@ -610,6 +644,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             plan_hist_all[idx].append([_p3(xs, D)] * T)
             plan_att_all[idx].append([{"R": I, "phi": 0.0} for _ in range(T)])
             exec_xyz_all[idx].append(_p3(xs, D))
+            vel_xyz_all[idx].append(_v3_from_state(xs, D).copy())
             exec_att_all[idx].append({"R": I, "phi": 0.0})
             phi_hist_all[idx].append(0.0)
 
@@ -631,6 +666,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         plan_hist_all=plan_hist_all,
         plan_att_all=plan_att_all,
         exec_xyz_all=exec_xyz_all,
+        vel_xyz_all=vel_xyz_all,
         exec_att_all=exec_att_all,
         phi_hist_all=phi_hist_all,
         fov_axis_hist=fov_axis_hist,
@@ -765,8 +801,10 @@ def run_rhc_with_rl_and_collect_frames_3d(
     use_obsnorm = bool(cfg.get("obsnorm", False))
     obs_mean = None
     obs_std = None
-
-    obs_expected = 5 * D + (2 if use_fuel else 0)
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    obs_include_arena_radius = bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))
+    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
+    obs_expected = 5 * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
 
     if use_obsnorm and "obs_stats" in cfg:
         import os
@@ -814,6 +852,10 @@ def run_rhc_with_rl_and_collect_frames_3d(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
+        if obs_include_arena_radius:
+            denom = max(abs(radius_obs_scale), 1e-9)
+            parts.append(np.array([arena_r / denom], dtype=np.float32))
+
         obs = np.concatenate(parts).astype(np.float32)
 
         if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
@@ -854,6 +896,9 @@ def run_rhc_with_rl_and_collect_frames_3d(
             else (float(x_vec[0]), float(x_vec[1]), 0.0)
         )
 
+    def _v3_vec(x_vec):
+        return tuple(map(float, _v3_from_state(x_vec, D)))
+
     def _identity_R():
         return np.eye(3, dtype=float)
 
@@ -864,8 +909,8 @@ def run_rhc_with_rl_and_collect_frames_3d(
         return np.array([uD[0], uD[1], 0.0], dtype=float)
 
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = (1.0 / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
-    vel_obs_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if bool(cfg.get("normalize_pos_obs", False)) else 1.0
+    pos_obs_scale = 1.0
+    vel_obs_scale = 1.0
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
@@ -935,12 +980,32 @@ def run_rhc_with_rl_and_collect_frames_3d(
         x1_ukf0 = x1_6_mean
 
         ukf12 = (
-            KF_CV(x2_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
+            KF_CV(
+                x2_ukf0,
+                P0,
+                Q,
+                Rm,
+                dt,
+                kind=estimator_kind,
+                dyn="hcw",
+                hcw=hcw_params,
+                **_ekf_factory_kwargs(cfg, linearization_group="observer_1_to_2"),
+            )
             if who in ("both", "1->2")
             else None
         )
         ukf21 = (
-            KF_CV(x1_ukf0, P0, Q, Rm, dt, kind=estimator_kind, dyn="hcw", hcw=hcw_params)
+            KF_CV(
+                x1_ukf0,
+                P0,
+                Q,
+                Rm,
+                dt,
+                kind=estimator_kind,
+                dyn="hcw",
+                hcw=hcw_params,
+                **_ekf_factory_kwargs(cfg, linearization_group="observer_2_to_1"),
+            )
             if who in ("both", "2->1")
             else None
         )
@@ -1105,6 +1170,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
     plan_hist1, plan_hist2 = [], []
     plan_att1, plan_att2 = [], []
     exec_xyz1, exec_xyz2 = [], []
+    vel_xyz1, vel_xyz2 = [], []
     exec_att1, exec_att2 = [], []
     phi_hist1, phi_hist2 = [], []
     fov_axis_hist, fov_seen_mask = [], []
@@ -1123,6 +1189,8 @@ def run_rhc_with_rl_and_collect_frames_3d(
     # t=0 logs
     exec_xyz1.append(_p3_vec(x1))
     exec_xyz2.append(_p3_vec(x2))
+    vel_xyz1.append(_v3_vec(x1))
+    vel_xyz2.append(_v3_vec(x2))
     exec_att1.append({"R": _identity_R(), "phi": 0.0})
     exec_att2.append({"R": _identity_R(), "phi": 0.0})
     phi_hist1.append(0.0)
@@ -1311,6 +1379,8 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
         exec_xyz1.append(_p3_vec(x1))
         exec_xyz2.append(_p3_vec(x2))
+        vel_xyz1.append(_v3_vec(x1))
+        vel_xyz2.append(_v3_vec(x2))
         fov_axis_hist.append(None)
         fov_seen_mask.append(False)
 
@@ -1334,6 +1404,12 @@ def run_rhc_with_rl_and_collect_frames_3d(
         "plan_att2": plan_att2,
         "exec1_xyz": exec_xyz1,
         "exec2_xyz": exec_xyz2,
+        "vel1_xyz": np.asarray(vel_xyz1, dtype=float),
+        "vel2_xyz": np.asarray(vel_xyz2, dtype=float),
+        "vel_xyz_all": [
+            np.asarray(vel_xyz1, dtype=float),
+            np.asarray(vel_xyz2, dtype=float),
+        ],
         "exec_att1": exec_att1,
         "exec_att2": exec_att2,
         "phi_hist1": phi_hist1,

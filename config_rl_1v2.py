@@ -59,7 +59,6 @@ COMMON: Dict[str, Any] = {
 
     # Arena
     "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
-    "normalize_pos_obs": True,
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 
@@ -147,6 +146,8 @@ KF_COMMON: Dict[str, Any] = {
         "sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "every": 1,
+        "ekf_jacobian_mode": "exact",  # "exact" | "frozen"
+        "ekf_use_torch": False,  # when True, EKF runs on cfg["device"] (e.g. "cuda")
         "pos_std0": 0.2 * ARENA_R,
         "vel_std0": 0.01,
         "action_access": "none",  # ground_truth | measured | none
@@ -243,6 +244,7 @@ TRAIN: Dict[str, Any] = {
     "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
 
     "gamma": 0.992, #Was 0.995
+    "reward_normalize_radius_m": None,  # optional constant radius for reward normalization; None => use arena radius
     "target_hit_reward_penalty": 10.0,
     "collision_penalty": 10.0,
     "wall_penalty": 2.5,
@@ -322,12 +324,18 @@ TRAIN: Dict[str, Any] = {
     "k_eff_def": 0.01,
     "k_eff_att": 0.01,
 
-    #Arena start positions config (relative to radius of arena)
+    # Arena start positions config.
+    # Fractional keys below are interpreted relative to arena["r"].
+    # Optional *_m overrides let you pin explicit shell bounds in meters.
     # "r_def_min": 0.0, #Default: 0.0
     # "r_def_max": 0.85, # Default: 0.5
+    # "r_def_min_m": 0.0,
+    # "r_def_max_m": 80.0,
 
     # "r_att_min": 0.0, #Default 0.4
     # "r_att_max": 0.95, #Default: 0.95
+    # "r_att_min_m": 30.0,
+    # "r_att_max_m": 95.0,
 
     "r_def_min": 0.0, #Default: 0.0
     "r_def_max": 0.8, # Default: 0.5

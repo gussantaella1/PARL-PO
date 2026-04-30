@@ -75,9 +75,8 @@ class RLPolicy_Multi:
             dtype=np.float32,
         )[: self.D]
         self.radius = float(ar.get("r", 1.0))
-        self.normalize_pos_obs = bool(self.cfg.get("normalize_pos_obs", False))
-        self.pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
-        self.vel_obs_scale = (float(self.cfg.get("dt", 1.0)) / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self.pos_obs_scale = 1.0
+        self.vel_obs_scale = 1.0
 
         def _pick(cfg, keys, default):
             for k in keys:

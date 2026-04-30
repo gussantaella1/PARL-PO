@@ -189,6 +189,12 @@ def _act_from_opponent_policy_mix(
 
 def train(cfg: Dict[str, Any]):
     set_seed(cfg["seed"])
+    if bool(cfg.get("use_kf", False)) and str(cfg.get("estimator_kind", "ukf")).lower() == "ekf":
+        ekf_mode = str(cfg.get("ukf", {}).get("ekf_jacobian_mode", "exact")).strip().lower().replace("-", "_")
+        if ekf_mode != "exact":
+            from ekf_estimator import AgentEKF
+
+            AgentEKF.clear_global_linearization_cache()
     device = cfg["device"]
 
     writer = None
@@ -276,6 +282,7 @@ def train(cfg: Dict[str, Any]):
         "R_att_mean": [],
         "muD_abs_mean": [],
         "stdD_mean": [],
+        "arena_radius_mean": [],
         "d1_mean": [],
         "d2_mean": [],
         "d2_true_mean": [],
@@ -348,9 +355,10 @@ def train(cfg: Dict[str, Any]):
         ep_ret_def = np.zeros(num_envs, dtype=np.float64)
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
-        d1_true_acc = 0.0
-        d2_true_acc = 0.0
-        d2_belief_acc = 0.0
+        d1_true_sq_m_acc = 0.0
+        d2_true_sq_m_acc = 0.0
+        d2_belief_sq_m_acc = 0.0
+        arena_radius_acc = 0.0
         meas_innov_acc = 0.0
         trP_acc = 0.0
         info_count = 0
@@ -451,16 +459,17 @@ def train(cfg: Dict[str, Any]):
 
             for inf in infos:
                 info_count += 1
+                radius_m = float(inf.get("arena_radius_m", cfg["arena"]["r"]))
+                radius_sq_m = radius_m * radius_m
+                arena_radius_acc += radius_m
                 if "d1_true_norm" in inf:
-                    d1_true_acc += inf["d1_true_norm"]
+                    d1_true_sq_m_acc += float(inf["d1_true_norm"]) * radius_sq_m
                 if "d2_true_norm" in inf:
-                    d2_true_acc += inf["d2_true_norm"]
+                    d2_true_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
                 if "d2_belief_norm" in inf:
-                    d2_belief_acc += inf["d2_belief_norm"]
+                    d2_belief_sq_m_acc += float(inf["d2_belief_norm"]) * radius_sq_m
                 elif "d2_true_norm" in inf:
-                    d2_belief_acc += inf["d2_true_norm"]
-                elif "d2_norm" in inf:
-                    d2_belief_acc += inf["d2_norm"]
+                    d2_belief_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
                 if "meas_innov_sq" in inf:
                     meas_innov_acc += inf["meas_innov_sq"]
                 if "ukf_trPpos" in inf:
@@ -533,13 +542,14 @@ def train(cfg: Dict[str, Any]):
                 )
 
             if info_count > 0:
-                R = cfg["arena"]["r"]
-                d1_true_mean = np.sqrt(d1_true_acc / info_count) * R
-                d2_true_mean = np.sqrt(d2_true_acc / info_count) * R
-                d2_belief_mean = np.sqrt(d2_belief_acc / info_count) * R
+                arena_radius_mean = arena_radius_acc / info_count
+                d1_true_mean = np.sqrt(d1_true_sq_m_acc / info_count)
+                d2_true_mean = np.sqrt(d2_true_sq_m_acc / info_count)
+                d2_belief_mean = np.sqrt(d2_belief_sq_m_acc / info_count)
                 meas_innov_mean = meas_innov_acc / info_count
                 trP_mean = trP_acc / info_count
             else:
+                arena_radius_mean = 0.0
                 d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
                 meas_innov_mean = trP_mean = 0.0
 
@@ -594,6 +604,7 @@ def train(cfg: Dict[str, Any]):
             metrics["R_att_mean"].append(R_att_mean)
             metrics["muD_abs_mean"].append(muD)
             metrics["stdD_mean"].append(stdD)
+            metrics["arena_radius_mean"].append(arena_radius_mean)
             metrics["d1_mean"].append(d1_true_mean)
             metrics["d2_mean"].append(d2_belief_mean)
             metrics["d2_true_mean"].append(d2_true_mean)
@@ -616,6 +627,7 @@ def train(cfg: Dict[str, Any]):
                 f"R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})"
             )
             print(f"   [def] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(f"   mean arena radius ≈ {arena_radius_mean:.3f} m")
             print(f"   approx true <||p1-center||> ≈ {d1_true_mean:.3f}")
             print(f"   approx true <||p2-center||> ≈ {d2_true_mean:.3f}")
             if cfg.get("use_kf", False):
@@ -626,6 +638,7 @@ def train(cfg: Dict[str, Any]):
                 gs = global_env_step
                 writer.add_scalar("returns/def_mean", R_def_mean, gs)
                 writer.add_scalar("returns/att_mean", R_att_mean, gs)
+                writer.add_scalar("arena/radius_mean_m", arena_radius_mean, gs)
                 writer.add_scalar("dist/def_true_p1_to_center_m", d1_true_mean, gs)
                 writer.add_scalar("dist/att_true_p2_to_center_m", d2_true_mean, gs)
                 writer.add_scalar("dist/att_belief_p2_to_center_m", d2_belief_mean, gs)

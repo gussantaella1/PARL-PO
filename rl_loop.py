@@ -213,7 +213,7 @@ if __name__ == "__main__":
         print("\n===== PHASE 0: Train DEFENDER_0 vs RULE attacker =====")
 
         phase0_extra = _merge_dicts(runtime_overrides, {
-            "gamma": 0.991,
+            # "gamma": 0.995,
             "hit_buffer_def": 0.25,
         })
         with runlog.stage(
@@ -274,8 +274,10 @@ if __name__ == "__main__":
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
             "r_att_min": 0.0,
-            "gamma": 0.991,
-            # "gamma": 0.994, #Aggressive, but can be confused
+            "r_att_min_m": 0.0,
+
+            # "gamma": 0.991,
+            # "gamma": 0.995,
 
             # NEW:
             # "opp_mix": {
@@ -376,7 +378,7 @@ if __name__ == "__main__":
                         # "gamma": 0.993,
                         # "gamma": 0.990, # Performed poorly against .994 attacker, good against .990 
                         # "gamma": 0.994, # Performed poorly against .994 attacker
-                        "gamma": 0.991,
+                        # "gamma": 0.995,
                         # Checkpoint-based attacker mixture:
                         "opp_mix": {
                             "resample": "episode",
@@ -467,7 +469,8 @@ if __name__ == "__main__":
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
             "r_att_min": 0.0,
-            "gamma": 0.991,
+            "r_att_min_m": 0.0,
+            # "gamma": 0.995,
 
             # Checkpoint-based attacker mixture:
             "opp_mix": {
@@ -583,7 +586,7 @@ if __name__ == "__main__":
             "att_ckpt_path": att2_teacher_ckpt,
             "def_ckpt_path": def1_teacher_ckpt,
             "freeze_attacker": True,
-            "gamma": 0.991,
+            # "gamma": 0.995,
 
                 # Checkpoint-based attacker mixture:
             "opp_mix": {
@@ -861,5 +864,21 @@ CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
   --vec_workers 8 \
   --num_envs 512 \
   --minibatch_size 8192
+
+"""
+
+
+"""
+For tensorboard:
+
+On remote:
+python -m tensorboard.main --logdir runs --host 127.0.0.1 --port 6006
+
+On local:
+ssh -N -L 6006:127.0.0.1:6006 gs34433@ase-a71915
+
+And open:
+http://127.0.0.1:6006/
+
 
 """

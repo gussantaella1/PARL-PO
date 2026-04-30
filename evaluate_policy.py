@@ -47,6 +47,7 @@ from matchup_runner import (
     SUPPORTED_BASELINE_OPPONENTS,
     run_rhc_with_policy_vs_baseline_collect_frames_3d,
 )
+from core.utils import resolve_start_radius_bounds
 from dispersion import build_episode_cfg_and_x0
 
 
@@ -811,6 +812,69 @@ def _sample_in_shell(
     return center + r * d
 
 
+def _sample_x0_random_shell(
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+    num_attackers: int,
+    vel_scale_override: Optional[float] = None,
+    min_sep_override: Optional[float] = None,
+) -> np.ndarray:
+    """
+    Mirror core/env.py random_shell so evaluation can sample the same
+    shell-bounded initial-condition family used during training.
+    """
+    D = int(cfg.get("D", 3))
+    center, R = _get_center_and_radius(cfg, D)
+    nx = 2 * D
+
+    v_max = float(cfg.get("train_ic_vmax", 0.0))
+    if vel_scale_override is not None:
+        v_max = float(vel_scale_override)
+
+    min_sep = float(cfg.get("train_min_sep", 0.0))
+    if min_sep_override is not None:
+        min_sep = float(min_sep_override)
+
+    r_def_min, r_def_max = resolve_start_radius_bounds(
+        cfg,
+        R,
+        who="def",
+        default_min_frac=0.0,
+        default_max_frac=1.0,
+    )
+    r_att_min, r_att_max = resolve_start_radius_bounds(
+        cfg,
+        R,
+        who="att",
+        default_min_frac=0.0,
+        default_max_frac=1.0,
+    )
+
+    p_def = _sample_in_shell(rng, center, r_def_min, r_def_max)
+    v_def = rng.uniform(-v_max, v_max, size=D)
+
+    xs = [np.concatenate([p_def, v_def], dtype=float)[:nx]]
+    p_atts: List[np.ndarray] = []
+    for _ in range(num_attackers):
+        for _att_try in range(1000):
+            p_att = _sample_in_shell(rng, center, r_att_min, r_att_max)
+            if np.linalg.norm(p_att - p_def) < min_sep:
+                continue
+            if any(np.linalg.norm(p_att - p_prev) < min_sep for p_prev in p_atts):
+                continue
+            break
+        else:
+            raise RuntimeError(
+                "random_shell: could not sample a feasible attacker initial condition after many attempts. "
+                "Try relaxing r_att_min/r_att_max or reducing train_min_sep."
+            )
+        p_atts.append(p_att)
+        v_att = rng.uniform(-v_max, v_max, size=D)
+        xs.append(np.concatenate([p_att, v_att], dtype=float)[:nx])
+
+    return np.asarray(xs, dtype=float)
+
+
 def _sample_x0_random_shell_advantage(
     cfg: Dict[str, Any],
     rng: np.random.Generator,
@@ -838,10 +902,20 @@ def _sample_x0_random_shell_advantage(
     percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
     radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
 
-    r_def_min = float(cfg.get("r_def_min", 0.0)) * R
-    r_def_max = float(cfg.get("r_def_max", 1.0)) * R
-    r_att_min = float(cfg.get("r_att_min", 0.0)) * R
-    r_att_max = float(cfg.get("r_att_max", 1.0)) * R
+    r_def_min, r_def_max = resolve_start_radius_bounds(
+        cfg,
+        R,
+        who="def",
+        default_min_frac=0.0,
+        default_max_frac=1.0,
+    )
+    r_att_min, r_att_max = resolve_start_radius_bounds(
+        cfg,
+        R,
+        who="att",
+        default_min_frac=0.0,
+        default_max_frac=1.0,
+    )
     r_att_min = max(r_att_min, radial_margin)
 
     if radial_margin < 0.0:
@@ -945,6 +1019,16 @@ def _sample_x0(
     Enforces a minimum defender-attacker separation if min_sep > 0.
     """
     train_ic_mode = str(cfg.get("train_ic_mode", "fixed"))
+    if train_ic_mode == "random_shell":
+        vel_scale_override = float(vel_scale) if cli_present and "--vel_scale" in cli_present else None
+        min_sep_override = float(min_sep) if cli_present and "--min_sep" in cli_present else None
+        return _sample_x0_random_shell(
+            cfg,
+            rng,
+            num_attackers=num_attackers,
+            vel_scale_override=vel_scale_override,
+            min_sep_override=min_sep_override,
+        )
     if train_ic_mode == "random_shell_advantage":
         vel_scale_override = float(vel_scale) if cli_present and "--vel_scale" in cli_present else None
         min_sep_override = float(min_sep) if cli_present and "--min_sep" in cli_present else None

@@ -1,48 +1,130 @@
 # ekf_estimator.py
 from __future__ import annotations
+
+from typing import Any
+
 import numpy as np
 
-from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
+try:
+    import torch
+except Exception:  # pragma: no cover - torch is expected in this repo, but keep import-safe.
+    torch = None
 
-# -------------------------------
-# Helpers 
-# -------------------------------
+from dyn_models import as_numpy_const, hcw_discrete_mats, hcw_mean_motion
 
-def _symmetrize(M: np.ndarray) -> np.ndarray:
+
+def _is_torch_tensor(value: Any) -> bool:
+    return torch is not None and isinstance(value, torch.Tensor)
+
+
+def _symmetrize(M):
+    if _is_torch_tensor(M):
+        return 0.5 * (M + M.transpose(-1, -2))
     return 0.5 * (M + M.T)
 
-def _psd_enforce(M: np.ndarray, floor: float = 1e-12) -> np.ndarray:
+
+def _psd_enforce(M, floor: float = 1e-12):
     """Force symmetric PSD by eigenvalue flooring."""
     M = _symmetrize(M)
+    if _is_torch_tensor(M):
+        eig, V = torch.linalg.eigh(M)
+        eig = torch.clamp(eig, min=floor)
+        return V @ torch.diag(eig) @ V.transpose(-1, -2)
     eig, V = np.linalg.eigh(M)
     eig = np.maximum(eig, floor)
     return (V * eig) @ V.T
 
-def _normalize_angle(a: float) -> float:
-    return (a + np.pi) % (2*np.pi) - np.pi
 
-def _body_bearing_from_world(p_obs: np.ndarray, R_wb: np.ndarray, p_tgt: np.ndarray):
+def _normalize_angle(a):
+    if _is_torch_tensor(a):
+        return torch.remainder(a + np.pi, 2.0 * np.pi) - np.pi
+    return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+
+def _body_bearing_from_world(p_obs, R_wb, p_tgt):
     """
     Unit vector from observer to target, expressed in OBSERVER BODY frame.
     R_wb maps world -> body (consistent with your animator).
     """
+    if _is_torch_tensor(p_tgt) or _is_torch_tensor(p_obs) or _is_torch_tensor(R_wb):
+        d_w = p_tgt - p_obs
+        n = torch.linalg.norm(d_w)
+        if float(n.item()) < 1e-12:
+            d_w = torch.tensor([1.0, 0.0, 0.0], dtype=p_tgt.dtype, device=p_tgt.device)
+            n = torch.tensor(1.0, dtype=p_tgt.dtype, device=p_tgt.device)
+        b_w = d_w / n
+        return R_wb @ b_w
+
     d_w = np.asarray(p_tgt, float) - np.asarray(p_obs, float)
     n = np.linalg.norm(d_w)
     if n < 1e-12:
-        d_w = np.array([1.0, 0.0, 0.0]); n = 1.0
+        d_w = np.array([1.0, 0.0, 0.0], dtype=float)
+        n = 1.0
     b_w = d_w / n
-    return R_wb @ b_w
+    return np.asarray(R_wb, float) @ b_w
 
-def _azel_from_body_vec(vb: np.ndarray):
+
+def _azel_from_body_vec(vb):
+    if _is_torch_tensor(vb):
+        x, y, z = vb.unbind()
+        rho = torch.sqrt(torch.clamp(x * x + y * y, min=1e-18))
+        az = torch.atan2(y, x)
+        el = torch.atan2(z, rho)
+        return az, el
+
     x, y, z = vb
     az = np.arctan2(y, x)
-    el = np.arctan2(z, np.sqrt(max(x*x + y*y, 1e-18)))
+    el = np.arctan2(z, np.sqrt(max(x * x + y * y, 1e-18)))
     return az, el
 
 
-# -------------------------------
-# Agent EKF (bearing-only, CV)
-# -------------------------------
+class _BackendArrayView:
+    """NumPy-friendly facade over the EKF's internal state/covariance tensors."""
+
+    def __init__(self, owner: "AgentEKF", attr_name: str):
+        self._owner = owner
+        self._attr_name = attr_name
+
+    def _value(self):
+        return getattr(self._owner, self._attr_name)
+
+    @property
+    def shape(self):
+        return tuple(self._value().shape)
+
+    @property
+    def size(self) -> int:
+        return int(self._value().numel() if _is_torch_tensor(self._value()) else self._value().size)
+
+    @property
+    def ndim(self) -> int:
+        return int(self._value().ndim)
+
+    @property
+    def dtype(self):
+        return self._value().dtype
+
+    def copy(self):
+        return np.array(self, copy=True)
+
+    def __array__(self, dtype=None):
+        arr = self._owner._to_numpy(self._value())
+        if dtype is not None:
+            arr = arr.astype(dtype, copy=False)
+        return arr
+
+    def __getitem__(self, key):
+        return self._owner._backend_value_to_python(self._value()[key])
+
+    def __setitem__(self, key, value):
+        self._owner._assign_backend_slice(self._attr_name, key, value)
+
+    def __len__(self):
+        return len(self._value())
+
+    def __repr__(self):
+        return repr(np.asarray(self))
+
 
 class AgentEKF:
     """
@@ -66,7 +148,14 @@ class AgentEKF:
         ekf.predict(dt, u=u_world, u_cov=Sigma_u)
         ekf.update(z, p_obs, R_wb)
     """
+
     _GLOBAL_LINEARIZATION_CACHE = {}
+
+    @staticmethod
+    def _numel(value: Any) -> int:
+        if _is_torch_tensor(value):
+            return int(value.numel())
+        return int(np.asarray(value).size)
 
     def __init__(
         self,
@@ -75,31 +164,139 @@ class AgentEKF:
         Q,
         R,
         dt,
-        dyn='cv',
+        dyn="cv",
         hcw=None,
-        jacobian_mode='exact',
-        linearization_group='default',
+        jacobian_mode="exact",
+        linearization_group="default",
+        use_torch_backend: bool = False,
+        device: str | None = None,
     ):
-        self.x  = np.asarray(x0, float).reshape(-1)
-        if self.x.size not in (6, 9):
-            raise ValueError(f"AgentEKF expects 6D or 9D state, got {self.x.size}.")
-        self.P  = _psd_enforce(np.asarray(P0, float))
-        self.Q  = _psd_enforce(np.asarray(Q,  float))
-        self.R  = _psd_enforce(np.asarray(R,  float))
-        self.dt = float(dt)
-        self.n  = int(self.x.size)
+        self._use_torch_backend = bool(use_torch_backend)
+        self._device = self._resolve_device(device) if self._use_torch_backend else None
+        self._torch_dtype = torch.float64 if torch is not None else None
 
-        self._dyn = (dyn or 'cv').lower()
+        self._x = self._vector_to_backend(x0)
+        x_numel = self._numel(self._x)
+        if x_numel not in (6, 9):
+            raise ValueError(
+                f"AgentEKF expects 6D or 9D state, got {x_numel}."
+            )
+        self.n = x_numel
+
+        self._P = _psd_enforce(self._matrix_to_backend(P0, shape=(self.n, self.n)))
+        self._Q = _psd_enforce(self._matrix_to_backend(Q, shape=(self.n, self.n)))
+        self._R = _psd_enforce(self._matrix_to_backend(R, shape=(2, 2)))
+        self.dt = float(dt)
+
+        self._dyn = (dyn or "cv").lower()
         self._hcw_params = (hcw or {})
         self._jacobian_mode = self._normalize_jacobian_mode(jacobian_mode)
         self._linearization_group = str(linearization_group)
         self._Ad = None
         self._Bd = None
-        if self._dyn == 'hcw':
+        if self._dyn == "hcw":
             n = hcw_mean_motion(self._hcw_params)
             Ad_mx, Bd_mx = hcw_discrete_mats(n, self.dt)
-            self._Ad = as_numpy_const(Ad_mx)
-            self._Bd = as_numpy_const(Bd_mx)
+            self._Ad = self._matrix_to_backend(as_numpy_const(Ad_mx))
+            self._Bd = self._matrix_to_backend(as_numpy_const(Bd_mx))
+
+    def _resolve_device(self, device: str | None):
+        if torch is None:
+            raise RuntimeError("EKF torch backend requested, but PyTorch could not be imported.")
+        resolved = torch.device(device or "cpu")
+        if resolved.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                f"EKF torch backend requested on device='{resolved}', but CUDA is not available."
+            )
+        return resolved
+
+    def _to_backend(self, value: Any, *, copy: bool = False):
+        if self._use_torch_backend:
+            if _is_torch_tensor(value):
+                out = value.to(device=self._device, dtype=self._torch_dtype)
+                return out.clone() if copy else out
+            out = torch.as_tensor(value, dtype=self._torch_dtype, device=self._device)
+            return out.clone() if copy else out
+        return np.array(value, dtype=float, copy=copy) if copy else np.asarray(value, dtype=float)
+
+    def _vector_to_backend(self, value: Any):
+        out = self._to_backend(value, copy=True).reshape(-1)
+        return out
+
+    def _matrix_to_backend(self, value: Any, shape: tuple[int, int] | None = None):
+        out = self._to_backend(value, copy=True)
+        if out.ndim != 2:
+            raise ValueError(f"Expected a matrix, got ndim={out.ndim}.")
+        if shape is not None and tuple(out.shape) != tuple(shape):
+            raise ValueError(f"Expected matrix shape {shape}, got {tuple(out.shape)}.")
+        return out
+
+    def _to_numpy(self, value: Any) -> np.ndarray:
+        if _is_torch_tensor(value):
+            return value.detach().cpu().numpy().copy()
+        return np.asarray(value, dtype=float).copy()
+
+    def _backend_value_to_python(self, value: Any):
+        if _is_torch_tensor(value):
+            if value.ndim == 0:
+                return float(value.item())
+            return value.detach().cpu().numpy().copy()
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 0:
+            return float(arr.item())
+        return arr.copy()
+
+    def _assign_backend_slice(self, attr_name: str, key: Any, value: Any):
+        target = getattr(self, attr_name)
+        if self._use_torch_backend:
+            target[key] = self._to_backend(value)
+        else:
+            target[key] = np.asarray(value, dtype=float)
+
+    def _zeros(self, shape: tuple[int, ...]):
+        if self._use_torch_backend:
+            return torch.zeros(shape, dtype=self._torch_dtype, device=self._device)
+        return np.zeros(shape, dtype=float)
+
+    def _eye(self, n: int):
+        if self._use_torch_backend:
+            return torch.eye(n, dtype=self._torch_dtype, device=self._device)
+        return np.eye(n, dtype=float)
+
+    @property
+    def x(self):
+        return _BackendArrayView(self, "_x")
+
+    @x.setter
+    def x(self, value):
+        x_new = self._vector_to_backend(value)
+        if self._numel(x_new) != self.n:
+            raise ValueError(f"Expected x to have length {self.n}.")
+        self._x = x_new
+
+    @property
+    def P(self):
+        return _BackendArrayView(self, "_P")
+
+    @P.setter
+    def P(self, value):
+        self._P = _psd_enforce(self._matrix_to_backend(value, shape=(self.n, self.n)))
+
+    @property
+    def Q(self):
+        return _BackendArrayView(self, "_Q")
+
+    @Q.setter
+    def Q(self, value):
+        self._Q = _psd_enforce(self._matrix_to_backend(value, shape=(self.n, self.n)))
+
+    @property
+    def R(self):
+        return _BackendArrayView(self, "_R")
+
+    @R.setter
+    def R(self, value):
+        self._R = _psd_enforce(self._matrix_to_backend(value, shape=(2, 2)))
 
     def _normalize_jacobian_mode(self, mode):
         key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
@@ -115,32 +312,37 @@ class AgentEKF:
         cls._GLOBAL_LINEARIZATION_CACHE.clear()
 
     def _global_linearization_key(self):
-        return (self._linearization_group, self.n, self._dyn, float(self.dt))
+        backend_key = "torch" if self._use_torch_backend else "numpy"
+        device_key = str(self._device) if self._use_torch_backend else "cpu"
+        return (self._linearization_group, self.n, self._dyn, float(self.dt), backend_key, device_key)
 
-    # ----- linear CV dynamics -----
     def F(self, dt=None):
-        if dt is None: dt = self.dt
-        F = np.eye(6)
-        F[0,3] = dt; F[1,4] = dt; F[2,5] = dt
+        if dt is None:
+            dt = self.dt
+        F = self._eye(6)
+        F[0, 3] = dt
+        F[1, 4] = dt
+        F[2, 5] = dt
         return F
 
     def B_accel(self, dt=None):
         """Input matrix for acceleration input u (3-vector)."""
-        if dt is None: dt = self.dt
-        B = np.zeros((6,3))
-        B[0:3, 0:3] = 0.5 * (dt**2) * np.eye(3)
-        B[3:6, 0:3] = dt * np.eye(3)
+        if dt is None:
+            dt = self.dt
+        B = self._zeros((6, 3))
+        B[0:3, 0:3] = 0.5 * (dt ** 2) * self._eye(3)
+        B[3:6, 0:3] = dt * self._eye(3)
         return B
 
     def linear_dynamics_mats(self, dt=None):
         if dt is None:
             dt = self.dt
-        if self._dyn == 'hcw':
+        if self._dyn == "hcw":
             if dt != self.dt or self._Ad is None:
                 n = hcw_mean_motion(self._hcw_params)
                 Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
-                Ad6 = as_numpy_const(Ad_mx)
-                Bd6 = as_numpy_const(Bd_mx)
+                Ad6 = self._matrix_to_backend(as_numpy_const(Ad_mx))
+                Bd6 = self._matrix_to_backend(as_numpy_const(Bd_mx))
             else:
                 Ad6, Bd6 = self._Ad, self._Bd
         else:
@@ -149,38 +351,50 @@ class AgentEKF:
         if self.n == 6:
             return Ad6, Bd6
 
-        A = np.eye(9)
+        A = self._eye(9)
         A[:6, :6] = Ad6
         A[:6, 6:9] = Bd6
-        B = np.zeros((9, 3))
+        B = self._zeros((9, 3))
         B[:6, :] = Bd6
         return A, B
 
-    def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
+    def _f_backend(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None):
         """
         Deterministic dynamics: x+ = A x + B u  (if u provided).
         If u_frame='body', convert u_body -> u_world using R_wb_tgt (world->body).
         """
         A, B = self.linear_dynamics_mats(dt)
-        x_next = A @ x
+        x_state = self._vector_to_backend(x)
+        x_next = A @ x_state
         if u is not None:
-            u = np.asarray(u, float).reshape(3)
-            if u_frame == 'body':
+            u_vec = self._vector_to_backend(u)
+            if self._numel(u_vec) != 3:
+                raise ValueError("EKF control input u must be a 3-vector.")
+            if u_frame == "body":
                 if R_wb_tgt is None:
                     raise ValueError("u given in 'body' frame but R_wb_tgt is None")
-                # body -> world: v_w = R_wb^T v_b
-                u = np.asarray(R_wb_tgt, float).T @ u
-            x_next = x_next + B @ u
+                u_vec = self._matrix_to_backend(R_wb_tgt, shape=(3, 3)).transpose(-1, -2) @ u_vec
+            x_next = x_next + B @ u_vec
         return x_next
 
-    # ----- measurement -----
-    def h(self, x, p_obs, R_wb):
-        p_tgt = x[:3]
-        v_b = _body_bearing_from_world(p_obs, R_wb, p_tgt)
-        az, el = _azel_from_body_vec(v_b)
-        return np.array([az, el], float)
+    def f(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None):
+        return self._to_numpy(self._f_backend(x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt))
 
-    def H_pos(self, x, p_obs, R_wb):
+    def _h_backend(self, x, p_obs, R_wb):
+        x_state = self._vector_to_backend(x)
+        p_tgt = x_state[:3]
+        p_obs_b = self._vector_to_backend(p_obs)
+        R_wb_b = self._matrix_to_backend(R_wb, shape=(3, 3))
+        v_b = _body_bearing_from_world(p_obs_b, R_wb_b, p_tgt)
+        az, el = _azel_from_body_vec(v_b)
+        if self._use_torch_backend:
+            return torch.stack([az, el])
+        return np.array([az, el], dtype=float)
+
+    def h(self, x, p_obs, R_wb):
+        return self._to_numpy(self._h_backend(x, p_obs, R_wb))
+
+    def _H_pos_backend(self, x, p_obs, R_wb):
         """
         Jacobian H wrt state x. Only depends on position (first 3 cols).
         We derive d(az,el)/dx using chain rule:
@@ -191,59 +405,75 @@ class AgentEKF:
         Let J_bwr = d b_b / d r = R_wb @ ((I - b_w b_w^T) / ||r||)
         Then dz/dp = (dz/db_b) @ J_bwr
         """
-        p = x[:3].astype(float)
-        p_obs = np.asarray(p_obs, float)
-        R_wb  = np.asarray(R_wb, float)
+        x_state = self._vector_to_backend(x)
+        p = x_state[:3]
+        p_obs_b = self._vector_to_backend(p_obs)
+        R_wb_b = self._matrix_to_backend(R_wb, shape=(3, 3))
 
-        r = p - p_obs
-        n = np.linalg.norm(r)
-        if n < 1e-12:
-            # avoid singularity; linearize around a tiny offset along camera x-axis
-            r = np.array([1.0, 0.0, 0.0])
-            n = 1.0
+        r = p - p_obs_b
+        n = torch.linalg.norm(r) if self._use_torch_backend else np.linalg.norm(r)
+        if float(n.item() if _is_torch_tensor(n) else n) < 1e-12:
+            r = self._vector_to_backend([1.0, 0.0, 0.0])
+            n = self._to_backend(1.0)
         b_w = r / n
-        b_b = R_wb @ b_w
-        bx, by, bz = b_b
+        b_b = R_wb_b @ b_w
+        if self._use_torch_backend:
+            bx, by, bz = b_b.unbind()
+            I = self._eye(3)
+            J_bwr = R_wb_b @ ((I - torch.outer(b_w, b_w)) / n)
+            eps = self._to_backend(1e-12)
+            rho2 = bx * bx + by * by
+            rho = torch.sqrt(torch.clamp(rho2, min=float(eps.item())))
+            den_el = rho2 + bz * bz
+            daz_db = torch.stack(
+                [
+                    -by / torch.clamp(rho2, min=float(eps.item())),
+                    bx / torch.clamp(rho2, min=float(eps.item())),
+                    self._to_backend(0.0),
+                ]
+            )
+            del_db = torch.stack(
+                [
+                    -bz * (bx / torch.clamp(rho, min=float(eps.item())))
+                    / torch.clamp(den_el, min=float(eps.item())),
+                    -bz * (by / torch.clamp(rho, min=float(eps.item())))
+                    / torch.clamp(den_el, min=float(eps.item())),
+                    rho / torch.clamp(den_el, min=float(eps.item())),
+                ]
+            )
+            DzDb = torch.stack([daz_db, del_db], dim=0)
+        else:
+            bx, by, bz = b_b
+            I = self._eye(3)
+            J_bwr = R_wb_b @ ((I - np.outer(b_w, b_w)) / n)
+            eps = 1e-12
+            rho2 = bx * bx + by * by
+            rho = np.sqrt(max(rho2, eps))
+            den_el = rho2 + bz * bz
+            daz_db = np.array([-by / max(rho2, eps), bx / max(rho2, eps), 0.0], dtype=float)
+            del_db = np.array(
+                [
+                    -bz * (bx / max(rho, eps)) / max(den_el, eps),
+                    -bz * (by / max(rho, eps)) / max(den_el, eps),
+                    rho / max(den_el, eps),
+                ],
+                dtype=float,
+            )
+            DzDb = np.vstack([daz_db, del_db])
 
-        # d b_b / d r
-        I = np.eye(3)
-        J_bwr = R_wb @ ((I - np.outer(b_w, b_w)) / n)  # (3x3)
-
-        # dz / d b_b
-        eps = 1e-12
-        rho2 = bx*bx + by*by
-        rho  = np.sqrt(max(rho2, eps))
-        den_el = (rho2 + bz*bz)  # = 1 (since b_b is unit), but keep for clarity/robustness
-
-        # ∂az/∂b = [-by/rho2, bx/rho2, 0]
-        daz_db = np.array([ -by / max(rho2, eps),  bx / max(rho2, eps), 0.0 ])
-
-        # ∂el/∂b using el = atan2(bz, rho)
-        # d el = (rho * dbz - bz * drho) / (rho^2 + bz^2)
-        # drho = (bx dbx + by dby)/rho  => ∂el/∂bx = (-bz * (bx/rho)) / den_el, similarly for by; ∂el/∂bz =  rho / den_el
-        del_db = np.array([
-            -bz * (bx / max(rho, eps)) / max(den_el, eps),
-            -bz * (by / max(rho, eps)) / max(den_el, eps),
-             rho / max(den_el, eps)
-        ])
-
-        DzDb = np.vstack([daz_db, del_db])  # (2x3)
-
-        # chain: dz/dp = DzDb @ J_bwr
-        H_p = DzDb @ J_bwr  # (2x3)
-
-        # full H wrt x; extra state dimensions have zero measurement sensitivity
-        H = np.zeros((2, self.n))
+        H_p = DzDb @ J_bwr
+        H = self._zeros((2, self.n))
         H[:, :3] = H_p
         return H
 
+    def H_pos(self, x, p_obs, R_wb):
+        return self._to_numpy(self._H_pos_backend(x, p_obs, R_wb))
+
     def _compute_measurement_linearization(self, x_ref, p_obs, R_wb):
-        H = self.H_pos(x_ref, p_obs, R_wb)
-        offset = self.h(x_ref, p_obs, R_wb) - H @ x_ref
-        return {
-            "H": H,
-            "offset": offset,
-        }
+        H = self._H_pos_backend(x_ref, p_obs, R_wb)
+        x_ref_b = self._vector_to_backend(x_ref)
+        offset = self._h_backend(x_ref_b, p_obs, R_wb) - H @ x_ref_b
+        return {"H": H, "offset": offset}
 
     def _get_measurement_linearization(self, x, p_obs, R_wb):
         if self._jacobian_mode == "exact":
@@ -255,13 +485,12 @@ class AgentEKF:
         return self._GLOBAL_LINEARIZATION_CACHE[key]
 
     def measurement_prediction(self, p_obs, R_wb):
-        linearization = self._get_measurement_linearization(self.x, p_obs, R_wb)
+        linearization = self._get_measurement_linearization(self._x, p_obs, R_wb)
         if linearization is None:
-            return self.h(self.x, p_obs, R_wb)
-        return linearization["H"] @ self.x + linearization["offset"]
+            return self._to_numpy(self._h_backend(self._x, p_obs, R_wb))
+        return self._to_numpy(linearization["H"] @ self._x + linearization["offset"])
 
-    # ----- EKF steps -----
-    def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
+    def predict(self, dt=None, u=None, u_cov=None, u_frame="world", R_wb_tgt=None):
         """
         EKF prediction. If u is provided, apply affine term B u.
         If u_cov (3x3) is provided, add B * u_cov * B^T to P to model input uncertainty.
@@ -269,52 +498,56 @@ class AgentEKF:
         if dt is None:
             dt = self.dt
 
-        if self._dyn == 'hcw' and (self._Ad is None or dt != self.dt):
+        if self._dyn == "hcw" and (self._Ad is None or dt != self.dt):
             n = hcw_mean_motion(self._hcw_params)
             Ad_mx, Bd_mx = hcw_discrete_mats(n, dt)
-            self._Ad = as_numpy_const(Ad_mx)
-            self._Bd = as_numpy_const(Bd_mx)
+            self._Ad = self._matrix_to_backend(as_numpy_const(Ad_mx))
+            self._Bd = self._matrix_to_backend(as_numpy_const(Bd_mx))
 
-        # state
-        self.x = self.f(self.x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt)
+        self._x = self._f_backend(self._x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt)
 
-        # covariance
         Ad, Bd = self.linear_dynamics_mats(dt)
-        Pp = Ad @ self.P @ Ad.T + self.Q
+        Pp = Ad @ self._P @ Ad.transpose(-1, -2) + self._Q
 
         if u_cov is not None:
-            U  = _psd_enforce(np.asarray(u_cov, float))
-            Pp += Bd @ U @ Bd.T
+            U = _psd_enforce(self._matrix_to_backend(u_cov, shape=(3, 3)))
+            Pp = Pp + Bd @ U @ Bd.transpose(-1, -2)
 
-        self.P = _psd_enforce(_symmetrize(Pp))
-        self.dt = dt
+        self._P = _psd_enforce(_symmetrize(Pp))
+        self.dt = float(dt)
 
     def update(self, z, p_obs, R_wb):
         """
         Bearing (az, el) update in observer BODY frame.
         """
-        z = np.asarray(z, float).reshape(2)
-        linearization = self._get_measurement_linearization(self.x, p_obs, R_wb)
+        z_b = self._vector_to_backend(z)
+        if self._numel(z_b) != 2:
+            raise ValueError("EKF measurement z must be a 2-vector [az, el].")
+
+        linearization = self._get_measurement_linearization(self._x, p_obs, R_wb)
         if linearization is None:
-            z_pred = self.h(self.x, p_obs, R_wb)
-            H = self.H_pos(self.x, p_obs, R_wb)
+            z_pred = self._h_backend(self._x, p_obs, R_wb)
+            H = self._H_pos_backend(self._x, p_obs, R_wb)
         else:
             H = linearization["H"]
-            z_pred = H @ self.x + linearization["offset"]
-        # innovation (angle wrap)
-        y = z - z_pred
-        y[0] = _normalize_angle(y[0]); y[1] = _normalize_angle(y[1])
+            z_pred = H @ self._x + linearization["offset"]
 
-        # innovation cov and Kalman gain
-        S = H @ self.P @ H.T + self.R
+        y = z_b - z_pred
+        y[0] = _normalize_angle(y[0])
+        y[1] = _normalize_angle(y[1])
+
+        S = H @ self._P @ H.transpose(-1, -2) + self._R
         S = _psd_enforce(_symmetrize(S))
-        K = self.P @ H.T @ np.linalg.inv(S + 1e-12*np.eye(2))
+        if self._use_torch_backend:
+            S_reg = S + 1e-12 * self._eye(2)
+            K = self._P @ H.transpose(-1, -2) @ torch.linalg.inv(S_reg)
+        else:
+            K = self._P @ H.T @ np.linalg.inv(S + 1e-12 * self._eye(2))
 
-        # state/cov updates (Joseph form for numerical robustness)
-        I = np.eye(self.n)
-        self.x = self.x + K @ y
-        IKH = (I - K @ H)
-        self.P = IKH @ self.P @ IKH.T + K @ self.R @ K.T
-        self.P = _psd_enforce(_symmetrize(self.P))
+        I = self._eye(self.n)
+        self._x = self._x + K @ y
+        IKH = I - K @ H
+        self._P = IKH @ self._P @ IKH.transpose(-1, -2) + K @ self._R @ K.transpose(-1, -2)
+        self._P = _psd_enforce(_symmetrize(self._P))
 
-        return self.x, self.P
+        return self._to_numpy(self._x), self._to_numpy(self._P)

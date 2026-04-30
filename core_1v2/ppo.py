@@ -33,10 +33,8 @@ class PPO:
         self.freeze_attacker = bool(cfg.get("freeze_attacker", False))
         self.D = int(cfg["D"])
         self.Na = int(cfg.get("num_attackers", 1))
-        arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-        normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
-        self._rule_obs_pos_scale = (1.0 / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
-        self._rule_obs_vel_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
+        self._rule_obs_pos_scale = 1.0
+        self._rule_obs_vel_scale = 1.0
 
         self.def_net = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
         self.def_opt = optim.Adam(

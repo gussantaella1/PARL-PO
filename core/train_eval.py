@@ -335,6 +335,7 @@ def train(cfg: Dict[str, Any]):
         "R_att_mean": [],
         "muD_abs_mean": [],
         "stdD_mean": [],
+        "arena_radius_mean": [],
         "d1_mean": [],          # defender true distance
         "d2_mean": [],          # attacker belief distance (what obs sees)
         "d2_true_mean": [],     # attacker true distance
@@ -385,6 +386,8 @@ def train(cfg: Dict[str, Any]):
     # Optional anneal of defender center tether
     def_center_base = cfg.get("def_center_coef", 0.0)
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
+    radius_knob = cfg.get("arena_radius_knob", {}) or {}
+    use_radius_knob = bool(radius_knob.get("enabled", False))
 
     for upd in range(1, total_updates + 1):
         term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
@@ -410,6 +413,10 @@ def train(cfg: Dict[str, Any]):
                     g["lr"] = base * scale
         # ------------------------------------------------
 
+        if use_radius_knob:
+            radius_progress = (upd - 1) / max(1, total_updates - 1)
+            _set_vec_attr(vec, "curriculum_progress", radius_progress)
+
         # Linear anneal multiplier from 1.0 → min_anneal for k_cent
         center_frac = upd / max(1, total_updates)
         k_cent_mul = 1.0 - (1.0 - min_anneal) * center_frac
@@ -434,11 +441,12 @@ def train(cfg: Dict[str, Any]):
         ep_ret_att = np.zeros(num_envs, dtype=np.float64)
 
         # accumulators for metrics over this update
-        d1_true_acc = 0.0
-        d2_true_acc = 0.0
-        d2_belief_acc = 0.0
-        p2_est_err_acc = 0.0
-        p1_est_err_acc = 0.0
+        d1_true_sq_m_acc = 0.0
+        d2_true_sq_m_acc = 0.0
+        d2_belief_sq_m_acc = 0.0
+        arena_radius_acc = 0.0
+        p2_est_err_sq_m_acc = 0.0
+        p1_est_err_sq_m_acc = 0.0
         meas_innov_acc = 0.0
         trP_acc = 0.0
         info_count = 0
@@ -553,24 +561,26 @@ def train(cfg: Dict[str, Any]):
                 info_count += 1
 
                 # always accumulate if present
+                radius_m = float(inf.get("arena_radius_m", cfg["arena"]["r"]))
+                radius_sq_m = radius_m * radius_m
+                arena_radius_acc += radius_m
+
                 if "d1_true_norm" in inf:
-                    d1_true_acc += inf["d1_true_norm"]
+                    d1_true_sq_m_acc += float(inf["d1_true_norm"]) * radius_sq_m
 
                 if "d2_true_norm" in inf:
-                    d2_true_acc += inf["d2_true_norm"]
+                    d2_true_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
 
                 # belief distance: fall back safely
                 if "d2_belief_norm" in inf:
-                    d2_belief_acc += inf["d2_belief_norm"]
+                    d2_belief_sq_m_acc += float(inf["d2_belief_norm"]) * radius_sq_m
                 elif "d2_true_norm" in inf:
-                    d2_belief_acc += inf["d2_true_norm"]
-                elif "d2_norm" in inf:
-                    d2_belief_acc += inf["d2_norm"]
+                    d2_belief_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
 
                 if "p2_est_err_norm" in inf:
-                    p2_est_err_acc += inf["p2_est_err_norm"]
+                    p2_est_err_sq_m_acc += float(inf["p2_est_err_norm"]) * radius_sq_m
                 if "p1_est_err_norm" in inf:
-                    p1_est_err_acc += inf["p1_est_err_norm"]
+                    p1_est_err_sq_m_acc += float(inf["p1_est_err_norm"]) * radius_sq_m
 
                 if "meas_innov_sq" in inf:
                     meas_innov_acc += inf["meas_innov_sq"]
@@ -674,16 +684,17 @@ def train(cfg: Dict[str, Any]):
 
             # means over all steps collected this update
             if info_count > 0:
-                R = cfg["arena"]["r"]
+                arena_radius_mean = arena_radius_acc / info_count
 
-                d1_true_mean = np.sqrt(d1_true_acc / info_count) * R
-                d2_true_mean = np.sqrt(d2_true_acc / info_count) * R
-                d2_belief_mean = np.sqrt(d2_belief_acc / info_count) * R
-                p2_est_err_mean = np.sqrt(p2_est_err_acc / info_count) * R
-                p1_est_err_mean = np.sqrt(p1_est_err_acc / info_count) * R
+                d1_true_mean = np.sqrt(d1_true_sq_m_acc / info_count)
+                d2_true_mean = np.sqrt(d2_true_sq_m_acc / info_count)
+                d2_belief_mean = np.sqrt(d2_belief_sq_m_acc / info_count)
+                p2_est_err_mean = np.sqrt(p2_est_err_sq_m_acc / info_count)
+                p1_est_err_mean = np.sqrt(p1_est_err_sq_m_acc / info_count)
                 meas_innov_mean = meas_innov_acc / info_count
                 trP_mean = trP_acc / info_count
             else:
+                arena_radius_mean = 0.0
                 d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
                 p2_est_err_mean = p1_est_err_mean = 0.0
                 meas_innov_mean = trP_mean = 0.0
@@ -771,6 +782,7 @@ def train(cfg: Dict[str, Any]):
             metrics["R_att_mean"].append(R_att_mean)
             metrics["muD_abs_mean"].append(muD)
             metrics["stdD_mean"].append(stdD)
+            metrics["arena_radius_mean"].append(arena_radius_mean)
 
             metrics["d1_mean"].append(d1_true_mean)
             metrics["d2_mean"].append(d2_belief_mean)
@@ -797,6 +809,7 @@ def train(cfg: Dict[str, Any]):
 
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
             print(f"   [{train_role}] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(f"   mean arena radius ≈ {arena_radius_mean:.3f} m")
             print(
                 f"   timing: rollout={rollout_time_s:.3f}s  "
                 f"optim={optim_time_s:.3f}s  total={update_time_s:.3f}s  "
@@ -827,6 +840,7 @@ def train(cfg: Dict[str, Any]):
                 # ===== Returns =====
                 writer.add_scalar("returns/def_mean", R_def_mean, gs)
                 writer.add_scalar("returns/att_mean", R_att_mean, gs)
+                writer.add_scalar("arena/radius_mean_m", arena_radius_mean, gs)
 
                 # ===== Distances (meters) =====
                 writer.add_scalar("dist/def_true_p1_to_center_m", d1_true_mean, gs)

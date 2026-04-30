@@ -24,6 +24,7 @@ __all__ = [
     "add_triad_legend",
     "animate_rollout_3d", "interactive_rollout_3d",
     "plot_rollout_thrust_u",
+    "plot_rollout_velocity",
     "plot_rollout_center_distance",
     "plot_rollout_relative_distance"
 ]
@@ -1761,6 +1762,174 @@ def plot_rollout_thrust_u(
 
     if title is None:
         title = f"Commanded thrust u (agent {agent})"
+    ax.set_title(title)
+    ax.legend()
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_rollout_velocity(
+    frames_dict,
+    cfg=None,
+    agent: int = 1,
+    rollout_idx: int | None = None,
+    dt: float | None = None,
+    title: str | None = None,
+    show: bool = True,
+):
+    """
+    Plot agent velocity in x,y,z and total speed for a rollout.
+
+    Parameters
+    ----------
+    frames_dict : dict
+        Rollout dict. This function first looks for explicit velocity histories in:
+        - N-aware:
+            * frames_dict['vel_xyz_all']
+            * frames_dict['vel_all'], frames_dict['v_all']
+        - 2-agent legacy:
+            * frames_dict['vel1_xyz'], frames_dict['vel2_xyz']
+        - Generic:
+            * frames_dict['vel_xyz'], frames_dict['vel'], frames_dict['velocity']
+
+        If no explicit velocity history is present, it falls back to differentiating
+        the executed position history using dt.
+    """
+
+    def _as_xyz_array(v_like):
+        if v_like is None:
+            return None
+        V = np.asarray(v_like, dtype=float)
+        if V.ndim != 2 or V.shape[0] < 1:
+            return None
+        if V.shape[1] == 2:
+            V = np.hstack([V, np.zeros((V.shape[0], 1), dtype=float)])
+        elif V.shape[1] < 2:
+            return None
+        return V[:, :3]
+
+    def _maybe_pick_rollout(obj):
+        if rollout_idx is None:
+            return obj
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            try:
+                return obj[rollout_idx]
+            except Exception:
+                return obj
+        return obj
+
+    def _pick_agent_series(container):
+        container = _maybe_pick_rollout(container)
+        a = agent - 1
+        if isinstance(container, (list, tuple)):
+            if 0 <= a < len(container):
+                return container[a]
+            return None
+        arr = np.asarray(container, dtype=float)
+        if arr.ndim == 3 and 0 <= a < arr.shape[0]:
+            return arr[a]
+        return None
+
+    def _first_present(keys):
+        for k in keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                return frames_dict[k]
+        return None
+
+    def _infer_dt():
+        if dt is not None:
+            return float(dt)
+        if cfg is not None:
+            for path in (("dt",), ("dyn", "dt"), ("sim", "dt")):
+                try:
+                    val = cfg
+                    for p in path:
+                        val = val[p]
+                    return float(val)
+                except Exception:
+                    pass
+        return None
+
+    vel_src = None
+    for k in ("vel_xyz_all", "vel_all", "v_all", "v_xyz_all"):
+        if k in frames_dict and frames_dict[k] is not None:
+            vel_src = _pick_agent_series(frames_dict[k])
+            if vel_src is not None:
+                break
+
+    if vel_src is None:
+        for k in (f"vel{agent}_xyz", f"vel{agent}", f"v{agent}_xyz", f"v{agent}"):
+            if k in frames_dict and frames_dict[k] is not None:
+                vel_src = _maybe_pick_rollout(frames_dict[k])
+                break
+
+    if vel_src is None:
+        vel_src = _first_present(("vel_xyz", "vel", "velocity", "v_xyz", "v_hist"))
+
+    V = _as_xyz_array(_maybe_pick_rollout(vel_src))
+
+    if V is None:
+        exec_src = None
+        for k in ("exec_xyz_all", "exec_all"):
+            if k in frames_dict and frames_dict[k] is not None:
+                exec_src = _pick_agent_series(frames_dict[k])
+                if exec_src is not None:
+                    break
+        if exec_src is None:
+            for k in (f"exec{agent}_xyz", f"x{agent}_xyz", f"traj{agent}_xyz"):
+                if k in frames_dict and frames_dict[k] is not None:
+                    exec_src = _maybe_pick_rollout(frames_dict[k])
+                    break
+        if exec_src is None:
+            exec_src = _first_present(("exec_xyz", "exec", "x_hist", "traj_xyz"))
+
+        P = _as_xyz_array(_maybe_pick_rollout(exec_src))
+        if P is None:
+            known = [
+                k for k in frames_dict.keys()
+                if any(s in k.lower() for s in ("vel", "velocity", "v_", "exec", "traj"))
+            ]
+            raise KeyError(
+                "Could not find velocity or executed-position history in frames_dict.\n"
+                "Tried explicit velocity keys and exec trajectory fallbacks.\n"
+                f"Relevant keys that do exist:\n  {known}"
+            )
+
+        dt_used = _infer_dt()
+        if P.shape[0] < 2:
+            V = np.zeros_like(P)
+        else:
+            step_dt = 1.0 if dt_used is None else dt_used
+            V = np.gradient(P, step_dt, axis=0, edge_order=1)
+    else:
+        dt_used = _infer_dt()
+
+    T = V.shape[0]
+    if dt_used is None:
+        t = np.arange(T)
+        xlab = "step"
+    else:
+        t = dt_used * np.arange(T)
+        xlab = "time [s]"
+
+    vx, vy, vz = V[:, 0], V[:, 1], V[:, 2]
+    vnorm = np.linalg.norm(V, axis=1)
+
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    ax.plot(t, vx, label=r"$v_x$")
+    ax.plot(t, vy, label=r"$v_y$")
+    ax.plot(t, vz, label=r"$v_z$")
+    ax.plot(t, vnorm, label=r"$\|v\|$", linewidth=2.0)
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel("velocity [m/s]")
+    ax.grid(True, alpha=0.35)
+
+    if title is None:
+        title = f"Velocity (agent {agent})"
     ax.set_title(title)
     ax.legend()
 

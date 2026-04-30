@@ -71,10 +71,8 @@ class PPO:
             self.att_base_lrs = None
             self.rule_ctrl = AttackerRuleController(cfg)
 
-        arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-        normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
-        self._rule_obs_pos_scale = (1.0 / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
-        self._rule_obs_vel_scale = (float(cfg.get("dt", 1.0)) / max(arena_r, 1e-9)) if normalize_pos_obs else 1.0
+        self._rule_obs_pos_scale = 1.0
+        self._rule_obs_vel_scale = 1.0
 
     @torch.no_grad()
     def act(self, obs_batch: torch.Tensor, who: str, deterministic: bool = False):

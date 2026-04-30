@@ -7,7 +7,7 @@ import os
 
 from ukf_estimator import KF_CV, _body_bearing_from_world, _azel_from_body_vec
 from config_rl_1v2 import build_dyn
-from core.utils import set_seed
+from core.utils import resolve_start_radius_bounds, set_seed
 
 # =============================================================
 # Environment (1 defender vs N attackers)
@@ -40,9 +40,8 @@ class Env:
             raise ValueError("Only 'sphere' arena is implemented.")
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
-        self.normalize_pos_obs = bool(cfg.get("normalize_pos_obs", False))
-        self._pos_obs_scale = (1.0 / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
-        self._vel_obs_scale = (self.dt / max(self.radius, 1e-9)) if self.normalize_pos_obs else 1.0
+        self._pos_obs_scale = 1.0
+        self._vel_obs_scale = 1.0
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -84,6 +83,14 @@ class Env:
         # reward params
         self.k_pos = float(cfg.get("k_pos"))
         self.k_dock = float(cfg.get("k_dock"))
+        self.reward_normalize_radius_m = cfg.get("reward_normalize_radius_m", None)
+        if self.reward_normalize_radius_m is not None:
+            self.reward_normalize_radius_m = float(self.reward_normalize_radius_m)
+            if self.reward_normalize_radius_m <= 0.0:
+                raise ValueError(
+                    "reward_normalize_radius_m must be > 0 when provided, "
+                    f"got {self.reward_normalize_radius_m}."
+                )
 
 
         self.lD    = float(cfg["effort_def"])
@@ -99,6 +106,12 @@ class Env:
 
         self.oi_radius = float(oi.get("r", 0.0))
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
+        self._reward_dist_scale = self._reward_normalization_radius()
+        self._reward_geom_scale = self._reward_dist_scale ** 2
+        self._term_dist_scale = self.radius
+        self._soft_wall_term = self.soft_wall
+        self._oi_radius_term = self.oi_radius_norm
+        self._arena_term_limit = self.margin
 
 
         self.hit_buffer_def = float(cfg.get("hit_buffer_def"))
@@ -128,6 +141,8 @@ class Env:
         self.estimator_kind = self._normalize_estimator_kind(cfg.get("estimator_kind", "ukf"))
         self.estimator_label = self.estimator_kind.upper()
         self._estimator_dyn = None
+        self._ekf_jacobian_mode = str(self._estimator_cfg.get("ekf_jacobian_mode", "exact"))
+        self._ekf_use_torch = bool(self._estimator_cfg.get("ekf_use_torch", False))
 
         #Fuel config
         fuel = cfg.get("fuel", {})
@@ -297,7 +312,13 @@ class Env:
             )
         return "hcw"
 
-    def _make_estimator(self, x0_est: np.ndarray):
+    def _make_estimator(self, x0_est: np.ndarray, linearization_group: str = "default"):
+        estimator_kwargs = {}
+        if self.estimator_kind == "ekf":
+            estimator_kwargs["jacobian_mode"] = self._ekf_jacobian_mode
+            estimator_kwargs["linearization_group"] = linearization_group
+            estimator_kwargs["use_torch_backend"] = self._ekf_use_torch
+            estimator_kwargs["device"] = self.cfg.get("device", "cpu")
         return KF_CV(
             x0=x0_est,
             P0=self._ukf_P0.copy(),
@@ -307,6 +328,7 @@ class Env:
             kind=self.estimator_kind,
             dyn=self._estimator_dyn,
             hcw=self.cfg.get("hcw", {}),
+            **estimator_kwargs,
         )
 
     def _kf_predict_control(self, ground_truth_u: np.ndarray | None):
@@ -372,6 +394,15 @@ class Env:
         share = float(team_reward) / float(max(1, self.num_attackers))
         return np.full((self.num_attackers,), share, dtype=np.float32)
 
+    def _reward_normalization_radius(self) -> float:
+        if self.reward_normalize_radius_m is not None:
+            return float(self.reward_normalize_radius_m)
+        return float(self.radius)
+
+    def _reward_geom_from_sqdist(self, sqdist: float) -> float:
+        sqdist = max(float(sqdist), 0.0)
+        return sqdist / max(self._reward_geom_scale, 1e-9)
+
     def reset(self) -> np.ndarray:
         self.t = 0
         mode = self.train_ic_mode
@@ -409,11 +440,8 @@ class Env:
             # r_def_min, r_def_max = 0.0, 0.5 * R
             # r_att_min, r_att_max = 0.4 * R, 0.95 * R
 
-            r_def_min = float(self.cfg.get("r_def_min")) * R  
-            r_def_max = float(self.cfg.get("r_def_max")) * R
-
-            r_att_min = float(self.cfg.get("r_att_min")) * R
-            r_att_max = float(self.cfg.get("r_att_max")) * R 
+            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
+            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
 
 
             # defender
@@ -465,11 +493,8 @@ class Env:
             percent_advantage_defender = self.cfg.get("percent_advantage_defender", 0.75)
             radial_margin = float(percent_advantage_defender*np.pi*2*oi_r) 
 
-            r_def_min = float(self.cfg.get("r_def_min")) * R
-            r_def_max = float(self.cfg.get("r_def_max")) * R
-
-            r_att_min = float(self.cfg.get("r_att_min")) * R
-            r_att_max = float(self.cfg.get("r_att_max")) * R
+            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
+            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
 
             r_att_min = max(r_att_min, radial_margin)
 
@@ -596,7 +621,10 @@ class Env:
                 x0_ukf = np.concatenate([pA_est, vA_est])
 
                 self.ukfs.append(
-                    self._make_estimator(x0_ukf)
+                    self._make_estimator(
+                        x0_ukf,
+                        linearization_group=f"defender_observer_{len(self.ukfs)}",
+                    )
                 )
 
             self._latest_meas_innov = 0.0
@@ -618,7 +646,7 @@ class Env:
             p2_geom = p2
 
         d2_raw = float(np.dot(p2_geom - self.center, p2_geom - self.center))
-        self._d2_prev = d2_raw / (self.radius**2)
+        self._d2_prev = self._reward_geom_from_sqdist(d2_raw)
 
         if self.use_fuel:
             self.m_def = self.m0_def
@@ -758,15 +786,16 @@ class Env:
         # ---- shared geometry needed by whichever reward(s) we compute ----
         # d2 and rel2 are used by both rewards
         d2_raw = float(np.dot(p2_reward - self.center, p2_reward - self.center))
-        d2 = d2_raw / (self.radius**2)
+        d2 = self._reward_geom_from_sqdist(d2_raw)
         delta_d2 = d2 - (self._d2_prev if self._d2_prev is not None else d2)
 
-        rel2 = float(np.dot((p2_reward - p1), (p2_reward - p1))) / (self.radius**2)
+        rel2_raw = float(np.dot((p2_reward - p1), (p2_reward - p1)))
+        rel2 = self._reward_geom_from_sqdist(rel2_raw)
 
         # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
         if need_def:
             d1_raw = float(np.dot(p1 - self.center, p1 - self.center))
-            d1 = d1_raw / (self.radius**2)
+            d1 = self._reward_geom_from_sqdist(d1_raw)
         else:
             d1 = 0.0  # placeholder
 
@@ -775,15 +804,15 @@ class Env:
         wall2 = 0.0
         center_keepout = 0.0
 
-        rho1 = np.linalg.norm(p1 - self.center)/ self.radius
-        rho2 = np.linalg.norm(p2_reward - self.center) / self.radius
+        rho1 = np.linalg.norm(p1 - self.center) / self._term_dist_scale
+        rho2 = np.linalg.norm(p2_reward - self.center) / self._term_dist_scale
 
-        v_scale = self.radius / self.dt
+        v_scale = self._reward_dist_scale / self.dt
 
         #Defender vars
         #             
         # rho1_rel_to_center = np.linalg.norm(p1 - self.center)
-        wall1 = ((max(0.0, rho1 - self.soft_wall))**2) * self.wallK
+        wall1 = ((max(0.0, rho1 - self._soft_wall_term))**2) * self.wallK
 
         # defender radial velocity
         rhat1 = (p1 - self.center)
@@ -799,22 +828,22 @@ class Env:
         v2n2 = float(np.dot(v2_reward, v2_reward)) / (v_scale**2)
         a2n2 = float(np.dot(a2_cmd, a2_cmd)) / (self.u_hi**2)
 
-        wall2 = ((max(0.0, rho2 - self.soft_wall))**2) * self.wallK
+        wall2 = ((max(0.0, rho2 - self._soft_wall_term))**2) * self.wallK
 
         # ---- termination scenariosalways uses TRUE state ----
 
         # 1) Hitting target
         hit_target = False
 
-        rho_att = float(att_center_dists[threat_idx]) / self.radius
-        rho_def = np.linalg.norm(p1 - self.center) / self.radius
+        rho_att = float(att_center_dists[threat_idx]) / self._term_dist_scale
+        rho_def = np.linalg.norm(p1 - self.center) / self._term_dist_scale
 
-        thresh_def = (1.0 + self.hit_buffer_def) * self.oi_radius_norm
-        thresh_att = (1.0 + self.hit_buffer_att) * self.oi_radius_norm
+        thresh_def = (1.0 + self.hit_buffer_def) * self._oi_radius_term
+        thresh_att = (1.0 + self.hit_buffer_att) * self._oi_radius_term
 
-        att_rho_all = att_center_dists / self.radius
-        att_hit_target = (self.oi_radius_norm > 0.0) and bool(np.any(att_rho_all <= thresh_att))
-        def_hit_target = (self.oi_radius_norm > 0.0) and (rho_def <= thresh_def)
+        att_rho_all = att_center_dists / self._term_dist_scale
+        att_hit_target = (self._oi_radius_term > 0.0) and bool(np.any(att_rho_all <= thresh_att))
+        def_hit_target = (self._oi_radius_term > 0.0) and (rho_def <= thresh_def)
 
 
         hit_target = att_hit_target or def_hit_target
@@ -832,11 +861,11 @@ class Env:
         # 3) Exiting the arena
 
         # oob for ANY attacker
-        oob1 = (rho1 >= self.margin)
+        oob1 = (rho1 >= self._arena_term_limit)
         oob2_any = False
         for pA_true in pA_list:
-            rhoA_true = np.linalg.norm(pA_true - self.center) / self.radius
-            if rhoA_true >= self.margin:
+            rhoA_true = np.linalg.norm(pA_true - self.center) / self._term_dist_scale
+            if rhoA_true >= self._arena_term_limit:
                 oob2_any = True
                 break
 
@@ -927,7 +956,7 @@ class Env:
         elif use_zero_sum:
 
             dist_rel = np.linalg.norm(p2_reward - p1)
-            dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self.radius
+            dock_gap = max(0.0, dist_rel - self.collision_radius_m) / self._reward_dist_scale
 
             g = (
                 self.k_pos * d2
@@ -1006,6 +1035,7 @@ class Env:
             "oob_def": bool(oob1),
             "oob_att": bool(oob2_any),
             "hit_target": bool(hit_target),
+            "arena_radius_m": float(self.radius),
 
             # NEW: what your logger expects
             "d1_true_norm": d1_true_norm,
@@ -1056,25 +1086,23 @@ class Env:
             vA_obs = vA_list
 
         # build obs = [p1c, pA1c, ..., pANc, rel1, ..., relN, v1, vA1, ..., vAN]
-        pos_scale = self._pos_obs_scale
-        vel_scale = self._vel_obs_scale
-        p1c = (p1 - self.center) * pos_scale
+        p1c = p1 - self.center
         parts = [p1c]
 
         # positions (centered)
         for pA in pA_obs:
-            parts.append((pA - self.center) * pos_scale)
+            parts.append(pA - self.center)
 
         # relative positions
         for pA in pA_obs:
-            parts.append((pA - p1) * pos_scale)
+            parts.append(pA - p1)
 
         # defender vel
-        parts.append(v1 * vel_scale)
+        parts.append(v1)
 
         # attacker vels
         for vA in vA_obs:
-            parts.append(vA * vel_scale)
+            parts.append(vA)
 
         # Defender and attacker fuel:
 
