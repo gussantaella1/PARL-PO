@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from core.safety_filter import project_box_halfspace_np, velocity_cbf_halfspace_np
+
 
 # ============================================================
 # Paper parameter bundle
@@ -252,6 +254,25 @@ def _baseline_objective_mode(cfg: Dict[str, Any]) -> str:
     return mode
 
 
+def _velocity_cbf_params_from_cfg(cfg: Dict[str, Any]) -> Tuple[bool, float, float, str, float | None]:
+    sf_cfg = dict(cfg.get("safety_filter", {}) or {})
+    enabled = bool(sf_cfg.get("enabled", False))
+    alpha = float(sf_cfg.get("alpha", 5.0))
+    raw_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+    vmax = np.inf if raw_vmax is None else float(raw_vmax)
+    dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
+    hcw_n = None
+    if dyn_name == "hcw":
+        hcw_cfg = dict(cfg.get("hcw", {}) or {})
+        if "n" in hcw_cfg:
+            hcw_n = float(hcw_cfg["n"])
+        else:
+            mu = float(hcw_cfg.get("mu", 3.986004418e14))
+            r0 = float(hcw_cfg["r0"])
+            hcw_n = float(np.sqrt(mu / (r0 ** 3)))
+    return enabled, alpha, vmax, dyn_name, hcw_n
+
+
 # ============================================================
 # PPO zero-sum objective bundle (for security / maximin)
 # ============================================================
@@ -364,6 +385,7 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
     """
     dt = float(cfg["dt"])
     dyn_name = (cfg.get("dynamics") or "hcw").lower()
+    sf_enabled, sf_alpha, sf_vmax, sf_dyn_name, sf_hcw_n = _velocity_cbf_params_from_cfg(cfg)
 
     ar = cfg.setdefault("arena", {})
     ar.setdefault("type", "sphere")
@@ -405,6 +427,38 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
             return x6.astype(np.float32)
         return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
 
+    def _maybe_filter_u(
+        xD: np.ndarray,
+        uD: np.ndarray,
+        Ad_now: np.ndarray | None,
+        Bd_now: np.ndarray | None,
+    ) -> np.ndarray:
+        uD = np.asarray(uD, dtype=np.float32).reshape(-1)
+        if not sf_enabled:
+            return uD
+        if not np.isfinite(sf_vmax) or sf_vmax <= 0.0:
+            return uD
+        if Bd_now is None and sf_dyn_name != "hcw":
+            return uD
+
+        xD = np.asarray(xD, dtype=np.float32).reshape(-1)
+        p = xD[:D]
+        v = xD[D : 2 * D]
+        a, b = velocity_cbf_halfspace_np(
+            p,
+            v,
+            vmax=sf_vmax,
+            alpha=sf_alpha,
+            dyn_name=sf_dyn_name,
+            dt=dt,
+            D=D,
+            Ad=Ad_now,
+            Bd=Bd_now,
+            hcw_n=sf_hcw_n,
+        )
+        BIG = 1e9
+        return project_box_halfspace_np(uD, -BIG, BIG, a, b).astype(np.float32, copy=False)
+
     if dyn_name == "hcw":
         if Ad is None or Bd is None:
             from dyn_models import hcw_mean_motion, hcw_discrete_mats, as_numpy_const
@@ -436,7 +490,13 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
 
     def step_plant_single(xD: np.ndarray, uD: np.ndarray, k: int) -> np.ndarray:
         x6 = _x6_from_xD(xD)
-        u3 = _u3(uD)
+        if dyn_type == "lti":
+            uD_eff = _maybe_filter_u(xD, uD, Ad, Bd)
+        elif dyn_type == "ltv":
+            uD_eff = _maybe_filter_u(xD, uD, Ad_seq[k], Bd_seq[k])
+        else:
+            uD_eff = _maybe_filter_u(xD, uD, None, None)
+        u3 = _u3(uD_eff)
 
         if dyn_type == "lti":
             x6n = (Ad @ x6 + Bd @ u3).astype(np.float32)
@@ -1376,6 +1436,13 @@ def _pad3(u: np.ndarray, D: int) -> np.ndarray:
     return np.array([u[0], u[1], 0.0], float)
 
 
+def _v3(xD: np.ndarray, D: int) -> np.ndarray:
+    xD = np.asarray(xD, float).reshape(-1)
+    if D == 3:
+        return np.array([xD[3], xD[4], xD[5]], float)
+    return np.array([xD[2], xD[3], 0.0], float)
+
+
 # ============================================================
 # Rollout runners
 # ============================================================
@@ -1421,8 +1488,8 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
 
     # initial states
     x0 = np.asarray(cfg["x0"], dtype=np.float32)
-    xE = x0[0, :nx].copy()
-    xP = x0[1, :nx].copy()
+    xE = np.asarray(x0[0, :nx], dtype=np.float32).copy()
+    xP = np.asarray(x0[1, :nx], dtype=np.float32).copy()
 
     # previous controls (neighborhood centers)
     uE_prev = np.zeros((D,), dtype=np.float32)
@@ -1434,6 +1501,7 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     plan_hist1, plan_hist2 = [], []
     plan_att1, plan_att2 = [], []
     exec_xyz1, exec_xyz2 = [], []
+    vel_xyz1, vel_xyz2 = [], []
     exec_att1, exec_att2 = [], []
     phi_hist1, phi_hist2 = [], []
     fov_axis_hist, fov_seen_mask = [], []
@@ -1451,6 +1519,8 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
     # t=0
     exec_xyz1.append(_p3(xE[:D], D))
     exec_xyz2.append(_p3(xP[:D], D))
+    vel_xyz1.append(_v3(xE, D))
+    vel_xyz2.append(_v3(xP, D))
     exec_att1.append({"R": _identity_R(), "phi": 0.0}); phi_hist1.append(0.0)
     exec_att2.append({"R": _identity_R(), "phi": 0.0}); phi_hist2.append(0.0)
     fov_axis_hist.append(None); fov_seen_mask.append(False)
@@ -1535,6 +1605,8 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
 
         exec_xyz1.append(_p3(xE, D))
         exec_xyz2.append(_p3(xP, D))
+        vel_xyz1.append(_v3(xE, D))
+        vel_xyz2.append(_v3(xP, D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
         if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
@@ -1545,6 +1617,12 @@ def run_rhc_with_paper_game_1v1_collect_frames_3d(
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
         "plan_att1": plan_att1, "plan_att2": plan_att2,
         "exec1_xyz": exec_xyz1, "exec2_xyz": exec_xyz2,
+        "vel1_xyz": np.asarray(vel_xyz1, dtype=float),
+        "vel2_xyz": np.asarray(vel_xyz2, dtype=float),
+        "vel_xyz_all": [
+            np.asarray(vel_xyz1, dtype=float),
+            np.asarray(vel_xyz2, dtype=float),
+        ],
         "exec_att1": exec_att1, "exec_att2": exec_att2,
         "phi_hist1": phi_hist1, "phi_hist2": phi_hist2,
         "fov_axis_hist": fov_axis_hist, "fov_seen_mask": fov_seen_mask,
@@ -1604,12 +1682,12 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     ppo_obj = _populate_ppo_obj_from_cfg(cfg, _ppo_obj_params_from_cfg(cfg))
 
     x0 = np.asarray(cfg["x0"], dtype=np.float32)
-    xE = x0[0, :nx].copy()
-    xP0 = x0[1, :nx].copy()
+    xE = np.asarray(x0[0, :nx], dtype=np.float32).copy()
+    xP0 = np.asarray(x0[1, :nx], dtype=np.float32).copy()
     if x0.shape[0] >= 3:
-        xP1 = x0[2, :nx].copy()
+        xP1 = np.asarray(x0[2, :nx], dtype=np.float32).copy()
     else:
-        xP1 = x0[1, :nx].copy()
+        xP1 = np.asarray(x0[1, :nx], dtype=np.float32).copy()
 
     uE_prev = np.zeros((D,), dtype=np.float32)
     uP_prev = [np.zeros((D,), dtype=np.float32), np.zeros((D,), dtype=np.float32)]
@@ -1619,6 +1697,7 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     plan_hist1, plan_hist2, plan_hist3 = [], [], []
     plan_att1, plan_att2, plan_att3 = [], [], []
     exec_xyz1, exec_xyz2, exec_xyz3 = [], [], []
+    vel_xyz1, vel_xyz2, vel_xyz3 = [], [], []
     exec_att1, exec_att2, exec_att3 = [], [], []
     phi_hist1, phi_hist2, phi_hist3 = [], [], []
     fov_axis_hist, fov_seen_mask = [], []
@@ -1635,6 +1714,9 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
     exec_xyz1.append(_p3(xE[:D], D))
     exec_xyz2.append(_p3(xP0[:D], D))
     exec_xyz3.append(_p3(xP1[:D], D))
+    vel_xyz1.append(_v3(xE, D))
+    vel_xyz2.append(_v3(xP0, D))
+    vel_xyz3.append(_v3(xP1, D))
     I = _identity_R()
     exec_att1.append({"R": I, "phi": 0.0}); phi_hist1.append(0.0)
     exec_att2.append({"R": I, "phi": 0.0}); phi_hist2.append(0.0)
@@ -1726,6 +1808,9 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
         exec_xyz1.append(_p3(xE, D))
         exec_xyz2.append(_p3(xP0, D))
         exec_xyz3.append(_p3(xP1, D))
+        vel_xyz1.append(_v3(xE, D))
+        vel_xyz2.append(_v3(xP0, D))
+        vel_xyz3.append(_v3(xP1, D))
         fov_axis_hist.append(None); fov_seen_mask.append(False)
 
         if term_dbg["done"] and bool(cfg.get("stop_on_done", True)):
@@ -1736,12 +1821,20 @@ def run_rhc_with_paper_game_1v2_collect_frames_3d(
         "plan_hist1": plan_hist1, "plan_hist2": plan_hist2,
         "plan_att1": plan_att1, "plan_att2": plan_att2,
         "exec1_xyz": exec_xyz1, "exec2_xyz": exec_xyz2,
+        "vel1_xyz": np.asarray(vel_xyz1, dtype=float),
+        "vel2_xyz": np.asarray(vel_xyz2, dtype=float),
         "exec_att1": exec_att1, "exec_att2": exec_att2,
         "phi_hist1": phi_hist1, "phi_hist2": phi_hist2,
 
         "plan_hist3": plan_hist3,
         "plan_att3": plan_att3,
         "exec3_xyz": exec_xyz3,
+        "vel3_xyz": np.asarray(vel_xyz3, dtype=float),
+        "vel_xyz_all": [
+            np.asarray(vel_xyz1, dtype=float),
+            np.asarray(vel_xyz2, dtype=float),
+            np.asarray(vel_xyz3, dtype=float),
+        ],
         "exec_att3": exec_att3,
         "phi_hist3": phi_hist3,
 

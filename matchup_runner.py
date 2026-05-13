@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from core.safety_filter import project_box_halfspace_np, velocity_cbf_halfspace_np
 from GameTheory_baseline import _gt_params_from_cfg
 from IPOPT_baseline import _ipopt_params_from_cfg, _solve_box_subproblem
 from paper_baseline_runner import (
@@ -24,12 +25,18 @@ from paper_baseline_runner import (
     _ppo_security_value_g,
 )
 from rl_infer import RLPolicyDiff
-from rl_infer_1v2 import RLPolicy_Multi
 from ukf_estimator import KF_CV
 from core.controllers import AttackerRuleController
 
 
 SUPPORTED_BASELINE_OPPONENTS = ("paper", "game_theory", "ipopt", "rule")
+
+
+def _v3_from_state(xD: np.ndarray, D: int) -> np.ndarray:
+    xD = np.asarray(xD, float).reshape(-1)
+    if D == 3:
+        return np.array([xD[3], xD[4], xD[5]], dtype=float)
+    return np.array([xD[2], xD[3], 0.0], dtype=float)
 
 
 def _normalize_kf_action_access(mode: Any) -> str:
@@ -105,6 +112,78 @@ def _normalize_angle(a: float) -> float:
 
 def _project_box(u: np.ndarray, umax: float) -> np.ndarray:
     return np.clip(np.asarray(u, dtype=float), -float(umax), float(umax))
+
+
+def _build_velocity_cbf_filter(
+    cfg: Dict[str, Any],
+    *,
+    D: int,
+    dt: float,
+    umax: float,
+):
+    sf_cfg = dict(cfg.get("safety_filter", {}) or {})
+    enabled = bool(sf_cfg.get("enabled", False))
+    u_lo = -float(umax)
+    u_hi = +float(umax)
+
+    if not enabled:
+        def _no_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+            return np.clip(np.asarray(u_nom, dtype=float).reshape(D,), u_lo, u_hi).astype(np.float32)
+        return _no_filter
+
+    kind = str(sf_cfg.get("kind", "velocity_cbf_qp")).strip().lower()
+    if kind != "velocity_cbf_qp":
+        raise ValueError(
+            f"Unsupported safety_filter.kind={kind!r}; expected 'velocity_cbf_qp'."
+        )
+
+    raw_cbf_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+    vmax = np.inf if raw_cbf_vmax is None else float(raw_cbf_vmax)
+    alpha = float(sf_cfg.get("alpha", 5.0))
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        raise ValueError(
+            "safety_filter requires a finite positive vmax either in "
+            "safety_filter['vmax'] or top-level cfg['vmax']."
+        )
+    if alpha <= 0.0:
+        raise ValueError(f"safety_filter['alpha'] must be > 0, got {alpha}.")
+
+    dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
+    hcw_n = None
+    if dyn_name == "hcw":
+        hcw_cfg = dict(cfg.get("hcw", {}) or {})
+        if "n" in hcw_cfg:
+            hcw_n = float(hcw_cfg["n"])
+        else:
+            mu = float(hcw_cfg.get("mu", 3.986004418e14))
+            r0 = float(hcw_cfg["r0"])
+            hcw_n = float(np.sqrt(mu / (r0 ** 3)))
+
+    dyn_cfg = dict(cfg.get("dyn", {}) or {})
+    Ad = dyn_cfg.get("Ad", None)
+    Bd = dyn_cfg.get("Bd", None)
+    if Ad is not None:
+        Ad = np.asarray(Ad, dtype=float)
+    if Bd is not None:
+        Bd = np.asarray(Bd, dtype=float)
+
+    def _apply_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+        u_nom = np.asarray(u_nom, dtype=float).reshape(D,)
+        a, b = velocity_cbf_halfspace_np(
+            np.asarray(p, dtype=float).reshape(D,),
+            np.asarray(v, dtype=float).reshape(D,),
+            vmax=vmax,
+            alpha=alpha,
+            dyn_name=dyn_name,
+            dt=dt,
+            D=D,
+            Ad=Ad,
+            Bd=Bd,
+            hcw_n=hcw_n,
+        )
+        return project_box_halfspace_np(u_nom, u_lo, u_hi, a, b).astype(np.float32)
+
+    return _apply_filter
 
 
 def _finite_diff_grad(fun, x: np.ndarray, eps: float) -> np.ndarray:
@@ -661,6 +740,7 @@ def _pack_multi_agent_rollout(
     plan_hist_all,
     plan_att_all,
     exec_xyz_all,
+    vel_xyz_all,
     exec_att_all,
     phi_hist_all,
     fov_axis_hist,
@@ -680,6 +760,7 @@ def _pack_multi_agent_rollout(
         "plan_hist_all": plan_hist_all,
         "plan_att_all": plan_att_all,
         "exec_xyz_all": exec_xyz_all,
+        "vel_xyz_all": [np.asarray(v, dtype=float) for v in vel_xyz_all],
         "exec_att_all": exec_att_all,
         "phi_hist_all": phi_hist_all,
         "fov_axis_hist": fov_axis_hist,
@@ -697,6 +778,7 @@ def _pack_multi_agent_rollout(
         out[f"plan_hist{key}"] = plan_hist_all[idx]
         out[f"plan_att{key}"] = plan_att_all[idx]
         out[f"exec{key}_xyz"] = exec_xyz_all[idx]
+        out[f"vel{key}_xyz"] = np.asarray(vel_xyz_all[idx], dtype=float)
         out[f"exec_att{key}"] = exec_att_all[idx]
         out[f"phi_hist{key}"] = phi_hist_all[idx]
 
@@ -758,15 +840,17 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     if x0.shape[0] < 1 + Na:
         raise ValueError(f"cfg['x0'] must contain defender plus {Na} attackers for num_attackers={Na}.")
 
-    xD = x0[0, :nx].copy()
-    xA_list = [x0[i + 1, :nx].copy() for i in range(Na)]
+    xD = np.asarray(x0[0, :nx], dtype=np.float32).copy()
+    xA_list = [np.asarray(x0[i + 1, :nx], dtype=np.float32).copy() for i in range(Na)]
 
     deterministic = bool(cfg.get("rl_eval_deterministic", True))
     umax = float(cfg.get("umax", 5e-4))
     debug_actions = bool(cfg.get("debug_actions", False))
     stop_on_done = bool(cfg.get("stop_on_done", True))
+    apply_velocity_cbf_filter = _build_velocity_cbf_filter(cfg, D=D, dt=dt, umax=umax)
 
     use_fuel = bool(cfg.get("fuel", {}).get("enable"))
+    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0)
     g0 = 9.80665
 
     if use_fuel:
@@ -818,32 +902,6 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         fuel_depleted = bool(m_next <= m_dry + 1e-9)
         return a_real.astype(np.float32), float(m_next), fuel_depleted, thrust_norm, float(mdot)
 
-    use_obsnorm = bool(cfg.get("obsnorm", False))
-    obs_mean = None
-    obs_std = None
-    radius_knob = cfg.get("arena_radius_knob", {}) or {}
-    obs_include_arena_radius = bool(
-        (Na == 1) and radius_knob.get("append_to_obs", radius_knob.get("enabled", False))
-    )
-    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
-    obs_expected = (2 + 3 * Na) * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
-
-    if use_obsnorm and "obs_stats" in cfg:
-        import os
-
-        mp = cfg["obs_stats"].get("mean_path", None)
-        sp = cfg["obs_stats"].get("std_path", None)
-
-        if mp and os.path.exists(mp):
-            obs_mean = np.load(mp).astype(np.float32)
-        if sp and os.path.exists(sp):
-            obs_std = np.load(sp).astype(np.float32)
-
-        if obs_mean is not None and obs_mean.shape[0] != obs_expected:
-            raise ValueError(f"obs_mean has dim {obs_mean.shape[0]}, expected {obs_expected}.")
-        if obs_std is not None and obs_std.shape[0] != obs_expected:
-            raise ValueError(f"obs_std has dim {obs_std.shape[0]}, expected {obs_expected}.")
-
     def build_train_obs(
         xD_vec: np.ndarray,
         xA_vecs: List[np.ndarray],
@@ -852,16 +910,16 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     ) -> np.ndarray:
         pD = xD_vec[:D]
         vD = xD_vec[D:2 * D]
-        parts: List[np.ndarray] = [(pD - center) * pos_obs_scale]
+        parts: List[np.ndarray] = [pD - center]
 
         for xA_vec in xA_vecs:
-            parts.append((xA_vec[:D] - center) * pos_obs_scale)
+            parts.append(xA_vec[:D] - center)
         for xA_vec in xA_vecs:
-            parts.append((xA_vec[:D] - pD) * pos_obs_scale)
+            parts.append(xA_vec[:D] - pD)
 
-        parts.append(vD * vel_obs_scale)
+        parts.append(vD)
         for xA_vec in xA_vecs:
-            parts.append(xA_vec[D:2 * D] * vel_obs_scale)
+            parts.append(xA_vec[D:2 * D])
 
         if use_fuel:
             fuel_frac_def = (m_def_cur - mdry_def) / (m0_def - mdry_def + 1e-9)
@@ -869,20 +927,12 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
-        if obs_include_arena_radius:
-            denom = max(abs(radius_obs_scale), 1e-9)
-            parts.append(np.array([arena_r / denom], dtype=np.float32))
-
         obs = np.concatenate(parts).astype(np.float32)
-        if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
-            obs = (obs - obs_mean) / (obs_std + 1e-8)
         return obs
 
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = 1.0
-    vel_obs_scale = 1.0
 
     use_kf = bool(cfg.get("use_kf", False))
     estimator_kind = _normalize_estimator_kind(cfg)
@@ -1002,6 +1052,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     plan_hist_all = [[] for _ in range(1 + Na)]
     plan_att_all = [[] for _ in range(1 + Na)]
     exec_xyz_all = [[] for _ in range(1 + Na)]
+    vel_xyz_all = [[] for _ in range(1 + Na)]
     exec_att_all = [[] for _ in range(1 + Na)]
     phi_hist_all = [[] for _ in range(1 + Na)]
     fov_axis_hist, fov_seen_mask = [], []
@@ -1019,6 +1070,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     all_states = [xD] + xA_list
     for idx, xs in enumerate(all_states):
         exec_xyz_all[idx].append(_p3(xs, D))
+        vel_xyz_all[idx].append(_v3_from_state(xs, D))
         exec_att_all[idx].append({"R": I, "phi": 0.0})
         phi_hist_all[idx].append(0.0)
     fov_axis_hist.append(None)
@@ -1088,6 +1140,11 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         else:
             uD_cmd = np.asarray(active_u_baseline, dtype=np.float32)
             uA_cmd = [u.copy() for u in u_policy_cmd]
+        uD_cmd = apply_velocity_cbf_filter(xD[:D], xD[D:2 * D], uD_cmd)
+        uA_cmd = [
+            apply_velocity_cbf_filter(xA_list[j][:D], xA_list[j][D:2 * D], uA_cmd[j])
+            for j in range(Na)
+        ]
 
         cmd_actions = [uD_cmd] + uA_cmd
         for idx, u_cmd in enumerate(cmd_actions):
@@ -1154,6 +1211,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
             plan_hist_all[idx].append([_p3(xs, D)] * T)
             plan_att_all[idx].append([{"R": I, "phi": 0.0} for _ in range(T)])
             exec_xyz_all[idx].append(_p3(xs, D))
+            vel_xyz_all[idx].append(_v3_from_state(xs, D))
             exec_att_all[idx].append({"R": I, "phi": 0.0})
             phi_hist_all[idx].append(0.0)
 
@@ -1175,6 +1233,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         plan_hist_all=plan_hist_all,
         plan_att_all=plan_att_all,
         exec_xyz_all=exec_xyz_all,
+        vel_xyz_all=vel_xyz_all,
         exec_att_all=exec_att_all,
         phi_hist_all=phi_hist_all,
         fov_axis_hist=fov_axis_hist,
@@ -1225,13 +1284,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
 
     num_attackers = int(cfg.get("num_attackers", 1))
     if num_attackers > 1:
-        return _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
-            cfg,
-            policy_role=policy_role,
-            opponent_baseline=opponent_baseline,
-            steps=steps,
-            turn_len=turn_len,
-        )
+        raise NotImplementedError("The multi-attacker matchup path has been removed; use num_attackers=1.")
 
     if steps is None:
         steps = int(cfg.get("T_eval", cfg.get("T", cfg.get("steps", 60))))
@@ -1259,15 +1312,17 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     if x0.shape[0] < 2:
         raise ValueError("cfg['x0'] must contain at least defender and attacker rows.")
 
-    x1 = x0[0, :nx].copy()
-    x2 = x0[1, :nx].copy()
+    x1 = np.asarray(x0[0, :nx], dtype=np.float32).copy()
+    x2 = np.asarray(x0[1, :nx], dtype=np.float32).copy()
 
     deterministic = bool(cfg.get("rl_eval_deterministic", True))
     umax = float(cfg.get("umax", 5e-4))
     debug_actions = bool(cfg.get("debug_actions", False))
     stop_on_done = bool(cfg.get("stop_on_done", True))
+    apply_velocity_cbf_filter = _build_velocity_cbf_filter(cfg, D=D, dt=dt, umax=umax)
 
     use_fuel = bool(cfg.get("fuel", {}).get("enable"))
+    obs_expected = 5 * D + (2 if use_fuel else 0)
     g0 = 9.80665
 
     if use_fuel:
@@ -1322,34 +1377,6 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
 
         return a_real.astype(np.float32), float(m_next), fuel_depleted, thrust_norm, float(mdot)
 
-    use_obsnorm = bool(cfg.get("obsnorm", False))
-    obs_mean = None
-    obs_std = None
-    radius_knob = cfg.get("arena_radius_knob", {}) or {}
-    obs_include_arena_radius = bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))
-    radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
-    obs_expected = 5 * D + (2 if use_fuel else 0) + (1 if obs_include_arena_radius else 0)
-
-    if use_obsnorm and "obs_stats" in cfg:
-        import os
-
-        mp = cfg["obs_stats"].get("mean_path", None)
-        sp = cfg["obs_stats"].get("std_path", None)
-
-        if mp and os.path.exists(mp):
-            obs_mean = np.load(mp).astype(np.float32)
-        if sp and os.path.exists(sp):
-            obs_std = np.load(sp).astype(np.float32)
-
-        if obs_mean is not None and obs_mean.shape[0] != obs_expected:
-            raise ValueError(
-                f"obs_mean has dim {obs_mean.shape[0]}, expected {obs_expected}."
-            )
-        if obs_std is not None and obs_std.shape[0] != obs_expected:
-            raise ValueError(
-                f"obs_std has dim {obs_std.shape[0]}, expected {obs_expected}."
-            )
-
     def build_train_obs(
         x1_vec: np.ndarray,
         x2_vec: np.ndarray,
@@ -1362,11 +1389,11 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         v2 = x2_vec[D:2 * D]
 
         parts = [
-            (p1 - center) * pos_obs_scale,
-            (p2 - center) * pos_obs_scale,
-            (p2 - p1) * pos_obs_scale,
-            v1 * vel_obs_scale,
-            v2 * vel_obs_scale,
+            p1 - center,
+            p2 - center,
+            p2 - p1,
+            v1,
+            v2,
         ]
 
         if use_fuel:
@@ -1375,20 +1402,12 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
-        if obs_include_arena_radius:
-            denom = max(abs(radius_obs_scale), 1e-9)
-            parts.append(np.array([arena_r / denom], dtype=np.float32))
-
         obs = np.concatenate(parts).astype(np.float32)
-        if use_obsnorm and (obs_mean is not None) and (obs_std is not None):
-            obs = (obs - obs_mean) / (obs_std + 1e-8)
         return obs
 
     step_plant_single, center_from_dyn, _ = _build_step_plant_single(cfg, steps=steps, D=D)
     center = np.asarray(center_from_dyn, dtype=np.float32)
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
-    pos_obs_scale = 1.0
-    vel_obs_scale = 1.0
 
     def _u3(uD: np.ndarray):
         uD = np.asarray(uD, float).reshape(-1)
@@ -1618,6 +1637,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     plan_hist1, plan_hist2 = [], []
     plan_att1, plan_att2 = [], []
     exec_xyz1, exec_xyz2 = [], []
+    vel_xyz1, vel_xyz2 = [], []
     exec_att1, exec_att2 = [], []
     phi_hist1, phi_hist2 = [], []
     fov_axis_hist, fov_seen_mask = [], []
@@ -1633,6 +1653,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
 
     exec_xyz1.append(_p3(x1, D))
     exec_xyz2.append(_p3(x2, D))
+    vel_xyz1.append(_v3_from_state(x1, D))
+    vel_xyz2.append(_v3_from_state(x2, D))
     exec_att1.append({"R": _identity_R(), "phi": 0.0})
     exec_att2.append({"R": _identity_R(), "phi": 0.0})
     phi_hist1.append(0.0)
@@ -1705,6 +1727,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         else:
             u1_cmd = active_u_baseline.copy()
             u2_cmd = u_policy_cmd
+        u1_cmd = apply_velocity_cbf_filter(x1[:D], x1[D:2 * D], u1_cmd)
+        u2_cmd = apply_velocity_cbf_filter(x2[:D], x2[D:2 * D], u2_cmd)
 
         u1_cmd_3 = _u3(u1_cmd)
         u2_cmd_3 = _u3(u2_cmd)
@@ -1848,6 +1872,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         phi_hist2.append(0.0)
         exec_xyz1.append(_p3(x1, D))
         exec_xyz2.append(_p3(x2, D))
+        vel_xyz1.append(_v3_from_state(x1, D))
+        vel_xyz2.append(_v3_from_state(x2, D))
         fov_axis_hist.append(None)
         fov_seen_mask.append(False)
 
@@ -1869,6 +1895,12 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         "plan_att2": plan_att2,
         "exec1_xyz": exec_xyz1,
         "exec2_xyz": exec_xyz2,
+        "vel1_xyz": np.asarray(vel_xyz1, dtype=float),
+        "vel2_xyz": np.asarray(vel_xyz2, dtype=float),
+        "vel_xyz_all": [
+            np.asarray(vel_xyz1, dtype=float),
+            np.asarray(vel_xyz2, dtype=float),
+        ],
         "exec_att1": exec_att1,
         "exec_att2": exec_att2,
         "phi_hist1": phi_hist1,

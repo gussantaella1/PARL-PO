@@ -15,64 +15,53 @@ import torch.optim as optim
 
 from core.utils import set_seed
 from core.models import ActorCriticDiff as ActorCriticDiffSingle
+from config_rl import build_dyn as build_dyn_impl
+from core.env import Env as EnvImpl
+from core.controllers import AttackerRuleController
 
 
 def _build_dyn_for_cfg(cfg: Dict[str, Any]):
-    if int(cfg.get("num_attackers", 1)) > 1:
-        from config_rl_1v2 import build_dyn as build_dyn_impl
-    else:
-        from config_rl import build_dyn as build_dyn_impl
     return build_dyn_impl(cfg)
-
-from core_1v2.models import ActorCriticDiff as ActorCriticDiffMulti
-from core.controllers import AttackerRuleController
-from core_1v2.utils import _obs_offsets, permute_obs_for_attacker
 
 
 def _env_cls_for_cfg(cfg: Dict[str, Any]):
-    if int(cfg.get("num_attackers", 1)) > 1:
-        from core_1v2.env import Env as EnvImpl
-    else:
-        from core.env import Env as EnvImpl
     return EnvImpl
 
 
 def _num_attackers(cfg: Dict[str, Any]) -> int:
-    return max(1, int(cfg.get("num_attackers", 1)))
+    num_attackers = max(1, int(cfg.get("num_attackers", 1)))
+    if num_attackers != 1:
+        raise ValueError("Distillation now supports only the 1v1 setting (num_attackers=1).")
+    return num_attackers
 
 
 def _actor_critic_cls(cfg: Dict[str, Any]):
-    return ActorCriticDiffMulti if _num_attackers(cfg) > 1 else ActorCriticDiffSingle
+    _num_attackers(cfg)
+    return ActorCriticDiffSingle
 
 
 def _obs_dim_from_cfg(cfg: Dict[str, Any]) -> int:
     D = int(cfg["D"])
-    Na = _num_attackers(cfg)
+    _num_attackers(cfg)
     fuel_dim = 2 if cfg.get("fuel", {}).get("enable", False) else 0
-    radius_knob = cfg.get("arena_radius_knob", {}) or {}
-    extra_dim = 1 if (Na == 1 and bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))) else 0
-    return (2 + 3 * Na) * D + fuel_dim + extra_dim
+    return 5 * D + fuel_dim
 
 
 def _permute_obs_np(obs: np.ndarray, D: int, Na: int, attacker_idx: int) -> np.ndarray:
-    obs_np = np.asarray(obs, dtype=np.float32)
-    if Na <= 1 or attacker_idx == 0:
-        return obs_np
-    obs_t = torch.as_tensor(obs_np[None, :], dtype=torch.float32)
-    obs_perm = permute_obs_for_attacker(obs_t, attacker_idx, D, Na)
-    return obs_perm.squeeze(0).cpu().numpy().astype(np.float32)
+    _ = (D, attacker_idx)
+    if Na != 1:
+        raise ValueError("Observation permutation is unavailable outside the 1v1 setting.")
+    return np.asarray(obs, dtype=np.float32)
 
 
 def _relative_state_from_obs(obs: np.ndarray, D: int, Na: int) -> np.ndarray:
     obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
-    _off_p1, _off_pA, off_rel, off_v1, off_vA = _obs_offsets(D, Na)
-    rel_blocks = [obs_np[off_rel + k * D : off_rel + (k + 1) * D] for k in range(Na)]
-    v1 = obs_np[off_v1 : off_v1 + D]
-    dv_blocks = []
-    for k in range(Na):
-        vA_k = obs_np[off_vA + k * D : off_vA + (k + 1) * D]
-        dv_blocks.append(vA_k - v1)
-    return np.concatenate(rel_blocks + dv_blocks).astype(np.float32)
+    if Na != 1:
+        raise ValueError("Relative-state extraction now supports only the 1v1 setting.")
+    rel = obs_np[2 * D : 3 * D]
+    v1 = obs_np[3 * D : 4 * D]
+    v2 = obs_np[4 * D : 5 * D]
+    return np.concatenate([rel, v2 - v1]).astype(np.float32)
 
 
 def _load_checkpoint_payload(path: str, map_location, label: str):
@@ -461,17 +450,6 @@ def _full_obs_from_env(env) -> np.ndarray:
         parts.append(np.array([np.clip(fdef, 0.0, 1.0)], dtype=np.float32))
         parts.append(np.array([np.clip(fatt, 0.0, 1.0)], dtype=np.float32))
 
-    radius_obs = None
-    radius_obs_fn = getattr(env, "_arena_radius_obs", None)
-    if callable(radius_obs_fn):
-        radius_obs = radius_obs_fn()
-    elif bool(getattr(env, "obs_include_arena_radius", False)):
-        denom = max(abs(float(getattr(env, "radius_obs_scale", 1.0))), 1e-9)
-        radius_obs = np.array([float(env.radius) / denom], dtype=np.float32)
-
-    if radius_obs is not None:
-        parts.append(np.asarray(radius_obs, dtype=np.float32).reshape(-1))
-
     return np.concatenate(parts).astype(np.float32)
 
 
@@ -750,13 +728,7 @@ def distill_from_teacher_paper_recurrent(
 
     cfg = copy.deepcopy(cfg)
     Na = _num_attackers(cfg)
-    cfg["use_kf"] = (Na == 1)
-    estimator_label = str(cfg.get("estimator_kind", "ukf")).upper()
-    if Na > 1:
-        print(
-            f"[distill] num_attackers>1: {estimator_label} is unavailable, so distillation uses direct env observations "
-            "with zero covariance features."
-        )
+    cfg["use_kf"] = True
 
     if ("dyn" not in cfg) or (cfg["dyn"].get("Ad") is None) or (cfg["dyn"].get("Bd") is None):
         _build_dyn_for_cfg(cfg)
@@ -1224,7 +1196,8 @@ def distill_from_teacher_modern(
 
     """
     cfg_mod = copy.deepcopy(cfg)
-    cfg_mod["use_kf"] = (_num_attackers(cfg_mod) == 1)
+    _num_attackers(cfg_mod)
+    cfg_mod["use_kf"] = True
     cfg_mod["_distill_save_method"] = "modern"
     cfg_mod.setdefault("distill_paper_action_loss", "mse")
     cfg_mod.setdefault("distill_paper_intent_loss", "mse")

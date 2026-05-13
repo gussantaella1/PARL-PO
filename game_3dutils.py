@@ -101,9 +101,9 @@ def build_h_builders(cfg, nx, D):
         funcs.append(h_sep)
 
     # -------- speed cap --------
-    vmax = cfg["vmax"] if "vmax" in cfg else (cfg["speed_max"] if "speed_max" in cfg else None)
-    if vmax is not None:
-        vmax2 = float(vmax)**2
+    raw_vmax = cfg["vmax"] if "vmax" in cfg else (cfg["speed_max"] if "speed_max" in cfg else None)
+    if raw_vmax is not None:
+        vmax2 = float(raw_vmax)**2
         vel_idx = list(range(D, 2*D))
         def _speed_h(agent):
             def h(m,k,_a=agent,_v=vel_idx,_v2=vmax2):
@@ -317,4 +317,3 @@ def in_fov(p_t, x_def, axis, fov_cfg, D: int):
     half = 0.5*np.deg2rad(float(fov_cfg["hfov_deg"]))
     cosang = float(np.dot(_unit(rel), _unit(axis)))
     return (cosang >= np.cos(half)), dist
-

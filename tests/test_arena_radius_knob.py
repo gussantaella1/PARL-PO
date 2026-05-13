@@ -54,6 +54,7 @@ class ArenaRadiusKnobTests(unittest.TestCase):
 
     def test_disabled_knob_ignores_staged_update_validation(self):
         cfg = self._base_cfg()
+        cfg["arena_radius_knob"]["enabled"] = False
 
         env = Env(cfg)
 
@@ -73,11 +74,50 @@ class ArenaRadiusKnobTests(unittest.TestCase):
         cfg = self._base_cfg()
         cfg["arena_radius_knob"]["enabled"] = True
         cfg["arena_radius_knob"]["schedule"] = "staged"
+        cfg["arena_radius_knob"]["stages"] = [
+            {"radius_m": 20.0, "updates": 1},
+            {"radius_m": 40.0, "updates": 1},
+        ]
+        cfg["total_updates"] = 3
 
         env = Env(cfg)
 
         with self.assertRaisesRegex(ValueError, "update counts must sum"):
             env._scheduled_arena_radius()
+
+    def test_stage_specific_attacker_shell_overrides_global_bounds(self):
+        cfg = self._base_cfg()
+        cfg["train_ic_mode"] = "random_shell"
+        cfg["train_min_sep"] = 0.0
+        cfg["total_updates"] = 2
+        cfg["r_def_min_m"] = 0.0
+        cfg["r_def_max_m"] = 0.0
+        cfg["r_att_min_m"] = 6.0
+        cfg["r_att_max"] = 0.95
+        cfg["arena_radius_knob"]["enabled"] = True
+        cfg["arena_radius_knob"]["schedule"] = "staged"
+        cfg["arena_radius_knob"]["sample_mode"] = "fixed"
+        cfg["arena_radius_knob"]["integer_only"] = False
+        cfg["arena_radius_knob"]["stages"] = [
+            {"radius_m": 20.0, "updates": 1, "r_att_min": 0.10, "r_att_max": 0.20},
+            {"radius_m": 40.0, "updates": 1, "r_att_min_m": 30.0, "r_att_max_m": 32.0},
+        ]
+
+        env = Env(cfg)
+
+        env.curriculum_progress = 0.0
+        env.reset()
+        _, _, pA_list, _ = env._unpack(env.state)
+        r_stage0 = float(np.linalg.norm(pA_list[0] - env.center))
+        self.assertGreaterEqual(r_stage0, 2.0 - 1e-6)
+        self.assertLessEqual(r_stage0, 4.0 + 1e-6)
+
+        env.curriculum_progress = 1.0
+        env.reset()
+        _, _, pA_list, _ = env._unpack(env.state)
+        r_stage1 = float(np.linalg.norm(pA_list[0] - env.center))
+        self.assertGreaterEqual(r_stage1, 30.0 - 1e-6)
+        self.assertLessEqual(r_stage1, 32.0 + 1e-6)
 
 
 if __name__ == "__main__":

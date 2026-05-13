@@ -1,0 +1,39 @@
+% Drop-in snippet for papers using \usepackage{algorithm} and \usepackage{algpseudocode}
+\begin{algorithm}[H]
+\caption{Velocity CBF-QP Saturation Filter}
+\label{alg:velocity-cbf-qp}
+\begin{algorithmic}[1]
+\State \textbf{Given:} nominal action $u_t^{\mathrm{nom}}$, agent state $(p_t,v_t)$, box bounds $-u_{\max}\le u\le u_{\max}$, speed limit $v_{\max}$, CBF gain $\alpha$, HCW mean motion $n$
+\State Compute barrier value $h_t \leftarrow v_{\max}^2-\|v_t\|_2^2$
+\State Compute HCW drift in the velocity channel
+\[
+f_v(p_t,v_t)\leftarrow
+\begin{bmatrix}
+3n^2 p_{x,t}+2n v_{y,t}\\
+-2n v_{x,t}\\
+-n^2 p_{z,t}
+\end{bmatrix}
+\]
+\State Form the CBF half-space from $\dot h_t+\alpha h_t\ge 0$
+\[
+a_t \leftarrow 2v_t,\qquad
+b_t \leftarrow \alpha h_t - 2 v_t^\top f_v(p_t,v_t)
+\]
+\State Solve the box-constrained projection
+\[
+u_t^\star \leftarrow
+\arg\min_{u}\ \tfrac12\|u-u_t^{\mathrm{nom}}\|_2^2
+\quad\text{s.t.}\quad
+a_t^\top u \le b_t,\ \ -u_{\max}\le u\le u_{\max}
+\]
+\State Clip $u_t^{\mathrm{nom}}$ to the box bounds; if the clipped action already satisfies $a_t^\top u \le b_t$, return it
+\State Let $u_{\min}$ be the box corner with components $(u_{\min})_k=-u_{\max}$ if $(a_t)_k\ge 0$ and $(u_{\min})_k=+u_{\max}$ otherwise
+\State If $a_t^\top u_{\min}>b_t$, return $u_t^\star\leftarrow u_{\min}$
+\State Otherwise search the KKT multiplier $\lambda\ge 0$ and evaluate
+\[
+u(\lambda)\leftarrow \mathrm{clip}\!\big(u_t^{\mathrm{nom}}-\lambda a_t,\ -u_{\max},\ u_{\max}\big)
+\]
+\State Increase $\lambda$ until $a_t^\top u(\lambda)\le b_t$, then bisect on $\lambda$ to the desired tolerance
+\State Return the projected safe action $u_t^\star \leftarrow u(\lambda)$
+\end{algorithmic}
+\end{algorithm}

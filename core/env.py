@@ -8,6 +8,12 @@ import os
 
 from ukf_estimator import KF_CV, _body_bearing_from_world, _azel_from_body_vec
 from config_rl import build_dyn
+from core.safety_filter import (
+    project_box_halfspace_np,
+    project_box_halfspace_torch,
+    velocity_cbf_halfspace_np,
+    velocity_cbf_halfspace_torch,
+)
 from core.utils import resolve_start_radius_bounds, set_seed
 
 # =============================================================
@@ -19,14 +25,12 @@ class Env:
     Observation: [p1-center, p2-center, (p2-p1), v1, v2]  (size = 5*D)
 
     Per-step rewards (distances normalized by R^2):
-      r_def = +αΔd2 + k_pos d2 - k_rel rel2 - k_cent d1 - k_vel||v1||^2 - k_vrad*vrad1^2 - λD||a1||^2 - wall1
-      r_att = -αΔd2 - k_pos d2 + k_rel rel2             - k_vel||v2||^2                           - wall2 - λA||a2||^2
+      r_def = +αΔd2 + k_pos d2 - k_dock*dock_gap - k_rel rel2 - k_cent d1 - k_vel||v1||^2 - k_vrad*vrad1^2 - λD||a1||^2 - wall1
+      r_att = -αΔd2 - k_pos d2 + k_dock*dock_gap + k_rel rel2             - k_vel||v2||^2                           - wall2 - λA||a2||^2
 
     Terminal bonus at done: r_def += β d2 - 0.10 d1, r_att -= β d2.
     """
     def __init__(self, cfg: Dict[str, Any]):
-        # self.scale_invariant = bool(cfg["scale_invariant"])
-
         self.cfg = cfg
         self.num_attackers = int(cfg.get("num_attackers", 1))
         self.D = int(cfg["D"])
@@ -41,8 +45,6 @@ class Env:
             raise ValueError("Only 'sphere' arena is implemented.")
         self.center = np.array([ar["cx"], ar["cy"], (ar["cz"] if self.D == 3 else 0.0)], dtype=np.float32)[:self.D]
         self.radius = float(ar["r"])
-        self._pos_obs_scale = 1.0
-        self._vel_obs_scale = 1.0
 
 
         self.def_keepout_buffer_m = float(cfg.get("def_keepout_buffer_m", 0.0))
@@ -50,6 +52,42 @@ class Env:
 
 
         umax = float(cfg["umax"]) ; self.u_lo, self.u_hi = -umax, +umax
+        raw_vmax = cfg.get("vmax", None)
+        self.vmax = np.inf if raw_vmax is None else float(raw_vmax)
+        if self.vmax < 0.0:
+            raise ValueError(f"vmax must be >= 0 or None, got {raw_vmax!r}.")
+
+        sf_cfg = dict(cfg.get("safety_filter", {}) or {})
+        self.velocity_cbf_enabled = bool(sf_cfg.get("enabled", False))
+        self.velocity_cbf_kind = str(sf_cfg.get("kind", "velocity_cbf_qp")).strip().lower()
+        raw_cbf_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+        self.velocity_cbf_vmax = np.inf if raw_cbf_vmax is None else float(raw_cbf_vmax)
+        self.velocity_cbf_alpha = float(sf_cfg.get("alpha", 5.0))
+        self._velocity_cbf_dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
+        self._velocity_cbf_hcw_n = None
+        if self._velocity_cbf_dyn_name == "hcw":
+            hcw_cfg = dict(cfg.get("hcw", {}) or {})
+            if "n" in hcw_cfg:
+                self._velocity_cbf_hcw_n = float(hcw_cfg["n"])
+            else:
+                mu = float(hcw_cfg.get("mu", 3.986004418e14))
+                r0 = float(hcw_cfg["r0"])
+                self._velocity_cbf_hcw_n = float(np.sqrt(mu / (r0 ** 3)))
+        if self.velocity_cbf_enabled:
+            if self.velocity_cbf_kind != "velocity_cbf_qp":
+                raise ValueError(
+                    f"Unsupported safety_filter.kind={self.velocity_cbf_kind!r}; "
+                    "expected 'velocity_cbf_qp'."
+                )
+            if not np.isfinite(self.velocity_cbf_vmax) or self.velocity_cbf_vmax <= 0.0:
+                raise ValueError(
+                    "safety_filter requires a finite positive vmax either in "
+                    "safety_filter['vmax'] or top-level cfg['vmax']."
+                )
+            if self.velocity_cbf_alpha <= 0.0:
+                raise ValueError(
+                    f"safety_filter['alpha'] must be > 0, got {self.velocity_cbf_alpha}."
+                )
 
         Ad = cfg["dyn"]["Ad"]; Bd = cfg["dyn"]["Bd"]
         if Ad is None or Bd is None:
@@ -321,35 +359,69 @@ class Env:
         radius_knob = dict(cfg.get("arena_radius_knob", {}) or {})
         self.arena_radius_knob = radius_knob
         self.arena_radius_knob_enabled = bool(radius_knob.get("enabled", False))
-        self.obs_include_arena_radius = bool(radius_knob.get("append_to_obs", self.arena_radius_knob_enabled))
-        self.radius_obs_scale = float(radius_knob.get("obs_scale", 1.0))
         self.curriculum_progress = 0.0
-        self._arena_radius_stages: list[tuple[float, float]] | None = None
+        self._arena_radius_stages: list[dict[str, Any]] | None = None
         self._base_arena_radius = float(self.radius)
         self._apply_arena_radius(self.radius)
 
     def set_opp_domain(self, mode: str):
         self.opp_domain = str(mode)
 
+    def _apply_velocity_cbf_filter(self, p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+        u_nom = np.asarray(u_nom, dtype=float).reshape(self.D,)
+        if not self.velocity_cbf_enabled:
+            return np.clip(u_nom, self.u_lo, self.u_hi)
+
+        a, b = velocity_cbf_halfspace_np(
+            p,
+            v,
+            vmax=self.velocity_cbf_vmax,
+            alpha=self.velocity_cbf_alpha,
+            dyn_name=self._velocity_cbf_dyn_name,
+            dt=self.dt,
+            D=self.D,
+            Ad=self.Ad,
+            Bd=self.Bd,
+            hcw_n=self._velocity_cbf_hcw_n,
+        )
+        return project_box_halfspace_np(u_nom, self.u_lo, self.u_hi, a, b)
+
     def _reward_normalization_radius(self) -> float:
         if self.reward_normalize_radius_m is not None:
             return float(self.reward_normalize_radius_m)
         return float(self.radius)
 
-    def _normalize_arena_radius_stages(self, raw_stages: Any) -> list[tuple[float, float]]:
+    def _normalize_arena_radius_stages(self, raw_stages: Any) -> list[dict[str, Any]]:
         if raw_stages is None:
             return []
         if not isinstance(raw_stages, (list, tuple)):
             raise ValueError("arena_radius_knob['stages'] must be a list of stage specs.")
 
-        fraction_stages: list[tuple[float, float]] = []
-        update_stages: list[tuple[float, int]] = []
+        shell_keys = (
+            "r_def_min",
+            "r_def_max",
+            "r_def_min_m",
+            "r_def_max_m",
+            "r_att_min",
+            "r_att_max",
+            "r_att_min_m",
+            "r_att_max_m",
+        )
+
+        fraction_stages: list[dict[str, Any]] = []
+        update_stages: list[dict[str, Any]] = []
         stage_units: str | None = None
         for idx, stage in enumerate(raw_stages):
+            shell_overrides: dict[str, Any] = {}
             if isinstance(stage, dict):
                 radius = stage.get("radius_m", stage.get("radius", stage.get("r")))
                 fraction = stage.get("fraction", stage.get("frac", stage.get("share")))
                 updates = stage.get("updates", stage.get("update", stage.get("num_updates")))
+                shell_overrides = {
+                    key: copy.deepcopy(stage[key])
+                    for key in shell_keys
+                    if key in stage
+                }
             elif isinstance(stage, (list, tuple)) and len(stage) == 2:
                 radius, fraction = stage
                 updates = None
@@ -390,14 +462,22 @@ class Env:
                         f"arena_radius_knob['stages'][{idx}] must have a positive integer "
                         f"updates count, got {updates}."
                     )
-                update_stages.append((radius, updates_rounded))
+                update_stages.append({
+                    "radius": radius,
+                    "updates": updates_rounded,
+                    "shell_overrides": shell_overrides,
+                })
             else:
                 fraction_val = float(fraction)
                 if fraction_val <= 0.0:
                     raise ValueError(
                         f"arena_radius_knob['stages'][{idx}] must have fraction > 0, got {fraction_val}."
                     )
-                fraction_stages.append((radius, fraction_val))
+                fraction_stages.append({
+                    "radius": radius,
+                    "fraction": fraction_val,
+                    "shell_overrides": shell_overrides,
+                })
 
         if stage_units == "updates":
             total_updates_cfg = int(self.cfg.get("total_updates", 0))
@@ -405,26 +485,30 @@ class Env:
                 raise ValueError(
                     "arena_radius_knob stages specified with 'updates' require cfg['total_updates'] > 0."
                 )
-            total_updates_stages = sum(updates for _, updates in update_stages)
+            total_updates_stages = sum(int(stage["updates"]) for stage in update_stages)
             if total_updates_stages != total_updates_cfg:
                 raise ValueError(
                     "arena_radius_knob['stages'] update counts must sum to "
                     f"cfg['total_updates'] ({total_updates_cfg}), got {total_updates_stages}."
                 )
-            return [
-                (radius, updates / float(total_updates_cfg))
-                for radius, updates in update_stages
-            ]
+            return [{
+                "radius": float(stage["radius"]),
+                "fraction": int(stage["updates"]) / float(total_updates_cfg),
+                "shell_overrides": copy.deepcopy(stage["shell_overrides"]),
+            } for stage in update_stages]
 
-        total_fraction = sum(fraction for _, fraction in fraction_stages)
+        total_fraction = sum(float(stage["fraction"]) for stage in fraction_stages)
         if total_fraction <= 0.0:
             raise ValueError("arena_radius_knob['stages'] must have a positive total fraction.")
 
-        return [(radius, fraction / total_fraction) for radius, fraction in fraction_stages]
+        return [{
+            "radius": float(stage["radius"]),
+            "fraction": float(stage["fraction"]) / total_fraction,
+            "shell_overrides": copy.deepcopy(stage["shell_overrides"]),
+        } for stage in fraction_stages]
 
     def _apply_arena_radius(self, radius: float):
         self.radius = float(radius)
-        self._vel_obs_scale = 1.0
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
         reward_norm_radius = self._reward_normalization_radius()
         self._reward_dist_scale = reward_norm_radius if self.normalize_reward else 1.0
@@ -440,14 +524,14 @@ class Env:
     def _arena_radius_schedule(self) -> str:
         return str(self.arena_radius_knob.get("schedule", "linear")).strip().lower()
 
-    def _get_arena_radius_stages(self) -> list[tuple[float, float]]:
+    def _get_arena_radius_stages(self) -> list[dict[str, Any]]:
         if self._arena_radius_stages is None:
             self._arena_radius_stages = self._normalize_arena_radius_stages(
                 self.arena_radius_knob.get("stages")
             )
         return self._arena_radius_stages
 
-    def _staged_arena_radius(self) -> float:
+    def _current_arena_stage(self) -> dict[str, Any]:
         stages = self._get_arena_radius_stages()
         if not stages:
             raise ValueError(
@@ -456,12 +540,30 @@ class Env:
 
         progress = float(np.clip(self.curriculum_progress, 0.0, 1.0))
         cumulative = 0.0
-        for idx, (radius, fraction) in enumerate(stages):
-            cumulative += fraction
+        for idx, stage in enumerate(stages):
+            cumulative += float(stage["fraction"])
             if progress < cumulative or idx == (len(stages) - 1):
-                return radius
+                return stage
 
-        return stages[-1][0]
+        return stages[-1]
+
+    def _staged_arena_radius(self) -> float:
+        return float(self._current_arena_stage()["radius"])
+
+    def _current_stage_shell_overrides(self) -> dict[str, Any]:
+        if not self.arena_radius_knob_enabled:
+            return {}
+        if self._arena_radius_schedule() not in ("staged", "stage", "piecewise"):
+            return {}
+        return dict(self._current_arena_stage().get("shell_overrides", {}) or {})
+
+    def _resolve_episode_shell_bounds(self, arena_radius: float, *, who: str) -> tuple[float, float]:
+        return resolve_start_radius_bounds(
+            self.cfg,
+            arena_radius,
+            who=who,
+            overrides=self._current_stage_shell_overrides(),
+        )
 
     def _scheduled_arena_radius(self) -> float:
         if not self.arena_radius_knob_enabled:
@@ -503,12 +605,6 @@ class Env:
                 return float(int(np.round(active_radius)))
             return float(np.random.randint(lo_i, hi_i + 1))
         return float(np.random.uniform(lo, hi))
-
-    def _arena_radius_obs(self) -> np.ndarray | None:
-        if not self.obs_include_arena_radius:
-            return None
-        denom = max(abs(self.radius_obs_scale), 1e-9)
-        return np.array([self.radius / denom], dtype=np.float32)
 
     def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
         if (not self.use_kf) or (self.ukf is None):
@@ -690,8 +786,8 @@ class Env:
             # r_def_min, r_def_max = 0.0, 0.5 * R
             # r_att_min, r_att_max = 0.4 * R, 0.95 * R
 
-            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
-            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
+            r_def_min, r_def_max = self._resolve_episode_shell_bounds(R, who="def")
+            r_att_min, r_att_max = self._resolve_episode_shell_bounds(R, who="att")
 
 
             # defender
@@ -743,10 +839,14 @@ class Env:
             percent_advantage_defender = self.cfg.get("percent_advantage_defender", 0.75)
             radial_margin = float(percent_advantage_defender*np.pi*2*oi_r) 
 
-            r_def_min, r_def_max = resolve_start_radius_bounds(self.cfg, R, who="def")
-            r_att_min, r_att_max = resolve_start_radius_bounds(self.cfg, R, who="att")
+            r_def_min, r_def_max = self._resolve_episode_shell_bounds(R, who="def")
+            r_att_min, r_att_max = self._resolve_episode_shell_bounds(R, who="att")
 
             r_att_min = max(r_att_min, radial_margin)
+            max_feasible_def_radius = r_att_max - radial_margin
+            # No defender sample outside this cap can ever satisfy the configured
+            # radial advantage, even in the most favorable attacker placement.
+            r_def_max = min(r_def_max, max_feasible_def_radius)
 
             if radial_margin < 0.0:
                 raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
@@ -757,7 +857,7 @@ class Env:
                 raise ValueError(f"Invalid attacker shell: [{r_att_min}, {r_att_max}]")
 
             # Quick feasibility sanity check
-            if r_def_min > (r_att_max - radial_margin):
+            if r_def_min > max_feasible_def_radius:
                 raise ValueError(
                     "Infeasible radial shells: defender cannot be at least "
                     f"{radial_margin:.3f} m closer to center than attacker. "
@@ -848,7 +948,7 @@ class Env:
 
         # ---- flatten to state (all agents) ----
         self._record_ic_scene(x0)
-        self.state = x0.reshape(-1)
+        self.state = x0.reshape(-1).astype(np.float32, copy=True)
 
         # With multi-attacker _unpack, we get lists:
         p1, v1, pA_list, vA_list = self._unpack(self.state)
@@ -948,14 +1048,21 @@ class Env:
             if self.weak_noise_std > 0:
                 a1_cmd = a1_cmd + np.random.normal(0.0, self.weak_noise_std, size=(self.D,))
 
-        a1_cmd = np.clip(a1_cmd, self.u_lo, self.u_hi)
-
         # Attacker commanded actions
         aA_cmd = np.asarray(aA_env, float)
         if aA_cmd.ndim == 1:
             aA_cmd = aA_cmd.reshape(1, self.D)
         else:
             aA_cmd = aA_cmd.reshape(self.num_attackers, self.D)
+
+        p1_cur, v1_cur, pA_cur, vA_cur = self._unpack(self.state)
+        if self.opp_domain == "none":
+            a1_cmd = np.clip(a1_cmd, self.u_lo, self.u_hi)
+        else:
+            a1_cmd = self._apply_velocity_cbf_filter(p1_cur, v1_cur, a1_cmd)
+        for k in range(self.num_attackers):
+            aA_cmd[k] = self._apply_velocity_cbf_filter(pA_cur[k], vA_cur[k], aA_cmd[k])
+        a1_cmd = np.clip(a1_cmd, self.u_lo, self.u_hi)
         aA_cmd = np.clip(aA_cmd, self.u_lo, self.u_hi)
 
         # -------------------------------------------------
@@ -1106,6 +1213,8 @@ class Env:
 
         rel2_raw = float(np.dot((p2_reward - p1), (p2_reward - p1)))
         rel2 = self._reward_geom_from_sqdist(rel2_raw)
+        dist_rel = float(np.sqrt(max(rel2_raw, 0.0)))
+        dock_gap = max(0.0, dist_rel - self.collision_radius_m) / max(self._reward_dist_scale, 1e-9)
 
         # d1 only needed for defender reward (step/terminal), but cheap; compute only if needed
         if need_def:
@@ -1206,6 +1315,7 @@ class Env:
                 raise RuntimeError("use_zero_sum requires use_kf=False.")
             g = (
                 self.k_pos * d2
+                - self.k_dock * dock_gap
             )
 
             # Control effort: defender pays for actuation directly in g, attacker sees the
@@ -1257,6 +1367,7 @@ class Env:
                 raise RuntimeError("use_zero_sum_kf requires use_kf=True.")
             g = (
                 self.k_pos * d2
+                - self.k_dock * dock_gap
             )
 
             # Control effort: defender pays for actuation directly in g, attacker sees the
@@ -1334,6 +1445,7 @@ class Env:
             "t": self.t,
             "d2_norm": d2,                 # whatever you used for reward (belief if UKF)
             "rel2_norm": rel2,
+            "dock_gap_norm": dock_gap,
             "oob_def": bool(oob1),
             "oob_att": bool(oob2_any),
             "hit_target": bool(hit_target),
@@ -1423,10 +1535,6 @@ class Env:
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
 
-        radius_obs = self._arena_radius_obs()
-        if radius_obs is not None:
-            parts.append(radius_obs)
-
         obs = np.concatenate(parts).astype(np.float32)
         return obs
 
@@ -1449,10 +1557,6 @@ class Env:
             fuel_frac_att = (self.m_att[0] - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
             parts.append(np.array([np.clip(fuel_frac_def, 0.0, 1.0)], dtype=np.float32))
             parts.append(np.array([np.clip(fuel_frac_att, 0.0, 1.0)], dtype=np.float32))
-
-        radius_obs = self._arena_radius_obs()
-        if radius_obs is not None:
-            parts.append(radius_obs)
 
         return np.concatenate(parts).astype(np.float32)
 
@@ -1512,7 +1616,7 @@ class Env:
             parts.append(p2n)
             parts.append(v2n)
 
-        return np.concatenate(parts, axis=0)
+        return np.concatenate(parts, axis=0).astype(np.float32, copy=False)
 
 
 
@@ -1923,8 +2027,10 @@ class TorchVecEnv:
         self.margin = float(base.margin)
         self.soft_wall = float(base.soft_wall)
         self.k_pos = float(base.k_pos)
+        self.k_dock = float(base.k_dock)
         self.u_lo = float(base.u_lo)
         self.u_hi = float(base.u_hi)
+        self.vmax = float(base.vmax)
         self.oi_radius_norm = float(base.oi_radius_norm)
         self.normalize_reward = bool(base.normalize_reward)
         self.normalize_reward_geometry_power = int(base.normalize_reward_geometry_power)
@@ -1944,13 +2050,21 @@ class TorchVecEnv:
         self.use_kf = bool(base.use_kf)
         self.use_fuel = bool(base.use_fuel)
         self.reward_type = str(base.reward_type)
-        self.obs_include_arena_radius = bool(base.obs_include_arena_radius)
-        self.radius_obs_scale = float(base.radius_obs_scale)
         self.reset_ukf_on_diverge = bool(base.reset_ukf_on_diverge)
+        self.velocity_cbf_enabled = bool(base.velocity_cbf_enabled)
+        self.velocity_cbf_kind = str(base.velocity_cbf_kind)
+        self.velocity_cbf_alpha = float(base.velocity_cbf_alpha)
+        self.velocity_cbf_vmax = float(base.velocity_cbf_vmax)
+        self._velocity_cbf_dyn_name = str(base._velocity_cbf_dyn_name)
+        self._velocity_cbf_hcw_n = (
+            None if base._velocity_cbf_hcw_n is None else float(base._velocity_cbf_hcw_n)
+        )
 
         self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
         self.Ad_t = torch.as_tensor(base.Ad, dtype=self.dtype, device=self.device)
         self.Bd_t = torch.as_tensor(base.Bd, dtype=self.dtype, device=self.device)
+        self.u_lo_t = torch.tensor(self.u_lo, dtype=self.dtype, device=self.device)
+        self.u_hi_t = torch.tensor(self.u_hi, dtype=self.dtype, device=self.device)
 
         if self.use_fuel:
             self.k_eff_def = float(base.k_eff_def)
@@ -2026,6 +2140,23 @@ class TorchVecEnv:
         fuel_frac_att = (self.m_att_t - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
         return fuel_frac_def.clamp(0.0, 1.0), fuel_frac_att.clamp(0.0, 1.0)
 
+    def _apply_velocity_cbf_filter_batch(self, x: torch.Tensor, u_nom: torch.Tensor) -> torch.Tensor:
+        if not self.velocity_cbf_enabled:
+            return torch.clamp(u_nom, min=self.u_lo_t, max=self.u_hi_t)
+
+        a, b = velocity_cbf_halfspace_torch(
+            x,
+            vmax=self.velocity_cbf_vmax,
+            alpha=self.velocity_cbf_alpha,
+            dyn_name=self._velocity_cbf_dyn_name,
+            dt=self.dt,
+            D=self.D,
+            Ad_t=self.Ad_t,
+            Bd_t=self.Bd_t,
+            hcw_n=self._velocity_cbf_hcw_n,
+        )
+        return project_box_halfspace_torch(u_nom, self.u_lo_t, self.u_hi_t, a, b)
+
     def _refresh_obs(self):
         p1, v1, p2, v2 = self._split_state()
 
@@ -2078,12 +2209,6 @@ class TorchVecEnv:
             fuel_frac_def, fuel_frac_att = self._fuel_fractions()
             obs_def_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
             obs_att_parts.extend([fuel_frac_def[:, None], fuel_frac_att[:, None]])
-
-        if self.obs_include_arena_radius:
-            denom = max(abs(self.radius_obs_scale), 1e-9)
-            radius_feat = (self.radius_t / denom)[:, None]
-            obs_def_parts.append(radius_feat)
-            obs_att_parts.append(radius_feat)
 
         self.obs_def = torch.cat(obs_def_parts, dim=-1).to(dtype=self.dtype)
         self.obs_att = torch.cat(obs_att_parts, dim=-1).to(dtype=self.dtype)
@@ -2151,8 +2276,15 @@ class TorchVecEnv:
             if torch.any(weak_noise > 0.0):
                 a1_cmd[weak_mask] = a1_cmd[weak_mask] + weak_noise[:, None] * torch.randn_like(a1_cmd[weak_mask])
 
-        a1_cmd = torch.clamp(a1_cmd, self.u_lo, self.u_hi)
-        a2_cmd = torch.clamp(a2_cmd, self.u_lo, self.u_hi)
+        x1 = self.state_t[:, : 2 * self.D]
+        x2 = self.state_t[:, 2 * self.D : 4 * self.D]
+        a1_cmd = self._apply_velocity_cbf_filter_batch(x1, a1_cmd)
+        a2_cmd = self._apply_velocity_cbf_filter_batch(x2, a2_cmd)
+        if torch.any(none_mask):
+            a1_cmd = a1_cmd.clone()
+            a1_cmd[none_mask] = 0.0
+        a1_cmd = torch.clamp(a1_cmd, min=self.u_lo_t, max=self.u_hi_t)
+        a2_cmd = torch.clamp(a2_cmd, min=self.u_lo_t, max=self.u_hi_t)
 
         if self.use_fuel:
             a1_real, self.m_def_t, fuel_depleted_def, thrust_def, mdot_def = self._apply_propulsion_batch(
@@ -2171,8 +2303,6 @@ class TorchVecEnv:
             mdot_def = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
             mdot_att = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
-        x1 = self.state_t[:, : 2 * self.D]
-        x2 = self.state_t[:, 2 * self.D : 4 * self.D]
         x1n = torch.matmul(x1, self.Ad_t.transpose(0, 1)) + torch.matmul(a1_real, self.Bd_t.transpose(0, 1))
         if torch.any(none_mask):
             x1n = torch.where(none_mask[:, None], x1, x1n)
@@ -2260,6 +2390,8 @@ class TorchVecEnv:
         d2_true_norm = center_delta_att.square().sum(dim=-1) / radius_sq
         d2_sq = center_delta_att.square().sum(dim=-1)
         rel2_sq = (p2 - p1).square().sum(dim=-1)
+        dist_rel = torch.sqrt(torch.clamp(rel2_sq, min=0.0))
+        dock_gap = torch.clamp(dist_rel - self.collision_radius_m, min=0.0) / reward_dist_scale
         if not self.normalize_reward:
             d2_reward = d2_sq
             rel2 = rel2_sq
@@ -2301,7 +2433,7 @@ class TorchVecEnv:
         if self.reward_type == "zero_sum_kf" and not self.use_kf:
             raise RuntimeError("use_zero_sum_kf requires use_kf=True.")
 
-        g = self.k_pos * d2_reward
+        g = self.k_pos * d2_reward - self.k_dock * dock_gap
         if self.use_fuel:
             burn_frac_def = (mdot_def * self.dt) / (self.m0_def - self.mdry_def + 1e-9)
             burn_frac_att = (mdot_att * self.dt) / (self.m0_att - self.mdry_att + 1e-9)
@@ -2350,6 +2482,7 @@ class TorchVecEnv:
 
         d2_np = d2_reward.detach().cpu().numpy()
         rel2_np = rel2.detach().cpu().numpy()
+        dock_gap_np = dock_gap.detach().cpu().numpy()
         d1_true_np = d1_true_norm.detach().cpu().numpy()
         d2_true_np = d2_true_norm.detach().cpu().numpy()
         oob1_np = oob1.detach().cpu().numpy()
@@ -2379,6 +2512,7 @@ class TorchVecEnv:
                 "t": int(t_np[i]),
                 "d2_norm": float(d2_np[i]),
                 "rel2_norm": float(rel2_np[i]),
+                "dock_gap_norm": float(dock_gap_np[i]),
                 "oob_def": bool(oob1_np[i]),
                 "oob_att": bool(oob2_np[i]),
                 "hit_target": bool(hit_target_np[i]),

@@ -1,0 +1,38 @@
+% Drop-in snippet for papers using \usepackage{algorithm} and \usepackage{algpseudocode}
+\begin{algorithm}[H]
+\caption{Agent-Centric Bearing-Only Kalman Filter Update}
+\label{alg:kf-methodology}
+\begin{algorithmic}[1]
+\State \textbf{Given:} HCW dynamics $(A,B)$, step size $\Delta t$, measurement period $m$, process noise $Q$, measurement noise $R$
+\State Init defender belief over attacker $(\hat{x}^{D\to A}_0,P^{D\to A}_0)$ and attacker belief over defender $(\hat{x}^{A\to D}_0,P^{A\to D}_0)$
+\State Measurement model: for observer $i$ and target $j$, let
+\[
+d_t^{i\to j}=p_t^j-p_t^i,\quad
+b_t^{i\to j}=R_{wb}^i\frac{d_t^{i\to j}}{\|d_t^{i\to j}\|_2},\quad
+h(p_t^i,R_{wb}^i,p_t^j)=
+\begin{bmatrix}
+\mathrm{atan2}(b_{y,t}^{i\to j},\,b_{x,t}^{i\to j})\\[2pt]
+\mathrm{atan2}\!\big(b_{z,t}^{i\to j},\,\sqrt{(b_{x,t}^{i\to j})^2+(b_{y,t}^{i\to j})^2}\big)
+\end{bmatrix}
+\]
+\For{$t=1,\dots,T$}
+  \State Propagate true defender and attacker states with applied controls $u_t^{D},u_t^{A}$
+  \For{each observer-target pair $(i,j)\in\{(D,A),(A,D)\}$}
+    \State Select filter control input $\tilde{u}_t^j$ from \texttt{action\_access}
+    \State Predict $\hat{x}_{t|t-1}^{i\to j}\leftarrow A\hat{x}_{t-1|t-1}^{i\to j}+B\tilde{u}_t^j$
+    \State Predict $P_{t|t-1}^{i\to j}\leftarrow A P_{t-1|t-1}^{i\to j} A^\top + Q + B\Sigma_u B^\top$
+    \If{$t \bmod m = 0$}
+      \State Form noisy bearing measurement $z_t^{i\to j}\leftarrow h(p_t^i,R_{wb}^i,p_t^j)+\nu_t$, $\nu_t\sim\mathcal{N}(0,R)$
+      \State Linearize $h$, compute innovation $y_t^{i\to j}=z_t^{i\to j}-\hat{z}_{t|t-1}^{i\to j}$, and apply EKF correction
+      \State Log $\|y_t^{i\to j}\|_2^2$ and $\mathrm{tr}(P^{i\to j}_{t,\mathrm{pos}})$
+    \EndIf
+    \If{belief diverges or leaves the allowed radius bound}
+      \State Clip/reset belief and restore covariance to $P_0$
+    \EndIf
+  \EndFor
+  \State Build each agent observation from true self-state and estimated opponent state
+  \State Compute reward/termination from the true physical state
+\EndFor
+\State \Return final beliefs $(\hat{x}^{D\to A}_{T|T},P^{D\to A}_{T|T})$, $(\hat{x}^{A\to D}_{T|T},P^{A\to D}_{T|T})$, and belief-space agent observations
+\end{algorithmic}
+\end{algorithm}

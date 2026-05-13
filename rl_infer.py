@@ -93,9 +93,7 @@ class RLPolicyDiff:
 
         self.use_mean_at_eval = bool(self.cfg.get("rl_eval_deterministic", True))
         self.use_fuel = bool(self.cfg.get("fuel", {}).get("enable"))
-        radius_knob = self.cfg.get("arena_radius_knob", {}) or {}
-        self.obs_has_arena_radius = bool(radius_knob.get("append_to_obs", radius_knob.get("enabled", False)))
-        self.obs_extra = (2 if self.use_fuel else 0) + (1 if self.obs_has_arena_radius else 0)
+        self.obs_extra = 2 if self.use_fuel else 0
         self.load_defender = bool(load_defender)
         self.load_attacker = bool(load_attacker)
 
@@ -115,8 +113,6 @@ class RLPolicyDiff:
             dtype=np.float32,
         )[: self.D]
         self.radius = float(ar.get("r", 1.0))
-        self.pos_obs_scale = 1.0
-        self.vel_obs_scale = 1.0
 
         # ==================== DEFENDER (always RL) ====================
         self.def_ckpt = None
@@ -312,12 +308,8 @@ class RLPolicyDiff:
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         expected = self.obs_dim_def if who == "def" else self.obs_dim_att
         if obs_np.shape[0] != expected:
-            if self.use_fuel and self.obs_has_arena_radius:
-                detail = "Fuel and arena radius are enabled, so expected 5D+3."
-            elif self.use_fuel:
+            if self.use_fuel:
                 detail = "Fuel is enabled, so expected 5D+2."
-            elif self.obs_has_arena_radius:
-                detail = "Arena radius is appended, so expected 5D+1."
             else:
                 detail = "Fuel is disabled, so expected 5D."
             raise ValueError(
@@ -462,16 +454,14 @@ class RLPolicyDiff:
         D = self.D
         c = self.center
 
-        # obs = [p1c, p2c, rel, v1, v2, (optional fuel_def, fuel_att, arena_radius)]
+        # obs = [p1c, p2c, rel, v1, v2, (optional fuel_def, fuel_att)]
         p1c = obs_np[0:D]
         p2c = obs_np[D : 2 * D]
         v1 = obs_np[3 * D : 4 * D]
         v2 = obs_np[4 * D : 5 * D]
 
-        p1 = (p1c / self.pos_obs_scale) + c
-        p2 = (p2c / self.pos_obs_scale) + c
-        v1 = v1 / self.vel_obs_scale
-        v2 = v2 / self.vel_obs_scale
+        p1 = p1c + c
+        p2 = p2c + c
 
         u = self.rule_ctrl.act(p1, v1, p2, v2)
         return np.clip(np.asarray(u, dtype=np.float32), -self.umax, +self.umax)

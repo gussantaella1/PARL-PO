@@ -21,6 +21,7 @@ def resolve_start_radius_bounds(
     who: str,
     default_min_frac: float = 0.0,
     default_max_frac: float = 1.0,
+    overrides: Dict[str, Any] | None = None,
 ) -> Tuple[float, float]:
     """
     Resolve training/eval shell bounds for the defender or attacker.
@@ -28,6 +29,10 @@ def resolve_start_radius_bounds(
     Fractional keys such as `r_def_min` are interpreted relative to the arena
     radius for backward compatibility. Explicit meter overrides like
     `r_def_min_m` take precedence when present.
+
+    Optional `overrides` can replace the global bounds for a given stage. When
+    an override provides either `r_<who>_<bound>` or `r_<who>_<bound>_m`, that
+    stage-level value takes precedence over the base config for that bound.
     """
     who = str(who).strip().lower()
     if who not in {"def", "att"}:
@@ -36,13 +41,29 @@ def resolve_start_radius_bounds(
     def _resolve(bound: str, default_frac: float) -> float:
         frac_key = f"r_{who}_{bound}"
         meter_key = f"{frac_key}_m"
-        meter_val = cfg.get(meter_key, None)
-        if meter_val is not None:
-            radius = float(meter_val)
-            source_key = meter_key
+
+        if overrides is not None and (frac_key in overrides or meter_key in overrides):
+            meter_val = overrides.get(meter_key, None)
+            frac_val = overrides.get(frac_key, None)
+            if meter_val is not None:
+                radius = float(meter_val)
+                source_key = meter_key
+            elif frac_val is not None:
+                radius = float(frac_val) * float(arena_radius)
+                source_key = frac_key
+            else:
+                # A stage can explicitly null out the meter override and fall back
+                # to the base fractional setting for that bound.
+                radius = float(cfg.get(frac_key, default_frac)) * float(arena_radius)
+                source_key = frac_key
         else:
-            radius = float(cfg.get(frac_key, default_frac)) * float(arena_radius)
-            source_key = frac_key
+            meter_val = cfg.get(meter_key, None)
+            if meter_val is not None:
+                radius = float(meter_val)
+                source_key = meter_key
+            else:
+                radius = float(cfg.get(frac_key, default_frac)) * float(arena_radius)
+                source_key = frac_key
         if radius < 0.0:
             raise ValueError(f"{source_key} must be >= 0, got {radius}.")
         return radius

@@ -57,7 +57,9 @@ COMMON: Dict[str, Any] = {
     },
 
     # Arena
-    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
+    # "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 20.0},
+    "arena": {"type": "sphere", "cx": 0.0, "cy": 0.0, "cz": 0.0, "r": 100.0},
+
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 
@@ -66,6 +68,14 @@ COMMON: Dict[str, Any] = {
     # "umax": 1.0,
     "umax": 0.1,
     # "umax": 0.01,
+    # "vmax": None,  # optional runtime speed cap; None disables clipping
+    "vmax": 1.5,  # optional runtime speed cap; None disables clipping
+    "safety_filter": {
+        "enabled": True,
+        "kind": "velocity_cbf_qp",
+        "alpha": 5.0,
+        "vmax": 1.5,  # None => fall back to top-level cfg["vmax"]
+    },
 
     # Initial conditions
     "x0": np.array([
@@ -225,9 +235,6 @@ TRAIN: Dict[str, Any] = {
     "save_best_ckpt": True,
     "save_last_ckpt": True,
 
-    # Optional checkpoints
-    "scale_invariant": True, # Normalizes radii
-
     "distill": False, #Does policy distillation, True or False
     "distill_method": "modern",  # "modern" or "paper_recurrent"
     "distill_collection_mode": "dagger",  # modern/paper_recurrent only support "dagger"
@@ -250,12 +257,11 @@ TRAIN: Dict[str, Any] = {
     # Vectorized rollout & logging
 
     #Base config
-    #"num_envs": 256,   #Was 256
     "num_envs": 256,   #Was 256
     # "steps_per_env": 512*5, #Was 512  
     # "steps_per_env": 2290,
-    "steps_per_env": 10240, #Was 512  
-    "total_updates": 1000,   #Was 2000
+    # "steps_per_env": 10240, #Was 512  
+    # "total_updates": 1000,   #Was 2000
     # "total_updates": 2000,   #Was 2000
     # "total_updates": 500,   #Was 2000
     "train_epochs": 3, #Was 3
@@ -280,17 +286,19 @@ TRAIN: Dict[str, Any] = {
     "steps_per_env": 512*4.5,  
     # "steps_per_env": 2048,  
     "train_ic_vmax": 0.5/4.5,            # max |v| component at t=0
-    "total_updates": 1500,   #Was 2000
+    "total_updates": 2000,   #Was 2000
+    # "total_updates": 2000,   #Was 2000
+    # "k_dock": 0.05/4.5,  # optional mild defender-approach shaping on normalized gap outside collision radius
+    "k_dock": 0.0, 
 
     # "k_pos": 0.05, #Was 0.05
     # "k_pos": 0.01, #Was 0.05
-    "k_dock": 0.0,  # only used when zero_sum_reward.mode == "legacy_dock"
 
 
     "normalize_reward": True,
     "normalize_reward_geometry_power": 2,
-    "reward_normalize_radius_m": None,  # optional constant radius for reward normalization; None => use active arena radius
-    # "reward_normalize_radius_m": 20.0,  # optional constant radius for reward normalization; None => use active arena radius
+    # "reward_normalize_radius_m": None,  # optional constant radius for reward normalization; None => use active arena radius
+    "reward_normalize_radius_m": 20.0,  # optional constant radius for reward normalization; None => use active arena radius
    
    
     "target_hit_reward_penalty": 10.0,
@@ -339,11 +347,11 @@ TRAIN: Dict[str, Any] = {
 
     # "r_att_min": 0.0, #Default 0.4
     # "r_att_max": 0.95, #Default: 0.95
-    # "r_att_min_m": 20.0 * 0.3,
+    "r_att_min_m": 20.0 * 0.3,
     # "r_att_max_m": 99.0,
 
     "r_def_min": 0.0, #Default: 0.0
-    "r_def_max": 0.8, # Default: 0.5
+    "r_def_max": 0.95, # Default: 0.5
 
     "r_att_min": 0.3, #Default 0.4
     "r_att_max": 0.95, #Default: 0.95
@@ -383,10 +391,9 @@ TRAIN: Dict[str, Any] = {
     # Training-only initial condition randomization
     # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell_advantage",  # or "fixed"
-    "train_min_sep": 2.0,             # min defender–attacker separation (m)
+    "train_min_sep": 1.0,             # min defender–attacker separation (m)
     "arena_radius_knob": {
-        "enabled": False,
-        "append_to_obs": False,
+        "enabled": True,
         "start_radius_m": 20.0,
         "final_radius_m": 100.0,
         "schedule": "staged",       # "linear" | "fixed" | "staged"
@@ -397,6 +404,12 @@ TRAIN: Dict[str, Any] = {
             # Use exactly one scheme for the whole list:
             # {"radius_m": 20.0, "fraction": 0.10},
             # {"radius_m": 20.0, "updates": 400},
+            #
+            # Stage entries may also override shell bounds for that stage using
+            # the same keys as the top-level config, for example:
+            # {"radius_m": 20.0, "updates": 400, "r_att_min": 0.30, "r_att_max": 0.95},
+            # {"radius_m": 40.0, "updates": 400, "r_att_min_m": 12.0, "r_att_max_m": 36.0},
+            # {"radius_m": 60.0, "updates": 400, "r_def_max": 0.80},
             # {"radius_m": 25.0, "fraction": 0.10},
             # {"radius_m": 30.0, "fraction": 0.10},
             # {"radius_m": 40.0, "fraction": 0.10},
@@ -417,27 +430,44 @@ TRAIN: Dict[str, Any] = {
             # {"radius_m": 90.0, "fraction": 0.075},
             # {"radius_m": 100.0, "fraction": 0.075},
 
-            {"radius_m": 20.0, "updates": 400},
-            {"radius_m": 30.0, "updates": 400},
-            {"radius_m": 40.0, "updates": 400},
-            {"radius_m": 50.0, "updates": 400},
-            {"radius_m": 60.0, "updates": 400},
-            {"radius_m": 70.0, "updates": 400},
-            {"radius_m": 80.0, "updates": 400},
-            {"radius_m": 90.0, "updates": 400},
-            {"radius_m": 100.0, "updates": 400},
+            # {"radius_m": 20.0, "updates": 400},
+            # {"radius_m": 30.0, "updates": 400},
+            # {"radius_m": 40.0, "updates": 400},
+            # {"radius_m": 50.0, "updates": 400},
+            # {"radius_m": 60.0, "updates": 400},
+            # {"radius_m": 70.0, "updates": 400},
+            # {"radius_m": 80.0, "updates": 400},
+            # {"radius_m": 90.0, "updates": 400},
+            # {"radius_m": 100.0, "updates": 400},
+
+            {"radius_m": 20.0, "updates": 400, "r_att_min_m": 0.20*30, "r_att_max_m": 0.95*20},
+            {"radius_m": 40.0, "updates": 400, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*40},
+            {"radius_m": 60.0, "updates": 400, "r_att_min_m": 0.95*40, "r_att_max_m": 0.95*60},
+            {"radius_m": 80.0, "updates": 400, "r_att_min_m": 0.95*60, "r_att_max_m": 0.95*80},
+            {"radius_m": 100.0, "updates": 400, "r_att_min_m": 0.95*80, "r_att_max_m": 0.95*100},
+
 
 
 
             # {"radius_m": 20.0, "fraction": 0.50},
             # {"radius_m": 100.0, "fraction": 0.50},
         ],
-        "obs_scale": 1.0,          # divide appended radius feature by this value
     },
 
-    "prior_type": "ls",                 #ls, nash, none
-    "prior_blend_att":        0.0,    # (optional) disable center prior for def
-    "prior_blend_def":        0.0,    # (optional) disable center prior for def
+    "prior_type": "none",          # ls, intercept, or none
+    "prior_blend_att": 0.0,
+    "prior_blend_def": 0.0,
+    "intercept_prior": {
+        "lookahead_steps": 10.0,  # attacker coasting lookahead in env steps
+        "mix": 1.0,               # 0 -> current attacker position, 1 -> full intercept target
+        "gain": 2.0,              # raw-action gain for the geometric intercept direction
+    },
+    "intercept_prior_train_only": {
+        "enabled": False,          # when True, override defender prior blend during PPO updates only
+        "start_blend": 0.5,
+        "end_blend": 0.0,
+        "anneal_fraction": 0.8,   # reach end_blend after this fraction of training progress
+    },
 
     "att_target_hit_radius": 0.0,          # attacker within % of R hits object
 

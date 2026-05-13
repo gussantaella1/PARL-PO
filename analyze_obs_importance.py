@@ -67,18 +67,12 @@ def _resolve_run_manifest_path(
 
 
 def _build_dyn_for_cfg(cfg: Dict[str, Any]) -> None:
-    if int(cfg.get("num_attackers", 1)) > 1:
-        from config_rl_1v2 import build_dyn
-    else:
-        from config_rl import build_dyn
+    from config_rl import build_dyn
     build_dyn(cfg)
 
 
 def _env_cls_for_cfg(cfg: Dict[str, Any]):
-    if int(cfg.get("num_attackers", 1)) > 1:
-        from core_1v2.env import Env
-    else:
-        from core.env import Env
+    from core.env import Env
     return Env
 
 
@@ -586,7 +580,6 @@ def main() -> None:
             "seed": int(args.seed),
             "sample_count": int(obs_np.shape[0]),
             "value_available": bool(value_grad is not None),
-            "normalize_pos_obs": bool(cfg.get("normalize_pos_obs", False)),
             "summary": summary,
         }
         out_path = Path(args.output_json).expanduser().resolve()

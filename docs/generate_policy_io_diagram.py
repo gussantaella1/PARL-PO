@@ -262,7 +262,7 @@ def main():
     ax.text(
         0.03,
         0.03,
-        "Code anchors: core/env.py, core_1v2/env.py, rl_infer.py, rl_infer_1v2.py, core/models.py, core/distill.py",
+        "Code anchors: core/env.py, rl_infer.py, core/models.py, core/distill.py",
         fontsize=10.5,
         color="#4b5d6b",
         ha="left",

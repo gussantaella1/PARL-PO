@@ -1794,6 +1794,8 @@ def plot_rollout_velocity(
             * frames_dict['vel1_xyz'], frames_dict['vel2_xyz']
         - Generic:
             * frames_dict['vel_xyz'], frames_dict['vel'], frames_dict['velocity']
+        - State-history fallback:
+            * frames_dict['states'], frames_dict['state_hist'], frames_dict['state_history']
 
         If no explicit velocity history is present, it falls back to differentiating
         the executed position history using dt.
@@ -1839,6 +1841,39 @@ def plot_rollout_velocity(
                 return frames_dict[k]
         return None
 
+    def _infer_state_layout(S):
+        if cfg is not None:
+            try:
+                D_cfg = int(cfg.get("D", 3))
+                n_agents_cfg = int(cfg.get("num_attackers", 1)) + 1
+                if S.shape[1] >= 2 * D_cfg * n_agents_cfg and agent <= n_agents_cfg:
+                    return D_cfg, n_agents_cfg
+            except Exception:
+                pass
+
+        for D_guess in (3, 2):
+            width = 2 * D_guess
+            if width <= 0 or (S.shape[1] % width) != 0:
+                continue
+            n_agents = S.shape[1] // width
+            if agent <= n_agents:
+                return D_guess, n_agents
+        return None, None
+
+    def _series_from_state_history(container, *, want_velocity: bool):
+        if container is None:
+            return None
+        S = np.asarray(_maybe_pick_rollout(container), dtype=float)
+        if S.ndim != 2 or S.shape[0] < 1:
+            return None
+        D_state, n_agents = _infer_state_layout(S)
+        if D_state is None or n_agents is None:
+            return None
+        base = 2 * (agent - 1) * D_state
+        start = base + (D_state if want_velocity else 0)
+        stop = start + D_state
+        return _as_xyz_array(S[:, start:stop])
+
     def _infer_dt():
         if dt is not None:
             return float(dt)
@@ -1870,6 +1905,9 @@ def plot_rollout_velocity(
         vel_src = _first_present(("vel_xyz", "vel", "velocity", "v_xyz", "v_hist"))
 
     V = _as_xyz_array(_maybe_pick_rollout(vel_src))
+    if V is None:
+        state_src = _first_present(("states", "state_hist", "state_history"))
+        V = _series_from_state_history(state_src, want_velocity=True)
 
     if V is None:
         exec_src = None
@@ -1888,13 +1926,16 @@ def plot_rollout_velocity(
 
         P = _as_xyz_array(_maybe_pick_rollout(exec_src))
         if P is None:
+            state_src = _first_present(("states", "state_hist", "state_history"))
+            P = _series_from_state_history(state_src, want_velocity=False)
+        if P is None:
             known = [
                 k for k in frames_dict.keys()
-                if any(s in k.lower() for s in ("vel", "velocity", "v_", "exec", "traj"))
+                if any(s in k.lower() for s in ("vel", "velocity", "v_", "exec", "traj", "state"))
             ]
             raise KeyError(
                 "Could not find velocity or executed-position history in frames_dict.\n"
-                "Tried explicit velocity keys and exec trajectory fallbacks.\n"
+                "Tried explicit velocity keys, state-history fallbacks, and exec trajectory fallbacks.\n"
                 f"Relevant keys that do exist:\n  {known}"
             )
 

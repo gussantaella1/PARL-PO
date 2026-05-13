@@ -1,11 +1,8 @@
 # Policy Inputs And Actuator Outputs
 
-This repo has two closely related policy I/O paths:
+This repo uses the `1v1` / single-attacker path in `core/env.py` + `rl_infer.py`.
 
-1. `1v1` / single-attacker path in `core/env.py` + `rl_infer.py`
-2. `1vN` / multi-attacker path in `core_1v2/env.py` + `rl_infer_1v2.py`
-
-In both cases, the policy output is a bounded acceleration command. The environment then clips it again and, if fuel is enabled, converts it into a realized acceleration subject to thrust and mass limits before propagating the dynamics.
+The policy output is a bounded acceleration command. The environment then clips it again and, if fuel is enabled, converts it into a realized acceleration subject to thrust and mass limits before propagating the dynamics.
 
 ## 1v1 Policy Flow
 
@@ -98,7 +95,6 @@ Attacker policy input:
 Notes:
 
 - If `use_kf=True`, the `*_obs` terms may be estimator beliefs instead of ground-truth opponent states.
-- If `normalize_pos_obs=True`, positions are scaled by `1 / arena_radius` and velocities by `dt / arena_radius`.
 - For student checkpoints, the policy internally reduces the observation to:
 
 ```text
@@ -154,7 +150,7 @@ Where:
 
 ## Code Anchors
 
-- Observation construction: `core/env.py`, `core_1v2/env.py`
-- Standard inference wrappers: `rl_infer.py`, `rl_infer_1v2.py`
-- Policy network and squash: `core/models.py`, `core_1v2/models.py`
+- Observation construction: `core/env.py`
+- Standard inference wrapper: `rl_infer.py`
+- Policy network and squash: `core/models.py`
 - Student / distilled policy path: `core/distill.py`

@@ -12,6 +12,7 @@ from config_rl import build_dyn, config_for_train
 from core.buffers import RolloutBuffer
 from core.distill import distill_from_teacher
 from core.env import Env, SubprocVecEnv, TorchVecEnv, VecEnv, collect_ic_history_from_vecenv
+from core.intercept_heuristic import annealed_prior_blend
 from core.models import ActorCriticDiff
 from core.plotting import make_tb_writer
 from core.ppo import PPO
@@ -345,6 +346,7 @@ def train(cfg: Dict[str, Any]):
         "ukf_trPpos_mean": [],  # optional
         "lr_pi": [],
         "lr_vf": [],
+        "prior_blend_def": [],
         "rollout_time_s": [],
         "optim_time_s": [],
         "update_time_s": [],
@@ -388,6 +390,18 @@ def train(cfg: Dict[str, Any]):
     min_anneal = float(cfg.get("def_center_min_anneal", 0.5))
     radius_knob = cfg.get("arena_radius_knob", {}) or {}
     use_radius_knob = bool(radius_knob.get("enabled", False))
+    prior_type = str(cfg.get("prior_type", "ls"))
+    intercept_train_only = cfg.get("intercept_prior_train_only", {}) or {}
+    use_intercept_train_only = (
+        train_role == "def"
+        and prior_type == "intercept"
+        and bool(intercept_train_only.get("enabled", False))
+    )
+    intercept_blend_start = float(intercept_train_only.get("start_blend", 0.0))
+    intercept_blend_end = float(intercept_train_only.get("end_blend", 0.0))
+    intercept_anneal_fraction = float(intercept_train_only.get("anneal_fraction", 1.0))
+    if bool(intercept_train_only.get("enabled", False)) and prior_type != "intercept":
+        print("[intercept_prior_train_only] ignored because prior_type!='intercept'")
 
     for upd in range(1, total_updates + 1):
         term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
@@ -416,6 +430,18 @@ def train(cfg: Dict[str, Any]):
         if use_radius_knob:
             radius_progress = (upd - 1) / max(1, total_updates - 1)
             _set_vec_attr(vec, "curriculum_progress", radius_progress)
+
+        if use_intercept_train_only:
+            blend_progress = (upd - 1) / max(1, total_updates - 1)
+            current_prior_blend_def = annealed_prior_blend(
+                blend_progress,
+                start_blend=intercept_blend_start,
+                end_blend=intercept_blend_end,
+                anneal_fraction=intercept_anneal_fraction,
+            )
+            ppo.def_net.set_prior_blend("def", current_prior_blend_def)
+        else:
+            current_prior_blend_def = ppo.def_net.get_prior_blend("def")
 
         # Linear anneal multiplier from 1.0 → min_anneal for k_cent
         center_frac = upd / max(1, total_updates)
@@ -794,6 +820,7 @@ def train(cfg: Dict[str, Any]):
 
             metrics["lr_pi"].append(lr_pi)
             metrics["lr_vf"].append(lr_vf)
+            metrics["prior_blend_def"].append(current_prior_blend_def)
             metrics["rollout_time_s"].append(rollout_time_s)
             metrics["optim_time_s"].append(optim_time_s)
             metrics["update_time_s"].append(update_time_s)
@@ -808,7 +835,10 @@ def train(cfg: Dict[str, Any]):
                 print("opp mix usage:", ", ".join(mix_summary))
 
             print(f"[update {upd:05d}] R_def_mean={R_def_mean:+.3f}  R_att_mean={R_att_mean:+.3f}  (batch={num_envs*steps_per_env})")
-            print(f"   [{train_role}] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}")
+            print(
+                f"   [{train_role}] |mu|_mean={muD:.3e}  std_mean={stdD:.3e}  "
+                f"prior_blend_def={current_prior_blend_def:.3f}"
+            )
             print(f"   mean arena radius ≈ {arena_radius_mean:.3f} m")
             print(
                 f"   timing: rollout={rollout_time_s:.3f}s  "
@@ -852,6 +882,7 @@ def train(cfg: Dict[str, Any]):
                 # ===== Policy stats =====
                 writer.add_scalar("policy/def_mu_abs_mean", muD, gs)
                 writer.add_scalar("policy/def_std_mean", stdD, gs)
+                writer.add_scalar("policy/prior_blend_def", current_prior_blend_def, gs)
 
                 # ===== Learning rates =====
                 writer.add_scalar("lr/def_policy", lr_pi, gs)
@@ -935,6 +966,9 @@ def train(cfg: Dict[str, Any]):
         writer.flush()
         writer.close()
 
+    if use_intercept_train_only:
+        ppo.def_net.set_prior_blend("def", intercept_blend_end)
+
     if save_last_ckpt and checkpoint_dir is not None:
         last_ckpt_path = os.path.join(
             checkpoint_dir,
@@ -958,6 +992,14 @@ def train(cfg: Dict[str, Any]):
 
 
 def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
+    def _pad_xyz(series: np.ndarray) -> np.ndarray:
+        arr = np.asarray(series, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError(f"Expected state series with shape (T, D), got {arr.shape}.")
+        if arr.shape[1] == 2:
+            return np.hstack([arr, np.zeros((arr.shape[0], 1), dtype=float)])
+        return arr[:, :3]
+
     env = Env(cfg)
     trajs = []
     for _ in range(episodes):
@@ -978,7 +1020,26 @@ def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
             states.append(env.state.copy())
             actions.append((a1_np.copy(), a2_np.copy()))
             infos.append(info)
-        trajs.append({"states": np.stack(states), "actions": actions, "infos": infos})
+        states_arr = np.stack(states)
+        D = int(cfg.get("D", 3))
+        exec_xyz_all = []
+        vel_xyz_all = []
+        for idx in range(2):
+            base = 2 * idx * D
+            exec_xyz_all.append(_pad_xyz(states_arr[:, base : base + D]))
+            vel_xyz_all.append(_pad_xyz(states_arr[:, base + D : base + (2 * D)]))
+
+        traj = {
+            "states": states_arr,
+            "actions": actions,
+            "infos": infos,
+            "exec_xyz_all": exec_xyz_all,
+            "vel_xyz_all": vel_xyz_all,
+        }
+        for idx, (P, V) in enumerate(zip(exec_xyz_all, vel_xyz_all), start=1):
+            traj[f"exec{idx}_xyz"] = P
+            traj[f"vel{idx}_xyz"] = V
+        trajs.append(traj)
     return trajs
 
     # ---------------------------------------------------------
