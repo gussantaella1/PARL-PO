@@ -333,6 +333,74 @@
       "lambda_intent": 1.0,
       "reward_mode_for_step": "def",
       "train_role": "rl"
+    },
+    "final_outputs": {
+      "def0": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 240.4120712379601,
+        "teacher_best_update": 620,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "att1": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 109.11158346362129,
+        "teacher_best_update": 400,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "def1": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 577.6536726799663,
+        "teacher_best_update": 490,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "att2": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 112.19933931917525,
+        "teacher_best_update": 400,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "def2": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 428.47412690001624,
+        "teacher_best_update": 910,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "plots_root": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/Plots"
     }
   },
   "stages": [
@@ -365,6 +433,302 @@
       "status": "ok",
       "end_utc": "2026-05-14T00:12:43.635953+00:00",
       "duration_s": 9368.103984907037
+    },
+    {
+      "name": "PHASE1_train_att1",
+      "start_utc": "2026-05-14T00:13:19.914015+00:00",
+      "meta": {
+        "phase_name": "att1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
+          "def_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+          "freeze_defender": true,
+          "train_ic_mode": "random_shell",
+          "r_att_min": 0.0,
+          "r_att_min_m": 0.0,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "def0_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.5,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 109.11158346362129,
+        "teacher_best_update": 400,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-14T03:17:50.333280+00:00",
+      "duration_s": 11070.419258014066
+    },
+    {
+      "name": "PHASE2_train_def1",
+      "start_utc": "2026-05-14T03:18:35.865110+00:00",
+      "meta": {
+        "phase_name": "def1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
+          "att_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+          "def_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+          "freeze_attacker": true,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "att1_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.5,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 577.6536726799663,
+        "teacher_best_update": 490,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-14T06:22:59.835478+00:00",
+      "duration_s": 11063.97036051494
+    },
+    {
+      "name": "PHASE3_train_att2",
+      "start_utc": "2026-05-14T06:23:53.836340+00:00",
+      "meta": {
+        "phase_name": "att2",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
+          "def_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+          "freeze_defender": true,
+          "train_ic_mode": "random_shell",
+          "r_att_min": 0.0,
+          "r_att_min_m": 0.0,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "def0_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 112.19933931917525,
+        "teacher_best_update": 400,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-14T09:47:15.086585+00:00",
+      "duration_s": 12201.250236795051
+    },
+    {
+      "name": "PHASE4_train_def2",
+      "start_utc": "2026-05-14T09:48:08.657704+00:00",
+      "meta": {
+        "phase_name": "def2",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
+          "att_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+          "def_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def1_teacher.pt",
+          "freeze_attacker": true,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "att1_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att1_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_full",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_very_weak",
+                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/att2_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 428.47412690001624,
+        "teacher_best_update": 910,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-14T12:28:12.775252+00:00",
+      "duration_s": 9604.117539166939
     }
   ]
 }
