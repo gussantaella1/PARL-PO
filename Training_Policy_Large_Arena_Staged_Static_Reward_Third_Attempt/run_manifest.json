@@ -1,13 +1,13 @@
 {
-  "created_utc": "2026-05-13T16:02:24.072152+00:00",
-  "out_dir": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt",
+  "created_utc": "2026-05-13T21:36:35.530102+00:00",
+  "out_dir": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
     "platform": "Linux-6.8.0-106-generic-x86_64-with-glibc2.35"
   },
   "configs": {
     "cli_args": {
-      "out_dir": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt",
+      "out_dir": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
       "phases": "0,1,2,3,4",
       "device": "cuda",
       "seed": null,
@@ -28,7 +28,7 @@
     "runtime_overrides": {
       "device": "cuda",
       "vec_backend": "torch",
-      "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt"
+      "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt"
     },
     "training config used": {
       "num_attackers": 1,
@@ -245,7 +245,7 @@
       "gamma": 0.991,
       "steps_per_env": 2304.0,
       "train_ic_vmax": 0.1111111111111111,
-      "total_updates": 2000,
+      "total_updates": 1000,
       "k_dock": 0.0,
       "normalize_reward": true,
       "normalize_reward_geometry_power": 2,
@@ -296,27 +296,9 @@
             "r_att_max_m": 19.0
           },
           {
-            "radius_m": 40.0,
-            "updates": 400,
-            "r_att_min_m": 19.0,
-            "r_att_max_m": 38.0
-          },
-          {
-            "radius_m": 60.0,
-            "updates": 400,
-            "r_att_min_m": 38.0,
-            "r_att_max_m": 57.0
-          },
-          {
-            "radius_m": 80.0,
-            "updates": 400,
-            "r_att_min_m": 57.0,
-            "r_att_max_m": 76.0
-          },
-          {
             "radius_m": 100.0,
-            "updates": 400,
-            "r_att_min_m": 76.0,
+            "updates": 600,
+            "r_att_min_m": 19.0,
             "r_att_max_m": 95.0
           }
         ]
@@ -339,7 +321,7 @@
       "use_tensorboard": true,
       "tb_logdir": "runs",
       "tb_run_name": "ppo_diffgame_def",
-      "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt",
+      "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
       "episodes_per_iter": 8,
       "max_steps": 300,
       "lookahead_H": 15,
@@ -356,82 +338,33 @@
   "stages": [
     {
       "name": "PHASE0_train_def0",
-      "start_utc": "2026-05-13T16:02:24.073978+00:00",
+      "start_utc": "2026-05-13T21:36:35.531967+00:00",
       "meta": {
         "phase_name": "def0",
         "attacker_mode": "rule",
         "extra_train_cfg": {
           "device": "cuda",
           "vec_backend": "torch",
-          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt",
+          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt",
           "hit_buffer_def": 0.25
         }
       },
       "outputs": {
         "train_role": "def",
-        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
+        "teacher_ckpt": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
         "teacher_best_metric_name": "R_def_mean",
-        "teacher_best_metric": 454.2397413082374,
-        "teacher_best_update": 1610,
-        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher__best.pt",
-        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
+        "teacher_best_metric": 240.4120712379601,
+        "teacher_best_update": 620,
+        "teacher_best_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt/def0_teacher.pt",
         "student_ckpt": null,
         "distill_enabled": false,
         "distill_method": "modern",
         "distill_duration_s": null
       },
       "status": "ok",
-      "end_utc": "2026-05-13T21:27:47.172427+00:00",
-      "duration_s": 19523.098450077
-    },
-    {
-      "name": "PHASE1_train_att1",
-      "start_utc": "2026-05-13T21:29:09.007905+00:00",
-      "meta": {
-        "phase_name": "att1",
-        "attacker_mode": "rl",
-        "extra_train_cfg": {
-          "device": "cuda",
-          "vec_backend": "torch",
-          "tb_run_prefix": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt",
-          "def_ckpt_path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
-          "freeze_defender": true,
-          "train_ic_mode": "random_shell",
-          "r_att_min": 0.0,
-          "r_att_min_m": 0.0,
-          "opp_mix": {
-            "resample": "episode",
-            "policies": [
-              {
-                "name": "def0_full",
-                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
-                "prob": 0.5,
-                "action_scale": 1.0,
-                "noise_std": 0.0,
-                "idle_prob": 0.0
-              },
-              {
-                "name": "def0_weak",
-                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
-                "prob": 0.3,
-                "action_scale": 0.25,
-                "noise_std": 0.05,
-                "idle_prob": 0.0
-              },
-              {
-                "name": "def0_very_weak",
-                "path": "Training_Policy_Large_Arena_Staged_Static_Reward_Second_Attempt/def0_teacher.pt",
-                "prob": 0.2,
-                "action_scale": 0.0,
-                "noise_std": 0.0,
-                "idle_prob": 0.0
-              }
-            ]
-          }
-        }
-      },
-      "end_utc": "2026-05-13T21:36:23.559182+00:00",
-      "duration_s": 434.55127002182417
+      "end_utc": "2026-05-14T00:12:43.635953+00:00",
+      "duration_s": 9368.103984907037
     }
   ]
 }

@@ -286,7 +286,7 @@ TRAIN: Dict[str, Any] = {
     "steps_per_env": 512*4.5,  
     # "steps_per_env": 2048,  
     "train_ic_vmax": 0.5/4.5,            # max |v| component at t=0
-    "total_updates": 2000,   #Was 2000
+    "total_updates": 1000,   #Was 2000
     # "total_updates": 2000,   #Was 2000
     # "k_dock": 0.05/4.5,  # optional mild defender-approach shaping on normalized gap outside collision radius
     "k_dock": 0.0, 
@@ -440,17 +440,15 @@ TRAIN: Dict[str, Any] = {
             # {"radius_m": 90.0, "updates": 400},
             # {"radius_m": 100.0, "updates": 400},
 
+            # {"radius_m": 20.0, "updates": 400, "r_att_min_m": 0.20*30, "r_att_max_m": 0.95*20},
+            # {"radius_m": 40.0, "updates": 400, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*40},
+            # {"radius_m": 60.0, "updates": 400, "r_att_min_m": 0.95*40, "r_att_max_m": 0.95*60},
+            # {"radius_m": 80.0, "updates": 400, "r_att_min_m": 0.95*60, "r_att_max_m": 0.95*80},
+            # {"radius_m": 100.0, "updates": 400, "r_att_min_m": 0.95*80, "r_att_max_m": 0.95*100},
+
+
             {"radius_m": 20.0, "updates": 400, "r_att_min_m": 0.20*30, "r_att_max_m": 0.95*20},
-            {"radius_m": 40.0, "updates": 400, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*40},
-            {"radius_m": 60.0, "updates": 400, "r_att_min_m": 0.95*40, "r_att_max_m": 0.95*60},
-            {"radius_m": 80.0, "updates": 400, "r_att_min_m": 0.95*60, "r_att_max_m": 0.95*80},
-            {"radius_m": 100.0, "updates": 400, "r_att_min_m": 0.95*80, "r_att_max_m": 0.95*100},
-
-
-
-
-            # {"radius_m": 20.0, "fraction": 0.50},
-            # {"radius_m": 100.0, "fraction": 0.50},
+            {"radius_m": 100.0, "updates": 600, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*100},
         ],
     },
 
