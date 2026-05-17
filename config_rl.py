@@ -22,8 +22,51 @@ def _merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             out[k] = _dcopy(v)
     return out
 
+
+def _apply_role_specific_curriculum_overrides(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Optionally deep-merge role-specific arena curriculum overrides.
+
+    `arena_radius_knob` remains the shared/default curriculum. When training the
+    attacker, `arena_radius_knob_att` can override only the fields that should
+    differ while inheriting everything else from the base setup. The defender
+    can likewise opt into `arena_radius_knob_def`, but leaving it unset keeps
+    the historical behavior unchanged.
+    """
+    role = str(cfg.get("train_role", "")).strip().lower()
+    role_key_map = {
+        "def": ("arena_radius_knob_def", "arena_radius_knob_defender"),
+        "att": ("arena_radius_knob_att", "arena_radius_knob_attacker"),
+    }
+    override_keys = role_key_map.get(role)
+    if override_keys is None:
+        return cfg
+
+    override_cfg = None
+    for key in override_keys:
+        candidate = cfg.get(key, None)
+        if candidate is None:
+            continue
+        if not isinstance(candidate, dict):
+            raise TypeError(f"{key} must be a dict when provided, got {type(candidate).__name__}.")
+        override_cfg = _merge(override_cfg or {}, candidate)
+
+    if override_cfg:
+        base_knob = cfg.get("arena_radius_knob", {})
+        if base_knob is None:
+            base_knob = {}
+        if not isinstance(base_knob, dict):
+            raise TypeError(
+                "arena_radius_knob must be a dict when role-specific curriculum overrides are used."
+            )
+        cfg["arena_radius_knob"] = _merge(base_knob, override_cfg)
+
+    return cfg
+
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
+    "umax": 2.0,
+
     "num_attackers": 1,   # default is 1
     "seed": 42,
     "device": "cuda",  # "cuda" if available
@@ -66,10 +109,17 @@ COMMON: Dict[str, Any] = {
     # Action bounds
     # "umax": 2.0,
     # "umax": 1.0,
-    "umax": 0.1,
+    # "umax": 0.1,
     # "umax": 0.01,
     # "vmax": None,  # optional runtime speed cap; None disables clipping
-    "vmax": 1.5,  # optional runtime speed cap; None disables clipping
+
+    #Original controller limit:
+    # "vmax": 1.5,  # optional runtime speed cap; None disables clipping
+
+    #New tester:
+    "vmax": 1.0,  # optional runtime speed cap; None disables clipping
+
+
     "safety_filter": {
         "enabled": True,
         "kind": "velocity_cbf_qp",
@@ -148,7 +198,7 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": False,
+    "use_kf": True,
     "estimator_kind": "ekf",
     "meas_innov_coef": 1.0,  
     "meas_cov_coef": 0.02,
@@ -229,8 +279,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    "reward_type": "zero_sum",
-    # "reward_type": "zero_sum_kf",
+    # "reward_type": "zero_sum",
+    "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
@@ -273,23 +323,26 @@ TRAIN: Dict[str, Any] = {
     "mp_start_method": None, # auto-selects a multiprocessing start method
 
     #Higher accelerations setting (2.0 m/s^2)
-    # "k_pos": 0.1,
-    # "gamma": 0.991, 
-    # "steps_per_env": 512,  
-    # "train_ic_vmax": 0.5,            # max |v| component at t=0
-    # "total_updates": 1000,   #Was 2000
+    "umax": 2.0,
+    "k_pos": 0.1,
+    "gamma": 0.991, 
+    "steps_per_env": 512,  
+    "train_ic_vmax": 0.5,            # max |v| component at t=0
+    "total_updates": 1000,   #Was 2000
+    "k_dock": 0.00,
 
 
     #Lower acceleration setting (0.1 m/s^2)
-    "k_pos": 0.1/4.5,
-    "gamma": 0.991, 
-    "steps_per_env": 512*4.5,  
-    # "steps_per_env": 2048,  
-    "train_ic_vmax": 0.5/4.5,            # max |v| component at t=0
-    "total_updates": 1000,   #Was 2000
-    # "total_updates": 2000,   #Was 2000
-    # "k_dock": 0.05/4.5,  # optional mild defender-approach shaping on normalized gap outside collision radius
-    "k_dock": 0.0, 
+    # "umax": 0.1,
+    # "k_pos": 0.1/4.5,
+    # "gamma": 0.991, 
+    # "steps_per_env": 512*4.5,  
+    # # "steps_per_env": 2048,  
+    # "train_ic_vmax": 0.5/4.5,            # max |v| component at t=0
+    # "total_updates": 1000,   #Was 2000
+    # # "total_updates": 2000,   #Was 2000
+    # # "k_dock": 0.05/4.5,  # optional mild defender-approach shaping on normalized gap outside collision radius
+    # "k_dock": 0.0, 
 
     # "k_pos": 0.05, #Was 0.05
     # "k_pos": 0.01, #Was 0.05
@@ -391,7 +444,7 @@ TRAIN: Dict[str, Any] = {
     # Training-only initial condition randomization
     # (env uses this; eval config will default back to "fixed")
     "train_ic_mode": "random_shell_advantage",  # or "fixed"
-    "train_min_sep": 1.0,             # min defender–attacker separation (m)
+    "train_min_sep": 2.0,             # min defender–attacker separation (m)
     "arena_radius_knob": {
         "enabled": True,
         "start_radius_m": 20.0,
@@ -410,45 +463,34 @@ TRAIN: Dict[str, Any] = {
             # {"radius_m": 20.0, "updates": 400, "r_att_min": 0.30, "r_att_max": 0.95},
             # {"radius_m": 40.0, "updates": 400, "r_att_min_m": 12.0, "r_att_max_m": 36.0},
             # {"radius_m": 60.0, "updates": 400, "r_def_max": 0.80},
-            # {"radius_m": 25.0, "fraction": 0.10},
-            # {"radius_m": 30.0, "fraction": 0.10},
-            # {"radius_m": 40.0, "fraction": 0.10},
-            # {"radius_m": 50.0, "fraction": 0.10},
-            # {"radius_m": 60.0, "fraction": 0.10},
-            # {"radius_m": 70.0, "fraction": 0.10},
-            # {"radius_m": 80.0, "fraction": 0.10},
-            # {"radius_m": 90.0, "fraction": 0.10},
-            # {"radius_m": 100.0, "fraction": 0.10},
 
-            # {"radius_m": 20.0, "fraction": 0.40},
-            # {"radius_m": 30.0, "fraction": 0.075},
-            # {"radius_m": 40.0, "fraction": 0.075},
-            # {"radius_m": 50.0, "fraction": 0.075},
-            # {"radius_m": 60.0, "fraction": 0.075},
-            # {"radius_m": 70.0, "fraction": 0.075},
-            # {"radius_m": 80.0, "fraction": 0.075},
-            # {"radius_m": 90.0, "fraction": 0.075},
-            # {"radius_m": 100.0, "fraction": 0.075},
 
-            # {"radius_m": 20.0, "updates": 400},
-            # {"radius_m": 30.0, "updates": 400},
-            # {"radius_m": 40.0, "updates": 400},
-            # {"radius_m": 50.0, "updates": 400},
-            # {"radius_m": 60.0, "updates": 400},
-            # {"radius_m": 70.0, "updates": 400},
-            # {"radius_m": 80.0, "updates": 400},
-            # {"radius_m": 90.0, "updates": 400},
-            # {"radius_m": 100.0, "updates": 400},
-
+            #Third attempt setting:
             # {"radius_m": 20.0, "updates": 400, "r_att_min_m": 0.20*30, "r_att_max_m": 0.95*20},
-            # {"radius_m": 40.0, "updates": 400, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*40},
-            # {"radius_m": 60.0, "updates": 400, "r_att_min_m": 0.95*40, "r_att_max_m": 0.95*60},
-            # {"radius_m": 80.0, "updates": 400, "r_att_min_m": 0.95*60, "r_att_max_m": 0.95*80},
-            # {"radius_m": 100.0, "updates": 400, "r_att_min_m": 0.95*80, "r_att_max_m": 0.95*100},
+            # {"radius_m": 100.0, "updates": 600, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*100},
 
 
-            {"radius_m": 20.0, "updates": 400, "r_att_min_m": 0.20*30, "r_att_max_m": 0.95*20},
-            {"radius_m": 100.0, "updates": 600, "r_att_min_m": 0.95*20, "r_att_max_m": 0.95*100},
+            #Fourth attempt setting:
+            # {"radius_m": 20.0, "updates": 1000, "r_att_min_m": 0.30*20, "r_att_max_m": 0.95*20},
+
+            # OG with preliminar actuation limits:
+            {"radius_m": 20.0, "updates": 1000, "r_att_min_m": 0.30*20, "r_att_max_m": 0.95*20, "r_def_min_m": 0.0, "r_def_max_m": 0.80*20},
+
+        ],
+    },
+    "arena_radius_knob_att": {
+        # Optional deep-merge override applied only when train_role=="att".
+        # Keep `arena_radius_knob` as the default/defender curriculum and set
+        # only the attacker-specific differences here.
+        #
+        # Example:
+        "enabled": True,
+        "stages": [
+            #Setting used in staged learening
+            # {"radius_m": 20.0, "updates": 1000, "r_att_min_m": 0.0,  "r_att_max_m": 19.0},
+
+            # OG with preliminar actuation limits:
+            {"radius_m": 20.0, "updates": 1000, "r_att_min_m": 0.0,  "r_att_max_m": 0.95*20, "r_def_min_m": 0.0, "r_def_max_m": 0.80*20},
         ],
     },
 
@@ -501,6 +543,7 @@ def config_for_train(**overrides) -> Dict[str, Any]:
     cfg = _merge(COMMON, TRAIN)
     if overrides:
         cfg = _merge(cfg, overrides)
+    cfg = _apply_role_specific_curriculum_overrides(cfg)
     return cfg
 
 def config_for_eval(**overrides) -> Dict[str, Any]:
@@ -576,6 +619,7 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
         },
     }
 
+    cfg = _apply_role_specific_curriculum_overrides(cfg)
     return cfg
 
 # ---------- Dynamics builder ----------

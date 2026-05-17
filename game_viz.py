@@ -24,6 +24,7 @@ __all__ = [
     "add_triad_legend",
     "animate_rollout_3d", "interactive_rollout_3d",
     "plot_rollout_thrust_u",
+    "plot_rollout_delta_v",
     "plot_rollout_velocity",
     "plot_rollout_center_distance",
     "plot_rollout_relative_distance"
@@ -1762,6 +1763,168 @@ def plot_rollout_thrust_u(
 
     if title is None:
         title = f"Commanded thrust u (agent {agent})"
+    ax.set_title(title)
+    ax.legend()
+
+    fig.tight_layout()
+    if show:
+        plt.show()
+    return fig, ax
+
+
+def plot_rollout_delta_v(
+    frames_dict,
+    cfg=None,
+    agents=(1, 2),
+    rollout_idx: int | None = None,
+    dt: float | None = None,
+    title: str | None = None,
+    show: bool = True,
+    prefer_realized: bool = True,
+):
+    """
+    Plot cumulative delta-V usage over rollout time for one or more agents.
+
+    Delta-V is approximated as the time integral of the executed acceleration
+    magnitude, i.e. cumulative sum of ``||u_real|| * dt``. If realized controls
+    are unavailable, the function falls back to commanded controls.
+    """
+
+    def _as_u_array(u_like):
+        if u_like is None:
+            return None
+        U = np.asarray(u_like, dtype=float)
+        if U.ndim != 2 or U.shape[0] < 1:
+            return None
+        if U.shape[1] < 3:
+            return None
+        return U[:, :3]
+
+    def _maybe_pick_rollout(obj):
+        if rollout_idx is None:
+            return obj
+        if isinstance(obj, (list, tuple)) and len(obj) > 0:
+            try:
+                return obj[rollout_idx]
+            except Exception:
+                return obj
+        return obj
+
+    def _pick_agent_series(container, agent: int):
+        container = _maybe_pick_rollout(container)
+        a0 = agent - 1
+        if isinstance(container, (list, tuple)):
+            if 0 <= a0 < len(container):
+                return container[a0]
+            return None
+        arr = np.asarray(container, dtype=float)
+        if arr.ndim == 3 and 0 <= a0 < arr.shape[0]:
+            return arr[a0]
+        return None
+
+    def _infer_dt():
+        if dt is not None:
+            return float(dt)
+        if cfg is None:
+            return None
+        for path in (("dt",), ("dyn", "dt"), ("sim", "dt")):
+            try:
+                val = cfg
+                for p in path:
+                    val = val[p]
+                return float(val)
+            except Exception:
+                pass
+        return None
+
+    def _get_control_for_agent(agent: int):
+        n_aware_preferred = ("u_real_all", "u_cmd_all", "u_all", "act_all", "actions_all")
+        n_aware_fallback = ("u_cmd_all", "u_all", "act_all", "actions_all", "u_real_all")
+        generic_preferred = ("u_real", "u_cmd", "u", "u_hist", "act", "actions", "u_cmd_xyz")
+        generic_fallback = ("u_cmd", "u", "u_hist", "act", "actions", "u_cmd_xyz", "u_real")
+
+        if prefer_realized:
+            n_aware_keys = n_aware_preferred
+            generic_keys = generic_preferred
+            legacy_keys = [
+                f"u{agent}_real_xyz", f"u{agent}_real",
+                f"u{agent}_cmd_xyz", f"u{agent}_xyz",
+                f"u{agent}_cmd", f"u{agent}",
+                f"act{agent}", f"action{agent}", f"actions{agent}",
+            ]
+        else:
+            n_aware_keys = n_aware_fallback
+            generic_keys = generic_fallback
+            legacy_keys = [
+                f"u{agent}_cmd_xyz", f"u{agent}_xyz",
+                f"u{agent}_cmd", f"u{agent}",
+                f"act{agent}", f"action{agent}", f"actions{agent}",
+                f"u{agent}_real_xyz", f"u{agent}_real",
+            ]
+
+        for k in n_aware_keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                picked = _pick_agent_series(frames_dict[k], agent)
+                U = _as_u_array(picked)
+                if U is not None:
+                    return U
+
+        for k in legacy_keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                U = _as_u_array(_maybe_pick_rollout(frames_dict[k]))
+                if U is not None:
+                    return U
+
+        for k in generic_keys:
+            if k in frames_dict and frames_dict[k] is not None:
+                U = _as_u_array(_maybe_pick_rollout(frames_dict[k]))
+                if U is not None:
+                    return U
+
+        return None
+
+    dt_plot = _infer_dt()
+    dt_eff = 1.0 if dt_plot is None else dt_plot
+
+    delta_v_by_agent = {}
+    for agent in agents:
+        agent = int(agent)
+        U = _get_control_for_agent(agent)
+        if U is None:
+            known = [
+                k for k in frames_dict.keys()
+                if any(s in k.lower() for s in ("u", "act", "action"))
+            ]
+            raise KeyError(
+                f"Could not find a control history for agent {agent}.\n"
+                "Tried realized and commanded control keys, including N-aware "
+                "u_real_all/u_cmd_all and legacy u{agent}_* keys.\n"
+                f"Known control-like keys: {known}"
+            )
+        dv = np.concatenate([[0.0], np.cumsum(np.linalg.norm(U, axis=1) * dt_eff)])
+        delta_v_by_agent[agent] = dv
+
+    T = min(dv.shape[0] for dv in delta_v_by_agent.values())
+    if dt_plot is None:
+        t = np.arange(T)
+        xlab = "step"
+        ylab = "cumulative control magnitude"
+    else:
+        t = dt_plot * np.arange(T)
+        xlab = "time [s]"
+        ylab = "cumulative delta-V [m/s]"
+
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    for agent in agents:
+        agent = int(agent)
+        ax.plot(t, delta_v_by_agent[agent][:T], linewidth=2.0, label=f"Agent {agent}")
+
+    ax.set_xlabel(xlab)
+    ax.set_ylabel(ylab)
+    ax.grid(True, alpha=0.35)
+
+    if title is None:
+        title = "Delta-V used vs time"
     ax.set_title(title)
     ax.legend()
 

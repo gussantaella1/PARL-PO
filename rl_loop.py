@@ -35,6 +35,15 @@ def _merge_dicts(base: dict, extra: dict) -> dict:
     return out
 
 
+def _build_phase_cfg(attacker_mode: str, train_role: str, extra_cfg: dict | None = None) -> dict:
+    extra_cfg = dict(extra_cfg or {})
+    return config_for_train(
+        attacker_mode=attacker_mode,
+        train_role=train_role,
+        **extra_cfg,
+    )
+
+
 def _parse_phase_list(text: str) -> set[int]:
     phases = set()
     for chunk in str(text).split(","):
@@ -216,6 +225,7 @@ if __name__ == "__main__":
             # "gamma": 0.995,
             "hit_buffer_def": 0.25,
         })
+        phase0_cfg = _build_phase_cfg("rule", "def", phase0_extra)
         with runlog.stage(
             "PHASE0_train_def0",
             phase_name="def0",
@@ -245,7 +255,7 @@ if __name__ == "__main__":
         )
 
         plot_ic_support_from_cfg(
-            cfg_training_log,
+            phase0_cfg,
             n_scenes=30000,
             seed=123,
             title="def0 feasible IC support",
@@ -255,7 +265,7 @@ if __name__ == "__main__":
 
         plot_ic_used_from_npz(
             os.path.join(OUT_DIR, "ic_samples_def0_teacher.npz"),
-            cfg_training_log,
+            phase0_cfg,
             title="def0 ICs actually used during training",
             out_path=os.path.join(PLOTS_DEF0, "def0_ic_used.png"),
             show=False,
@@ -273,11 +283,8 @@ if __name__ == "__main__":
             "def_ckpt_path": def0_teacher_ckpt,
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
-            "r_att_min": 0.0,
-            "r_att_min_m": 0.0,
-
-            # "gamma": 0.991,
-            # "gamma": 0.995,
+            # "r_att_min": 0.0,
+            # "r_att_min_m": 0.0,
 
             # NEW:
             # "opp_mix": {
@@ -319,6 +326,7 @@ if __name__ == "__main__":
             },
 
         })
+        phase1_cfg = _build_phase_cfg("rl", "att", phase1_extra)
 
         with runlog.stage(
             "PHASE1_train_att1",
@@ -347,7 +355,7 @@ if __name__ == "__main__":
         )
 
         plot_ic_support_from_cfg(
-            cfg_training_log,
+            phase1_cfg,
             n_scenes=30000,
             seed=123,
             title="att1 feasible IC support",
@@ -357,7 +365,7 @@ if __name__ == "__main__":
 
         plot_ic_used_from_npz(
             os.path.join(OUT_DIR, "ic_samples_att1_teacher.npz"),
-            cfg_training_log,
+            phase1_cfg,
             title="att1 ICs actually used during training",
             out_path=os.path.join(PLOTS_ATT1, "att1_ic_used.png"),
             show=False,
@@ -375,10 +383,6 @@ if __name__ == "__main__":
         phase2_extra = _merge_dicts(runtime_overrides, {"att_ckpt_path": att1_teacher_ckpt,
                         "def_ckpt_path": def0_teacher_ckpt,
                         "freeze_attacker": True,
-                        # "gamma": 0.993,
-                        # "gamma": 0.990, # Performed poorly against .994 attacker, good against .990 
-                        # "gamma": 0.994, # Performed poorly against .994 attacker
-                        # "gamma": 0.995,
                         # Checkpoint-based attacker mixture:
                         "opp_mix": {
                             "resample": "episode",
@@ -411,6 +415,7 @@ if __name__ == "__main__":
                         },
 
                         })
+        phase2_cfg = _build_phase_cfg("rl", "def", phase2_extra)
 
         with runlog.stage(
             "PHASE2_train_def1",
@@ -440,7 +445,7 @@ if __name__ == "__main__":
         )
 
         plot_ic_support_from_cfg(
-            cfg_training_log,
+            phase2_cfg,
             n_scenes=30000,
             seed=123,
             title="def1 feasible IC support",
@@ -450,7 +455,7 @@ if __name__ == "__main__":
 
         plot_ic_used_from_npz(
             os.path.join(OUT_DIR, "ic_samples_def1_teacher.npz"),
-            cfg_training_log,
+            phase2_cfg,
             title="def1 ICs actually used during training",
             out_path=os.path.join(PLOTS_DEF1, "def1_ic_used.png"),
             show=False,
@@ -468,8 +473,8 @@ if __name__ == "__main__":
             "def_ckpt_path": def1_teacher_ckpt,
             "freeze_defender": True,
             "train_ic_mode": "random_shell",
-            "r_att_min": 0.0,
-            "r_att_min_m": 0.0,
+            # "r_att_min": 0.0,
+            # "r_att_min_m": 0.0,
             # "gamma": 0.995,
 
             # Checkpoint-based attacker mixture:
@@ -529,6 +534,7 @@ if __name__ == "__main__":
             },
 
         })
+        phase3_cfg = _build_phase_cfg("rl", "att", phase3_extra)
 
         with runlog.stage(
             "PHASE3_train_att2",
@@ -557,7 +563,7 @@ if __name__ == "__main__":
         )
 
         plot_ic_support_from_cfg(
-            cfg_training_log,
+            phase3_cfg,
             n_scenes=30000,
             seed=123,
             title="att2 feasible IC support",
@@ -567,7 +573,7 @@ if __name__ == "__main__":
 
         plot_ic_used_from_npz(
             os.path.join(OUT_DIR, "ic_samples_att2_teacher.npz"),
-            cfg_training_log,
+            phase3_cfg,
             title="att2 ICs actually used during training",
             out_path=os.path.join(PLOTS_ATT2, "att2_ic_used.png"),
             show=False,
@@ -647,6 +653,7 @@ if __name__ == "__main__":
 
             
         })
+        phase4_cfg = _build_phase_cfg("rl", "def", phase4_extra)
 
         with runlog.stage(
             "PHASE4_train_def2",
@@ -675,7 +682,7 @@ if __name__ == "__main__":
         )
 
         plot_ic_support_from_cfg(
-            cfg_training_log,
+            phase4_cfg,
             n_scenes=30000,
             seed=123,
             title="def2 feasible IC support",
@@ -685,7 +692,7 @@ if __name__ == "__main__":
 
         plot_ic_used_from_npz(
             os.path.join(OUT_DIR, "ic_samples_def2_teacher.npz"),
-            cfg_training_log,
+            phase4_cfg,
             title="def2 ICs actually used during training",
             out_path=os.path.join(PLOTS_DEF2, "def2_ic_used.png"),
             show=False,

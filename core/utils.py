@@ -38,6 +38,15 @@ def resolve_start_radius_bounds(
     if who not in {"def", "att"}:
         raise ValueError(f"Unsupported shell owner {who!r}; expected 'def' or 'att'.")
 
+    def _radius_from_fraction(frac_value: Any, source_key: str) -> float:
+        frac = float(frac_value)
+        if frac > 1.0 + 1e-9:
+            raise ValueError(
+                f"{source_key}={frac} is being interpreted as a fraction of the arena radius. "
+                f"If you meant meters, use {source_key}_m instead."
+            )
+        return frac * float(arena_radius)
+
     def _resolve(bound: str, default_frac: float) -> float:
         frac_key = f"r_{who}_{bound}"
         meter_key = f"{frac_key}_m"
@@ -49,12 +58,12 @@ def resolve_start_radius_bounds(
                 radius = float(meter_val)
                 source_key = meter_key
             elif frac_val is not None:
-                radius = float(frac_val) * float(arena_radius)
+                radius = _radius_from_fraction(frac_val, frac_key)
                 source_key = frac_key
             else:
                 # A stage can explicitly null out the meter override and fall back
                 # to the base fractional setting for that bound.
-                radius = float(cfg.get(frac_key, default_frac)) * float(arena_radius)
+                radius = _radius_from_fraction(cfg.get(frac_key, default_frac), frac_key)
                 source_key = frac_key
         else:
             meter_val = cfg.get(meter_key, None)
@@ -62,7 +71,7 @@ def resolve_start_radius_bounds(
                 radius = float(meter_val)
                 source_key = meter_key
             else:
-                radius = float(cfg.get(frac_key, default_frac)) * float(arena_radius)
+                radius = _radius_from_fraction(cfg.get(frac_key, default_frac), frac_key)
                 source_key = frac_key
         if radius < 0.0:
             raise ValueError(f"{source_key} must be >= 0, got {radius}.")
