@@ -52,16 +52,16 @@ class Env:
 
 
         umax = float(cfg["umax"]) ; self.u_lo, self.u_hi = -umax, +umax
-        raw_vmax = cfg.get("vmax", None)
-        self.vmax = np.inf if raw_vmax is None else float(raw_vmax)
-        if self.vmax < 0.0:
-            raise ValueError(f"vmax must be >= 0 or None, got {raw_vmax!r}.")
-
         sf_cfg = dict(cfg.get("safety_filter", {}) or {})
         self.velocity_cbf_enabled = bool(sf_cfg.get("enabled", False))
         self.velocity_cbf_kind = str(sf_cfg.get("kind", "velocity_cbf_qp")).strip().lower()
-        raw_cbf_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+        raw_cbf_vmax = sf_cfg.get("vmax", None)
+        if raw_cbf_vmax is None:
+            raw_cbf_vmax = cfg.get("vmax", None)
         self.velocity_cbf_vmax = np.inf if raw_cbf_vmax is None else float(raw_cbf_vmax)
+        self.vmax = self.velocity_cbf_vmax
+        if self.vmax < 0.0:
+            raise ValueError(f"safety_filter['vmax'] must be >= 0 or None, got {raw_cbf_vmax!r}.")
         self.velocity_cbf_alpha = float(sf_cfg.get("alpha", 5.0))
         self._velocity_cbf_dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
         self._velocity_cbf_hcw_n = None
@@ -82,7 +82,7 @@ class Env:
             if not np.isfinite(self.velocity_cbf_vmax) or self.velocity_cbf_vmax <= 0.0:
                 raise ValueError(
                     "safety_filter requires a finite positive vmax either in "
-                    "safety_filter['vmax'] or top-level cfg['vmax']."
+                    "safety_filter['vmax'] (or legacy top-level cfg['vmax'])."
                 )
             if self.velocity_cbf_alpha <= 0.0:
                 raise ValueError(
@@ -2050,6 +2050,7 @@ class TorchVecEnv:
         self.use_kf = bool(base.use_kf)
         self.use_fuel = bool(base.use_fuel)
         self.reward_type = str(base.reward_type)
+        self.estimator_kind = str(base.estimator_kind)
         self.reset_ukf_on_diverge = bool(base.reset_ukf_on_diverge)
         self.velocity_cbf_enabled = bool(base.velocity_cbf_enabled)
         self.velocity_cbf_kind = str(base.velocity_cbf_kind)
@@ -2059,6 +2060,8 @@ class TorchVecEnv:
         self._velocity_cbf_hcw_n = (
             None if base._velocity_cbf_hcw_n is None else float(base._velocity_cbf_hcw_n)
         )
+        self.belief_clip_factor = float(base.belief_clip_factor)
+        self._batched_ekf_enabled = bool(self.use_kf and self.estimator_kind == "ekf")
 
         self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
         self.Ad_t = torch.as_tensor(base.Ad, dtype=self.dtype, device=self.device)
@@ -2092,12 +2095,75 @@ class TorchVecEnv:
         self.oi_radius_term_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
         self.arena_term_limit_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
+        if self._batched_ekf_enabled:
+            self._ekf_dtype = torch.float64
+            self._ekf_state_dim = int(base._ukf_state_dim)
+            self._ekf_every = int(base._ukf_every)
+            self._ekf_jacobian_mode = str(base._ekf_jacobian_mode)
+            self._kf_action_access = str(base._ukf_action_access)
+            self._kf_control_meas_std_t = torch.as_tensor(
+                base._kf_control_meas_std,
+                dtype=self._ekf_dtype,
+                device=self.device,
+            )
+            self._ekf_meas_std_t = torch.sqrt(
+                torch.clamp(
+                    torch.diagonal(
+                        torch.as_tensor(base._ukf_R, dtype=self._ekf_dtype, device=self.device)
+                    ),
+                    min=0.0,
+                )
+            )
+            self._ekf_P0_t = torch.as_tensor(base._ukf_P0, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_Q_t = torch.as_tensor(base._ukf_Q, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_R_t = torch.as_tensor(base._ukf_R, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_I_t = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_I3_t = torch.eye(3, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_Ad_t = torch.as_tensor(base.Ad, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_Bd_t = torch.as_tensor(base.Bd, dtype=self._ekf_dtype, device=self.device)
+            if self._ekf_state_dim == 9:
+                A9 = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device)
+                B9 = torch.zeros((self._ekf_state_dim, 3), dtype=self._ekf_dtype, device=self.device)
+                A9[:6, :6] = self._ekf_Ad_t
+                A9[:6, 6:9] = self._ekf_Bd_t
+                B9[:6, :] = self._ekf_Bd_t
+                self._ekf_Ad_t = A9
+                self._ekf_Bd_t = B9
+            self._def_ekf_x_t = torch.zeros(
+                (self.num_envs, self._ekf_state_dim),
+                dtype=self._ekf_dtype,
+                device=self.device,
+            )
+            self._def_ekf_P_t = torch.zeros(
+                (self.num_envs, self._ekf_state_dim, self._ekf_state_dim),
+                dtype=self._ekf_dtype,
+                device=self.device,
+            )
+            self._att_ekf_x_t = torch.zeros_like(self._def_ekf_x_t)
+            self._att_ekf_P_t = torch.zeros_like(self._def_ekf_P_t)
+            self._ekf_frozen_linearizations = {
+                "defender_observer": None,
+                "attacker_observer": None,
+            }
+
         if self.use_fuel:
             self.m_def_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
             self.m_att_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
         for env in self.envs:
             env.set_opp_domain(_sample_opp_domain(env.cfg))
+
+        if self.use_kf:
+            if self._batched_ekf_enabled:
+                print(
+                    f"[TorchVecEnv] batched {self.estimator_kind.upper()} path enabled "
+                    f"(device={self.device}, num_envs={self.num_envs})."
+                )
+            else:
+                print(
+                    f"[TorchVecEnv] KF enabled with estimator_kind={self.estimator_kind}; "
+                    "using per-env scalar estimator path."
+                )
 
         self.obs_def = None
         self.obs_att = None
@@ -2122,6 +2188,29 @@ class TorchVecEnv:
         if self.use_fuel:
             self.m_def_t[idx] = float(env.m_def)
             self.m_att_t[idx] = float(env.m_att[0])
+        if self._batched_ekf_enabled:
+            if env.ukf is not None:
+                self._def_ekf_x_t[idx] = torch.as_tensor(
+                    np.asarray(env.ukf.x, dtype=np.float64),
+                    dtype=self._ekf_dtype,
+                    device=self.device,
+                )
+                self._def_ekf_P_t[idx] = torch.as_tensor(
+                    np.asarray(env.ukf.P, dtype=np.float64),
+                    dtype=self._ekf_dtype,
+                    device=self.device,
+                )
+            if env.att_ukf is not None:
+                self._att_ekf_x_t[idx] = torch.as_tensor(
+                    np.asarray(env.att_ukf.x, dtype=np.float64),
+                    dtype=self._ekf_dtype,
+                    device=self.device,
+                )
+                self._att_ekf_P_t[idx] = torch.as_tensor(
+                    np.asarray(env.att_ukf.P, dtype=np.float64),
+                    dtype=self._ekf_dtype,
+                    device=self.device,
+                )
 
     def _sync_from_envs(self, indices: List[int] | None = None):
         if indices is None:
@@ -2157,10 +2246,231 @@ class TorchVecEnv:
         )
         return project_box_halfspace_torch(u_nom, self.u_lo_t, self.u_hi_t, a, b)
 
+    def _ekf_symmetrize(self, M: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (M + M.transpose(-1, -2))
+
+    def _ekf_psd_enforce(self, M: torch.Tensor, floor: float = 1e-12) -> torch.Tensor:
+        M = self._ekf_symmetrize(M)
+        eig, V = torch.linalg.eigh(M)
+        eig = torch.clamp(eig, min=floor)
+        return V @ torch.diag_embed(eig) @ V.transpose(-1, -2)
+
+    def _ekf_normalize_angle(self, a: torch.Tensor) -> torch.Tensor:
+        return torch.remainder(a + np.pi, 2.0 * np.pi) - np.pi
+
+    def _ekf_measurement_from_positions(
+        self,
+        p_obs: torch.Tensor,
+        p_tgt: torch.Tensor,
+    ) -> torch.Tensor:
+        r = p_tgt - p_obs
+        n = torch.linalg.vector_norm(r, dim=-1, keepdim=True)
+        zero_mask = n.squeeze(-1) < 1e-12
+        if torch.any(zero_mask):
+            fallback = torch.tensor([1.0, 0.0, 0.0], dtype=self._ekf_dtype, device=self.device)
+            r = torch.where(zero_mask[:, None], fallback[None, :], r)
+            n = torch.where(zero_mask[:, None], torch.ones_like(n), n)
+        b = r / n
+        bx, by, bz = b.unbind(dim=-1)
+        rho = torch.sqrt(torch.clamp(bx * bx + by * by, min=1e-18))
+        az = torch.atan2(by, bx)
+        el = torch.atan2(bz, rho)
+        return torch.stack([az, el], dim=-1)
+
+    def _ekf_measurement_jacobian(
+        self,
+        x_state: torch.Tensor,
+        p_obs: torch.Tensor,
+    ) -> torch.Tensor:
+        p = x_state[:, :3]
+        r = p - p_obs
+        n = torch.linalg.vector_norm(r, dim=-1, keepdim=True)
+        zero_mask = n.squeeze(-1) < 1e-12
+        if torch.any(zero_mask):
+            fallback = torch.tensor([1.0, 0.0, 0.0], dtype=self._ekf_dtype, device=self.device)
+            r = torch.where(zero_mask[:, None], fallback[None, :], r)
+            n = torch.where(zero_mask[:, None], torch.ones_like(n), n)
+        b = r / n
+        outer = b[:, :, None] * b[:, None, :]
+        J_bwr = (self._ekf_I3_t.unsqueeze(0) - outer) / n[:, None, :]
+        bx, by, bz = b.unbind(dim=-1)
+        rho2 = bx * bx + by * by
+        rho = torch.sqrt(torch.clamp(rho2, min=1e-12))
+        den_el = rho2 + bz * bz
+        zeros = torch.zeros_like(bx)
+        daz_db = torch.stack(
+            [
+                -by / torch.clamp(rho2, min=1e-12),
+                bx / torch.clamp(rho2, min=1e-12),
+                zeros,
+            ],
+            dim=-1,
+        )
+        del_db = torch.stack(
+            [
+                -bz * (bx / torch.clamp(rho, min=1e-12)) / torch.clamp(den_el, min=1e-12),
+                -bz * (by / torch.clamp(rho, min=1e-12)) / torch.clamp(den_el, min=1e-12),
+                rho / torch.clamp(den_el, min=1e-12),
+            ],
+            dim=-1,
+        )
+        DzDb = torch.stack([daz_db, del_db], dim=1)
+        H_p = torch.matmul(DzDb, J_bwr)
+        H = torch.zeros(
+            (x_state.shape[0], 2, self._ekf_state_dim),
+            dtype=self._ekf_dtype,
+            device=self.device,
+        )
+        H[:, :, :3] = H_p
+        return H
+
+    def _ekf_linearization(
+        self,
+        role_key: str,
+        x_state: torch.Tensor,
+        p_obs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._ekf_jacobian_mode == "exact":
+            H = self._ekf_measurement_jacobian(x_state, p_obs)
+            z_pred = self._ekf_measurement_from_positions(p_obs, x_state[:, :3])
+            return H, z_pred
+
+        cache = self._ekf_frozen_linearizations.get(role_key)
+        if cache is None:
+            x_ref = x_state[:1]
+            p_obs_ref = p_obs[:1]
+            H_ref = self._ekf_measurement_jacobian(x_ref, p_obs_ref)[0]
+            z_ref = self._ekf_measurement_from_positions(p_obs_ref, x_ref[:, :3])[0]
+            offset_ref = z_ref - (H_ref @ x_ref[0])
+            cache = (H_ref, offset_ref)
+            self._ekf_frozen_linearizations[role_key] = cache
+        H_ref, offset_ref = cache
+        H = H_ref.unsqueeze(0).expand(x_state.shape[0], -1, -1)
+        z_pred = torch.matmul(H, x_state.unsqueeze(-1)).squeeze(-1) + offset_ref.unsqueeze(0)
+        return H, z_pred
+
+    def _ekf_predict_control(
+        self,
+        u_true: torch.Tensor,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        u_true = u_true.to(dtype=self._ekf_dtype)
+        if self._kf_action_access == "ground_truth":
+            return u_true, None
+        if self._kf_action_access == "measured":
+            noise = self._kf_control_meas_std_t.unsqueeze(0) * torch.randn(
+                (u_true.shape[0], 3),
+                dtype=self._ekf_dtype,
+                device=self.device,
+            )
+            u_meas = torch.clamp(u_true + noise, min=self.u_lo, max=self.u_hi)
+            cov = torch.diag_embed(
+                self._kf_control_meas_std_t.square().unsqueeze(0).expand(u_true.shape[0], -1)
+            )
+            return u_meas, cov
+        return None, None
+
+    def _ekf_predict_batch(
+        self,
+        x_state: torch.Tensor,
+        P_state: torch.Tensor,
+        u_true: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        u_predict, u_cov = self._ekf_predict_control(u_true)
+        x_pred = torch.matmul(x_state, self._ekf_Ad_t.transpose(0, 1))
+        if u_predict is not None:
+            x_pred = x_pred + torch.matmul(u_predict, self._ekf_Bd_t.transpose(0, 1))
+        A = self._ekf_Ad_t.unsqueeze(0)
+        P_pred = torch.matmul(A, torch.matmul(P_state, A.transpose(-1, -2))) + self._ekf_Q_t.unsqueeze(0)
+        if u_cov is not None:
+            B = self._ekf_Bd_t.unsqueeze(0)
+            P_pred = P_pred + torch.matmul(B, torch.matmul(u_cov, B.transpose(-1, -2)))
+        return x_pred, self._ekf_psd_enforce(P_pred)
+
+    def _ekf_update_batch(
+        self,
+        x_state: torch.Tensor,
+        P_state: torch.Tensor,
+        p_obs: torch.Tensor,
+        p_tgt_true: torch.Tensor,
+        role_key: str,
+        update_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        meas_innov = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        trP = torch.diagonal(P_state[:, :3, :3], dim1=-2, dim2=-1).sum(dim=-1).to(dtype=self.dtype)
+        if not torch.any(update_mask):
+            return x_state, P_state, meas_innov, trP
+
+        idx = torch.nonzero(update_mask, as_tuple=False).flatten()
+        x_sel = x_state[idx]
+        P_sel = P_state[idx]
+        p_obs_sel = p_obs[idx].to(dtype=self._ekf_dtype)
+        p_tgt_sel = p_tgt_true[idx].to(dtype=self._ekf_dtype)
+        z_true = self._ekf_measurement_from_positions(p_obs_sel, p_tgt_sel)
+        z_noise = self._ekf_meas_std_t.unsqueeze(0) * torch.randn(
+            (idx.shape[0], 2),
+            dtype=self._ekf_dtype,
+            device=self.device,
+        )
+        z_meas = z_true + z_noise
+        H, z_pred = self._ekf_linearization(role_key, x_sel, p_obs_sel)
+        innov = self._ekf_normalize_angle(z_meas - z_pred)
+        meas_innov[idx] = innov.square().sum(dim=-1).to(dtype=self.dtype)
+        PHt = torch.matmul(P_sel, H.transpose(-1, -2))
+        S = torch.matmul(H, PHt) + self._ekf_R_t.unsqueeze(0)
+        S = self._ekf_psd_enforce(S)
+        K = torch.matmul(PHt, torch.linalg.inv(S + 1e-12 * torch.eye(2, dtype=self._ekf_dtype, device=self.device).unsqueeze(0)))
+        x_upd = x_sel + torch.matmul(K, innov.unsqueeze(-1)).squeeze(-1)
+        IKH = self._ekf_I_t.unsqueeze(0) - torch.matmul(K, H)
+        P_upd = torch.matmul(IKH, torch.matmul(P_sel, IKH.transpose(-1, -2)))
+        P_upd = P_upd + torch.matmul(K, torch.matmul(self._ekf_R_t.unsqueeze(0), K.transpose(-1, -2)))
+        x_state[idx] = x_upd
+        P_state[idx] = self._ekf_psd_enforce(P_upd)
+        trP = torch.diagonal(P_state[:, :3, :3], dim1=-2, dim2=-1).sum(dim=-1).to(dtype=self.dtype)
+        return x_state, P_state, meas_innov, trP
+
+    def _ekf_belief_state_batch(
+        self,
+        x_state: torch.Tensor,
+        P_state: torch.Tensor,
+        p_true: torch.Tensor,
+        v_true: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        p_bel = x_state[:, : self.D].clone()
+        v_bel = x_state[:, self.D : 2 * self.D].clone()
+        center = self.center_t.to(dtype=self._ekf_dtype)
+        p_true_ekf = p_true.to(dtype=self._ekf_dtype)
+        v_true_ekf = v_true.to(dtype=self._ekf_dtype)
+        r_est = torch.linalg.vector_norm(p_bel - center, dim=-1)
+        r_max = self.belief_clip_factor * self.radius_t.to(dtype=self._ekf_dtype)
+        finite_mask = torch.isfinite(p_bel).all(dim=-1) & torch.isfinite(v_bel).all(dim=-1) & torch.isfinite(r_est)
+        overflow_mask = finite_mask & (r_est > r_max)
+        clip_mask = overflow_mask & (r_est > 1e-9)
+        fallback_mask = ~finite_mask
+        if torch.any(clip_mask):
+            direction = (p_bel[clip_mask] - center) / r_est[clip_mask, None]
+            p_bel[clip_mask] = center + direction * r_max[clip_mask, None]
+        if torch.any(fallback_mask):
+            p_bel[fallback_mask] = p_true_ekf[fallback_mask]
+            v_bel[fallback_mask] = v_true_ekf[fallback_mask]
+        if self.reset_ukf_on_diverge:
+            reset_mask = overflow_mask | fallback_mask
+            if torch.any(reset_mask):
+                x_state[reset_mask, : self.D] = p_true_ekf[reset_mask]
+                x_state[reset_mask, self.D : 2 * self.D] = v_true_ekf[reset_mask]
+                if self._ekf_state_dim > 2 * self.D:
+                    x_state[reset_mask, 2 * self.D :] = 0.0
+                P_state[reset_mask] = self._ekf_P0_t.unsqueeze(0).expand(int(reset_mask.sum().item()), -1, -1)
+                p_bel[reset_mask] = p_true_ekf[reset_mask]
+                v_bel[reset_mask] = v_true_ekf[reset_mask]
+        return p_bel.to(dtype=self.dtype), v_bel.to(dtype=self.dtype)
+
     def _refresh_obs(self):
         p1, v1, p2, v2 = self._split_state()
 
-        if self.use_kf:
+        if self._batched_ekf_enabled:
+            p2_obs, v2_obs = self._ekf_belief_state_batch(self._def_ekf_x_t, self._def_ekf_P_t, p2, v2)
+            p1_obs, v1_obs = self._ekf_belief_state_batch(self._att_ekf_x_t, self._att_ekf_P_t, p1, v1)
+        elif self.use_kf:
             p1_np = p1.detach().cpu().numpy()
             v1_np = v1.detach().cpu().numpy()
             p2_np = p2.detach().cpu().numpy()
@@ -2317,7 +2627,39 @@ class TorchVecEnv:
         att_meas_innov = np.zeros((self.num_envs,), dtype=np.float32)
         att_meas_trP = np.zeros((self.num_envs,), dtype=np.float32)
 
-        if self.use_kf:
+        if self._batched_ekf_enabled:
+            self._def_ekf_x_t, self._def_ekf_P_t = self._ekf_predict_batch(
+                self._def_ekf_x_t,
+                self._def_ekf_P_t,
+                a2_real,
+            )
+            self._att_ekf_x_t, self._att_ekf_P_t = self._ekf_predict_batch(
+                self._att_ekf_x_t,
+                self._att_ekf_P_t,
+                a1_real,
+            )
+            update_mask = (self._t_steps % self._ekf_every) == 0
+            self._def_ekf_x_t, self._def_ekf_P_t, meas_innov_t, meas_trP_t = self._ekf_update_batch(
+                self._def_ekf_x_t,
+                self._def_ekf_P_t,
+                p1,
+                p2,
+                "defender_observer",
+                update_mask,
+            )
+            self._att_ekf_x_t, self._att_ekf_P_t, att_meas_innov_t, att_meas_trP_t = self._ekf_update_batch(
+                self._att_ekf_x_t,
+                self._att_ekf_P_t,
+                p2,
+                p1,
+                "attacker_observer",
+                update_mask,
+            )
+            meas_innov = meas_innov_t.detach().cpu().numpy()
+            meas_trP = meas_trP_t.detach().cpu().numpy()
+            att_meas_innov = att_meas_innov_t.detach().cpu().numpy()
+            att_meas_trP = att_meas_trP_t.detach().cpu().numpy()
+        elif self.use_kf:
             p1_np = p1.detach().cpu().numpy()
             v1_np = v1.detach().cpu().numpy()
             p2_np = p2.detach().cpu().numpy()
@@ -2462,7 +2804,22 @@ class TorchVecEnv:
         p2_est_err_norm = None
         d1_belief_norm = None
         p1_est_err_norm = None
-        if self.use_kf:
+        if self._batched_ekf_enabled:
+            p2_belief_t, _ = self._ekf_belief_state_batch(self._def_ekf_x_t, self._def_ekf_P_t, p2, v2)
+            p1_belief_t, _ = self._ekf_belief_state_batch(self._att_ekf_x_t, self._att_ekf_P_t, p1, v1)
+            d2_belief_norm = (
+                (p2_belief_t - self.center_t).square().sum(dim=-1) / radius_sq
+            ).detach().cpu().numpy()
+            p2_est_err_norm = (
+                (p2_belief_t - p2).square().sum(dim=-1) / radius_sq
+            ).detach().cpu().numpy()
+            d1_belief_norm = (
+                (p1_belief_t - self.center_t).square().sum(dim=-1) / radius_sq
+            ).detach().cpu().numpy()
+            p1_est_err_norm = (
+                (p1_belief_t - p1).square().sum(dim=-1) / radius_sq
+            ).detach().cpu().numpy()
+        elif self.use_kf:
             p1_np = p1.detach().cpu().numpy()
             v1_np = v1.detach().cpu().numpy()
             p2_np = p2.detach().cpu().numpy()

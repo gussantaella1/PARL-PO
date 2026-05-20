@@ -101,7 +101,10 @@ def build_h_builders(cfg, nx, D):
         funcs.append(h_sep)
 
     # -------- speed cap --------
-    raw_vmax = cfg["vmax"] if "vmax" in cfg else (cfg["speed_max"] if "speed_max" in cfg else None)
+    sf_cfg = dict(cfg.get("safety_filter", {}) or {})
+    raw_vmax = sf_cfg.get("vmax", None)
+    if raw_vmax is None:
+        raw_vmax = cfg["vmax"] if "vmax" in cfg else (cfg["speed_max"] if "speed_max" in cfg else None)
     if raw_vmax is not None:
         vmax2 = float(raw_vmax)**2
         vel_idx = list(range(D, 2*D))

@@ -65,7 +65,7 @@ def _apply_role_specific_curriculum_overrides(cfg: Dict[str, Any]) -> Dict[str, 
 
 # ---------- COMMON (shared by train & eval/rollout) ----------
 COMMON: Dict[str, Any] = {
-    "umax": 2.0,
+    "umax": 0.1,
 
     "num_attackers": 1,   # default is 1
     "seed": 42,
@@ -106,25 +106,21 @@ COMMON: Dict[str, Any] = {
     "arena_terminate_margin": 1.0,
     "soft_wall_start": 0.5,
 
-    # Action bounds
+    # Action / controller bounds
     # "umax": 2.0,
     # "umax": 1.0,
     # "umax": 0.1,
     # "umax": 0.01,
-    # "vmax": None,  # optional runtime speed cap; None disables clipping
-
-    #Original controller limit:
-    # "vmax": 1.5,  # optional runtime speed cap; None disables clipping
-
-    #New tester:
-    "vmax": 1.0,  # optional runtime speed cap; None disables clipping
-
+    #
+    # Keep the controller speed cap under safety_filter["vmax"] so it does not
+    # get confused with the training actuation limit cfg["umax"].
 
     "safety_filter": {
         "enabled": True,
         "kind": "velocity_cbf_qp",
         "alpha": 5.0,
-        "vmax": 1.5,  # None => fall back to top-level cfg["vmax"]
+        # "vmax": 1.5,  # controller speed cap; set to None to disable the cap
+        "vmax": 1.0
     },
 
     # Initial conditions
@@ -198,7 +194,9 @@ ARENA_R = float(COMMON["arena"]["r"])
 SENSOR_NOISE_DEFAULT_DEG = 0.5
 
 KF_COMMON: Dict[str, Any] = {
-    "use_kf": True,
+    # "use_kf": True,
+    "use_kf": False,
+
     "estimator_kind": "ekf",
     "meas_innov_coef": 1.0,  
     "meas_cov_coef": 0.02,
@@ -210,11 +208,13 @@ KF_COMMON: Dict[str, Any] = {
         "every": 1,
         "ekf_jacobian_mode": "exact",  # "exact" | "frozen"
         "ekf_use_torch": True,  # when True, EKF runs on cfg["device"] (e.g. "cuda")
-        "pos_std0": 0.2 * ARENA_R,
+        # "pos_std0": 0.2 * ARENA_R,
+        "pos_std0": 0.2 * 20.0,
         "vel_std0": 0.01,
         "action_access": "measured",  # ground_truth | measured | none
         "action_meas_std": 0.25 * float(COMMON["umax"]),  # used when action_access == "measured"
-        "init_pos_std": 0.2 * ARENA_R,
+        # "init_pos_std": 0.2 * ARENA_R,
+        "init_pos_std": 0.2 * 20.0,
         "init_vel_std": 0.01,
         "init_mean_pos_std": 0.0,
         "init_mean_vel_std": 0.0,
@@ -224,9 +224,11 @@ KF_COMMON: Dict[str, Any] = {
         "accel_Q_scale": 1e-4,
         "center_sigma_az": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
         "center_sigma_el": np.deg2rad(SENSOR_NOISE_DEFAULT_DEG),
-        "center_pos_std0": 0.2 * ARENA_R,
+        # "center_pos_std0": 0.2 * ARENA_R,
+        "center_pos_std0": 0.2 * 20.0,
         "center_vel_std0": 0.01,
-        "center_init_pos_std": 0.2 * ARENA_R,
+        # "center_init_pos_std": 0.2 * ARENA_R,
+        "center_init_pos_std": 0.2 * 20.0,
         "center_init_vel_std": 0.01,
         "center_init_mean_pos_std": 0.0,
         "center_init_mean_vel_std": 0.0,
@@ -279,8 +281,8 @@ COMMON = _merge(COMMON,VIZ)
 
 # ---------- TRAIN (training-only knobs) ----------
 TRAIN: Dict[str, Any] = {
-    # "reward_type": "zero_sum",
-    "reward_type": "zero_sum_kf",
+    "reward_type": "zero_sum",
+    # "reward_type": "zero_sum_kf",
 
     "save_best_ckpt": True,
     "save_last_ckpt": True,
@@ -308,12 +310,6 @@ TRAIN: Dict[str, Any] = {
 
     #Base config
     "num_envs": 256,   #Was 256
-    # "steps_per_env": 512*5, #Was 512  
-    # "steps_per_env": 2290,
-    # "steps_per_env": 10240, #Was 512  
-    # "total_updates": 1000,   #Was 2000
-    # "total_updates": 2000,   #Was 2000
-    # "total_updates": 500,   #Was 2000
     "train_epochs": 3, #Was 3
     "minibatch_size": 4096,  #Was 8192
     "log_every": 10,
@@ -323,11 +319,26 @@ TRAIN: Dict[str, Any] = {
     "mp_start_method": None, # auto-selects a multiprocessing start method
 
     #Higher accelerations setting (2.0 m/s^2)
-    "umax": 2.0,
-    "k_pos": 0.1,
+    # "umax": 2.0,
+    # "k_pos": 0.1,
+    # "steps_per_env": 512, 
+
+    # Scale for 0.5 umax - 
+    "umax": 0.5,
+    "k_pos": 0.1/2, #Started at -8
+    "steps_per_env": 512*2, 
+
+    # Scale for 0.1 umax - 
+    # "umax": 0.1,
+    # "k_pos": 0.1/4.5, #Started at -8
+    # "steps_per_env": 512*4.5, 
+    # "k_pos": 0.1/4, #Started at -8
+    # "steps_per_env": 512*4, 
+
+
     "gamma": 0.991, 
-    "steps_per_env": 512,  
-    "train_ic_vmax": 0.5,            # max |v| component at t=0
+    # "train_ic_vmax": 0.5/4,            # max |v| component at t=0
+    "train_ic_vmax": 0.5/2,            # max |v| component at t=0
     "total_updates": 1000,   #Was 2000
     "k_dock": 0.00,
 

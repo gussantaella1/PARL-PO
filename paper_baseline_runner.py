@@ -258,7 +258,9 @@ def _velocity_cbf_params_from_cfg(cfg: Dict[str, Any]) -> Tuple[bool, float, flo
     sf_cfg = dict(cfg.get("safety_filter", {}) or {})
     enabled = bool(sf_cfg.get("enabled", False))
     alpha = float(sf_cfg.get("alpha", 5.0))
-    raw_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+    raw_vmax = sf_cfg.get("vmax", None)
+    if raw_vmax is None:
+        raw_vmax = cfg.get("vmax", None)
     vmax = np.inf if raw_vmax is None else float(raw_vmax)
     dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
     hcw_n = None

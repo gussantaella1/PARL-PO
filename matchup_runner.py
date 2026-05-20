@@ -137,13 +137,15 @@ def _build_velocity_cbf_filter(
             f"Unsupported safety_filter.kind={kind!r}; expected 'velocity_cbf_qp'."
         )
 
-    raw_cbf_vmax = sf_cfg.get("vmax", cfg.get("vmax", None))
+    raw_cbf_vmax = sf_cfg.get("vmax", None)
+    if raw_cbf_vmax is None:
+        raw_cbf_vmax = cfg.get("vmax", None)
     vmax = np.inf if raw_cbf_vmax is None else float(raw_cbf_vmax)
     alpha = float(sf_cfg.get("alpha", 5.0))
     if not np.isfinite(vmax) or vmax <= 0.0:
         raise ValueError(
             "safety_filter requires a finite positive vmax either in "
-            "safety_filter['vmax'] or top-level cfg['vmax']."
+            "safety_filter['vmax'] (or legacy top-level cfg['vmax'])."
         )
     if alpha <= 0.0:
         raise ValueError(f"safety_filter['alpha'] must be > 0, got {alpha}.")

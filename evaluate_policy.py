@@ -62,12 +62,11 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "num_trials": 200,
     "seed": 0,
     "policy_role": "def",          # "def" or "att"
-    "opponent_source": "policy",   # "policy" | "paper" | "game_theory" | "ipopt"
+    "opponent_source": "policy",   # "policy" | "paper" | "game_theory" | "ipopt" | "rule"
     "sample_ic": False,
     "pos_scale": 0.95,
     "vel_scale": 0.0,
     "min_sep": 0.0,
-    "multi_att_mode": "worst",
     "alpha": 0.05,
     "log_every": 10,
     "print_first_out_keys": False,
@@ -89,9 +88,16 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "device": None,
     "def_ckpt_path": None,
     "att_ckpt_path": None,
-    "deterministic": False,
-    "use_kf": False,
+    "attacker_mode": None,
+    "deterministic": None,
+    "use_kf": None,
     "estimator_kind": None,
+    "kf_action_access": None,
+    "kf_action_meas_std": None,
+    "velocity_controller_enabled": None,
+    "velocity_controller_speed": None,
+    "umax": None,
+    "arena_radius": None,
     "x0_pos_jitter": None,
     "x0_vel_jitter": None,
     "dynamics": None,
@@ -120,6 +126,38 @@ def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
         cfg["attacker_ckpt"] = ap
 
 
+def _parse_bool(value: str) -> bool:
+    key = str(value).strip().lower()
+    if key in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if key in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Could not parse boolean value {value!r}. Expected true/false."
+    )
+
+
+def _parse_scalar_or_vector(value: str) -> float | List[float]:
+    parts = [p.strip() for p in str(value).split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("Expected a scalar or comma-separated list of floats.")
+    vals = [float(p) for p in parts]
+    if len(vals) == 1:
+        return float(vals[0])
+    return [float(v) for v in vals]
+
+
+def _normalize_attacker_mode(value: Any) -> str:
+    key = str(value).strip().lower()
+    if key in {"rl", "train"}:
+        return "rl"
+    if key == "rule":
+        return "rule"
+    raise RuntimeError(
+        f"Unsupported attacker_mode={value!r}; expected 'rl', 'train', or 'rule'."
+    )
+
+
 
 def _require_existing_file(path_str: Optional[str], label: str) -> None:
     if path_str is None:
@@ -138,9 +176,31 @@ def _validate_eval_inputs(args: argparse.Namespace, cfg: Dict[str, Any]) -> None
     if args.att_trials_in is not None:
         _require_existing_file(args.att_trials_in, "att_trials_in CSV")
 
+    num_attackers = int(cfg.get("num_attackers", 1))
+    if num_attackers != 1:
+        raise RuntimeError(
+            "evaluate_policy.py now supports only num_attackers=1. "
+            f"Loaded cfg['num_attackers']={num_attackers}."
+        )
+
+    attacker_mode = _normalize_attacker_mode(cfg.get("attacker_mode", "rl"))
+    cfg["attacker_mode"] = attacker_mode
+
+    if args.opponent_source == "rule" and args.policy_role != "def":
+        raise RuntimeError(
+            "opponent_source='rule' is only supported when evaluating the defender policy "
+            "against a rule-based attacker."
+        )
+    if args.policy_role == "att" and attacker_mode != "rl":
+        raise RuntimeError(
+            "policy_role='att' requires attacker_mode='rl' so the evaluated attacker policy "
+            "is loaded from a checkpoint."
+        )
+
     if args.opponent_source == "policy":
         _require_existing_file(cfg.get("def_ckpt_path"), "defender checkpoint")
-        _require_existing_file(cfg.get("att_ckpt_path"), "attacker checkpoint")
+        if attacker_mode == "rl":
+            _require_existing_file(cfg.get("att_ckpt_path"), "attacker checkpoint")
     elif args.policy_role == "def":
         _require_existing_file(cfg.get("def_ckpt_path"), "defender checkpoint")
     else:
@@ -684,6 +744,57 @@ def _rows_from_positions(prefix: str, positions: np.ndarray) -> List[Dict[str, f
             f"{prefix}_vz": 0.0,
         })
     return rows
+
+
+def _radius_key(val: float, ndigits: int = 6) -> float:
+    return round(float(val), ndigits)
+
+
+def _shell_radius_from_row(
+    row: Dict[str, float],
+    prefix: str,
+    D: int,
+    center: np.ndarray,
+) -> float:
+    p = _entity_state_from_row(row, prefix, D)[:D]
+    return float(np.linalg.norm(p - center))
+
+
+def _format_shell_radius_counts(
+    rows: List[Dict[str, float]],
+    prefix: str,
+    D: int,
+    center: np.ndarray,
+) -> str:
+    counts: Dict[float, int] = {}
+    for row in rows:
+        key = _radius_key(_shell_radius_from_row(row, prefix, D, center))
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join(f"{r:g} x{counts[r]}" for r in sorted(counts))
+
+
+def _format_valid_shell_pair_counts(
+    cfg: Dict[str, Any],
+    def_rows: List[Dict[str, float]],
+    att_rows: List[Dict[str, float]],
+    valid_pair_indices: List[Tuple[int, int]],
+) -> str:
+    D = int(cfg.get("D", 3))
+    center, _arena_r = _get_center_and_radius(cfg, D)
+    def_radii = [_radius_key(_shell_radius_from_row(row, "def", D, center)) for row in def_rows]
+    att_radii = [_radius_key(_shell_radius_from_row(row, "att1", D, center)) for row in att_rows]
+
+    pair_counts: Dict[Tuple[float, float], int] = {}
+    for di, ai in valid_pair_indices:
+        key = (def_radii[di], att_radii[ai])
+        pair_counts[key] = pair_counts.get(key, 0) + 1
+
+    if not pair_counts:
+        return "none"
+    return ", ".join(
+        f"{r_def:g}->{r_att:g}: {count}"
+        for (r_def, r_att), count in sorted(pair_counts.items())
+    )
 
 
 
@@ -1559,81 +1670,11 @@ def _save_start_plots(
             return arr[:, 0], arr[:, 2]
         raise ValueError(f"unknown plane={plane}")
 
-    def _plot_cloud_spread(ax, plane: str):
-        x_def, y_def = _coords(starts_def, plane)
-        datasets: List[Tuple[str, np.ndarray, np.ndarray]] = [("def_start", x_def, y_def)]
-        for j, sa in enumerate(starts_atts):
-            if sa.size == 0:
-                continue
-            x_att, y_att = _coords(sa, plane)
-            datasets.append((f"att{j+1}_start", x_att, y_att))
-
-        for label, xs, ys in datasets:
-            x_mean = float(np.mean(xs))
-            y_mean = float(np.mean(ys))
-            x_std = float(np.std(xs, ddof=0))
-            y_std = float(np.std(ys, ddof=0))
-            ax.errorbar(
-                x_mean,
-                y_mean,
-                xerr=x_std,
-                yerr=y_std,
-                fmt="o",
-                markersize=6,
-                capsize=4,
-                elinewidth=1.2,
-                label=f"{label} mean +/-1 SD",
-            )
-
-        _decorate(ax, plane, f"Start Spread (mean +/-1 SD, {plane.upper()})", "x", plane[1])
-        ax.legend(fontsize=8)
-
-    def _plot_rate_uncertainty(
-        ax,
-        pts: np.ndarray,
-        rate_stats: List[Dict[str, Any]],
-        title: str,
-    ) -> None:
-        if pts.size == 0 or not rate_stats:
-            ax.set_title(title)
-            ax.set_xlabel("Start radius (m)")
-            ax.set_ylabel("Pass rate")
-            ax.text(0.5, 0.5, "No aggregated points", ha="center", va="center", transform=ax.transAxes)
-            ax.grid(True, alpha=0.3)
-            return
-
-        radii = np.linalg.norm(pts - center[None, :], axis=1)
-        means = np.asarray([s["mean"] for s in rate_stats], dtype=float)
-        lower_errs = np.asarray([_binary_ci_errorbars(s)[0] for s in rate_stats], dtype=float)
-        upper_errs = np.asarray([_binary_ci_errorbars(s)[1] for s in rate_stats], dtype=float)
-        counts = np.asarray([s["n"] for s in rate_stats], dtype=int)
-        order = np.argsort(radii)
-        ci_pct = int(round((1.0 - float(alpha)) * 100.0))
-        ax.errorbar(
-            radii[order],
-            means[order],
-            yerr=np.asarray([lower_errs[order], upper_errs[order]], dtype=float),
-            fmt="o",
-            linestyle="none",
-            capsize=3,
-            color="tab:blue",
-            ecolor="tab:gray",
-            alpha=0.9,
-        )
-        if len(order) <= 25:
-            for r, m, c in zip(radii[order], means[order], counts[order]):
-                ax.annotate(f"n={int(c)}", (float(r), float(m)), xytext=(4, 4), textcoords="offset points", fontsize=7)
-        ax.set_ylim(-0.05, 1.05)
-        ax.set_xlabel("Start radius (m)")
-        ax.set_ylabel(f"Pass rate with Wilson {ci_pct}% CI")
-        ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-
     # -------------------------
     # 1) Plain coverage plots
     # -------------------------
     # XY
-    fig, (ax_cov, ax_spread) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_cov = plt.subplots(figsize=(7, 6))
     ax_cov.scatter(
         starts_def[:, 0], starts_def[:, 1],
         marker="o", s=marker_size,
@@ -1651,13 +1692,12 @@ def _save_start_plots(
         )
     _decorate(ax_cov, "xy", "Evaluated Starting Positions (XY)", "x", "y")
     ax_cov.legend()
-    _plot_cloud_spread(ax_spread, "xy")
     fig.tight_layout()
     fig.savefig(out_dir / "starts_xy.png", dpi=180)
     plt.close(fig)
 
     # XZ
-    fig, (ax_cov, ax_spread) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_cov = plt.subplots(figsize=(7, 6))
     ax_cov.scatter(
         starts_def[:, 0], starts_def[:, 2],
         marker="o", s=marker_size,
@@ -1675,7 +1715,6 @@ def _save_start_plots(
         )
     _decorate(ax_cov, "xz", "Evaluated Starting Positions (XZ)", "x", "z")
     ax_cov.legend()
-    _plot_cloud_spread(ax_spread, "xz")
     fig.tight_layout()
     fig.savefig(out_dir / "starts_xz.png", dpi=180)
     plt.close(fig)
@@ -1723,7 +1762,7 @@ def _save_start_plots(
 
 
     # Defender success XY
-    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_map = plt.subplots(figsize=(7, 6))
     sc = ax_map.scatter(
         def_pts[:, 0], def_pts[:, 1],
         c=def_rates, cmap=cmap,
@@ -1733,13 +1772,12 @@ def _save_start_plots(
     _decorate(ax_map, "xy", "Defender start: pass rate over attacker starts (XY)", "x", "y")
     cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
-    _plot_rate_uncertainty(ax_err, def_pts, def_rate_stats, "Defender start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "def_success_xy.png", dpi=180)
     plt.close(fig)
 
     # Defender success XZ
-    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_map = plt.subplots(figsize=(7, 6))
     sc = ax_map.scatter(
         def_pts[:, 0], def_pts[:, 2],
         c=def_rates, cmap=cmap,
@@ -1749,13 +1787,12 @@ def _save_start_plots(
     _decorate(ax_map, "xz", "Defender start: pass rate over attacker starts (XZ)", "x", "z")
     cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
-    _plot_rate_uncertainty(ax_err, def_pts, def_rate_stats, "Defender start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "def_success_xz.png", dpi=180)
     plt.close(fig)
 
     # Attacker success XY
-    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_map = plt.subplots(figsize=(7, 6))
     sc = ax_map.scatter(
         att_pts[:, 0], att_pts[:, 1],
         c=att_rates, cmap=cmap,
@@ -1765,13 +1802,12 @@ def _save_start_plots(
     _decorate(ax_map, "xy", "Attacker start: pass rate over defender starts (XY)", "x", "y")
     cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
-    _plot_rate_uncertainty(ax_err, att_pts, att_rate_stats, "Attacker start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "att_success_xy.png", dpi=180)
     plt.close(fig)
 
     # Attacker success XZ
-    fig, (ax_map, ax_err) = plt.subplots(1, 2, figsize=(13, 5.5))
+    fig, ax_map = plt.subplots(figsize=(7, 6))
     sc = ax_map.scatter(
         att_pts[:, 0], att_pts[:, 2],
         c=att_rates, cmap=cmap,
@@ -1781,7 +1817,6 @@ def _save_start_plots(
     _decorate(ax_map, "xz", "Attacker start: pass rate over defender starts (XZ)", "x", "z")
     cbar = fig.colorbar(sc, ax=ax_map)
     cbar.set_label("pass rate")
-    _plot_rate_uncertainty(ax_err, att_pts, att_rate_stats, "Attacker start uncertainty by radius")
     fig.tight_layout()
     fig.savefig(out_dir / "att_success_xz.png", dpi=180)
     plt.close(fig)
@@ -1913,15 +1948,16 @@ def main():
     ap.add_argument("--vel_scale", type=float, default=0.0, help="Stddev of sampled initial velocities.")
     ap.add_argument("--min_sep", type=float, default=0.0, help="Min defender-attacker separation when sampling.")
 
-    # multi-attacker aggregation mode
-    ap.add_argument("--multi_att_mode", default="worst",
-                    choices=["worst", "avg"],
-                    help="If num_attackers>1, aggregate per-attacker metrics from the same joint rollout.")
-
     # common overrides
     ap.add_argument("--device", default=None)
     ap.add_argument("--def_ckpt_path", default=None)
     ap.add_argument("--att_ckpt_path", default=None)
+    ap.add_argument(
+        "--attacker_mode",
+        default=None,
+        choices=["rl", "rule", "train"],
+        help="Override cfg['attacker_mode'] for 1v1 policy rollouts. 'train' is treated as 'rl'.",
+    )
     ap.add_argument(
         "--policy_role",
         default="def",
@@ -1934,10 +1970,52 @@ def main():
         choices=["policy", *SUPPORTED_BASELINE_OPPONENTS],
         help="Opponent controller used in evaluation. 'policy' preserves the current policy-vs-policy rollout path.",
     )
-    ap.add_argument("--deterministic", action="store_true", help="Force rl_eval_deterministic=True")
-    ap.add_argument("--use_kf", action="store_true", help="Force use_kf=True")
+    ap.add_argument(
+        "--deterministic",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool,
+        help="Override rl_eval_deterministic. Pass --deterministic, --deterministic true, or --deterministic false.",
+    )
+    ap.add_argument(
+        "--use_kf",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool,
+        help="Override use_kf. Pass --use_kf, --use_kf true, or --use_kf false.",
+    )
     ap.add_argument("--estimator_kind", choices=["ukf", "ekf"], default=None,
                     help="Force the enabled estimator kind. Setting this also enables the estimator.")
+    ap.add_argument(
+        "--kf_action_access",
+        choices=["ground_truth", "measured", "none"],
+        default=None,
+        help="Override ukf.action_access for rollout estimation.",
+    )
+    ap.add_argument(
+        "--kf_action_meas_std",
+        default=None,
+        type=_parse_scalar_or_vector,
+        help="Override ukf.action_meas_std with a scalar or comma-separated x,y,z values.",
+    )
+    ap.add_argument(
+        "--velocity_controller_enabled",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool,
+        help="Override safety_filter.enabled. Pass true/false to match notebook single-rollout behavior.",
+    )
+    ap.add_argument(
+        "--velocity_controller_speed",
+        type=float,
+        default=None,
+        help="Override the velocity controller speed cap via safety_filter['vmax'].",
+    )
+    ap.add_argument("--umax", type=float, default=None, help="Override cfg['umax'] for rollout.")
+    ap.add_argument("--arena_radius", type=float, default=None, help="Override spherical arena radius in meters.")
     ap.add_argument("--x0_pos_jitter", type=float, default=None)
     ap.add_argument("--x0_vel_jitter", type=float, default=None)
 
@@ -1964,7 +2042,7 @@ def main():
     ap.add_argument("--def_trials_in", default=None,
                     help="CSV of defender start states (def_x,def_y,def_z[,def_vx,def_vy,def_vz]).")
     ap.add_argument("--att_trials_in", default=None,
-                    help="CSV of attacker start states. Rows may provide att1_* only or a full attacker team att1_*, att2_*, ....")
+                    help="CSV of attacker start states (att1_x,att1_y,att1_z[,att1_vx,att1_vy,att1_vz]).")
     ap.add_argument("--max_pairs", type=int, default=None,
                     help="If set in cartesian mode, cap total evaluated pairs (sampled).")
 
@@ -2032,22 +2110,43 @@ def main():
     if args.collision_radius_m is not None:
         cfg0["collision_radius_m"] = float(args.collision_radius_m)
 
-    mod.build_dyn(cfg0)
-
     # Apply overrides
     if args.device is not None:
         cfg0["device"] = args.device
 
     _apply_ckpt_overrides(cfg0, args.def_ckpt_path, args.att_ckpt_path)
-    _validate_eval_inputs(args, cfg0)
+    if args.attacker_mode is not None:
+        cfg0["attacker_mode"] = _normalize_attacker_mode(args.attacker_mode)
 
-    if args.deterministic:
-        cfg0["rl_eval_deterministic"] = True
-    if args.use_kf:
-        cfg0["use_kf"] = True
+    cfg0["attacker_mode"] = _normalize_attacker_mode(cfg0.get("attacker_mode", "rl"))
+
+    if args.deterministic is not None:
+        cfg0["rl_eval_deterministic"] = bool(args.deterministic)
+    if args.use_kf is not None:
+        cfg0["use_kf"] = bool(args.use_kf)
     if args.estimator_kind is not None:
+        if args.use_kf is False:
+            raise RuntimeError("--estimator_kind cannot be combined with --use_kf false.")
         cfg0["use_kf"] = True
         cfg0["estimator_kind"] = str(args.estimator_kind)
+    if args.kf_action_access is not None:
+        cfg0.setdefault("ukf", {})
+        cfg0["ukf"]["action_access"] = str(args.kf_action_access)
+    if args.kf_action_meas_std is not None:
+        cfg0.setdefault("ukf", {})
+        cfg0["ukf"]["action_meas_std"] = args.kf_action_meas_std
+    if args.velocity_controller_enabled is not None:
+        cfg0.setdefault("safety_filter", {})
+        cfg0["safety_filter"]["enabled"] = bool(args.velocity_controller_enabled)
+    if args.velocity_controller_speed is not None:
+        cfg0.setdefault("safety_filter", {})
+        cfg0["safety_filter"]["vmax"] = float(args.velocity_controller_speed)
+    if args.umax is not None:
+        cfg0["umax"] = float(args.umax)
+    if args.arena_radius is not None:
+        cfg0.setdefault("arena", {})
+        cfg0["arena"]["type"] = "sphere"
+        cfg0["arena"]["r"] = float(args.arena_radius)
 
     if args.x0_pos_jitter is not None or args.x0_vel_jitter is not None:
         cfg0.setdefault("x0_jitter", {})
@@ -2059,8 +2158,14 @@ def main():
     if args.steps is not None:
         cfg0["T"] = int(args.steps)
 
+    _validate_eval_inputs(args, cfg0)
+
     D = int(cfg0.get("D", 3))
     num_attackers = max(1, int(cfg0.get("num_attackers", 1)))
+    if num_attackers != 1:
+        raise RuntimeError(
+            "evaluate_policy.py now supports only num_attackers=1 after the multi-attacker path removal."
+        )
     dyn_name = str(cfg0.get("dynamics", "hcw"))
     use_kf = bool(cfg0.get("use_kf", False))
     estimator_kind = str(cfg0.get("estimator_kind", "ukf"))
@@ -2069,6 +2174,15 @@ def main():
         f"device={cfg0.get('device', None)} deterministic={cfg0.get('rl_eval_deterministic', None)} "
         f"use_kf={use_kf} estimator_kind={estimator_kind}")
     log(f"[eval] matchup: policy_role={args.policy_role} opponent_source={args.opponent_source}")
+    log(
+        "[eval] rollout knobs: "
+        f"attacker_mode={cfg0.get('attacker_mode', 'rl')} "
+        f"kf_action_access={(cfg0.get('ukf', {}) or {}).get('action_access')} "
+        f"kf_action_meas_std={(cfg0.get('ukf', {}) or {}).get('action_meas_std')} "
+        f"velocity_ctrl={(cfg0.get('safety_filter', {}) or {}).get('enabled')} "
+        f"velocity_speed={(cfg0.get('safety_filter', {}) or {}).get('vmax', cfg0.get('vmax'))} "
+        f"umax={cfg0.get('umax')} arena_r={(cfg0.get('arena', {}) or {}).get('r')}"
+    )
 
     # ---------------------------
     # Build dyn (once, based on cfg0)
@@ -2108,7 +2222,9 @@ def main():
                                               rng=rng_grid, include_center=bool(args.include_center))
 
         def_rows = _rows_from_positions("def", def_pos)
-        att_rows = _expand_attacker_team_rows(_rows_from_positions("att1", att_pos), D, num_attackers)
+        att_rows = _rows_from_positions("att1", att_pos)
+        def_shell_summary = _format_shell_radius_counts(def_rows, "def", D, center)
+        att_shell_summary = _format_shell_radius_counts(att_rows, "att1", D, center)
         valid_pair_indices = _valid_def_att_pair_indices(
             cfg0,
             def_rows,
@@ -2122,6 +2238,18 @@ def main():
             raise RuntimeError(
                 "auto_shell_grid produced no defender/attacker pairs that satisfy the configured training constraints."
             )
+        valid_shell_pair_summary = _format_valid_shell_pair_counts(
+            cfg0,
+            def_rows,
+            att_rows,
+            valid_pair_indices,
+        )
+        log(f"[eval] auto_shell defender radii/counts: {def_shell_summary}")
+        log(f"[eval] auto_shell attacker radii/counts: {att_shell_summary}")
+        log(
+            "[eval] auto_shell valid shell-pair counts: "
+            f"{valid_shell_pair_summary} | total_valid_pairs={total_pairs_valid}"
+        )
 
         # Now choose how to pair them
         if args.grid_mode == "paired":
@@ -2147,10 +2275,6 @@ def main():
     elif args.grid_mode == "paired" and args.trials_in is not None:
         paired_rows = _load_trials_csv(args.trials_in, D)
         log(f"[eval] loaded paired trials_in: {args.trials_in} ({len(paired_rows)} rows)")
-        if num_attackers > 1 and any(_row_num_attackers(r, D) < num_attackers for r in paired_rows):
-            raise RuntimeError(
-                f"--trials_in rows must include att1..att{num_attackers} columns when cfg['num_attackers']={num_attackers}."
-            )
         if len(paired_rows) < int(args.num_trials):
             raise RuntimeError(
                 f"--trials_in has {len(paired_rows)} rows but --num_trials={args.num_trials}. "
@@ -2164,7 +2288,7 @@ def main():
         if args.def_trials_in is None or args.att_trials_in is None:
             raise RuntimeError("cartesian mode requires --def_trials_in and --att_trials_in (unless using --auto_shell_grid)")
         def_rows = _load_def_csv(args.def_trials_in, D)
-        att_rows = _expand_attacker_team_rows(_load_att_csv(args.att_trials_in, D), D, num_attackers)
+        att_rows = _load_att_csv(args.att_trials_in, D)
 
         total_pairs = len(def_rows) * len(att_rows)
         if total_pairs <= 0:
@@ -2195,7 +2319,7 @@ def main():
 
     # Start position logs
     starts_def: List[np.ndarray] = []
-    starts_atts: List[List[np.ndarray]] = [[] for _ in range(num_attackers)]
+    starts_atts: List[List[np.ndarray]] = [[]]
 
     trial_rows: List[Dict[str, Any]] = []
     passes = 0
@@ -2290,11 +2414,8 @@ def main():
         for j in range(num_attackers):
             if 1 + j < x0.shape[0]:
                 starts_atts[j].append(x0[1 + j, :D].copy())
-
-
-
-        per_att_metrics = []
-        per_att_errors = 0
+        trial_metrics: Dict[str, Any]
+        trial_errors = 0
 
         cfg_run = copy.deepcopy(cfg_trial)
         cfg_run["x0"] = np.asarray(x0, dtype=float).tolist()
@@ -2345,46 +2466,27 @@ def main():
                         log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
 
             rollout_timing = out.get("rollout_timing_sec", {}) or {}
-            for j in range(num_attackers):
-                try:
-                    out_j = _extract_single_attacker_rollout(out, j)
-                    m = _compute_trial_metrics(cfg_run, out_j)
-                    m.update(_extract_kf_trial_metrics(out_j, D))
-                    rollout_steps = _rollout_num_steps(out_j)
-                    m["rollout_num_steps"] = int(rollout_steps)
-                    for timing_key in ("setup", "simulation", "total"):
-                        timing_val = float(rollout_timing.get(timing_key, float("nan")))
-                        m[f"rollout_{timing_key}_sec"] = timing_val
-                        if rollout_steps > 0 and np.isfinite(timing_val):
-                            m[f"rollout_{timing_key}_sec_per_step"] = timing_val / float(rollout_steps)
-                        else:
-                            m[f"rollout_{timing_key}_sec_per_step"] = float("nan")
-                except Exception as e:
-                    per_att_errors += 1
-                    m = {"pass": 0, "error": str(e)}
-                    if args.print_errors:
-                        log(f"[eval][trial {i}/{n_total-1}][att {j+1}] ERROR: {e}")
-                        if args.trace_errors:
-                            log(traceback.format_exc())
-                per_att_metrics.append(m)
+            trial_metrics = _compute_trial_metrics(cfg_run, out)
+            trial_metrics.update(_extract_kf_trial_metrics(out, D))
+            rollout_steps = _rollout_num_steps(out)
+            trial_metrics["rollout_num_steps"] = int(rollout_steps)
+            for timing_key in ("setup", "simulation", "total"):
+                timing_val = float(rollout_timing.get(timing_key, float("nan")))
+                trial_metrics[f"rollout_{timing_key}_sec"] = timing_val
+                if rollout_steps > 0 and np.isfinite(timing_val):
+                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = timing_val / float(rollout_steps)
+                else:
+                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = float("nan")
 
         except Exception as e:
-            per_att_errors = num_attackers
-            per_att_metrics = [{"pass": 0, "error": str(e)} for _ in range(num_attackers)]
+            trial_errors = 1
+            trial_metrics = {"pass": 0, "error": str(e)}
             if args.print_errors:
                 log(f"[eval][trial {i}/{n_total-1}] ERROR: {e}")
                 if args.trace_errors:
                     log(traceback.format_exc())
 
-        if not per_att_metrics:
-            per_att_metrics = [{"pass": 0, "error": "no attackers present"}]
-            per_att_errors += 1
-
-        # Aggregate across attackers
-        if args.multi_att_mode == "worst":
-            pass_trial = int(all(m.get("pass", 0) == 1 for m in per_att_metrics))
-        else:
-            pass_trial = int(round(np.mean([m.get("pass", 0) for m in per_att_metrics])))
+        pass_trial = int(trial_metrics.get("pass", 0))
 
         passes += pass_trial
 
@@ -2394,26 +2496,24 @@ def main():
             "seed": seed,
             "grid_mode": args.grid_mode if not args.auto_shell_grid else f"{args.grid_mode}+auto_shell",
             "pass_trial": pass_trial,
-            "num_attackers": num_attackers,
-            "num_att_errors": per_att_errors,
+            "num_attackers": 1,
+            "num_att_errors": trial_errors,
 
             "def_x": float(x0[0, 0]),
             "def_y": float(x0[0, 1]) if D >= 2 else 0.0,
             "def_z": float(x0[0, 2]) if D == 3 else 0.0,
+            "att1_x": float(x0[1, 0]) if x0.shape[0] > 1 else float("nan"),
+            "att1_y": float(x0[1, 1]) if (x0.shape[0] > 1 and D >= 2) else float("nan"),
+            "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
         }
-        for j in range(num_attackers):
-            row[f"att{j+1}_x"] = float(x0[1 + j, 0]) if (1 + j) < x0.shape[0] else float("nan")
-            row[f"att{j+1}_y"] = float(x0[1 + j, 1]) if ((1 + j) < x0.shape[0] and D >= 2) else float("nan")
-            row[f"att{j+1}_z"] = float(x0[1 + j, 2]) if ((1 + j) < x0.shape[0] and D == 3) else float("nan")
 
         if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
             row["def_idx"] = cart_di
             row["att_idx"] = cart_ai
 
-        row.update(_aggregate_trial_metrics(per_att_metrics))
-        for j, metrics in enumerate(per_att_metrics, start=1):
-            for k_, v_ in metrics.items():
-                row[f"att{j}_{k_}"] = v_
+        row.update(_aggregate_trial_metrics([trial_metrics]))
+        for k_, v_ in trial_metrics.items():
+            row[f"att1_{k_}"] = v_
 
         trial_rows.append(row)
 
@@ -2437,7 +2537,7 @@ def main():
                 f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
                 f"rollout_sim={last_rollout_sim} | "
                 f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
-                f"errors_this_trial={per_att_errors}{extra}"
+                f"errors_this_trial={trial_errors}{extra}"
             )
 
     # Aggregate stats
@@ -2545,12 +2645,27 @@ def main():
     trial_oi_viol_att_any_rate, trial_oi_viol_att_any_rate_stats = _rate_value_and_stats("trial_oi_viol_att_any")
     trial_rollout_error_any_rate, trial_rollout_error_any_rate_stats = _rate_value_and_stats("trial_rollout_error_any")
     trial_kf_enabled_rate, trial_kf_enabled_rate_stats = _rate_value_and_stats("att1_kf_enabled_rollout")
-    primary_metric_name = "defender_capture_pass_rate" if args.policy_role == "def" else (
-        "attacker_hit_any_rate" if num_attackers > 1 else "attacker_hit_rate"
-    )
+    primary_metric_name = "defender_capture_pass_rate" if args.policy_role == "def" else "attacker_hit_rate"
     primary_metric_value = float(sr) if args.policy_role == "def" else (
         float(np.mean(trial_attacker_hit_vals)) if trial_attacker_hit_vals.size else float("nan")
     )
+    rollout_cfg_summary = {
+        "num_attackers": 1,
+        "attacker_mode": str(cfg0.get("attacker_mode", "rl")),
+        "use_kf": bool(cfg0.get("use_kf", False)),
+        "estimator_kind": str(cfg0.get("estimator_kind", "ukf")),
+        "kf_action_access": (cfg0.get("ukf", {}) or {}).get("action_access"),
+        "kf_action_meas_std": (cfg0.get("ukf", {}) or {}).get("action_meas_std"),
+        "velocity_controller_enabled": bool((cfg0.get("safety_filter", {}) or {}).get("enabled", False)),
+        "velocity_controller_speed": (cfg0.get("safety_filter", {}) or {}).get("vmax"),
+        "umax": cfg0.get("umax"),
+        "arena_radius": (cfg0.get("arena", {}) or {}).get("r"),
+        "dynamics": cfg0.get("dynamics"),
+        "dt": cfg0.get("dt"),
+        "steps": cfg0.get("T"),
+        "def_ckpt_path": cfg0.get("def_ckpt_path"),
+        "att_ckpt_path": cfg0.get("att_ckpt_path"),
+    }
 
     results = {
         "num_trials": n,
@@ -2571,12 +2686,12 @@ def main():
         "config_module": args.config_module,
         "base_cfg_source": base_cfg_source,
         "run_manifest": str(manifest_path) if manifest_path is not None else None,
+        "rollout_cfg": rollout_cfg_summary,
         "grid_mode": args.grid_mode,
         "auto_shell_grid": bool(args.auto_shell_grid),
         "shell_fracs": args.shell_fracs if args.auto_shell_grid else None,
         "points_per_shell": int(args.points_per_shell) if args.auto_shell_grid else None,
         "include_center": bool(args.include_center) if args.auto_shell_grid else None,
-        "multi_att_mode": args.multi_att_mode,
         "timing_sec": {
             "total": float(time.time() - t_global0),
             "trial_loop": float(time.time() - t_loop0),
@@ -2584,12 +2699,11 @@ def main():
         "outcome_breakdown": outcome_breakdown,
         "notes": [
             "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
-            "For num_attackers>1, evaluation runs one joint rollout per trial and extracts attacker-specific metrics from the shared trajectory.",
+            "This evaluation harness is now 1v1-only and mirrors the single-rollout notebook workflow.",
             "When zero_sum_reward.mode is enabled and collision_radius_m > 0, PASS means the defender captures the attacker before any attacker hit or invalid termination/keepout event.",
             "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
             "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
             "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
-            "If attacker grid rows only provide att1_* and num_attackers>1, evaluation deterministically expands them into attacker-team rows.",
             "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
             "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_trial.attacker_hit_any_rate for attacker-side comparisons.",
         ],
@@ -2645,8 +2759,7 @@ def main():
             "kf_att_def_trPpos_mean": _metric_summary("att1_kf_att_def_trPpos_mean"),
         },
     }
-    for j in range(num_attackers):
-        results[f"metrics_att{j+1}"] = _attacker_metric_block(f"att{j+1}")
+    results["metrics_att1"] = _attacker_metric_block("att1")
 
 
     (out_dir / "results.json").write_text(json.dumps(results, indent=2))
@@ -2749,11 +2862,11 @@ python evaluate_policy.py \
   
 python evaluate_policy.py \
 --def_ckpt_path Training_Policy_0.75/def0_teacher.pt \
---att_ckpt_path Training_Policy_0.75/att1_teacher.pt \  
---out_dir Training_Policy_0.75/MC_eval/def0_vs_att1 \  
---auto_shell_grid  \
---grid_mode cartesian  \ 
---shell_fracs 0.2,0.4,0.6,0.8 \ 
+--att_ckpt_path Training_Policy_0.75/att1_teacher.pt \
+--out_dir Training_Policy_0.75/MC_eval/def0_vs_att1 \
+--auto_shell_grid \
+--grid_mode cartesian \
+--shell_fracs 0.2,0.4,0.6,0.8 \
 --points_per_shell 40 \
 --x0_vel_jitter 0.5
 """
@@ -2842,4 +2955,22 @@ python evaluate_policy.py \
 """
 python evaluate_policy.py   --def_ckpt_path Training_Policy_New_Reward/def1_teacher.pt   --att_ckpt_path Training_Policy_New_Reward/att1_teacher.pt   --out_dir Training_Policy_New_Reward/MC_eval/shell_cart_allpairs_def1_vs_att1_tester   --auto_shell_grid   --grid_mode cartesian   --shell_fracs 0.25,0.5,0.75,0.90   --points_per_shell 10
 
+"""
+
+
+# Final tests:
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_Redo_OG_Actuation \
+  --def_ckpt_path Training_Policy_Redo_OG_Actuation/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_Redo_OG_Actuation/att1_teacher.pt \
+  --out_dir Training_Policy_Redo_OG_Actuation/MC_eval/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --arena_radius 25.0 \
+
+  --points_per_shell 40 \
+  --x0_vel_jitter 0.5
 """

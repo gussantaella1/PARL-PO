@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-05-17T03:39:46.301260+00:00",
+  "created_utc": "2026-05-17T04:04:54.671536+00:00",
   "out_dir": "Training_Policy_Redo_OG_Actuation_KF_ON",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
@@ -342,7 +342,398 @@
       "lambda_intent": 1.0,
       "reward_mode_for_step": "def",
       "train_role": "rl"
+    },
+    "final_outputs": {
+      "def0": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 43.8728449385103,
+        "teacher_best_update": 800,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "att1": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 35.21737764325587,
+        "teacher_best_update": 700,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "def1": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 72.86264551176839,
+        "teacher_best_update": 990,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "att2": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 31.84359768550064,
+        "teacher_best_update": 910,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "def2": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 70.48976188013785,
+        "teacher_best_update": 830,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "plots_root": "Training_Policy_Redo_OG_Actuation_KF_ON/Plots"
     }
   },
-  "stages": []
+  "stages": [
+    {
+      "name": "PHASE0_train_def0",
+      "start_utc": "2026-05-17T04:04:54.681253+00:00",
+      "meta": {
+        "phase_name": "def0",
+        "attacker_mode": "rule",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Redo_OG_Actuation_KF_ON",
+          "hit_buffer_def": 0.25
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 43.8728449385103,
+        "teacher_best_update": 800,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-17T05:19:28.700573+00:00",
+      "duration_s": 4474.019323056098
+    },
+    {
+      "name": "PHASE1_train_att1",
+      "start_utc": "2026-05-17T05:20:36.916628+00:00",
+      "meta": {
+        "phase_name": "att1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Redo_OG_Actuation_KF_ON",
+          "def_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+          "freeze_defender": true,
+          "train_ic_mode": "random_shell",
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "def0_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.5,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 35.21737764325587,
+        "teacher_best_update": 700,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-17T07:44:44.256379+00:00",
+      "duration_s": 8647.33974519698
+    },
+    {
+      "name": "PHASE2_train_def1",
+      "start_utc": "2026-05-17T07:46:11.950169+00:00",
+      "meta": {
+        "phase_name": "def1",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Redo_OG_Actuation_KF_ON",
+          "att_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+          "def_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+          "freeze_attacker": true,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "att1_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.5,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 72.86264551176839,
+        "teacher_best_update": 990,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-17T10:16:21.006183+00:00",
+      "duration_s": 9009.056007085368
+    },
+    {
+      "name": "PHASE3_train_att2",
+      "start_utc": "2026-05-17T10:18:21.630738+00:00",
+      "meta": {
+        "phase_name": "att2",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Redo_OG_Actuation_KF_ON",
+          "def_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+          "freeze_defender": true,
+          "train_ic_mode": "random_shell",
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "def0_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def0_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def0_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "def1_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "att",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+        "teacher_best_metric_name": "R_att_mean",
+        "teacher_best_metric": 31.84359768550064,
+        "teacher_best_update": 910,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-17T12:48:52.088498+00:00",
+      "duration_s": 9030.457751192153
+    },
+    {
+      "name": "PHASE4_train_def2",
+      "start_utc": "2026-05-17T12:50:17.015985+00:00",
+      "meta": {
+        "phase_name": "def2",
+        "attacker_mode": "rl",
+        "extra_train_cfg": {
+          "device": "cuda",
+          "vec_backend": "torch",
+          "tb_run_prefix": "Training_Policy_Redo_OG_Actuation_KF_ON",
+          "att_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+          "def_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def1_teacher.pt",
+          "freeze_attacker": true,
+          "opp_mix": {
+            "resample": "episode",
+            "policies": [
+              {
+                "name": "att1_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.15,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att1_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att1_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_full",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+                "prob": 0.3,
+                "action_scale": 1.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+                "prob": 0.2,
+                "action_scale": 0.25,
+                "noise_std": 0.05,
+                "idle_prob": 0.0
+              },
+              {
+                "name": "att2_very_weak",
+                "path": "Training_Policy_Redo_OG_Actuation_KF_ON/att2_teacher.pt",
+                "prob": 0.1,
+                "action_scale": 0.0,
+                "noise_std": 0.0,
+                "idle_prob": 0.0
+              }
+            ]
+          }
+        }
+      },
+      "outputs": {
+        "train_role": "def",
+        "teacher_ckpt": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher.pt",
+        "teacher_best_metric_name": "R_def_mean",
+        "teacher_best_metric": 70.48976188013785,
+        "teacher_best_update": 830,
+        "teacher_best_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher__best.pt",
+        "teacher_last_ckpt_path": "Training_Policy_Redo_OG_Actuation_KF_ON/def2_teacher.pt",
+        "student_ckpt": null,
+        "distill_enabled": false,
+        "distill_method": "modern",
+        "distill_duration_s": null
+      },
+      "status": "ok",
+      "end_utc": "2026-05-17T15:05:16.224639+00:00",
+      "duration_s": 8099.20864616707
+    }
+  ]
 }

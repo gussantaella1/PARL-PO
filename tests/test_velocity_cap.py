@@ -62,7 +62,12 @@ def _base_cfg(factory):
     cfg["dyn"]["Bd"] = np.zeros((dim, int(cfg["D"])), dtype=np.float32)
     cfg["train_ic_mode"] = "fixed"
     cfg["x0_jitter"] = {"pos": 0.0, "vel": 0.0}
-    cfg["vmax"] = 2.5
+    cfg["safety_filter"] = {
+        "enabled": True,
+        "kind": "velocity_cbf_qp",
+        "alpha": 5.0,
+        "vmax": 2.5,
+    }
     cfg["x0"] = np.array(
         [
             [1.0, 2.0, 3.0, 3.0, 4.0, 0.0],
@@ -80,7 +85,7 @@ class VelocityCapTests(unittest.TestCase):
 
         state = np.asarray(env.state, dtype=float)
         D = int(cfg["D"])
-        vmax = float(cfg["vmax"])
+        vmax = float(cfg["safety_filter"]["vmax"])
 
         self.assertGreater(np.linalg.norm(state[D:2 * D]), vmax + 1e-6)
         self.assertGreater(np.linalg.norm(state[3 * D:4 * D]), vmax + 1e-6)
@@ -98,7 +103,7 @@ class VelocityCapTests(unittest.TestCase):
         cfg = _base_cfg(config_for_train_single)
         step_plant_single, _, _ = _build_step_plant_single(cfg, steps=2, D=int(cfg["D"]))
         D = int(cfg["D"])
-        vmax = float(cfg["vmax"])
+        vmax = float(cfg["safety_filter"]["vmax"])
 
         x_next = step_plant_single(np.asarray(cfg["x0"][1], dtype=np.float32), np.zeros(D, dtype=np.float32), 0)
 
@@ -106,13 +111,7 @@ class VelocityCapTests(unittest.TestCase):
 
     def test_single_env_velocity_cbf_filter_blocks_outward_accel(self):
         cfg = _base_cfg(config_for_train_single)
-        cfg["vmax"] = None
-        cfg["safety_filter"] = {
-            "enabled": True,
-            "kind": "velocity_cbf_qp",
-            "alpha": 5.0,
-            "vmax": 1.0,
-        }
+        cfg["safety_filter"]["vmax"] = 1.0
         env = SingleEnv(cfg)
 
         p = np.zeros((int(cfg["D"]),), dtype=float)

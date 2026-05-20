@@ -175,7 +175,10 @@ def pad_x0_with_att(x0_row, att_cfg, D):
 def make_bounds(cfg: dict):
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx, nu = dims_from_D(D)
-    raw_vmax = cfg.get("vmax", None)
+    sf_cfg = dict(cfg.get("safety_filter", {}) or {})
+    raw_vmax = sf_cfg.get("vmax", None)
+    if raw_vmax is None:
+        raw_vmax = cfg.get("vmax", None)
     vmax = float(raw_vmax) if raw_vmax is not None else 1e6
     umax = float(cfg["umax"])
     ar = cfg["arena"]; ar_type = ar.get("type", "box")
