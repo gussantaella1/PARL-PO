@@ -6,7 +6,9 @@ from __future__ import annotations
 from typing import Dict, Any, List
 import time
 import numpy as np
+import torch
 
+from core.env import TorchVecEnv
 from core.safety_filter import project_box_halfspace_np, velocity_cbf_halfspace_np
 from paper_baseline_runner import _build_step_plant_single, _identity_R, _p3
 from rl_infer import RLPolicyDiff
@@ -227,6 +229,306 @@ def _pack_multi_agent_rollout(
         out["mdot_all"] = [np.asarray(v, dtype=float) for v in mdot_all]
 
     return out
+
+
+def run_batched_rhc_with_rl_and_collect_frames_3d(
+    cfgs: List[Dict[str, Any]],
+    *,
+    steps: int,
+    turn_len: int | None = None,
+) -> List[Dict[str, Any]]:
+    if not cfgs:
+        return []
+
+    cfg0 = cfgs[0]
+    D = int(cfg0.get("D", np.asarray(cfg0["x0"]).shape[1] // 2))
+    num_attackers = int(cfg0.get("num_attackers", 1))
+    if num_attackers != 1:
+        raise NotImplementedError("Batched eval currently supports num_attackers == 1 only.")
+
+    dyn_name = str(cfg0.get("dynamics", "hcw")).lower()
+    if dyn_name != "hcw":
+        raise NotImplementedError("Batched eval currently supports HCW dynamics only.")
+
+    for cfg in cfgs:
+        if int(cfg.get("num_attackers", 1)) != 1:
+            raise NotImplementedError("Batched eval currently supports num_attackers == 1 only.")
+        if str(cfg.get("dynamics", "hcw")).lower() != dyn_name:
+            raise ValueError("All batched rollout configs must share the same dynamics model.")
+
+    t_fn0 = time.perf_counter()
+    batch_size = len(cfgs)
+    device = str(cfg0.get("device", "cpu"))
+    deterministic = bool(cfg0.get("rl_eval_deterministic", True))
+    stop_on_done = bool(cfg0.get("stop_on_done", True))
+    use_kf = bool(cfg0.get("use_kf", False))
+    use_fuel = bool(cfg0.get("fuel", {}).get("enable"))
+    obs_expected = 5 * D + (2 if use_fuel else 0)
+    meas_every = max(1, int((cfg0.get("ukf", {}) or {}).get("every", 1)))
+
+    vec = TorchVecEnv(cfgs, num_envs=batch_size, device=device)
+    pol = RLPolicyDiff(cfg0, device=device)
+    din_def, din_att = pol.verify_ckpt_compat()
+    if din_def != obs_expected or din_att != obs_expected:
+        raise RuntimeError(
+            f"Policy obs dims mismatch in batched eval: defender={din_def}, attacker={din_att}, "
+            f"expected={obs_expected} (D={D}, use_fuel={use_fuel})."
+        )
+
+    def_hidden = pol.def_net.init_hidden(batch_size=batch_size, device=pol.device) if pol.def_is_student else None
+    def_u_prev = (
+        torch.zeros((batch_size, pol.act_dim), dtype=torch.float32, device=pol.device)
+        if pol.def_is_student else None
+    )
+    att_hidden = pol.att_net.init_hidden(batch_size=batch_size, device=pol.device) if pol.att_is_student else None
+    att_u_prev = (
+        torch.zeros((batch_size, pol.act_dim), dtype=torch.float32, device=pol.device)
+        if pol.att_is_student else None
+    )
+
+    def _state_np() -> np.ndarray:
+        return vec.state_t.detach().cpu().numpy()
+
+    def _p3_from_slice(x_slice: np.ndarray) -> tuple[float, float, float]:
+        return _p3(np.asarray(x_slice, dtype=np.float32), D)
+
+    def _v3_from_slice(x_slice: np.ndarray) -> tuple[float, float, float]:
+        return tuple(map(float, _v3_from_state(np.asarray(x_slice, dtype=np.float32), D)))
+
+    def _current_estimator_snapshot():
+        if not use_kf:
+            return None
+        if vec._batched_ekf_enabled:
+            est12 = vec._def_ekf_x_t[:, :3].detach().cpu().numpy()
+            est21 = vec._att_ekf_x_t[:, :3].detach().cpu().numpy()
+            trp12 = (
+                torch.diagonal(vec._def_ekf_P_t[:, :3, :3], dim1=-2, dim2=-1)
+                .sum(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            trp21 = (
+                torch.diagonal(vec._att_ekf_P_t[:, :3, :3], dim1=-2, dim2=-1)
+                .sum(dim=-1)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            return est12, est21, trp12, trp21
+
+        est12_rows, est21_rows, trp12_rows, trp21_rows = [], [], [], []
+        for env in vec.envs:
+            if env.ukf is None or env.att_ukf is None:
+                return None
+            est12_rows.append(np.asarray(env.ukf.x[:3], dtype=float))
+            est21_rows.append(np.asarray(env.att_ukf.x[:3], dtype=float))
+            trp12_rows.append(float(np.trace(env.ukf.P[:3, :3])))
+            trp21_rows.append(float(np.trace(env.att_ukf.P[:3, :3])))
+        return (
+            np.asarray(est12_rows, dtype=float),
+            np.asarray(est21_rows, dtype=float),
+            np.asarray(trp12_rows, dtype=float),
+            np.asarray(trp21_rows, dtype=float),
+        )
+
+    exec_xyz1 = [[] for _ in range(batch_size)]
+    exec_xyz2 = [[] for _ in range(batch_size)]
+    vel_xyz1 = [[] for _ in range(batch_size)]
+    vel_xyz2 = [[] for _ in range(batch_size)]
+    u_cmd_norm_1 = [[] for _ in range(batch_size)]
+    u_cmd_norm_2 = [[] for _ in range(batch_size)]
+    u_real_norm_1 = [[] for _ in range(batch_size)]
+    u_real_norm_2 = [[] for _ in range(batch_size)]
+    fuel_frac_def = [[] for _ in range(batch_size)] if use_fuel else None
+    fuel_frac_att = [[] for _ in range(batch_size)] if use_fuel else None
+    thrust_def = [[] for _ in range(batch_size)] if use_fuel else None
+    thrust_att = [[] for _ in range(batch_size)] if use_fuel else None
+    mdot_def = [[] for _ in range(batch_size)] if use_fuel else None
+    mdot_att = [[] for _ in range(batch_size)] if use_fuel else None
+    done_info_all: List[Dict[str, Any] | None] = [None for _ in range(batch_size)]
+
+    est12_xyz = [[] for _ in range(batch_size)] if use_kf else None
+    est21_xyz = [[] for _ in range(batch_size)] if use_kf else None
+    meas12_azel = [[None] for _ in range(batch_size)] if use_kf else None
+    meas21_azel = [[None] for _ in range(batch_size)] if use_kf else None
+    meas12_innov_sq = [[float("nan")] for _ in range(batch_size)] if use_kf else None
+    meas21_innov_sq = [[float("nan")] for _ in range(batch_size)] if use_kf else None
+    trP12_pos = [[] for _ in range(batch_size)] if use_kf else None
+    trP21_pos = [[] for _ in range(batch_size)] if use_kf else None
+
+    state_np = _state_np()
+    for i in range(batch_size):
+        x1 = state_np[i, : 2 * D]
+        x2 = state_np[i, 2 * D : 4 * D]
+        exec_xyz1[i].append(_p3_from_slice(x1))
+        exec_xyz2[i].append(_p3_from_slice(x2))
+        vel_xyz1[i].append(_v3_from_slice(x1))
+        vel_xyz2[i].append(_v3_from_slice(x2))
+
+    if use_fuel:
+        fuel_def_np, fuel_att_np = [t.detach().cpu().numpy() for t in vec._fuel_fractions()]
+        for i in range(batch_size):
+            fuel_frac_def[i].append(float(fuel_def_np[i]))
+            fuel_frac_att[i].append(float(fuel_att_np[i]))
+
+    if use_kf:
+        snapshot = _current_estimator_snapshot()
+        if snapshot is not None:
+            est12_np, est21_np, trp12_np, trp21_np = snapshot
+            for i in range(batch_size):
+                est12_xyz[i].append(np.asarray(est12_np[i], dtype=float).copy())
+                est21_xyz[i].append(np.asarray(est21_np[i], dtype=float).copy())
+                trP12_pos[i].append(float(trp12_np[i]))
+                trP21_pos[i].append(float(trp21_np[i]))
+
+    active = torch.ones((batch_size,), dtype=torch.bool, device=vec.device)
+
+    t_roll0 = time.perf_counter()
+    for _k in range(int(steps)):
+        if stop_on_done and not bool(torch.any(active).item()):
+            break
+
+        sigma_feat = vec.get_student_sigma_features()
+        a1, def_hidden, def_u_prev = pol.act_def_batch_torch(
+            vec.obs_def,
+            deterministic=deterministic,
+            sigma_feat=sigma_feat,
+            hidden=def_hidden,
+            u_prev=def_u_prev,
+        )
+        a2, att_hidden, att_u_prev = pol.act_att_batch_torch(
+            vec.obs_att,
+            deterministic=deterministic,
+            sigma_feat=sigma_feat,
+            hidden=att_hidden,
+            u_prev=att_u_prev,
+        )
+
+        _, _r1, _r2, done_t, infos = vec.step(
+            a1,
+            a2,
+            reward_mode="both",
+            active_mask=active,
+            auto_reset=False,
+        )
+
+        state_np = _state_np()
+        done_np = done_t.detach().cpu().numpy().astype(bool)
+        active_np = active.detach().cpu().numpy().astype(bool)
+        est_snapshot = _current_estimator_snapshot() if use_kf else None
+
+        for i in range(batch_size):
+            if not active_np[i]:
+                continue
+
+            info = infos[i]
+            x1 = state_np[i, : 2 * D]
+            x2 = state_np[i, 2 * D : 4 * D]
+            exec_xyz1[i].append(_p3_from_slice(x1))
+            exec_xyz2[i].append(_p3_from_slice(x2))
+            vel_xyz1[i].append(_v3_from_slice(x1))
+            vel_xyz2[i].append(_v3_from_slice(x2))
+            u_cmd_norm_1[i].append(float(info["u_cmd_norm_def"]))
+            u_cmd_norm_2[i].append(float(info["u_cmd_norm_att"]))
+            u_real_norm_1[i].append(float(info["u_real_norm_def"]))
+            u_real_norm_2[i].append(float(info["u_real_norm_att"]))
+
+            if use_fuel:
+                fuel_frac_def[i].append(float(info["fuel_frac_def"]))
+                fuel_frac_att[i].append(float(info["fuel_frac_att"]))
+                thrust_def[i].append(float(info["thrust_def"]))
+                thrust_att[i].append(float(info["thrust_att"]))
+                mdot_def[i].append(float(info["mdot_def"]))
+                mdot_att[i].append(float(info["mdot_att"]))
+
+            if use_kf and est_snapshot is not None:
+                est12_np, est21_np, _trp12_np, _trp21_np = est_snapshot
+                meas_taken = bool(info.get("meas_taken", (int(info["t"]) % meas_every) == 0))
+                att_meas_taken = bool(info.get("att_meas_taken", meas_taken))
+                est12_xyz[i].append(np.asarray(est12_np[i], dtype=float).copy())
+                est21_xyz[i].append(np.asarray(est21_np[i], dtype=float).copy())
+                meas12_azel[i].append(True if meas_taken else None)
+                meas21_azel[i].append(True if att_meas_taken else None)
+                meas12_innov_sq[i].append(float(info["meas_innov_sq"]) if meas_taken else float("nan"))
+                meas21_innov_sq[i].append(float(info["att_meas_innov_sq"]) if att_meas_taken else float("nan"))
+                trP12_pos[i].append(float(info["ukf_trPpos"]))
+                trP21_pos[i].append(float(info["att_ukf_trPpos"]))
+
+            if done_np[i]:
+                done_info_all[i] = {
+                    "t": int(info["t"]),
+                    "oob_def": bool(info["oob_def"]),
+                    "oob_att": bool(info["oob_att"]),
+                    "hit_target": bool(info["hit_target"]),
+                    "collision": bool(info["collision"]),
+                }
+
+        if stop_on_done:
+            active = active & (~done_t.to(dtype=torch.bool))
+
+    t_fn1 = time.perf_counter()
+    timing = {
+        "setup": float((t_roll0 - t_fn0) / max(1, batch_size)),
+        "simulation": float((t_fn1 - t_roll0) / max(1, batch_size)),
+        "total": float((t_fn1 - t_fn0) / max(1, batch_size)),
+    }
+
+    outs: List[Dict[str, Any]] = []
+    for i in range(batch_size):
+        out: Dict[str, Any] = {
+            "exec1_xyz": np.asarray(exec_xyz1[i], dtype=float),
+            "exec2_xyz": np.asarray(exec_xyz2[i], dtype=float),
+            "vel1_xyz": np.asarray(vel_xyz1[i], dtype=float),
+            "vel2_xyz": np.asarray(vel_xyz2[i], dtype=float),
+            "vel_xyz_all": [
+                np.asarray(vel_xyz1[i], dtype=float),
+                np.asarray(vel_xyz2[i], dtype=float),
+            ],
+            "u_cmd_norm_all": [
+                np.asarray(u_cmd_norm_1[i], dtype=float),
+                np.asarray(u_cmd_norm_2[i], dtype=float),
+            ],
+            "u_real_norm_all": [
+                np.asarray(u_real_norm_1[i], dtype=float),
+                np.asarray(u_real_norm_2[i], dtype=float),
+            ],
+            "done_info": done_info_all[i],
+            "rollout_timing_sec": dict(timing),
+        }
+        if use_fuel:
+            out.update(
+                {
+                    "fuel_frac_all": [
+                        np.asarray(fuel_frac_def[i], dtype=float),
+                        np.asarray(fuel_frac_att[i], dtype=float),
+                    ],
+                    "thrust_all": [
+                        np.asarray(thrust_def[i], dtype=float),
+                        np.asarray(thrust_att[i], dtype=float),
+                    ],
+                    "mdot_all": [
+                        np.asarray(mdot_def[i], dtype=float),
+                        np.asarray(mdot_att[i], dtype=float),
+                    ],
+                }
+            )
+        if use_kf and est12_xyz is not None:
+            out.update(
+                {
+                    "est12_xyz": np.asarray(est12_xyz[i], dtype=float),
+                    "est21_xyz": np.asarray(est21_xyz[i], dtype=float),
+                    "meas12_azel": list(meas12_azel[i]),
+                    "meas21_azel": list(meas21_azel[i]),
+                    "meas12_innov_sq": np.asarray(meas12_innov_sq[i], dtype=float),
+                    "meas21_innov_sq": np.asarray(meas21_innov_sq[i], dtype=float),
+                    "trP12_pos": np.asarray(trP12_pos[i], dtype=float),
+                    "trP21_pos": np.asarray(trP21_pos[i], dtype=float),
+                }
+            )
+        outs.append(out)
+
+    return outs
 
 
 def _run_rhc_with_rl_and_collect_frames_3d_multi(

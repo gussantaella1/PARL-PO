@@ -325,8 +325,14 @@ TRAIN: Dict[str, Any] = {
 
     # Scale for 0.5 umax - 
     "umax": 0.5,
-    "k_pos": 0.1/2, #Started at -8
+    "k_pos": 0.1/2,
     "steps_per_env": 512*2, 
+    # "steps_per_env": 512*4, 
+    "k_dock": 0.1/8,
+
+    # "k_dock": 0.00,
+    # "k_pos": 0.1/2,
+    # "steps_per_env": 512*3, 
 
     # Scale for 0.1 umax - 
     # "umax": 0.1,
@@ -337,10 +343,13 @@ TRAIN: Dict[str, Any] = {
 
 
     "gamma": 0.991, 
-    # "train_ic_vmax": 0.5/4,            # max |v| component at t=0
-    "train_ic_vmax": 0.5/2,            # max |v| component at t=0
+    # "train_ic_vmax": 0.5/2,            # max |v| component at t=0
+    "train_ic_vmax": 1.0,
+
+    # "train_ic_vmax": 1.0,
+    # "train_ic_vmax": 0.5,            # max |v| component at t=0
     "total_updates": 1000,   #Was 2000
-    "k_dock": 0.00,
+
 
 
     #Lower acceleration setting (0.1 m/s^2)

@@ -323,6 +323,21 @@ class RLPolicyDiff:
             return self.use_mean_at_eval
         return bool(deterministic)
 
+    def _validate_obs_batch_torch(self, obs_batch: torch.Tensor | np.ndarray, who: str) -> torch.Tensor:
+        if isinstance(obs_batch, torch.Tensor):
+            obs_t = obs_batch.to(device=self.device, dtype=torch.float32)
+        else:
+            obs_t = torch.as_tensor(np.asarray(obs_batch, dtype=np.float32), dtype=torch.float32, device=self.device)
+        if obs_t.ndim == 1:
+            obs_t = obs_t.unsqueeze(0)
+        expected = self.obs_dim_def if who == "def" else self.obs_dim_att
+        if obs_t.ndim != 2 or obs_t.shape[1] != expected:
+            raise ValueError(
+                f"Observation batch mismatch for {who}: got shape {tuple(obs_t.shape)}, "
+                f"expected (B, {expected})."
+            )
+        return obs_t
+
     def _student_features(
         self,
         obs: np.ndarray,
@@ -345,6 +360,39 @@ class RLPolicyDiff:
 
         return xhat_rel, sigma_np
 
+    def _student_features_batch_torch(
+        self,
+        obs_batch: torch.Tensor,
+        sigma_feat: Optional[torch.Tensor | np.ndarray],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        rel = obs_batch[:, 2 * self.D : 3 * self.D]
+        v1 = obs_batch[:, 3 * self.D : 4 * self.D]
+        v2 = obs_batch[:, 4 * self.D : 5 * self.D]
+        xhat_rel = torch.cat([rel, v2 - v1], dim=-1)
+
+        if sigma_feat is None:
+            sigma_t = torch.zeros(
+                (obs_batch.shape[0], self.student_sigma_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        else:
+            if isinstance(sigma_feat, torch.Tensor):
+                sigma_t = sigma_feat.to(device=self.device, dtype=torch.float32)
+            else:
+                sigma_t = torch.as_tensor(np.asarray(sigma_feat, dtype=np.float32), dtype=torch.float32, device=self.device)
+            if sigma_t.ndim == 1:
+                sigma_t = sigma_t.unsqueeze(0)
+            if sigma_t.shape[0] == 1 and obs_batch.shape[0] > 1:
+                sigma_t = sigma_t.expand(obs_batch.shape[0], -1)
+            if sigma_t.ndim != 2 or sigma_t.shape != (obs_batch.shape[0], self.student_sigma_dim):
+                raise ValueError(
+                    f"sigma_feat batch mismatch: got shape {tuple(sigma_t.shape)}, "
+                    f"expected ({obs_batch.shape[0]}, {self.student_sigma_dim})."
+                )
+
+        return xhat_rel, sigma_t
+
     def _act_one_student(
         self,
         model: PartialObsStudentPolicy,
@@ -365,6 +413,47 @@ class RLPolicyDiff:
         a = a_env.squeeze(0).detach().cpu().numpy().astype(np.float32)
         a = np.clip(a, -self.umax, +self.umax)
         return a, hidden, a.copy()
+
+    def _act_student_batch_torch(
+        self,
+        model: PartialObsStudentPolicy,
+        obs_batch: torch.Tensor | np.ndarray,
+        sigma_feat: Optional[torch.Tensor | np.ndarray],
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]],
+        u_prev: Optional[torch.Tensor | np.ndarray],
+        who: str,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        obs_t = self._validate_obs_batch_torch(obs_batch, who=who)
+        xhat_t, sigma_t = self._student_features_batch_torch(obs_t, sigma_feat)
+        batch_size = int(obs_t.shape[0])
+
+        if hidden is None:
+            hidden = model.init_hidden(batch_size=batch_size, device=self.device)
+        else:
+            hidden = (
+                hidden[0].to(device=self.device, dtype=torch.float32),
+                hidden[1].to(device=self.device, dtype=torch.float32),
+            )
+        if u_prev is None:
+            u_prev_t = torch.zeros((batch_size, self.act_dim), dtype=torch.float32, device=self.device)
+        elif isinstance(u_prev, torch.Tensor):
+            u_prev_t = u_prev.to(device=self.device, dtype=torch.float32)
+        else:
+            u_prev_t = torch.as_tensor(np.asarray(u_prev, dtype=np.float32), dtype=torch.float32, device=self.device)
+        if u_prev_t.ndim == 1:
+            u_prev_t = u_prev_t.unsqueeze(0)
+        if u_prev_t.shape[0] == 1 and batch_size > 1:
+            u_prev_t = u_prev_t.expand(batch_size, -1)
+        if u_prev_t.shape != (batch_size, self.act_dim):
+            raise ValueError(
+                f"u_prev batch mismatch: got shape {tuple(u_prev_t.shape)}, "
+                f"expected ({batch_size}, {self.act_dim})."
+            )
+
+        with torch.no_grad():
+            a_env, _, hidden_next = model.step(xhat_t, sigma_t, u_prev_t, hidden)
+        a_env = torch.clamp(a_env, -self.umax, +self.umax)
+        return a_env, hidden_next, a_env.detach()
 
     def _act_one_obs(
         self,
@@ -389,6 +478,26 @@ class RLPolicyDiff:
         a = a_env.squeeze(0).detach().cpu().numpy().astype(np.float32)
         return np.clip(a, -self.umax, +self.umax)
 
+    def _act_batch_obs_torch(
+        self,
+        net: torch.nn.Module,
+        obs_batch: torch.Tensor | np.ndarray,
+        who: str,
+        deterministic: Optional[bool],
+    ) -> torch.Tensor:
+        obs_t = self._validate_obs_batch_torch(obs_batch, who=who)
+        deterministic = self._resolve_deterministic(deterministic)
+
+        with torch.no_grad():
+            if deterministic:
+                dist = net.dist(obs_t, who=who)
+                u_raw = dist.mean
+                a_env = torch.tanh(u_raw) * self.umax
+            else:
+                a_env, _, _ = net.act(obs_t, who=who, act_scale=self.umax)
+
+        return torch.clamp(a_env, -self.umax, +self.umax)
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -397,6 +506,67 @@ class RLPolicyDiff:
         Returns expected obs dims for defender and attacker.
         """
         return self.obs_dim_def, self.obs_dim_att
+
+    def act_def_batch_torch(
+        self,
+        obs_batch: torch.Tensor | np.ndarray,
+        deterministic: Optional[bool] = None,
+        sigma_feat: Optional[torch.Tensor | np.ndarray] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        u_prev: Optional[torch.Tensor | np.ndarray] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        if self.def_net is None:
+            raise RuntimeError("Defender policy was not loaded in RLPolicyDiff.")
+        if self.def_is_student:
+            a_env, hidden_next, u_prev_next = self._act_student_batch_torch(
+                self.def_net,
+                obs_batch,
+                sigma_feat,
+                hidden,
+                u_prev,
+                who="def",
+            )
+            return a_env, hidden_next, u_prev_next
+        return self._act_batch_obs_torch(self.def_net, obs_batch, who="def", deterministic=deterministic), None, None
+
+    def act_att_batch_torch(
+        self,
+        obs_batch: torch.Tensor | np.ndarray,
+        deterministic: Optional[bool] = None,
+        sigma_feat: Optional[torch.Tensor | np.ndarray] = None,
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        u_prev: Optional[torch.Tensor | np.ndarray] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        obs_t = self._validate_obs_batch_torch(obs_batch, who="att")
+
+        if self.attacker_mode == "rl":
+            if self.att_net is None:
+                raise RuntimeError("Attacker policy was not loaded in RLPolicyDiff.")
+            if self.att_is_student:
+                a_env, hidden_next, u_prev_next = self._act_student_batch_torch(
+                    self.att_net,
+                    obs_t,
+                    sigma_feat,
+                    hidden,
+                    u_prev,
+                    who="att",
+                )
+                return a_env, hidden_next, u_prev_next
+            return self._act_batch_obs_torch(self.att_net, obs_t, who="att", deterministic=deterministic), None, None
+
+        if self.rule_ctrl is None:
+            raise RuntimeError("attacker_mode='rule' but rule controller is not initialized.")
+
+        D = self.D
+        p1c = obs_t[:, 0:D]
+        p2c = obs_t[:, D : 2 * D]
+        v1 = obs_t[:, 3 * D : 4 * D]
+        v2 = obs_t[:, 4 * D : 5 * D]
+        c = torch.as_tensor(self.center, dtype=obs_t.dtype, device=obs_t.device)
+        p1 = p1c + c
+        p2 = p2c + c
+        a_env = self.rule_ctrl.act_multi_batch_torch(p1, v1, p2[:, None, :], v2[:, None, :])[:, 0, :]
+        return torch.clamp(a_env, -self.umax, +self.umax), None, None
 
     def act_def_obs(
         self,

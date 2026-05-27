@@ -2006,11 +2006,23 @@ class TorchVecEnv:
 
     torch_backend = True
 
-    def __init__(self, cfg: Dict[str, Any], num_envs: int, device: str | torch.device):
-        self.cfg = copy.deepcopy(cfg)
-        self.num_envs = int(num_envs)
+    def __init__(self, cfg: Dict[str, Any] | List[Dict[str, Any]], num_envs: int, device: str | torch.device):
         self.device = torch.device(device)
-        self.envs: List[Env] = [Env(copy.deepcopy(cfg)) for _ in range(self.num_envs)]
+        if isinstance(cfg, list):
+            cfg_list = [copy.deepcopy(c) for c in cfg]
+            if not cfg_list:
+                raise ValueError("TorchVecEnv requires at least one config.")
+            if int(num_envs) != len(cfg_list):
+                raise ValueError(
+                    f"TorchVecEnv num_envs={num_envs} does not match cfg list length={len(cfg_list)}."
+                )
+            self.cfg = copy.deepcopy(cfg_list[0])
+            self.num_envs = len(cfg_list)
+            self.envs = [Env(c) for c in cfg_list]
+        else:
+            self.cfg = copy.deepcopy(cfg)
+            self.num_envs = int(num_envs)
+            self.envs = [Env(copy.deepcopy(cfg)) for _ in range(self.num_envs)]
 
         if not self.envs:
             raise ValueError("TorchVecEnv requires at least one environment.")
@@ -2536,6 +2548,28 @@ class TorchVecEnv:
         for env in self.envs:
             setattr(env, name, value)
 
+    def get_student_sigma_features(self) -> torch.Tensor | None:
+        if not self.use_kf:
+            return None
+
+        sigma_dim = (2 * self.D) * (2 * self.D + 1) // 2
+        if self._batched_ekf_enabled:
+            P_rel = self._def_ekf_P_t[:, : 2 * self.D, : 2 * self.D].to(dtype=self.dtype)
+            iu = torch.triu_indices(2 * self.D, 2 * self.D, device=self.device)
+            return P_rel[:, iu[0], iu[1]]
+
+        sigma_rows = []
+        for env in self.envs:
+            if env.ukf is None:
+                return None
+            P = np.asarray(env.ukf.P, dtype=np.float32)
+            P_rel = P[: 2 * self.D, : 2 * self.D]
+            iu = np.triu_indices(2 * self.D)
+            sigma_rows.append(P_rel[iu].astype(np.float32))
+        if not sigma_rows:
+            return torch.zeros((self.num_envs, sigma_dim), dtype=self.dtype, device=self.device)
+        return torch.as_tensor(np.stack(sigma_rows, axis=0), dtype=self.dtype, device=self.device)
+
     def _apply_propulsion_batch(
         self,
         a_cmd: torch.Tensor,
@@ -2561,9 +2595,32 @@ class TorchVecEnv:
         fuel_depleted = m_next <= (m_dry + 1e-9)
         return a_real, m_next, fuel_depleted, thrust_norm, mdot
 
-    def step(self, a1_env, aA_env, reward_mode: str = "both"):
+    def step(
+        self,
+        a1_env,
+        aA_env,
+        reward_mode: str = "both",
+        *,
+        active_mask: torch.Tensor | np.ndarray | None = None,
+        auto_reset: bool = True,
+    ):
         need_def = reward_mode in ("def", "both")
         need_att = reward_mode in ("att", "both")
+
+        if active_mask is None:
+            active_mask_t = torch.ones((self.num_envs,), dtype=torch.bool, device=self.device)
+        else:
+            active_mask_t = torch.as_tensor(active_mask, dtype=torch.bool, device=self.device).reshape(self.num_envs)
+        all_active = bool(torch.all(active_mask_t).item())
+
+        prev_state = self.state_t.clone() if not all_active else None
+        prev_t_steps = self._t_steps.clone() if not all_active else None
+        prev_m_def = self.m_def_t.clone() if (self.use_fuel and not all_active) else None
+        prev_m_att = self.m_att_t.clone() if (self.use_fuel and not all_active) else None
+        prev_def_ekf_x = self._def_ekf_x_t.clone() if (self._batched_ekf_enabled and not all_active) else None
+        prev_def_ekf_P = self._def_ekf_P_t.clone() if (self._batched_ekf_enabled and not all_active) else None
+        prev_att_ekf_x = self._att_ekf_x_t.clone() if (self._batched_ekf_enabled and not all_active) else None
+        prev_att_ekf_P = self._att_ekf_P_t.clone() if (self._batched_ekf_enabled and not all_active) else None
 
         a1_cmd = torch.as_tensor(a1_env, dtype=self.dtype, device=self.device).reshape(self.num_envs, self.D)
         aA_cmd = torch.as_tensor(aA_env, dtype=self.dtype, device=self.device)
@@ -2799,6 +2856,9 @@ class TorchVecEnv:
 
         r1 = g if need_def else torch.zeros_like(g)
         r2 = -g if need_att else torch.zeros_like(g)
+        if not all_active:
+            r1 = torch.where(active_mask_t, r1, torch.zeros_like(r1))
+            r2 = torch.where(active_mask_t, r2, torch.zeros_like(r2))
 
         d2_belief_norm = None
         p2_est_err_norm = None
@@ -2842,12 +2902,21 @@ class TorchVecEnv:
         dock_gap_np = dock_gap.detach().cpu().numpy()
         d1_true_np = d1_true_norm.detach().cpu().numpy()
         d2_true_np = d2_true_norm.detach().cpu().numpy()
+        u_cmd_norm_def_np = torch.linalg.vector_norm(a1_cmd, dim=-1).detach().cpu().numpy()
+        u_cmd_norm_att_np = torch.linalg.vector_norm(a2_cmd, dim=-1).detach().cpu().numpy()
+        u_real_norm_def_np = torch.linalg.vector_norm(a1_real, dim=-1).detach().cpu().numpy()
+        u_real_norm_att_np = torch.linalg.vector_norm(a2_real, dim=-1).detach().cpu().numpy()
         oob1_np = oob1.detach().cpu().numpy()
         oob2_np = oob2_any.detach().cpu().numpy()
         hit_target_np = hit_target.detach().cpu().numpy()
         collision_np = collision.detach().cpu().numpy()
         t_np = self._t_steps.detach().cpu().numpy()
         radius_np = self.radius_t.detach().cpu().numpy()
+        meas_taken_np = None
+        if self.use_kf:
+            every = int(self._ekf_every) if self._batched_ekf_enabled else int(self.envs[0]._ukf_every)
+            every = max(1, every)
+            meas_taken_np = (t_np % every) == 0
 
         fuel_frac_def_np = None
         fuel_frac_att_np = None
@@ -2877,12 +2946,18 @@ class TorchVecEnv:
                 "d1_true_norm": float(d1_true_np[i]),
                 "d2_true_norm": float(d2_true_np[i]),
                 "collision": bool(collision_np[i]),
+                "u_cmd_norm_def": float(u_cmd_norm_def_np[i]),
+                "u_cmd_norm_att": float(u_cmd_norm_att_np[i]),
+                "u_real_norm_def": float(u_real_norm_def_np[i]),
+                "u_real_norm_att": float(u_real_norm_att_np[i]),
             }
             if self.use_kf:
                 info["meas_innov_sq"] = float(meas_innov[i])
                 info["ukf_trPpos"] = float(meas_trP[i])
                 info["att_meas_innov_sq"] = float(att_meas_innov[i])
                 info["att_ukf_trPpos"] = float(att_meas_trP[i])
+                info["meas_taken"] = bool(meas_taken_np[i])
+                info["att_meas_taken"] = bool(meas_taken_np[i])
                 if d2_belief_norm is not None:
                     info["d2_belief_norm"] = float(d2_belief_norm[i])
                 if p2_est_err_norm is not None:
@@ -2902,13 +2977,28 @@ class TorchVecEnv:
                 info["mdot_att"] = float(mdot_att_np[i])
             infos.append(info)
 
-        done_indices = torch.nonzero(done, as_tuple=False).flatten().detach().cpu().tolist()
-        for idx in done_indices:
-            env = self.envs[idx]
-            if env.opp_resample == "episode":
-                env.set_opp_domain(_sample_opp_domain(env.cfg))
-            env.reset()
-            self._sync_slot_from_env(idx)
+        done = torch.where(active_mask_t, done, torch.ones_like(done))
+
+        if not all_active:
+            self.state_t = torch.where(active_mask_t[:, None], self.state_t, prev_state)
+            self._t_steps = torch.where(active_mask_t, self._t_steps, prev_t_steps)
+            if self.use_fuel:
+                self.m_def_t = torch.where(active_mask_t, self.m_def_t, prev_m_def)
+                self.m_att_t = torch.where(active_mask_t, self.m_att_t, prev_m_att)
+            if self._batched_ekf_enabled:
+                self._def_ekf_x_t = torch.where(active_mask_t[:, None], self._def_ekf_x_t, prev_def_ekf_x)
+                self._def_ekf_P_t = torch.where(active_mask_t[:, None, None], self._def_ekf_P_t, prev_def_ekf_P)
+                self._att_ekf_x_t = torch.where(active_mask_t[:, None], self._att_ekf_x_t, prev_att_ekf_x)
+                self._att_ekf_P_t = torch.where(active_mask_t[:, None, None], self._att_ekf_P_t, prev_att_ekf_P)
+
+        if auto_reset:
+            done_indices = torch.nonzero(done & active_mask_t, as_tuple=False).flatten().detach().cpu().tolist()
+            for idx in done_indices:
+                env = self.envs[idx]
+                if env.opp_resample == "episode":
+                    env.set_opp_domain(_sample_opp_domain(env.cfg))
+                env.reset()
+                self._sync_slot_from_env(idx)
 
         self._refresh_obs()
         return self.obs, r1, r2, done.to(dtype=self.dtype), infos

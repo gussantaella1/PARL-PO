@@ -66,6 +66,21 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
         overrides["device"] = args.device
     if args.seed is not None:
         overrides["seed"] = args.seed
+    if args.umax is not None:
+        overrides["umax"] = args.umax
+    if args.vmax is not None:
+        vmax = float(args.vmax)
+        if vmax <= 0.0:
+            raise ValueError(f"--vmax must be > 0, got {vmax!r}.")
+        overrides["vmax"] = vmax
+        overrides.setdefault("safety_filter", {})
+        overrides["safety_filter"]["vmax"] = vmax
+    if args.k_pos is not None:
+        overrides["k_pos"] = args.k_pos
+    if args.k_dock is not None:
+        overrides["k_dock"] = args.k_dock
+    if args.train_ic_vmax is not None:
+        overrides["train_ic_vmax"] = args.train_ic_vmax
     if args.num_envs is not None:
         overrides["num_envs"] = args.num_envs
     if args.steps_per_env is not None:
@@ -108,6 +123,11 @@ def _parse_args():
     ap.add_argument("--phases", default="0,1,2,3,4", help="Comma-separated subset of phases to run.")
     ap.add_argument("--device", default=None, help="Override training device, e.g. cuda, cuda:0, or cpu.")
     ap.add_argument("--seed", type=int, default=None, help="Override the training seed.")
+    ap.add_argument("--umax", type=float, default=None, help="Override cfg['umax'].")
+    ap.add_argument("--vmax", type=float, default=None, help="Override cfg['safety_filter']['vmax'].")
+    ap.add_argument("--k_pos", type=float, default=None, help="Override cfg['k_pos'].")
+    ap.add_argument("--k_dock", type=float, default=None, help="Override cfg['k_dock'].")
+    ap.add_argument("--train_ic_vmax", type=float, default=None, help="Override cfg['train_ic_vmax'].")
     ap.add_argument("--num_envs", type=int, default=None, help="Override cfg['num_envs'].")
     ap.add_argument("--steps_per_env", type=int, default=None, help="Override cfg['steps_per_env'].")
     ap.add_argument("--total_updates", type=int, default=None, help="Override cfg['total_updates'].")

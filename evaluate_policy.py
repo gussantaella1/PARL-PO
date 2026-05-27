@@ -42,7 +42,10 @@ from typing import Any, Dict, List, Tuple, Optional
 import numpy as np
 
 # IMPORTANT: must match your CURRENT runner
-from game_runner import run_rhc_with_rl_and_collect_frames_3d
+from game_runner import (
+    run_batched_rhc_with_rl_and_collect_frames_3d,
+    run_rhc_with_rl_and_collect_frames_3d,
+)
 from matchup_runner import (
     SUPPORTED_BASELINE_OPPONENTS,
     run_rhc_with_policy_vs_baseline_collect_frames_3d,
@@ -67,11 +70,13 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "pos_scale": 0.95,
     "vel_scale": 0.0,
     "min_sep": 0.0,
+    "advantage_scale": None,
     "alpha": 0.05,
     "log_every": 10,
     "print_first_out_keys": False,
     "print_errors": False,
     "trace_errors": False,
+    "save_rollout_error_cases": False,
     "trials_in": None,
     "grid_mode": "paired",
     "def_trials_in": None,
@@ -79,6 +84,8 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "max_pairs": None,
     "auto_shell_grid": False,
     "shell_fracs": "0.2,0.4,0.6,0.8",
+    "def_shell_radius": None,
+    "att_shell_radius": None,
     "points_per_shell": 40,
     "include_center": False,
 
@@ -86,6 +93,7 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     # run_manifest.json when set to a non-None or active value.
     "steps": None,
     "device": None,
+    "eval_batch_size": None,
     "def_ckpt_path": None,
     "att_ckpt_path": None,
     "attacker_mode": None,
@@ -94,6 +102,7 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "estimator_kind": None,
     "kf_action_access": None,
     "kf_action_meas_std": None,
+    "vmax": None,
     "velocity_controller_enabled": None,
     "velocity_controller_speed": None,
     "umax": None,
@@ -653,6 +662,29 @@ def _radius_from_cfg(val: float, arena_r: float) -> float:
     return float(val)
 
 
+def _resolve_shell_plan_radius(
+    raw_val: Optional[float],
+    arena_r: float,
+    label: str,
+) -> float:
+    """
+    Resolve the base radius used for shell planning.
+
+    If unspecified, shell planning falls back to the arena radius. Otherwise,
+    reuse _radius_from_cfg so callers may specify either meters or a fraction
+    of the arena radius.
+    """
+    if raw_val is None:
+        return float(arena_r)
+
+    radius = _radius_from_cfg(float(raw_val), arena_r)
+    if not np.isfinite(radius) or radius <= 0.0:
+        raise ValueError(
+            f"{label} must resolve to a finite positive radius, got {raw_val!r}."
+        )
+    return float(radius)
+
+
 def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     jit = cfg.get("x0_jitter", {}) or {}
     pos_j = float(jit.get("pos", 0.0))
@@ -662,6 +694,56 @@ def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generat
     out[:, :D] += rng.normal(size=out[:, :D].shape) * pos_j
     out[:, D:2*D] += rng.normal(size=out[:, D:2*D].shape) * vel_j
     return out
+
+
+def _resolve_rollout_vmax(cfg: Dict[str, Any]) -> Optional[float]:
+    sf_cfg = cfg.get("safety_filter", {}) or {}
+    raw_vmax = sf_cfg.get("vmax", None)
+    if raw_vmax is None:
+        raw_vmax = cfg.get("vmax", None)
+    if raw_vmax is None:
+        return None
+    vmax = float(raw_vmax)
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        raise ValueError(f"vmax must be finite and > 0, got {raw_vmax!r}")
+    return vmax
+
+
+def _project_x0_velocities_to_vmax(x0: np.ndarray, D: int, vmax: float) -> np.ndarray:
+    out = np.asarray(x0, dtype=float).copy()
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        return out
+
+    vel = out[:, D:2 * D]
+    speeds = np.linalg.norm(vel, axis=1, keepdims=True)
+    scale = np.ones_like(speeds, dtype=float)
+    mask = speeds > float(vmax)
+    scale[mask] = float(vmax) / (speeds[mask] + 1e-12)
+    vel *= scale
+    out[:, D:2 * D] = vel
+    return out
+
+
+def _is_cuda_device(device: Any) -> bool:
+    if device is None:
+        return False
+    key = str(device).strip().lower()
+    return key == "cuda" or key.startswith("cuda:")
+
+
+def _supports_batched_cuda_eval(cfg: Dict[str, Any], opponent_source: str) -> bool:
+    if not _is_cuda_device(cfg.get("device", None)):
+        return False
+    if str(opponent_source).strip().lower() != "policy":
+        return False
+    if int(cfg.get("num_attackers", 1)) != 1:
+        return False
+    if str(cfg.get("dynamics", "hcw")).strip().lower() != "hcw":
+        return False
+    disp_params = ((cfg.get("dispersion", {}) or {}).get("params", {}) or {})
+    if bool(disp_params.get("enabled", False)):
+        return False
+    return True
 
 
 # ------------------------- auto shell grid (no CSV) -------------------------
@@ -703,14 +785,14 @@ def _fibonacci_sphere_points(n: int, rng: Optional[np.random.Generator] = None) 
 
 def _generate_shelled_positions(
     center: np.ndarray,
-    arena_r: float,
+    shell_radius: float,
     shell_fracs: List[float],
     points_per_shell: int,
     rng: Optional[np.random.Generator] = None,
     include_center: bool = False,
 ) -> np.ndarray:
     """
-    Generate positions on shells at radii = frac * arena_r. Returns (N,3).
+    Generate positions on shells at radii = frac * shell_radius. Returns (N,3).
     """
     shell_fracs = [float(s) for s in shell_fracs if float(s) > 0.0]
     pts_all = []
@@ -718,7 +800,7 @@ def _generate_shelled_positions(
         pts_all.append(center.reshape(1, 3).copy())
 
     for frac in shell_fracs:
-        rad = frac * float(arena_r)
+        rad = frac * float(shell_radius)
         unit = _fibonacci_sphere_points(points_per_shell, rng=rng)
         pts_all.append(center[None, :] + rad * unit)
 
@@ -820,13 +902,35 @@ def _make_paired_rows_from_def_att(
     return out
 
 
-def _radial_advantage_margin(cfg: Dict[str, Any]) -> float:
+def _default_radial_advantage_margin(cfg: Dict[str, Any]) -> float:
     oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
     percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
     radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
     if radial_margin < 0.0:
         raise ValueError(f"percent_advantage_defender must be >= 0, got {percent_advantage_defender}")
     return radial_margin
+
+
+def _radial_advantage_scale(cfg: Dict[str, Any]) -> float:
+    raw_scale = cfg.get("advantage_scale", 1.0)
+    if raw_scale is None:
+        return 1.0
+    scale = float(raw_scale)
+    if not np.isfinite(scale):
+        raise ValueError(f"advantage_scale must be finite, got {raw_scale!r}")
+    return scale
+
+
+def _radial_advantage_margin(cfg: Dict[str, Any]) -> float:
+    return float(_default_radial_advantage_margin(cfg) * _radial_advantage_scale(cfg))
+
+
+def _advantage_constraint_satisfied(r_def: float, r_atts: List[float], radial_margin: float) -> bool:
+    if radial_margin >= 0.0:
+        return all(r_def <= (r_att - radial_margin) for r_att in r_atts)
+
+    attacker_margin = -float(radial_margin)
+    return all(r_att <= (r_def - attacker_margin) for r_att in r_atts)
 
 
 def _valid_def_att_pair_indices(
@@ -851,7 +955,7 @@ def _valid_def_att_pair_indices(
             p_atts = [x[:D] for x in att_states]
             r_atts = [float(np.linalg.norm(p_att - center)) for p_att in p_atts]
 
-            if require_training_advantage and any(r_def > (r_att - radial_margin) for r_att in r_atts):
+            if require_training_advantage and not _advantage_constraint_satisfied(r_def, r_atts, radial_margin):
                 continue
             if min_sep > 0.0 and any(np.linalg.norm(p_def - p_att) < min_sep for p_att in p_atts):
                 continue
@@ -995,7 +1099,8 @@ def _sample_x0_random_shell_advantage(
 ) -> np.ndarray:
     """
     Mirror core/env.py random_shell_advantage so evaluation can sample the
-    same defender-favored radial geometry used during training.
+    same training-style radial geometry used during training, with an
+    optional eval-time signed advantage scale override.
     """
     D = int(cfg.get("D", 3))
     center, R = _get_center_and_radius(cfg, D)
@@ -1009,9 +1114,7 @@ def _sample_x0_random_shell_advantage(
     if min_sep_override is not None:
         min_sep = float(min_sep_override)
 
-    oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
-    percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
-    radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
+    radial_margin = _radial_advantage_margin(cfg)
 
     r_def_min, r_def_max = resolve_start_radius_bounds(
         cfg,
@@ -1027,20 +1130,30 @@ def _sample_x0_random_shell_advantage(
         default_min_frac=0.0,
         default_max_frac=1.0,
     )
-    r_att_min = max(r_att_min, radial_margin)
+    margin_abs = abs(radial_margin)
 
-    if radial_margin < 0.0:
-        raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
+    if radial_margin >= 0.0:
+        r_att_min = max(r_att_min, margin_abs)
+    else:
+        r_att_max = min(r_att_max, r_def_max - margin_abs)
+
     if r_def_min > r_def_max:
         raise ValueError(f"Invalid defender shell: [{r_def_min}, {r_def_max}]")
     if r_att_min > r_att_max:
         raise ValueError(f"Invalid attacker shell: [{r_att_min}, {r_att_max}]")
-    if num_attackers > 0 and r_def_min > (r_att_max - radial_margin):
-        raise ValueError(
-            "Infeasible radial shells: defender cannot be at least "
-            f"{radial_margin:.3f} m closer to center than attacker. "
-            f"Got r_def_min={r_def_min:.3f}, r_att_max={r_att_max:.3f}."
-        )
+    if num_attackers > 0:
+        if radial_margin >= 0.0 and r_def_min > (r_att_max - margin_abs):
+            raise ValueError(
+                "Infeasible radial shells: defender cannot be at least "
+                f"{margin_abs:.3f} m closer to center than attacker. "
+                f"Got r_def_min={r_def_min:.3f}, r_att_max={r_att_max:.3f}."
+            )
+        if radial_margin < 0.0 and r_att_min > (r_def_max - margin_abs):
+            raise ValueError(
+                "Infeasible radial shells: attacker cannot be at least "
+                f"{margin_abs:.3f} m closer to center than defender. "
+                f"Got r_att_min={r_att_min:.3f}, r_def_max={r_def_max:.3f}."
+            )
 
     placed = False
     p_def = np.zeros(D, dtype=float)
@@ -1082,19 +1195,33 @@ def _sample_x0_random_shell_advantage(
             placed = True
             break
 
-        r_att_nearest = min(r_atts)
-        r_def_max_eff = min(r_def_max, r_att_nearest - radial_margin)
-        if r_def_max_eff < r_def_min:
-            continue
-
         found_def = False
-        for _def_try in range(1000):
-            cand = _sample_in_shell(rng, center, r_def_min, r_def_max_eff)
-            if any(np.linalg.norm(cand - p_att) < min_sep for p_att in p_atts):
+        if radial_margin >= 0.0:
+            r_att_nearest = min(r_atts)
+            r_def_max_eff = min(r_def_max, r_att_nearest - margin_abs)
+            if r_def_max_eff < r_def_min:
                 continue
-            p_def = cand
-            found_def = True
-            break
+
+            for _def_try in range(1000):
+                cand = _sample_in_shell(rng, center, r_def_min, r_def_max_eff)
+                if any(np.linalg.norm(cand - p_att) < min_sep for p_att in p_atts):
+                    continue
+                p_def = cand
+                found_def = True
+                break
+        else:
+            r_att_farthest = max(r_atts)
+            r_def_min_eff = max(r_def_min, r_att_farthest + margin_abs)
+            if r_def_min_eff > r_def_max:
+                continue
+
+            for _def_try in range(1000):
+                cand = _sample_in_shell(rng, center, r_def_min_eff, r_def_max)
+                if any(np.linalg.norm(cand - p_att) < min_sep for p_att in p_atts):
+                    continue
+                p_def = cand
+                found_def = True
+                break
 
         if not found_def:
             continue
@@ -1107,7 +1234,7 @@ def _sample_x0_random_shell_advantage(
         raise RuntimeError(
             "random_shell_advantage: could not sample a feasible initial condition after many attempts. "
             "Try relaxing r_def_max, increasing r_att_min/r_att_max, reducing train_min_sep, "
-            "or reducing percent_advantage_defender."
+            "or adjusting advantage_scale / percent_advantage_defender."
         )
 
     xs = [np.concatenate([p_def, v_def], dtype=float)[:nx]]
@@ -1221,6 +1348,40 @@ def _classify_trial_outcome(row: Dict[str, Any]) -> str:
     return "unclassified_failure"
 
 
+def _outcome_pretty_name(label: str) -> str:
+    pretty = {
+        "defender_capture": "Defender capture",
+        "defender_success": "Defender success",
+        "attacker_hit_oi": "Attacker hit OI",
+        "defender_crashed_wall": "Defender crashed wall",
+        "attacker_crashed_wall": "Attacker crashed wall",
+        "defender_hit_oi": "Defender hit OI",
+        "collision_but_not_success": "Collision but not success",
+        "timeout_no_capture": "Timeout / no capture",
+        "capture_required_not_met": "Capture required not met",
+        "rollout_error": "Rollout error",
+        "unclassified_failure": "Unclassified failure",
+    }
+    return pretty.get(str(label), str(label))
+
+
+def _outcome_color(label: str) -> str:
+    palette = {
+        "defender_capture": "#2ca02c",
+        "defender_success": "#1f77b4",
+        "attacker_hit_oi": "#d62728",
+        "defender_crashed_wall": "#9467bd",
+        "attacker_crashed_wall": "#ff7f0e",
+        "defender_hit_oi": "#8c564b",
+        "collision_but_not_success": "#e377c2",
+        "timeout_no_capture": "#bcbd22",
+        "capture_required_not_met": "#17becf",
+        "rollout_error": "#7f7f7f",
+        "unclassified_failure": "#111111",
+    }
+    return palette.get(str(label), "#111111")
+
+
 def _save_outcome_histogram(
     out_dir: Path,
     trial_rows: List[Dict[str, Any]],
@@ -1317,6 +1478,18 @@ def _save_outcome_histogram(
     }
 
 
+def _downsample_xyz_path(xyz: np.ndarray, max_points: int = 256) -> np.ndarray:
+    arr = np.asarray(xyz, dtype=float)
+    if arr.ndim != 2 or arr.size == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    arr = arr[:, :3]
+    if arr.shape[0] <= max_points:
+        return np.asarray(arr, dtype=np.float32)
+    idx = np.linspace(0, arr.shape[0] - 1, num=max_points, dtype=int)
+    idx = np.unique(idx)
+    return np.asarray(arr[idx], dtype=np.float32)
+
+
 def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
     D = int(cfg.get("D", 3))
     center, arena_r = _get_center_and_radius(cfg, D)
@@ -1385,6 +1558,23 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
         if uatt.size:
             uatt_mean, uatt_max = float(np.mean(uatt)), float(np.max(uatt))
 
+    dt = float(cfg.get("dt", float("nan")))
+    u_real_norms = out.get("u_real_norm_all", None)
+    delta_v_def_mean = delta_v_att_mean = float("nan")
+    delta_v_def_total = delta_v_att_total = float("nan")
+    delta_v_def_max = delta_v_att_max = float("nan")
+    if np.isfinite(dt) and dt > 0.0 and u_real_norms is not None and len(u_real_norms) >= 2:
+        dv_def = np.asarray(u_real_norms[0], dtype=float) * dt
+        dv_att = np.asarray(u_real_norms[1], dtype=float) * dt
+        if dv_def.size:
+            delta_v_def_mean = float(np.mean(dv_def))
+            delta_v_def_total = float(np.sum(dv_def))
+            delta_v_def_max = float(np.max(dv_def))
+        if dv_att.size:
+            delta_v_att_mean = float(np.mean(dv_att))
+            delta_v_att_total = float(np.sum(dv_att))
+            delta_v_att_max = float(np.max(dv_att))
+
     verify_require_capture = bool(cfg.get("verify_require_capture", False))
     zero_sum_cfg = cfg.get("zero_sum_reward", {}) or {}
     zero_sum_mode = str(zero_sum_cfg.get("mode", "")).strip().lower()
@@ -1440,6 +1630,12 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
         "uatt_mean": uatt_mean,
         "udef_max": udef_max,
         "uatt_max": uatt_max,
+        "delta_v_def_mean": delta_v_def_mean,
+        "delta_v_att_mean": delta_v_att_mean,
+        "delta_v_def_total": delta_v_def_total,
+        "delta_v_att_total": delta_v_att_total,
+        "delta_v_def_max": delta_v_def_max,
+        "delta_v_att_max": delta_v_att_max,
     }
 
 
@@ -1593,6 +1789,12 @@ def _aggregate_trial_metrics(per_att_metrics: List[Dict[str, Any]]) -> Dict[str,
         "trial_t_oi_viol_att": _min_non_negative([m.get("t_oi_viol_att", -1) for m in per_att_metrics]),
         "trial_udef_mean": _mean_metric(per_att_metrics, "udef_mean"),
         "trial_uatt_mean": _mean_metric(per_att_metrics, "uatt_mean"),
+        "trial_delta_v_def_mean": _mean_metric(per_att_metrics, "delta_v_def_mean"),
+        "trial_delta_v_att_mean": _mean_metric(per_att_metrics, "delta_v_att_mean"),
+        "trial_delta_v_def_total": _mean_metric(per_att_metrics, "delta_v_def_total"),
+        "trial_delta_v_att_total": _mean_metric(per_att_metrics, "delta_v_att_total"),
+        "trial_delta_v_def_max": _mean_metric(per_att_metrics, "delta_v_def_max"),
+        "trial_delta_v_att_max": _mean_metric(per_att_metrics, "delta_v_att_max"),
         "trial_rollout_num_steps": _mean_metric(per_att_metrics, "rollout_num_steps"),
         "trial_rollout_setup_sec": _mean_metric(per_att_metrics, "rollout_setup_sec"),
         "trial_rollout_setup_sec_per_step": _mean_metric(per_att_metrics, "rollout_setup_sec_per_step"),
@@ -1822,6 +2024,328 @@ def _save_start_plots(
     plt.close(fig)
 
 
+def _save_success_vs_delta_v_plot(
+    out_dir: Path,
+    trial_rows: List[Dict[str, Any]],
+) -> Optional[str]:
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    outcome_order = [
+        "defender_capture",
+        "defender_success",
+        "attacker_hit_oi",
+        "defender_crashed_wall",
+        "attacker_crashed_wall",
+        "defender_hit_oi",
+        "collision_but_not_success",
+        "timeout_no_capture",
+        "capture_required_not_met",
+        "rollout_error",
+        "unclassified_failure",
+    ]
+
+    grouped: Dict[str, List[Tuple[float, float, float]]] = {}
+    for row in trial_rows:
+        try:
+            dv_def = float(row.get("trial_delta_v_def_total", float("nan")))
+            dv_att = float(row.get("trial_delta_v_att_total", float("nan")))
+            pass_trial = float(row.get("pass_trial", float("nan")))
+        except Exception:
+            continue
+        if not (np.isfinite(dv_def) and np.isfinite(dv_att) and np.isfinite(pass_trial)):
+            continue
+        label = str(row.get("outcome_label", _classify_trial_outcome(row)))
+        grouped.setdefault(label, []).append((dv_def, dv_att, pass_trial))
+
+    if not grouped:
+        return None
+
+    rng = np.random.default_rng(0)
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    ax_success, ax_pareto = axes
+
+    present_labels: List[str] = []
+    for label in outcome_order:
+        pts = grouped.get(label, [])
+        if not pts:
+            continue
+        present_labels.append(label)
+        arr = np.asarray(pts, dtype=float)
+        color = _outcome_color(label)
+        y_jitter = arr[:, 2] + rng.uniform(-0.06, 0.06, size=arr.shape[0])
+        ax_success.scatter(
+            arr[:, 0],
+            y_jitter,
+            s=12,
+            alpha=0.45,
+            c=color,
+            edgecolors="none",
+        )
+        ax_pareto.scatter(
+            arr[:, 0],
+            arr[:, 1],
+            s=12,
+            alpha=0.45,
+            c=color,
+            edgecolors="none",
+        )
+
+    ax_success.set_title("Success vs Defender Total Delta-v")
+    ax_success.set_xlabel("Defender total delta-v")
+    ax_success.set_ylabel("Trial outcome")
+    ax_success.set_yticks([0.0, 1.0])
+    ax_success.set_yticklabels(["Fail", "Pass"])
+    ax_success.set_ylim(-0.2, 1.2)
+    ax_success.grid(True, alpha=0.3)
+
+    ax_pareto.set_title("Delta-v Pareto View")
+    ax_pareto.set_xlabel("Defender total delta-v")
+    ax_pareto.set_ylabel("Attacker total delta-v")
+    ax_pareto.grid(True, alpha=0.3)
+
+    legend_handles = [
+        Line2D(
+            [0],
+            [0],
+            marker="o",
+            linestyle="None",
+            markersize=6,
+            markerfacecolor=_outcome_color(label),
+            markeredgecolor="none",
+            label=_outcome_pretty_name(label),
+        )
+        for label in present_labels
+    ]
+    if legend_handles:
+        fig.legend(
+            handles=legend_handles,
+            loc="lower center",
+            ncol=min(3, len(legend_handles)),
+            bbox_to_anchor=(0.5, -0.02),
+        )
+
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 1.0))
+    path = out_dir / "success_vs_delta_v.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return str(path.name)
+
+
+def _save_time_to_event_histograms(
+    out_dir: Path,
+    trial_rows: List[Dict[str, Any]],
+    dt: float,
+) -> Optional[str]:
+    import matplotlib.pyplot as plt
+
+    if not np.isfinite(dt) or dt <= 0.0:
+        return None
+
+    capture_times: List[float] = []
+    attacker_hit_times: List[float] = []
+    timeout_times: List[float] = []
+
+    for row in trial_rows:
+        label = str(row.get("outcome_label", _classify_trial_outcome(row)))
+
+        t_collide = row.get("trial_t_collide", float("nan"))
+        try:
+            t_collide_f = float(t_collide)
+        except Exception:
+            t_collide_f = float("nan")
+        if label == "defender_capture" and np.isfinite(t_collide_f) and t_collide_f >= 0.0:
+            capture_times.append(t_collide_f * float(dt))
+
+        t_att_hit = row.get("trial_t_att_hit", float("nan"))
+        try:
+            t_att_hit_f = float(t_att_hit)
+        except Exception:
+            t_att_hit_f = float("nan")
+        if int(row.get("trial_attacker_hit_any", 0)) == 1 and np.isfinite(t_att_hit_f) and t_att_hit_f >= 0.0:
+            attacker_hit_times.append(t_att_hit_f * float(dt))
+
+        if label == "timeout_no_capture":
+            try:
+                timeout_steps = float(row.get("trial_rollout_num_steps", float("nan")))
+            except Exception:
+                timeout_steps = float("nan")
+            if np.isfinite(timeout_steps) and timeout_steps >= 0.0:
+                timeout_times.append(timeout_steps * float(dt))
+
+    datasets = [
+        ("Time to capture", np.asarray(capture_times, dtype=float), "#2ca02c"),
+        ("Time to attacker hit", np.asarray(attacker_hit_times, dtype=float), "#d62728"),
+        ("Time to timeout", np.asarray(timeout_times, dtype=float), "#bcbd22"),
+    ]
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    for ax, (title, vals, color) in zip(axes, datasets):
+        ax.set_title(title)
+        ax.set_xlabel("Time from rollout start (s)")
+        ax.set_ylabel("Trials")
+        ax.grid(True, alpha=0.3)
+        if vals.size == 0:
+            ax.text(0.5, 0.5, "No events", ha="center", va="center", transform=ax.transAxes)
+            continue
+
+        bins = min(40, max(10, int(np.sqrt(vals.size))))
+        ax.hist(vals, bins=bins, color=color, edgecolor="black", alpha=0.8)
+        mean = float(np.mean(vals))
+        std = float(np.std(vals, ddof=0))
+        ax.axvline(mean, color="black", linestyle="--", linewidth=1.2)
+        ax.text(
+            0.98,
+            0.95,
+            f"n={vals.size}\nmean={mean:.2f}s\nstd={std:.2f}s",
+            ha="right",
+            va="top",
+            transform=ax.transAxes,
+            fontsize=9,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "alpha": 0.8, "edgecolor": "none"},
+        )
+
+    fig.tight_layout()
+    path = out_dir / "time_to_event_histograms.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return str(path.name)
+
+
+def _save_trajectory_overlay_plots(
+    out_dir: Path,
+    cfg: Dict[str, Any],
+    trajectory_records: List[Tuple[str, np.ndarray, np.ndarray]],
+) -> List[str]:
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.lines import Line2D
+    from matplotlib.colors import to_rgba
+
+    if not trajectory_records:
+        return []
+
+    D = int(cfg.get("D", 3))
+    if D != 3:
+        return []
+
+    center, arena_r = _get_center_and_radius(cfg, D)
+    oi = cfg.get("oi", {}) or {}
+    oi_enabled = bool(oi.get("enabled", False))
+    oi_r = float(oi.get("r", 0.0)) if oi_enabled else 0.0
+    success_labels = {"defender_capture", "defender_success"}
+    timeout_labels = {"timeout_no_capture"}
+
+    def _segments(plane: str, role_idx: int, group: str) -> List[np.ndarray]:
+        segs: List[np.ndarray] = []
+        for outcome_label, def_xyz, att_xyz in trajectory_records:
+            if group == "success":
+                keep = outcome_label in success_labels
+            elif group == "timeout":
+                keep = outcome_label in timeout_labels
+            elif group == "failure":
+                keep = outcome_label not in success_labels and outcome_label not in timeout_labels
+            else:
+                raise ValueError(f"unknown trajectory group={group!r}")
+            if not keep:
+                continue
+            xyz = def_xyz if role_idx == 0 else att_xyz
+            if xyz.ndim != 2 or xyz.shape[0] < 2:
+                continue
+            if plane == "xy":
+                segs.append(np.asarray(xyz[:, [0, 1]], dtype=float))
+            else:
+                segs.append(np.asarray(xyz[:, [0, 2]], dtype=float))
+        return segs
+
+    def _draw_circle(ax, plane: str, r: float, label: Optional[str] = None, lw: float = 1.2) -> None:
+        cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
+        if plane == "xy":
+            circ = plt.Circle((cx, cy), r, fill=False, linewidth=lw)
+            ax.add_patch(circ)
+            if label:
+                ax.text(cx + r, cy, label, fontsize=8, va="center")
+        else:
+            circ = plt.Circle((cx, cz), r, fill=False, linewidth=lw)
+            ax.add_patch(circ)
+            if label:
+                ax.text(cx + r, cz, label, fontsize=8, va="center")
+
+    def _decorate(ax, plane: str, title: str, ylabel: str) -> None:
+        ax.set_title(title)
+        ax.set_xlabel("x (m)")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.25)
+        _draw_circle(ax, plane, float(arena_r), label="arena", lw=1.2)
+        if oi_enabled and oi_r > 0.0:
+            _draw_circle(ax, plane, float(oi_r), label="OI", lw=1.2)
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(float(center[0] - 1.05 * arena_r), float(center[0] + 1.05 * arena_r))
+        if plane == "xy":
+            ax.set_ylim(float(center[1] - 1.05 * arena_r), float(center[1] + 1.05 * arena_r))
+        else:
+            ax.set_ylim(float(center[2] - 1.05 * arena_r), float(center[2] + 1.05 * arena_r))
+
+    def _save_plane(plane: str, filename: str, ylabel: str) -> str:
+        success_def = _segments(plane, 0, "success")
+        success_att = _segments(plane, 1, "success")
+        timeout_def = _segments(plane, 0, "timeout")
+        timeout_att = _segments(plane, 1, "timeout")
+        fail_def = _segments(plane, 0, "failure")
+        fail_att = _segments(plane, 1, "failure")
+
+        fig, ax = plt.subplots(figsize=(8, 7))
+        _decorate(
+            ax,
+            plane,
+            f"Trajectory Overlay ({plane.upper()}): green success underlay, grey timeout mid-layer, red failure overlay",
+            ylabel,
+        )
+
+        collections = [
+            (success_def, to_rgba("#2ca02c", alpha=0.05), "solid", 1),
+            (success_att, to_rgba("#2ca02c", alpha=0.05), "dashed", 1),
+            (timeout_def, to_rgba("#7f7f7f", alpha=0.07), "solid", 2),
+            (timeout_att, to_rgba("#7f7f7f", alpha=0.07), "dashed", 2),
+            (fail_def, to_rgba("#d62728", alpha=0.08), "solid", 3),
+            (fail_att, to_rgba("#d62728", alpha=0.08), "dashed", 3),
+        ]
+        for segs, color, linestyle, zorder in collections:
+            if not segs:
+                continue
+            lc = LineCollection(
+                segs,
+                colors=[color],
+                linewidths=0.5,
+                linestyles=linestyle,
+                zorder=zorder,
+            )
+            ax.add_collection(lc)
+
+        n_success = sum(1 for label, _, _ in trajectory_records if label in success_labels)
+        n_timeout = sum(1 for label, _, _ in trajectory_records if label in timeout_labels)
+        n_fail = max(0, len(trajectory_records) - n_success - n_timeout)
+        legend_handles = [
+            Line2D([0], [0], color="#2ca02c", linestyle="solid", linewidth=1.0, label=f"Successful defender (n={n_success})"),
+            Line2D([0], [0], color="#2ca02c", linestyle="dashed", linewidth=1.0, label="Successful attacker"),
+            Line2D([0], [0], color="#7f7f7f", linestyle="solid", linewidth=1.0, label=f"Timeout defender (n={n_timeout})"),
+            Line2D([0], [0], color="#7f7f7f", linestyle="dashed", linewidth=1.0, label="Timeout attacker"),
+            Line2D([0], [0], color="#d62728", linestyle="solid", linewidth=1.0, label=f"Unsuccessful defender (n={n_fail})"),
+            Line2D([0], [0], color="#d62728", linestyle="dashed", linewidth=1.0, label="Unsuccessful attacker"),
+        ]
+        ax.legend(handles=legend_handles, loc="upper right")
+        fig.tight_layout()
+        path = out_dir / filename
+        fig.savefig(path, dpi=180)
+        plt.close(fig)
+        return str(path.name)
+
+    return [
+        _save_plane("xy", "trajectory_overlay_xy.png", "y (m)"),
+        _save_plane("xz", "trajectory_overlay_xz.png", "z (m)"),
+    ]
+
+
 def _save_kf_eval_plots(
     out_dir: Path,
     trial_rows: List[Dict[str, Any]],
@@ -1947,9 +2471,25 @@ def main():
     ap.add_argument("--pos_scale", type=float, default=0.95, help="Sample within pos_scale * arena_r.")
     ap.add_argument("--vel_scale", type=float, default=0.0, help="Stddev of sampled initial velocities.")
     ap.add_argument("--min_sep", type=float, default=0.0, help="Min defender-attacker separation when sampling.")
+    ap.add_argument(
+        "--advantage_scale",
+        type=float,
+        default=None,
+        help="Scale the config-derived default radial advantage used for random_shell_advantage "
+             "sampling and auto-shell advantage filtering. 1.0 keeps the saved config behavior, "
+             "0.0 removes the enforced advantage, and negative values flip the same magnitude "
+             "of advantage to the attacker (for example -1.0).",
+    )
 
     # common overrides
     ap.add_argument("--device", default=None)
+    ap.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=None,
+        help="When using CUDA policy-vs-policy eval, number of rollouts to evaluate in parallel. "
+             "If omitted, a conservative default batch size is chosen automatically.",
+    )
     ap.add_argument("--def_ckpt_path", default=None)
     ap.add_argument("--att_ckpt_path", default=None)
     ap.add_argument(
@@ -2001,6 +2541,15 @@ def main():
         help="Override ukf.action_meas_std with a scalar or comma-separated x,y,z values.",
     )
     ap.add_argument(
+        "--vmax",
+        type=float,
+        default=None,
+        help="Override the rollout speed cap used by the velocity controller via cfg['vmax'] "
+             "and safety_filter['vmax']. When this speed cap is active, whether from the CLI "
+             "or the loaded eval config/run_manifest, Monte Carlo initial velocity "
+             "sampling/jitter is projected to satisfy it.",
+    )
+    ap.add_argument(
         "--velocity_controller_enabled",
         nargs="?",
         const=True,
@@ -2012,12 +2561,21 @@ def main():
         "--velocity_controller_speed",
         type=float,
         default=None,
-        help="Override the velocity controller speed cap via safety_filter['vmax'].",
+        help="Legacy alias for --vmax.",
     )
     ap.add_argument("--umax", type=float, default=None, help="Override cfg['umax'] for rollout.")
     ap.add_argument("--arena_radius", type=float, default=None, help="Override spherical arena radius in meters.")
     ap.add_argument("--x0_pos_jitter", type=float, default=None)
-    ap.add_argument("--x0_vel_jitter", type=float, default=None)
+    ap.add_argument(
+        "--velocity_dispersion_std",
+        "--x0_vel_jitter",
+        dest="x0_vel_jitter",
+        type=float,
+        default=None,
+        help="Override x0_jitter['vel'] as the per-axis Gaussian standard deviation used for "
+             "initial velocity dispersion. --velocity_dispersion_std is the preferred name; "
+             "--x0_vel_jitter remains supported.",
+    )
 
     ap.add_argument("--alpha", type=float, default=0.05, help="CI alpha (0.05 => 95% CI).")
 
@@ -2030,6 +2588,8 @@ def main():
                     help="Print exception messages when a trial fails.")
     ap.add_argument("--trace_errors", action="store_true",
                     help="Also print full traceback for failed trials (implies --print_errors).")
+    ap.add_argument("--save_rollout_error_cases", action="store_true",
+                    help="Write rollout_error_cases.csv containing failed trials with their starting states.")
 
     # paired CSV (existing)
     ap.add_argument("--trials_in", default=None,
@@ -2043,14 +2603,19 @@ def main():
                     help="CSV of defender start states (def_x,def_y,def_z[,def_vx,def_vy,def_vz]).")
     ap.add_argument("--att_trials_in", default=None,
                     help="CSV of attacker start states (att1_x,att1_y,att1_z[,att1_vx,att1_vy,att1_vz]).")
-    ap.add_argument("--max_pairs", type=int, default=None,
-                    help="If set in cartesian mode, cap total evaluated pairs (sampled).")
+    ap.add_argument("--index", "--max_pairs", dest="max_pairs", type=int, default=None,
+                    help="If set in cartesian mode, cap total evaluated pairs (sampled). "
+                         "--index is the preferred name; --max_pairs remains supported.")
 
     # NEW: auto shell grid (no CSV)
     ap.add_argument("--auto_shell_grid", action="store_true",
                     help="Generate discrete defender/attacker start grids on spherical shells (no CSV).")
     ap.add_argument("--shell_fracs", type=str, default="0.2,0.4,0.6,0.8",
-                    help="Comma-separated shell radii as fractions of arena radius (0,1].")
+                    help="Comma-separated shell radii as fractions of each agent's shell planning radius (0,1].")
+    ap.add_argument("--def_shell_radius", type=float, default=None,
+                    help="Defender shell planning radius. If omitted, uses arena radius. Values in (0,1] are treated as fractions of arena radius; larger values are meters.")
+    ap.add_argument("--att_shell_radius", type=float, default=None,
+                    help="Attacker shell planning radius. If omitted, uses arena radius. Values in (0,1] are treated as fractions of arena radius; larger values are meters.")
     ap.add_argument("--points_per_shell", type=int, default=40,
                     help="Number of points per shell (per agent grid).")
     ap.add_argument("--include_center", action="store_true",
@@ -2135,12 +2700,23 @@ def main():
     if args.kf_action_meas_std is not None:
         cfg0.setdefault("ukf", {})
         cfg0["ukf"]["action_meas_std"] = args.kf_action_meas_std
+    if args.vmax is not None and args.velocity_controller_speed is not None:
+        if not np.isclose(float(args.vmax), float(args.velocity_controller_speed)):
+            raise RuntimeError(
+                "--vmax and --velocity_controller_speed were both provided with different values. "
+                "Use just --vmax, or pass matching values."
+            )
+    vmax_override = args.vmax if args.vmax is not None else args.velocity_controller_speed
+    if vmax_override is not None:
+        vmax_override = float(vmax_override)
+        if not np.isfinite(vmax_override) or vmax_override <= 0.0:
+            raise RuntimeError(f"--vmax must be finite and > 0, got {vmax_override!r}.")
+        cfg0["vmax"] = vmax_override
+        cfg0.setdefault("safety_filter", {})
+        cfg0["safety_filter"]["vmax"] = vmax_override
     if args.velocity_controller_enabled is not None:
         cfg0.setdefault("safety_filter", {})
         cfg0["safety_filter"]["enabled"] = bool(args.velocity_controller_enabled)
-    if args.velocity_controller_speed is not None:
-        cfg0.setdefault("safety_filter", {})
-        cfg0["safety_filter"]["vmax"] = float(args.velocity_controller_speed)
     if args.umax is not None:
         cfg0["umax"] = float(args.umax)
     if args.arena_radius is not None:
@@ -2157,6 +2733,8 @@ def main():
 
     if args.steps is not None:
         cfg0["T"] = int(args.steps)
+    if args.advantage_scale is not None:
+        cfg0["advantage_scale"] = float(args.advantage_scale)
 
     _validate_eval_inputs(args, cfg0)
 
@@ -2177,10 +2755,12 @@ def main():
     log(
         "[eval] rollout knobs: "
         f"attacker_mode={cfg0.get('attacker_mode', 'rl')} "
+        f"advantage_scale={_radial_advantage_scale(cfg0):.3f} "
+        f"radial_advantage_effective_m={_radial_advantage_margin(cfg0):.3f} "
         f"kf_action_access={(cfg0.get('ukf', {}) or {}).get('action_access')} "
         f"kf_action_meas_std={(cfg0.get('ukf', {}) or {}).get('action_meas_std')} "
         f"velocity_ctrl={(cfg0.get('safety_filter', {}) or {}).get('enabled')} "
-        f"velocity_speed={(cfg0.get('safety_filter', {}) or {}).get('vmax', cfg0.get('vmax'))} "
+        f"vmax={_resolve_rollout_vmax(cfg0)} "
         f"umax={cfg0.get('umax')} arena_r={(cfg0.get('arena', {}) or {}).get('r')}"
     )
 
@@ -2199,6 +2779,8 @@ def main():
     def_rows: Optional[List[Dict[str, float]]] = None
     att_rows: Optional[List[Dict[str, float]]] = None
     valid_pair_indices: Optional[List[Tuple[int, int]]] = None
+    def_shell_plan_radius: Optional[float] = None
+    att_shell_plan_radius: Optional[float] = None
 
     n_total: int
 
@@ -2208,6 +2790,16 @@ def main():
             raise RuntimeError("--auto_shell_grid currently supports only D=3 (sphere).")
 
         center, arena_r = _get_center_and_radius(cfg0, D)
+        def_shell_plan_radius = _resolve_shell_plan_radius(
+            args.def_shell_radius,
+            arena_r,
+            "--def_shell_radius",
+        )
+        att_shell_plan_radius = _resolve_shell_plan_radius(
+            args.att_shell_radius,
+            arena_r,
+            "--att_shell_radius",
+        )
 
         shell_fracs = [float(s.strip()) for s in args.shell_fracs.split(",") if s.strip() != ""]
         shell_fracs = [s for s in shell_fracs if 0.0 < s <= 1.0]
@@ -2216,9 +2808,9 @@ def main():
 
         rng_grid = np.random.default_rng(int(args.seed) + 12345)
 
-        def_pos = _generate_shelled_positions(center, arena_r, shell_fracs, int(args.points_per_shell),
+        def_pos = _generate_shelled_positions(center, def_shell_plan_radius, shell_fracs, int(args.points_per_shell),
                                               rng=rng_grid, include_center=bool(args.include_center))
-        att_pos = _generate_shelled_positions(center, arena_r, shell_fracs, int(args.points_per_shell),
+        att_pos = _generate_shelled_positions(center, att_shell_plan_radius, shell_fracs, int(args.points_per_shell),
                                               rng=rng_grid, include_center=bool(args.include_center))
 
         def_rows = _rows_from_positions("def", def_pos)
@@ -2247,6 +2839,10 @@ def main():
         log(f"[eval] auto_shell defender radii/counts: {def_shell_summary}")
         log(f"[eval] auto_shell attacker radii/counts: {att_shell_summary}")
         log(
+            "[eval] auto_shell planning radii: "
+            f"arena={arena_r:g} defender={def_shell_plan_radius:g} attacker={att_shell_plan_radius:g}"
+        )
+        log(
             "[eval] auto_shell valid shell-pair counts: "
             f"{valid_shell_pair_summary} | total_valid_pairs={total_pairs_valid}"
         )
@@ -2256,7 +2852,9 @@ def main():
             n_total = min(int(args.num_trials), total_pairs_valid)
             paired_rows = _paired_rows_from_pair_indices(def_rows, att_rows, valid_pair_indices, n_total, D, num_attackers)
             log(f"[eval] auto_shell_grid paired: shells={shell_fracs} points_per_shell={args.points_per_shell} "
-                f"include_center={args.include_center} valid_pairs={total_pairs_valid}/{total_pairs_all} -> paired_rows={len(paired_rows)}")
+                f"include_center={args.include_center} def_shell_radius={def_shell_plan_radius:g} "
+                f"att_shell_radius={att_shell_plan_radius:g} "
+                f"valid_pairs={total_pairs_valid}/{total_pairs_all} -> paired_rows={len(paired_rows)}")
         else:
             if args.max_pairs is None:
                 n_total = total_pairs_valid
@@ -2264,7 +2862,8 @@ def main():
             else:
                 n_total = min(int(args.max_pairs), total_pairs_valid)
                 log(f"[eval] auto_shell_grid cartesian: valid pairs={total_pairs_valid} / {total_pairs_all}, evaluating={n_total} (sampled)")
-            log(f"[eval] auto_shell_grid cartesian grids: def_rows={len(def_rows)} att_rows={len(att_rows)}")
+            log(f"[eval] auto_shell_grid cartesian grids: def_rows={len(def_rows)} att_rows={len(att_rows)} "
+                f"def_shell_radius={def_shell_plan_radius:g} att_shell_radius={att_shell_plan_radius:g}")
 
         # Make CSV args irrelevant
         args.trials_in = None
@@ -2322,41 +2921,225 @@ def main():
     starts_atts: List[List[np.ndarray]] = [[]]
 
     trial_rows: List[Dict[str, Any]] = []
+    trajectory_records: List[Tuple[str, np.ndarray, np.ndarray]] = []
     passes = 0
+
+    use_batched_cuda_eval = _supports_batched_cuda_eval(cfg0, args.opponent_source)
+    if use_batched_cuda_eval:
+        eval_batch_size = int(args.eval_batch_size) if args.eval_batch_size is not None else min(128, max(1, n_total))
+        if eval_batch_size <= 0:
+            raise RuntimeError(f"--eval_batch_size must be >= 1, got {eval_batch_size}.")
+        log(
+            f"[eval] batched CUDA eval enabled: batch_size={eval_batch_size} "
+            f"(device={cfg0.get('device')}, opponent_source={args.opponent_source})"
+        )
+    else:
+        eval_batch_size = 1
+        if _is_cuda_device(cfg0.get("device", None)) and str(args.opponent_source).strip().lower() == "policy":
+            log(
+                "[eval] CUDA requested, but batched eval is not active for this configuration; "
+                "falling back to scalar rollouts."
+            )
 
     log("[eval] beginning trials...")
     t_loop0 = time.time()
+    first_out_logged = False
+    pending_items: List[Dict[str, Any]] = []
+
+    def _maybe_log_first_rollout(i_trial: int, out: Dict[str, Any]) -> None:
+        nonlocal first_out_logged
+        if first_out_logged or not args.print_first_out_keys:
+            return
+        first_out_logged = True
+        log("[eval] first rollout returned keys:")
+        log("  " + ", ".join(sorted(list(out.keys()))))
+        exec_xyz_all = out.get("exec_xyz_all", None)
+        if isinstance(exec_xyz_all, list) and exec_xyz_all:
+            lens = [len(np.asarray(p, dtype=float)) for p in exec_xyz_all]
+            log(f"[eval] first rollout sanity: len(exec_xyz_all)={lens}")
+            if len(exec_xyz_all) >= 2:
+                p1 = np.asarray(exec_xyz_all[0], dtype=float)
+                p2 = np.asarray(exec_xyz_all[1], dtype=float)
+                if p1.size and p2.size:
+                    d0 = float(np.linalg.norm(p1[0, :D] - p2[0, :D]))
+                    dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
+                    log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
+            return
+
+        p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
+        p2 = np.asarray(out.get("exec2_xyz", []), dtype=float)
+        log(f"[eval] first rollout sanity: len(exec1_xyz)={len(p1)} len(exec2_xyz)={len(p2)}")
+        if p1.size and p2.size:
+            d0 = float(np.linalg.norm(p1[0, :D] - p2[0, :D]))
+            dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
+            log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
+
+    def _record_trial_result(item: Dict[str, Any], out: Optional[Dict[str, Any]], error: Optional[Exception]) -> None:
+        nonlocal passes
+
+        i_trial = int(item["trial"])
+        x0 = np.asarray(item["x0"], dtype=float)
+        cfg_run = item["cfg_run"]
+        cart_di = item["def_idx"]
+        cart_ai = item["att_idx"]
+
+        trial_errors = 0
+        trial_metrics: Dict[str, Any]
+        trial_def_xyz_down = None
+        trial_att_xyz_down = None
+
+        try:
+            if error is not None:
+                raise error
+            assert out is not None
+            _maybe_log_first_rollout(i_trial, out)
+
+            rollout_timing = out.get("rollout_timing_sec", {}) or {}
+            trial_metrics = _compute_trial_metrics(cfg_run, out)
+            trial_metrics.update(_extract_kf_trial_metrics(out, D))
+            rollout_steps = _rollout_num_steps(out)
+            trial_metrics["rollout_num_steps"] = int(rollout_steps)
+            p_def_xyz, p_att_xyz = _extract_positions(out, D)
+            trial_def_xyz_down = _downsample_xyz_path(p_def_xyz)
+            trial_att_xyz_down = _downsample_xyz_path(p_att_xyz)
+            for timing_key in ("setup", "simulation", "total"):
+                timing_val = float(rollout_timing.get(timing_key, float("nan")))
+                trial_metrics[f"rollout_{timing_key}_sec"] = timing_val
+                if rollout_steps > 0 and np.isfinite(timing_val):
+                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = timing_val / float(rollout_steps)
+                else:
+                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = float("nan")
+
+        except Exception as exc:
+            trial_errors = 1
+            trial_metrics = {"pass": 0, "error": str(exc)}
+            if args.print_errors:
+                log(f"[eval][trial {i_trial}/{n_total-1}] ERROR: {exc}")
+                if args.trace_errors:
+                    log(traceback.format_exc())
+
+        pass_trial = int(trial_metrics.get("pass", 0))
+        passes += pass_trial
+
+        row: Dict[str, Any] = {
+            "trial": i_trial,
+            "seed": int(item["seed"]),
+            "grid_mode": args.grid_mode if not args.auto_shell_grid else f"{args.grid_mode}+auto_shell",
+            "pass_trial": pass_trial,
+            "num_attackers": 1,
+            "num_att_errors": trial_errors,
+            "def_x": float(x0[0, 0]),
+            "def_y": float(x0[0, 1]) if D >= 2 else 0.0,
+            "def_z": float(x0[0, 2]) if D == 3 else 0.0,
+            "def_vx": float(x0[0, D + 0]) if x0.shape[1] > D else 0.0,
+            "def_vy": float(x0[0, D + 1]) if (x0.shape[1] > D + 1 and D >= 2) else 0.0,
+            "def_vz": float(x0[0, D + 2]) if (x0.shape[1] > D + 2 and D == 3) else 0.0,
+            "att1_x": float(x0[1, 0]) if x0.shape[0] > 1 else float("nan"),
+            "att1_y": float(x0[1, 1]) if (x0.shape[0] > 1 and D >= 2) else float("nan"),
+            "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
+            "att1_vx": float(x0[1, D + 0]) if (x0.shape[0] > 1 and x0.shape[1] > D) else float("nan"),
+            "att1_vy": float(x0[1, D + 1]) if (x0.shape[0] > 1 and x0.shape[1] > D + 1 and D >= 2) else float("nan"),
+            "att1_vz": float(x0[1, D + 2]) if (x0.shape[0] > 1 and x0.shape[1] > D + 2 and D == 3) else float("nan"),
+        }
+
+        if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
+            row["def_idx"] = cart_di
+            row["att_idx"] = cart_ai
+
+        row.update(_aggregate_trial_metrics([trial_metrics]))
+        for k_, v_ in trial_metrics.items():
+            row[f"att1_{k_}"] = v_
+        row["outcome_label"] = _classify_trial_outcome(row)
+
+        trial_rows.append(row)
+        if trial_def_xyz_down is not None and trial_att_xyz_down is not None:
+            trajectory_records.append((str(row["outcome_label"]), trial_def_xyz_down, trial_att_xyz_down))
+
+        if (i_trial == 0) or ((i_trial + 1) % max(1, int(args.log_every)) == 0) or (i_trial == n_total - 1):
+            sr_sofar = passes / float(i_trial + 1)
+            dt_trial = time.time() - float(item["t_trial0"])
+            last_min_rel = row.get("trial_min_rel_dist", row.get("att1_min_rel_dist", None))
+            last_hit = row.get("trial_attacker_hit_any", row.get("att1_attacker_hit", None))
+            last_def_term = row.get("trial_def_term_any", row.get("att1_def_term", None))
+            last_att_term = row.get("trial_att_term_any", row.get("att1_att_term", None))
+            last_rollout_sim = row.get("trial_rollout_simulation_sec", row.get("att1_rollout_simulation_sec", None))
+
+            extra = ""
+            if args.grid_mode == "cartesian":
+                extra = f" | def_idx={row.get('def_idx')} att_idx={row.get('att_idx')}"
+
+            log(
+                f"[eval] progress {i_trial+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
+                f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
+                f"rollout_sim={last_rollout_sim} | "
+                f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
+                f"errors_this_trial={trial_errors}{extra}"
+            )
+
+    def _run_scalar_rollout(cfg_run: Dict[str, Any], steps_run: int) -> Dict[str, Any]:
+        if args.opponent_source == "policy":
+            return run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
+        return run_rhc_with_policy_vs_baseline_collect_frames_3d(
+            cfg_run,
+            policy_role=args.policy_role,
+            opponent_baseline=args.opponent_source,
+            steps=steps_run,
+        )
+
+    def _flush_pending_items() -> None:
+        nonlocal pending_items
+        if not pending_items:
+            return
+
+        if use_batched_cuda_eval:
+            try:
+                batch_outs = run_batched_rhc_with_rl_and_collect_frames_3d(
+                    [item["cfg_run"] for item in pending_items],
+                    steps=int(pending_items[0]["steps_run"]),
+                )
+                if len(batch_outs) != len(pending_items):
+                    raise RuntimeError(
+                        f"Batched rollout returned {len(batch_outs)} outputs for {len(pending_items)} trials."
+                    )
+                for item, out in zip(pending_items, batch_outs):
+                    _record_trial_result(item, out, None)
+                pending_items = []
+                return
+            except Exception as batch_exc:
+                log(f"[eval] batched CUDA rollout failed; retrying pending trials one-by-one. reason={batch_exc}")
+
+        for item in pending_items:
+            try:
+                np.random.seed(int(item["ep_seed"]))
+                out = _run_scalar_rollout(item["cfg_run"], int(item["steps_run"]))
+                _record_trial_result(item, out, None)
+            except Exception as exc:
+                _record_trial_result(item, None, exc)
+        pending_items = []
 
     for i in range(n_total):
         t_trial0 = time.time()
         seed = int(args.seed + i)
 
-        # Runner uses np.random for measurement noise, so set it
         np.random.seed(seed)
         rng = np.random.default_rng(seed)
 
-        # Let dispersion mutate cfg per episode (kept)
         cfg_trial, _x0_unused, ep_seed = build_episode_cfg_and_x0(
             cfg0,
             episode_idx=i,
-            trials_row=None,  # we handle our own grids below
+            trials_row=None,
         )
-
 
         if args.dynamics is not None:
             cfg_trial["dynamics"] = str(args.dynamics)
         if args.dt is not None:
             cfg_trial["dt"] = float(args.dt)
-        
+
         np.random.seed(int(ep_seed))
 
-        # Always keep T as a clean int if it exists
         if "T" in cfg_trial and cfg_trial["T"] is not None:
             cfg_trial["T"] = int(cfg_trial["T"])
 
-        # ---------------------------
-        # Build x0 for this trial
-        # ---------------------------
         cart_di = cart_ai = None
 
         if paired_rows is not None:
@@ -2375,22 +3158,19 @@ def main():
                 if args.max_pairs is None:
                     pair_idx = i
                 else:
-                    # sampled pairs (not guaranteed unique) - fine for MC
                     pair_idx = int(rng.integers(0, total_pairs))
-
                 di = pair_idx // len(att_rows)
                 ai = pair_idx % len(att_rows)
 
             cart_di, cart_ai = int(di), int(ai)
-
             rd = def_rows[di]
             ra = att_rows[ai]
-
             x0 = _build_cartesian_x0(rd, ra, D, num_attackers)
 
         elif args.sample_ic:
             x0 = _sample_x0(
-                cfg_trial, rng,
+                cfg_trial,
+                rng,
                 num_attackers=num_attackers,
                 pos_scale=float(args.pos_scale),
                 vel_scale=float(args.vel_scale),
@@ -2408,137 +3188,48 @@ def main():
             )
 
         x0 = _apply_x0_jitter(cfg_trial, x0, rng)
+        active_vel_jitter = float((cfg_trial.get("x0_jitter", {}) or {}).get("vel", 0.0))
+        active_rollout_vmax = _resolve_rollout_vmax(cfg_trial)
+        if active_rollout_vmax is not None and (
+            args.sample_ic or args.auto_shell_grid or active_vel_jitter > 0.0
+        ):
+            x0 = _project_x0_velocities_to_vmax(x0, D, float(active_rollout_vmax))
 
-        # log starts (for plots)
         starts_def.append(x0[0, :D].copy())
         for j in range(num_attackers):
             if 1 + j < x0.shape[0]:
                 starts_atts[j].append(x0[1 + j, :D].copy())
-        trial_metrics: Dict[str, Any]
-        trial_errors = 0
 
         cfg_run = copy.deepcopy(cfg_trial)
         cfg_run["x0"] = np.asarray(x0, dtype=float).tolist()
-
-        # force CLI ckpt paths into the rollout cfg
         _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
-        # Determine steps for this rollout (never pass None)
         steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
         if steps_run <= 0:
             raise RuntimeError(f"Invalid steps_run={steps_run}. Provide --steps or ensure cfg['T'] is set.")
-
-        # Also keep cfg_run['T'] consistent with steps
         cfg_run["T"] = steps_run
 
-        try:
-            if args.opponent_source == "policy":
-                out = run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
-            else:
-                out = run_rhc_with_policy_vs_baseline_collect_frames_3d(
-                    cfg_run,
-                    policy_role=args.policy_role,
-                    opponent_baseline=args.opponent_source,
-                    steps=steps_run,
-                )
+        if pending_items and int(pending_items[0]["steps_run"]) != steps_run:
+            _flush_pending_items()
 
-            if i == 0 and args.print_first_out_keys:
-                log("[eval] first rollout returned keys:")
-                log("  " + ", ".join(sorted(list(out.keys()))))
-                exec_xyz_all = out.get("exec_xyz_all", None)
-                if isinstance(exec_xyz_all, list) and exec_xyz_all:
-                    lens = [len(np.asarray(p, dtype=float)) for p in exec_xyz_all]
-                    log(f"[eval] first rollout sanity: len(exec_xyz_all)={lens}")
-                    if len(exec_xyz_all) >= 2:
-                        p1 = np.asarray(exec_xyz_all[0], dtype=float)
-                        p2 = np.asarray(exec_xyz_all[1], dtype=float)
-                        if p1.size and p2.size:
-                            d0 = float(np.linalg.norm(p1[0, :D] - p2[0, :D]))
-                            dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
-                            log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
-                else:
-                    p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
-                    p2 = np.asarray(out.get("exec2_xyz", []), dtype=float)
-                    log(f"[eval] first rollout sanity: len(exec1_xyz)={len(p1)} len(exec2_xyz)={len(p2)}")
-                    if p1.size and p2.size:
-                        d0 = float(np.linalg.norm(p1[0, :D] - p2[0, :D]))
-                        dT = float(np.linalg.norm(p1[-1, :D] - p2[-1, :D]))
-                        log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
+        pending_items.append(
+            {
+                "trial": i,
+                "seed": seed,
+                "x0": np.asarray(x0, dtype=float),
+                "cfg_run": cfg_run,
+                "steps_run": steps_run,
+                "def_idx": cart_di,
+                "att_idx": cart_ai,
+                "ep_seed": int(ep_seed),
+                "t_trial0": t_trial0,
+            }
+        )
 
-            rollout_timing = out.get("rollout_timing_sec", {}) or {}
-            trial_metrics = _compute_trial_metrics(cfg_run, out)
-            trial_metrics.update(_extract_kf_trial_metrics(out, D))
-            rollout_steps = _rollout_num_steps(out)
-            trial_metrics["rollout_num_steps"] = int(rollout_steps)
-            for timing_key in ("setup", "simulation", "total"):
-                timing_val = float(rollout_timing.get(timing_key, float("nan")))
-                trial_metrics[f"rollout_{timing_key}_sec"] = timing_val
-                if rollout_steps > 0 and np.isfinite(timing_val):
-                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = timing_val / float(rollout_steps)
-                else:
-                    trial_metrics[f"rollout_{timing_key}_sec_per_step"] = float("nan")
+        if (not use_batched_cuda_eval) or (len(pending_items) >= eval_batch_size):
+            _flush_pending_items()
 
-        except Exception as e:
-            trial_errors = 1
-            trial_metrics = {"pass": 0, "error": str(e)}
-            if args.print_errors:
-                log(f"[eval][trial {i}/{n_total-1}] ERROR: {e}")
-                if args.trace_errors:
-                    log(traceback.format_exc())
-
-        pass_trial = int(trial_metrics.get("pass", 0))
-
-        passes += pass_trial
-
-        # One row per trial; stores aggregate trial metrics and per-attacker metrics
-        row: Dict[str, Any] = {
-            "trial": i,
-            "seed": seed,
-            "grid_mode": args.grid_mode if not args.auto_shell_grid else f"{args.grid_mode}+auto_shell",
-            "pass_trial": pass_trial,
-            "num_attackers": 1,
-            "num_att_errors": trial_errors,
-
-            "def_x": float(x0[0, 0]),
-            "def_y": float(x0[0, 1]) if D >= 2 else 0.0,
-            "def_z": float(x0[0, 2]) if D == 3 else 0.0,
-            "att1_x": float(x0[1, 0]) if x0.shape[0] > 1 else float("nan"),
-            "att1_y": float(x0[1, 1]) if (x0.shape[0] > 1 and D >= 2) else float("nan"),
-            "att1_z": float(x0[1, 2]) if (x0.shape[0] > 1 and D == 3) else float("nan"),
-        }
-
-        if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
-            row["def_idx"] = cart_di
-            row["att_idx"] = cart_ai
-
-        row.update(_aggregate_trial_metrics([trial_metrics]))
-        for k_, v_ in trial_metrics.items():
-            row[f"att1_{k_}"] = v_
-
-        trial_rows.append(row)
-
-        # Progress print
-        if (i == 0) or ((i + 1) % max(1, int(args.log_every)) == 0) or (i == n_total - 1):
-            sr_sofar = passes / float(i + 1)
-            dt_trial = time.time() - t_trial0
-
-            last_min_rel = row.get("trial_min_rel_dist", row.get("att1_min_rel_dist", None))
-            last_hit = row.get("trial_attacker_hit_any", row.get("att1_attacker_hit", None))
-            last_def_term = row.get("trial_def_term_any", row.get("att1_def_term", None))
-            last_att_term = row.get("trial_att_term_any", row.get("att1_att_term", None))
-            last_rollout_sim = row.get("trial_rollout_simulation_sec", row.get("att1_rollout_simulation_sec", None))
-
-            extra = ""
-            if args.grid_mode == "cartesian":
-                extra = f" | def_idx={row.get('def_idx')} att_idx={row.get('att_idx')}"
-
-            log(
-                f"[eval] progress {i+1}/{n_total} | pass_so_far={passes} ({sr_sofar:.3f}) | "
-                f"last_pass={pass_trial} | trial_time={dt_trial:.3f}s | "
-                f"rollout_sim={last_rollout_sim} | "
-                f"min_rel={last_min_rel} hit={last_hit} def_term={last_def_term} att_term={last_att_term} "
-                f"errors_this_trial={trial_errors}{extra}"
-            )
+    _flush_pending_items()
 
     # Aggregate stats
     n = len(trial_rows)
@@ -2600,6 +3291,12 @@ def main():
             "oi_viol_att_rate_stats": oi_viol_att_rate_stats,
             "udef_mean": _metric_summary(f"{prefix}_udef_mean"),
             "uatt_mean": _metric_summary(f"{prefix}_uatt_mean"),
+            "delta_v_def_mean": _metric_summary(f"{prefix}_delta_v_def_mean"),
+            "delta_v_att_mean": _metric_summary(f"{prefix}_delta_v_att_mean"),
+            "delta_v_def_total": _metric_summary(f"{prefix}_delta_v_def_total"),
+            "delta_v_att_total": _metric_summary(f"{prefix}_delta_v_att_total"),
+            "delta_v_def_max": _metric_summary(f"{prefix}_delta_v_def_max"),
+            "delta_v_att_max": _metric_summary(f"{prefix}_delta_v_att_max"),
             "rollout_num_steps": _metric_summary(f"{prefix}_rollout_num_steps"),
             "rollout_setup_sec": _metric_summary(f"{prefix}_rollout_setup_sec"),
             "rollout_setup_sec_per_step": _metric_summary(f"{prefix}_rollout_setup_sec_per_step"),
@@ -2657,9 +3354,15 @@ def main():
         "kf_action_access": (cfg0.get("ukf", {}) or {}).get("action_access"),
         "kf_action_meas_std": (cfg0.get("ukf", {}) or {}).get("action_meas_std"),
         "velocity_controller_enabled": bool((cfg0.get("safety_filter", {}) or {}).get("enabled", False)),
-        "velocity_controller_speed": (cfg0.get("safety_filter", {}) or {}).get("vmax"),
+        "velocity_controller_speed": _resolve_rollout_vmax(cfg0),
+        "vmax": _resolve_rollout_vmax(cfg0),
         "umax": cfg0.get("umax"),
+        "advantage_scale": _radial_advantage_scale(cfg0),
+        "radial_advantage_effective_m": _radial_advantage_margin(cfg0),
+        "percent_advantage_defender": cfg0.get("percent_advantage_defender"),
         "arena_radius": (cfg0.get("arena", {}) or {}).get("r"),
+        "def_shell_radius": float(def_shell_plan_radius) if def_shell_plan_radius is not None else None,
+        "att_shell_radius": float(att_shell_plan_radius) if att_shell_plan_radius is not None else None,
         "dynamics": cfg0.get("dynamics"),
         "dt": cfg0.get("dt"),
         "steps": cfg0.get("T"),
@@ -2690,13 +3393,17 @@ def main():
         "grid_mode": args.grid_mode,
         "auto_shell_grid": bool(args.auto_shell_grid),
         "shell_fracs": args.shell_fracs if args.auto_shell_grid else None,
+        "def_shell_radius": float(def_shell_plan_radius) if def_shell_plan_radius is not None else None,
+        "att_shell_radius": float(att_shell_plan_radius) if att_shell_plan_radius is not None else None,
         "points_per_shell": int(args.points_per_shell) if args.auto_shell_grid else None,
         "include_center": bool(args.include_center) if args.auto_shell_grid else None,
+        "save_rollout_error_cases": bool(args.save_rollout_error_cases),
         "timing_sec": {
             "total": float(time.time() - t_global0),
             "trial_loop": float(time.time() - t_loop0),
         },
         "outcome_breakdown": outcome_breakdown,
+        "rollout_error_cases_count": int(sum(1 for r in trial_rows if r.get("outcome_label") == "rollout_error")),
         "notes": [
             "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
             "This evaluation harness is now 1v1-only and mirrors the single-rollout notebook workflow.",
@@ -2704,7 +3411,9 @@ def main():
             "Otherwise PASS uses the legacy verifier: attacker does not hit target and no terminations/keepout violations, with optional capture gating via cfg['verify_require_capture'].",
             "grid_mode=paired uses --trials_in rows or --auto_shell_grid pairing.",
             "grid_mode=cartesian uses product of --def_trials_in x --att_trials_in or --auto_shell_grid grids.",
-            "If --max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
+            "If --index/--max_pairs is set in cartesian mode, pairs are sampled (not guaranteed unique).",
+            "Delta-v metrics are computed from realized control norms (u_real) times dt, so they reflect executed per-step delta-v and trajectory-total delta-v.",
+            "Trajectory overlay plots render all recorded trials with per-trajectory downsampling for plotting efficiency.",
             "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_trial.attacker_hit_any_rate for attacker-side comparisons.",
         ],
         "metrics_trial": {
@@ -2728,6 +3437,12 @@ def main():
             "kf_enabled_rollout_rate_stats": trial_kf_enabled_rate_stats,
             "udef_mean": _metric_summary("trial_udef_mean"),
             "uatt_mean": _metric_summary("trial_uatt_mean"),
+            "delta_v_def_mean": _metric_summary("trial_delta_v_def_mean"),
+            "delta_v_att_mean": _metric_summary("trial_delta_v_att_mean"),
+            "delta_v_def_total": _metric_summary("trial_delta_v_def_total"),
+            "delta_v_att_total": _metric_summary("trial_delta_v_att_total"),
+            "delta_v_def_max": _metric_summary("trial_delta_v_def_max"),
+            "delta_v_att_max": _metric_summary("trial_delta_v_att_max"),
             "rollout_num_steps": _metric_summary("trial_rollout_num_steps"),
             "rollout_setup_sec": _metric_summary("trial_rollout_setup_sec"),
             "rollout_setup_sec_per_step": _metric_summary("trial_rollout_setup_sec_per_step"),
@@ -2780,6 +3495,15 @@ def main():
         for r in timeout_rows:
             w.writerow(r)
 
+    rollout_error_rows = [r for r in trial_rows if r.get("outcome_label") == "rollout_error"]
+    rollout_error_csv_path = out_dir / "rollout_error_cases.csv"
+    if args.save_rollout_error_cases:
+        with rollout_error_csv_path.open("w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for r in rollout_error_rows:
+                w.writerow(r)
+
     clean_resolution_rows = [
         r for r in trial_rows
         if int(r.get("trial_attacker_hit_any", 0)) == 0
@@ -2814,20 +3538,36 @@ def main():
         alpha=float(args.alpha),
     )
 
+    extra_plot_files: List[str] = []
+    success_vs_delta_v_path = _save_success_vs_delta_v_plot(out_dir, trial_rows)
+    if success_vs_delta_v_path is not None:
+        extra_plot_files.append(success_vs_delta_v_path)
+    event_hist_path = _save_time_to_event_histograms(out_dir, trial_rows, float(cfg0.get("dt", float("nan"))))
+    if event_hist_path is not None:
+        extra_plot_files.append(event_hist_path)
+    extra_plot_files.extend(_save_trajectory_overlay_plots(out_dir, cfg0, trajectory_records))
+
     kf_plot_paths: List[str] = []
+    if extra_plot_files:
+        results["extra_plot_files"] = extra_plot_files
     if use_kf:
         kf_plot_paths = _save_kf_eval_plots(out_dir, trial_rows, estimator_kind.upper())
         if kf_plot_paths:
             results["kf_plot_files"] = [str(Path(p).name) for p in kf_plot_paths]
-            (out_dir / "results.json").write_text(json.dumps(results, indent=2))
+    if extra_plot_files or kf_plot_paths:
+        (out_dir / "results.json").write_text(json.dumps(results, indent=2))
 
     log(f"[eval] DONE | trials={n} passes={k} success_rate={sr:.3f} CI={lo:.3f}..{hi:.3f}")
     log(f"[eval] wrote: {out_dir/'results.json'}")
     log(f"[eval] wrote: {out_dir/'trials.csv'}")
     log(f"[eval] wrote: {out_dir/'timeout_no_capture_cases.csv'} ({len(timeout_rows)} rows)")
+    if args.save_rollout_error_cases:
+        log(f"[eval] wrote: {out_dir/'rollout_error_cases.csv'} ({len(rollout_error_rows)} rows)")
     log(f"[eval] wrote: {out_dir/'clean_non_hit_non_term_cases.csv'} ({len(clean_resolution_rows)} rows)")
     log(f"[eval] wrote: {out_dir/'starts_xy.png'}")
     log(f"[eval] wrote: {out_dir/'starts_xz.png'}")
+    for name in extra_plot_files:
+        log(f"[eval] wrote: {out_dir/name}")
     for p in kf_plot_paths:
         log(f"[eval] wrote: {p}")
     log(f"[eval] total_time={time.time() - t_global0:.3f}s")
@@ -2935,7 +3675,7 @@ python evaluate_policy.py \
   --grid_mode cartesian \
   --def_trials_in shelled_trials.csv \
   --att_trials_in shelled_trials.csv
-  --max_pairs 5000
+  --index 5000
 """
 
 
@@ -2973,4 +3713,85 @@ python evaluate_policy.py \
 
   --points_per_shell 40 \
   --x0_vel_jitter 0.5
+"""
+
+
+#20 meter
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_Redo_Mid_Actuation \
+  --def_ckpt_path Training_Policy_Redo_Mid_Actuation/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_Redo_Mid_Actuation/att1_teacher.pt \
+  --out_dir Training_Policy_Redo_Mid_Actuation/MC_eval_20m/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --arena_radius 20.0 \
+  --points_per_shell 40 \
+  --x0_vel_jitter 0.5 \
+  --umax 0.5 \
+  --velocity_controller_enabled true \
+  --velocity_controller_speed 1.0
+"""
+
+# 100 meter
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_Redo_Mid_Actuation \
+  --def_ckpt_path Training_Policy_Redo_Mid_Actuation/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_Redo_Mid_Actuation/att1_teacher.pt \
+  --out_dir Training_Policy_Redo_Mid_Actuation/MC_eval_100m/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --arena_radius 100.0 \
+  --points_per_shell 40 \
+  --umax 0.5 \
+  --velocity_controller_enabled true \
+  --vmax 1.0
+  --advantage_scale 1.0
+  --save_rollout_error_cases
+
+"""
+
+
+
+#OG actuation
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_Redo_OG_Actuation \
+  --def_ckpt_path Training_Policy_Redo_OG_Actuation/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_Redo_OG_Actuation/att1_teacher.pt \
+  --out_dir Training_Policy_Redo_OG_Actuation/MC_eval_100m/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --arena_radius 100.0 \
+  --points_per_shell 40 \
+  --velocity_controller_enabled true \
+  --vmax 1.0
+  --advantage_scale 1.0
+  --save_rollout_error_cases
+
+"""
+
+"""
+python evaluate_policy.py \
+  --run_dir Training_Policy_Redo_Redox_Actuation \
+  --def_ckpt_path Training_Policy_Redo_Redox_Actuation/def1_teacher.pt \
+  --att_ckpt_path Training_Policy_Redo_Redox_Actuation/att1_teacher.pt \
+  --out_dir Training_Policy_Redo_Redox_Actuation/MC_eval_100m/def1_vs_att1 \
+  --auto_shell_grid \
+  --grid_mode cartesian \
+  --shell_fracs 0.2,0.4,0.6,0.8 \
+  --arena_radius 100.0 \
+  --points_per_shell 40 \
+  --velocity_controller_enabled true \
+  --vmax 1.0
+  --advantage_scale 1.0
+  --save_rollout_error_cases
+
 """
