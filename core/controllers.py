@@ -53,6 +53,7 @@ class AttackerRuleController:
         self.min_sep      = float(rule["min_sep"])
         self.repulse_gain = float(rule["repulse_gain"])
         self.umax         = float(cfg["umax"])
+        self._torch_param_cache = {}
 
         # One-step ridge solution gain for u_center
         self.K = np.linalg.solve(
@@ -142,10 +143,16 @@ class AttackerRuleController:
         return np.stack(u_list, axis=0).astype(np.float32)
 
     def _torch_params(self, device: torch.device, dtype: torch.dtype):
-        center = torch.as_tensor(self.center, device=device, dtype=dtype)
-        Ad = torch.as_tensor(self.Ad, device=device, dtype=dtype)
-        K = torch.as_tensor(self.K, device=device, dtype=dtype)
-        return center, Ad, K
+        key = (device.type, device.index, dtype)
+        cached = self._torch_param_cache.get(key)
+        if cached is None:
+            cached = (
+                torch.as_tensor(self.center, device=device, dtype=dtype),
+                torch.as_tensor(self.Ad, device=device, dtype=dtype),
+                torch.as_tensor(self.K, device=device, dtype=dtype),
+            )
+            self._torch_param_cache[key] = cached
+        return cached
 
     def act_multi_batch_torch(
         self,

@@ -2006,8 +2006,15 @@ class TorchVecEnv:
 
     torch_backend = True
 
-    def __init__(self, cfg: Dict[str, Any] | List[Dict[str, Any]], num_envs: int, device: str | torch.device):
+    def __init__(
+        self,
+        cfg: Dict[str, Any] | List[Dict[str, Any]],
+        num_envs: int,
+        device: str | torch.device,
+        episode_seeds: List[int] | None = None,
+    ):
         self.device = torch.device(device)
+        cfg_list = None
         if isinstance(cfg, list):
             cfg_list = [copy.deepcopy(c) for c in cfg]
             if not cfg_list:
@@ -2046,10 +2053,14 @@ class TorchVecEnv:
         self.oi_radius_norm = float(base.oi_radius_norm)
         self.normalize_reward = bool(base.normalize_reward)
         self.normalize_reward_geometry_power = int(base.normalize_reward_geometry_power)
+        self.reward_normalize_radius_m = (
+            None if base.reward_normalize_radius_m is None else float(base.reward_normalize_radius_m)
+        )
         self.reward_dist_scale = float(base._reward_dist_scale)
         self.reward_geom_scale = float(base._reward_geom_scale)
         self.term_dist_scale = float(base._term_dist_scale)
         self.soft_wall_term = float(base._soft_wall_term)
+        self.oi_radius = float(base.oi_radius)
         self.oi_radius_term = float(base._oi_radius_term)
         self.arena_term_limit = float(base._arena_term_limit)
         self.hit_buffer_def = float(base.hit_buffer_def)
@@ -2074,6 +2085,35 @@ class TorchVecEnv:
         )
         self.belief_clip_factor = float(base.belief_clip_factor)
         self._batched_ekf_enabled = bool(self.use_kf and self.estimator_kind == "ekf")
+        self.curriculum_progress = float(getattr(base, "curriculum_progress", 0.0))
+        self.train_ic_mode = str(base.train_ic_mode)
+        self.train_ic_vmax = float(base.train_ic_vmax)
+        self.train_min_sep = float(base.train_min_sep)
+        self.record_ic_history = bool(base.record_ic_history)
+        self.max_ic_history = int(base.max_ic_history)
+        self._ic_history_def_chunks: list[np.ndarray] = []
+        self._ic_history_att_chunks: list[np.ndarray] = []
+        self._ic_history_def_count = 0
+        self._ic_history_att_count = 0
+        self._fast_reset_enabled = bool(
+            cfg_list is None
+            and self.num_attackers == 1
+            and ((not self.use_kf) or self._batched_ekf_enabled)
+        )
+        self._x0_base_t = torch.as_tensor(base._x0, dtype=self.dtype, device=self.device)
+        x0_jitter = self.cfg.get("x0_jitter", None) or {}
+        self._x0_jitter_pos = float(x0_jitter.get("pos", 0.0))
+        self._x0_jitter_vel = float(x0_jitter.get("vel", 0.0))
+        self._percent_advantage_defender = float(self.cfg.get("percent_advantage_defender", 0.75))
+        self._opp_resample_episode = (str(base.opp_resample).strip().lower() == "episode")
+        self._opp_domain_modes = list((self.cfg.get("opp_mix", {}) or {}).get("modes", ["def0"]))
+        opp_probs = (self.cfg.get("opp_mix", {}) or {}).get("probs", None)
+        if opp_probs is None:
+            self._opp_domain_probs_t = None
+        else:
+            probs_arr = np.asarray(opp_probs, dtype=np.float32)
+            probs_arr = probs_arr / max(float(probs_arr.sum()), 1e-12)
+            self._opp_domain_probs_t = torch.as_tensor(probs_arr, dtype=self.dtype, device=self.device)
 
         self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
         self.Ad_t = torch.as_tensor(base.Ad, dtype=self.dtype, device=self.device)
@@ -2106,6 +2146,25 @@ class TorchVecEnv:
         self.soft_wall_term_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
         self.oi_radius_term_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
         self.arena_term_limit_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
+        if episode_seeds is None:
+            if cfg_list is not None:
+                self._episode_seeds = [int(c.get("seed", idx)) for idx, c in enumerate(cfg_list)]
+            else:
+                base_seed = int(self.cfg.get("seed", 0))
+                self._episode_seeds = [base_seed + idx for idx in range(self.num_envs)]
+        else:
+            if len(episode_seeds) != self.num_envs:
+                raise ValueError(
+                    f"TorchVecEnv episode_seeds length={len(episode_seeds)} does not match num_envs={self.num_envs}."
+                )
+            self._episode_seeds = [int(seed) for seed in episode_seeds]
+        self._use_per_env_torch_generators = (episode_seeds is not None)
+        self._reset_counts = np.zeros((self.num_envs,), dtype=np.int64)
+        self._torch_generators = (
+            [self._make_torch_generator(seed) for seed in self._episode_seeds]
+            if self._use_per_env_torch_generators
+            else None
+        )
 
         if self._batched_ekf_enabled:
             self._ekf_dtype = torch.float64
@@ -2113,6 +2172,9 @@ class TorchVecEnv:
             self._ekf_every = int(base._ukf_every)
             self._ekf_jacobian_mode = str(base._ekf_jacobian_mode)
             self._kf_action_access = str(base._ukf_action_access)
+            self._ukf_init_mean_pos_std = float(base._ukf_init_mean_pos_std)
+            self._ukf_init_mean_vel_std = float(base._ukf_init_mean_vel_std)
+            self._ukf_init_mean_accel_std = float(getattr(base, "_ukf_init_mean_accel_std", 0.0))
             self._kf_control_meas_std_t = torch.as_tensor(
                 base._kf_control_meas_std,
                 dtype=self._ekf_dtype,
@@ -2131,6 +2193,7 @@ class TorchVecEnv:
             self._ekf_R_t = torch.as_tensor(base._ukf_R, dtype=self._ekf_dtype, device=self.device)
             self._ekf_I_t = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device)
             self._ekf_I3_t = torch.eye(3, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_I2_t = torch.eye(2, dtype=self._ekf_dtype, device=self.device)
             self._ekf_Ad_t = torch.as_tensor(base.Ad, dtype=self._ekf_dtype, device=self.device)
             self._ekf_Bd_t = torch.as_tensor(base.Bd, dtype=self._ekf_dtype, device=self.device)
             if self._ekf_state_dim == 9:
@@ -2162,8 +2225,11 @@ class TorchVecEnv:
             self.m_def_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
             self.m_att_t = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
-        for env in self.envs:
+        for idx, env in enumerate(self.envs):
+            if self._use_per_env_torch_generators:
+                np.random.seed(self._env_reset_seed(idx, offset=11))
             env.set_opp_domain(_sample_opp_domain(env.cfg))
+            self._opp_mode_codes[idx] = _opp_mode_code(env.opp_domain)
 
         if self.use_kf:
             if self._batched_ekf_enabled:
@@ -2180,7 +2246,375 @@ class TorchVecEnv:
         self.obs_def = None
         self.obs_att = None
         self.obs = None
+        self.last_step_stats = None
         self.reset()
+
+    def _make_torch_generator(self, seed: int) -> torch.Generator:
+        gen_device = self.device
+        try:
+            gen = torch.Generator(device=gen_device)
+        except TypeError:
+            gen = torch.Generator(device=gen_device.type)
+        gen.manual_seed(int(seed))
+        return gen
+
+    def _env_reset_seed(self, idx: int, *, offset: int = 0) -> int:
+        return int(self._episode_seeds[idx] + 1_000_003 * int(self._reset_counts[idx]) + int(offset))
+
+    def _randn_for_env_indices(
+        self,
+        env_indices: torch.Tensor | np.ndarray | List[int],
+        shape_tail: tuple[int, ...],
+        *,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        idx_t = torch.as_tensor(env_indices, dtype=torch.int64).reshape(-1)
+        if idx_t.numel() == 0:
+            return torch.empty((0,) + tuple(shape_tail), dtype=dtype, device=self.device)
+        if not self._use_per_env_torch_generators:
+            return torch.randn(
+                (int(idx_t.numel()),) + tuple(shape_tail),
+                dtype=dtype,
+                device=self.device,
+            )
+        idx_list = idx_t.detach().cpu().tolist()
+        rows = [
+            torch.randn(tuple(shape_tail), generator=self._torch_generators[int(idx)], dtype=dtype, device=self.device)
+            for idx in idx_list
+        ]
+        return torch.stack(rows, dim=0)
+
+    def _sample_opp_mode_codes(self, count: int) -> torch.Tensor:
+        if count <= 0:
+            return torch.empty((0,), dtype=torch.int64, device=self.device)
+        if len(self._opp_domain_modes) == 1:
+            return torch.full(
+                (count,),
+                _opp_mode_code(self._opp_domain_modes[0]),
+                dtype=torch.int64,
+                device=self.device,
+            )
+        if self._opp_domain_probs_t is None:
+            mode_idx = torch.randint(len(self._opp_domain_modes), (count,), device=self.device)
+        else:
+            mode_idx = torch.multinomial(self._opp_domain_probs_t, num_samples=count, replacement=True).to(dtype=torch.int64)
+        codes = torch.zeros((count,), dtype=torch.int64, device=self.device)
+        for idx, mode in enumerate(self._opp_domain_modes):
+            code = _opp_mode_code(mode)
+            if code != 0:
+                codes = torch.where(mode_idx == idx, torch.full_like(codes, code), codes)
+        return codes
+
+    def _sample_shell_positions(self, r_min: torch.Tensor, r_max: torch.Tensor) -> torch.Tensor:
+        if torch.any(r_max < r_min):
+            raise ValueError("Invalid shell bounds passed to _sample_shell_positions.")
+        count = int(r_min.shape[0])
+        dirs = torch.randn((count, self.D), dtype=self.dtype, device=self.device)
+        dirs = dirs / torch.linalg.vector_norm(dirs, dim=-1, keepdim=True).clamp_min(1e-9)
+        u = torch.rand((count,), dtype=self.dtype, device=self.device)
+        r_min_pow = torch.pow(r_min, self.D)
+        r_max_pow = torch.pow(r_max, self.D)
+        radii = torch.pow(r_min_pow + (r_max_pow - r_min_pow) * u, 1.0 / float(self.D))
+        return self.center_t.unsqueeze(0) + radii[:, None] * dirs
+
+    def _sample_arena_radius_batch(self, count: int) -> torch.Tensor:
+        probe = self.envs[0]
+        active_radius = float(probe._scheduled_arena_radius())
+        if not probe.arena_radius_knob_enabled:
+            return torch.full((count,), float(probe._base_arena_radius), dtype=self.dtype, device=self.device)
+        start_radius = float(probe.arena_radius_knob.get("start_radius_m", probe._base_arena_radius))
+        sample_mode = str(probe.arena_radius_knob.get("sample_mode", "uniform")).strip().lower()
+        integer_only = bool(probe.arena_radius_knob.get("integer_only", False))
+        if sample_mode == "fixed":
+            radius = float(int(np.round(active_radius))) if integer_only else active_radius
+            return torch.full((count,), radius, dtype=self.dtype, device=self.device)
+        if sample_mode != "uniform":
+            raise ValueError(f"Unknown arena_radius_knob sample_mode={sample_mode!r}")
+        lo = min(start_radius, active_radius)
+        hi = max(start_radius, active_radius)
+        if (hi - lo) <= 1e-9:
+            radius = float(int(np.round(hi))) if integer_only else hi
+            return torch.full((count,), radius, dtype=self.dtype, device=self.device)
+        if integer_only:
+            lo_i = int(np.ceil(lo))
+            hi_i = int(np.floor(hi))
+            if hi_i < lo_i:
+                return torch.full((count,), float(int(np.round(active_radius))), dtype=self.dtype, device=self.device)
+            return torch.randint(lo_i, hi_i + 1, (count,), device=self.device, dtype=torch.int64).to(dtype=self.dtype)
+        return lo + (hi - lo) * torch.rand((count,), dtype=self.dtype, device=self.device)
+
+    def _resolve_shell_bound_array(
+        self,
+        radii: torch.Tensor,
+        *,
+        who: str,
+        bound: str,
+        default_frac: float,
+        overrides: Dict[str, Any] | None,
+    ) -> torch.Tensor:
+        frac_key = f"r_{who}_{bound}"
+        meter_key = f"{frac_key}_m"
+
+        def _radius_from_fraction(frac_value: Any, source_key: str) -> torch.Tensor:
+            frac = float(frac_value)
+            if frac > 1.0 + 1e-9:
+                raise ValueError(
+                    f"{source_key}={frac} is being interpreted as a fraction of the arena radius. "
+                    f"If you meant meters, use {source_key}_m instead."
+                )
+            return radii * frac
+
+        if overrides is not None and (frac_key in overrides or meter_key in overrides):
+            meter_val = overrides.get(meter_key, None)
+            frac_val = overrides.get(frac_key, None)
+            if meter_val is not None:
+                radius = torch.full_like(radii, float(meter_val))
+                source_key = meter_key
+            elif frac_val is not None:
+                radius = _radius_from_fraction(frac_val, frac_key)
+                source_key = frac_key
+            else:
+                radius = _radius_from_fraction(self.cfg.get(frac_key, default_frac), frac_key)
+                source_key = frac_key
+        else:
+            meter_val = self.cfg.get(meter_key, None)
+            if meter_val is not None:
+                radius = torch.full_like(radii, float(meter_val))
+                source_key = meter_key
+            else:
+                radius = _radius_from_fraction(self.cfg.get(frac_key, default_frac), frac_key)
+                source_key = frac_key
+
+        if torch.any(radius < 0.0):
+            raise ValueError(f"{source_key} must be >= 0.")
+        return radius
+
+    def _resolve_shell_bounds_batch(self, radii: torch.Tensor, *, who: str) -> tuple[torch.Tensor, torch.Tensor]:
+        overrides = self.envs[0]._current_stage_shell_overrides()
+        return (
+            self._resolve_shell_bound_array(radii, who=who, bound="min", default_frac=0.0, overrides=overrides),
+            self._resolve_shell_bound_array(radii, who=who, bound="max", default_frac=1.0, overrides=overrides),
+        )
+
+    def _record_ic_batch(self, p1: torch.Tensor, p2: torch.Tensor) -> None:
+        if not self.record_ic_history:
+            return
+        def_np = p1.detach().cpu().numpy().astype(np.float32, copy=True)
+        att_np = p2.detach().cpu().numpy().astype(np.float32, copy=True)
+        self._ic_history_def_chunks.append(def_np)
+        self._ic_history_att_chunks.append(att_np)
+        self._ic_history_def_count += int(def_np.shape[0])
+        self._ic_history_att_count += int(att_np.shape[0])
+
+        while self._ic_history_def_count > self.max_ic_history and self._ic_history_def_chunks:
+            removed = self._ic_history_def_chunks.pop(0)
+            self._ic_history_def_count -= int(removed.shape[0])
+        while self._ic_history_att_count > self.max_ic_history * self.num_attackers and self._ic_history_att_chunks:
+            removed = self._ic_history_att_chunks.pop(0)
+            self._ic_history_att_count -= int(removed.shape[0])
+
+    def collect_ic_history(self):
+        if self._ic_history_def_chunks or self._ic_history_att_chunks:
+            def_pos = (
+                np.concatenate(self._ic_history_def_chunks, axis=0)
+                if self._ic_history_def_chunks
+                else np.zeros((0, self.D), dtype=np.float32)
+            )
+            att_pos = (
+                np.concatenate(self._ic_history_att_chunks, axis=0)
+                if self._ic_history_att_chunks
+                else np.zeros((0, self.D), dtype=np.float32)
+            )
+            return def_pos, att_pos
+
+        def_all = []
+        att_all = []
+        for env in self.envs:
+            d, a = env.get_ic_history_arrays()
+            if d.shape[0] > 0:
+                def_all.append(d)
+            if a.shape[0] > 0:
+                att_all.append(a)
+        def_pos = np.concatenate(def_all, axis=0) if def_all else np.zeros((0, self.D), dtype=np.float32)
+        att_pos = np.concatenate(att_all, axis=0) if att_all else np.zeros((0, self.D), dtype=np.float32)
+        return def_pos, att_pos
+
+    def _fast_reset_slots(self, indices: torch.Tensor, *, resample_opp: bool) -> None:
+        idx_t = torch.as_tensor(indices, dtype=torch.int64, device=self.device).reshape(-1)
+        count = int(idx_t.numel())
+        if count == 0:
+            return
+
+        radii = self._sample_arena_radius_batch(count)
+        reward_norm_radius = (
+            torch.full_like(radii, self.reward_normalize_radius_m)
+            if self.reward_normalize_radius_m is not None
+            else radii
+        )
+        if self.normalize_reward:
+            reward_dist_scale = reward_norm_radius
+            reward_geom_scale = torch.pow(reward_norm_radius, self.normalize_reward_geometry_power)
+            term_dist_scale = radii
+            soft_wall_term = torch.full_like(radii, self.soft_wall)
+            oi_radius_term = self.oi_radius / radii.clamp_min(1e-9)
+            arena_term_limit = torch.full_like(radii, self.margin)
+        else:
+            ones = torch.ones_like(radii)
+            reward_dist_scale = ones
+            reward_geom_scale = ones
+            term_dist_scale = ones
+            soft_wall_term = self.soft_wall * radii
+            oi_radius_term = torch.full_like(radii, self.oi_radius)
+            arena_term_limit = self.margin * radii
+
+        mode = self.train_ic_mode
+        D = self.D
+        v_max = self.train_ic_vmax
+        min_sep = self.train_min_sep
+        p1 = None
+        p2 = None
+
+        if mode == "fixed":
+            x0 = self._x0_base_t.unsqueeze(0).expand(count, -1, -1).clone()
+            if self._x0_jitter_pos > 0.0:
+                pos_jitter = (2.0 * torch.rand((count, 2, D), dtype=self.dtype, device=self.device) - 1.0) * self._x0_jitter_pos
+                x0[:, :, 0:D] += pos_jitter
+            if self._x0_jitter_vel > 0.0:
+                vel_jitter = (2.0 * torch.rand((count, 2, D), dtype=self.dtype, device=self.device) - 1.0) * self._x0_jitter_vel
+                x0[:, :, D : 2 * D] += vel_jitter
+            p1 = x0[:, 0, 0:D]
+            v1 = x0[:, 0, D : 2 * D]
+            p2 = x0[:, 1, 0:D]
+            v2 = x0[:, 1, D : 2 * D]
+        elif mode == "random_shell":
+            r_def_min, r_def_max = self._resolve_shell_bounds_batch(radii, who="def")
+            r_att_min, r_att_max = self._resolve_shell_bounds_batch(radii, who="att")
+            if torch.any(r_def_min > r_def_max):
+                raise ValueError("Invalid defender shell bounds for random_shell.")
+            if torch.any(r_att_min > r_att_max):
+                raise ValueError("Invalid attacker shell bounds for random_shell.")
+            p1 = self._sample_shell_positions(r_def_min, r_def_max)
+            p2 = self._sample_shell_positions(r_att_min, r_att_max)
+            if min_sep > 0.0:
+                invalid = torch.linalg.vector_norm(p2 - p1, dim=-1) < min_sep
+                tries = 0
+                while torch.any(invalid):
+                    tries += 1
+                    if tries > 256:
+                        raise RuntimeError("random_shell fast reset could not satisfy min_sep after many retries.")
+                    p2[invalid] = self._sample_shell_positions(r_att_min[invalid], r_att_max[invalid])
+                    invalid = torch.linalg.vector_norm(p2 - p1, dim=-1) < min_sep
+            v1 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+            v2 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+        elif mode == "random_shell_advantage":
+            radial_margin = self._percent_advantage_defender * np.pi * 2.0 * self.oi_radius
+            if radial_margin < 0.0:
+                raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
+            r_def_min, r_def_max = self._resolve_shell_bounds_batch(radii, who="def")
+            r_att_min, r_att_max = self._resolve_shell_bounds_batch(radii, who="att")
+            r_att_min = torch.maximum(r_att_min, torch.full_like(r_att_min, radial_margin))
+            max_feasible_def_radius = r_att_max - radial_margin
+            r_def_max = torch.minimum(r_def_max, max_feasible_def_radius)
+            if torch.any(r_def_min > r_def_max):
+                raise ValueError("Invalid defender shell bounds for random_shell_advantage.")
+            if torch.any(r_att_min > r_att_max):
+                raise ValueError("Invalid attacker shell bounds for random_shell_advantage.")
+            if torch.any(r_def_min > max_feasible_def_radius):
+                raise ValueError("Infeasible radial shells for random_shell_advantage.")
+
+            p1 = torch.empty((count, D), dtype=self.dtype, device=self.device)
+            p2 = torch.empty((count, D), dtype=self.dtype, device=self.device)
+            remaining = torch.arange(count, device=self.device, dtype=torch.int64)
+            tries = 0
+            while remaining.numel() > 0:
+                tries += 1
+                if tries > 512:
+                    raise RuntimeError(
+                        "random_shell_advantage fast reset could not sample a feasible initial condition."
+                    )
+                p2_try = self._sample_shell_positions(r_att_min[remaining], r_att_max[remaining])
+                r_att = torch.linalg.vector_norm(p2_try - self.center_t.unsqueeze(0), dim=-1)
+                r_def_max_eff = torch.minimum(r_def_max[remaining], r_att - radial_margin)
+                feasible = r_def_max_eff >= r_def_min[remaining]
+
+                next_remaining_parts = []
+                if torch.any(~feasible):
+                    next_remaining_parts.append(remaining[~feasible])
+                if torch.any(feasible):
+                    feasible_idx = remaining[feasible]
+                    p2_feasible = p2_try[feasible]
+                    p1_try = self._sample_shell_positions(r_def_min[feasible_idx], r_def_max_eff[feasible])
+                    sep_ok = torch.linalg.vector_norm(p1_try - p2_feasible, dim=-1) >= min_sep
+                    if torch.any(sep_ok):
+                        ok_idx = feasible_idx[sep_ok]
+                        p1[ok_idx] = p1_try[sep_ok]
+                        p2[ok_idx] = p2_feasible[sep_ok]
+                    if torch.any(~sep_ok):
+                        next_remaining_parts.append(feasible_idx[~sep_ok])
+                if next_remaining_parts:
+                    remaining = torch.cat(next_remaining_parts)
+                else:
+                    remaining = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+            v1 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+            v2 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+        else:
+            raise ValueError(f"Unknown train_ic_mode='{mode}'")
+
+        self.state_t[idx_t] = torch.cat([p1, v1, p2, v2], dim=-1)
+        self._t_steps[idx_t] = 0
+        self.radius_t[idx_t] = radii
+        self.reward_dist_scale_t[idx_t] = reward_dist_scale
+        self.reward_geom_scale_t[idx_t] = reward_geom_scale
+        self.term_dist_scale_t[idx_t] = term_dist_scale
+        self.soft_wall_term_t[idx_t] = soft_wall_term
+        self.oi_radius_term_t[idx_t] = oi_radius_term
+        self.arena_term_limit_t[idx_t] = arena_term_limit
+        if resample_opp:
+            self._opp_mode_codes[idx_t] = self._sample_opp_mode_codes(count)
+        self._weak_scale_t[idx_t] = float(self.envs[0].weak_scale)
+        self._weak_noise_std_t[idx_t] = float(self.envs[0].weak_noise_std)
+
+        if self.use_fuel:
+            self.m_def_t[idx_t] = self.m0_def
+            self.m_att_t[idx_t] = self.m0_att
+
+        if self._batched_ekf_enabled:
+            p1_ekf = p1.to(dtype=self._ekf_dtype)
+            v1_ekf = v1.to(dtype=self._ekf_dtype)
+            p2_ekf = p2.to(dtype=self._ekf_dtype)
+            v2_ekf = v2.to(dtype=self._ekf_dtype)
+            if self._ukf_init_mean_pos_std > 0.0:
+                p2_ekf = p2_ekf + self._ukf_init_mean_pos_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+                p1_ekf = p1_ekf + self._ukf_init_mean_pos_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+            if self._ukf_init_mean_vel_std > 0.0:
+                v2_ekf = v2_ekf + self._ukf_init_mean_vel_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+                v1_ekf = v1_ekf + self._ukf_init_mean_vel_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+            if self._ekf_state_dim == 9:
+                accel_scale = self._ukf_init_mean_accel_std
+                att_accel = accel_scale * torch.randn((count, 3), dtype=self._ekf_dtype, device=self.device)
+                def_accel = accel_scale * torch.randn((count, 3), dtype=self._ekf_dtype, device=self.device)
+                self._def_ekf_x_t[idx_t] = torch.cat([p2_ekf, v2_ekf, att_accel], dim=-1)
+                self._att_ekf_x_t[idx_t] = torch.cat([p1_ekf, v1_ekf, def_accel], dim=-1)
+            else:
+                self._def_ekf_x_t[idx_t] = torch.cat([p2_ekf, v2_ekf], dim=-1)
+                self._att_ekf_x_t[idx_t] = torch.cat([p1_ekf, v1_ekf], dim=-1)
+            self._def_ekf_P_t[idx_t] = self._ekf_P0_t.unsqueeze(0).expand(count, -1, -1)
+            self._att_ekf_P_t[idx_t] = self._ekf_P0_t.unsqueeze(0).expand(count, -1, -1)
+
+        self._record_ic_batch(p1, p2)
+
+    def _reset_env_slot(self, idx: int, *, resample_opp: bool) -> None:
+        env = self.envs[idx]
+        if resample_opp:
+            if self._use_per_env_torch_generators:
+                np.random.seed(self._env_reset_seed(idx, offset=11))
+            env.set_opp_domain(_sample_opp_domain(env.cfg))
+        if self._use_per_env_torch_generators:
+            np.random.seed(self._env_reset_seed(idx, offset=23))
+        env.reset()
+        self._reset_counts[idx] += 1
+        self._sync_slot_from_env(idx)
 
     def _sync_slot_from_env(self, idx: int):
         env = self.envs[idx]
@@ -2263,9 +2697,24 @@ class TorchVecEnv:
 
     def _ekf_psd_enforce(self, M: torch.Tensor, floor: float = 1e-12) -> torch.Tensor:
         M = self._ekf_symmetrize(M)
-        eig, V = torch.linalg.eigh(M)
+        diag = torch.diagonal(M, dim1=-2, dim2=-1)
+        if torch.any(diag < floor):
+            M = M.clone()
+            idx = torch.arange(M.shape[-1], device=M.device)
+            M[..., idx, idx] = torch.clamp(diag, min=floor)
+
+        _, info = torch.linalg.cholesky_ex(M)
+        bad = info > 0
+        if not torch.any(bad):
+            return M
+
+        M = M.clone()
+        bad_idx = torch.nonzero(bad, as_tuple=False).flatten()
+        M_bad = M[bad_idx]
+        eig, V = torch.linalg.eigh(M_bad)
         eig = torch.clamp(eig, min=floor)
-        return V @ torch.diag_embed(eig) @ V.transpose(-1, -2)
+        M[bad_idx] = V @ torch.diag_embed(eig) @ V.transpose(-1, -2)
+        return M
 
     def _ekf_normalize_angle(self, a: torch.Tensor) -> torch.Tensor:
         return torch.remainder(a + np.pi, 2.0 * np.pi) - np.pi
@@ -2369,10 +2818,11 @@ class TorchVecEnv:
         if self._kf_action_access == "ground_truth":
             return u_true, None
         if self._kf_action_access == "measured":
-            noise = self._kf_control_meas_std_t.unsqueeze(0) * torch.randn(
-                (u_true.shape[0], 3),
+            env_indices = torch.arange(u_true.shape[0], device=self.device)
+            noise = self._kf_control_meas_std_t.unsqueeze(0) * self._randn_for_env_indices(
+                env_indices,
+                (3,),
                 dtype=self._ekf_dtype,
-                device=self.device,
             )
             u_meas = torch.clamp(u_true + noise, min=self.u_lo, max=self.u_hi)
             cov = torch.diag_embed(
@@ -2418,10 +2868,10 @@ class TorchVecEnv:
         p_obs_sel = p_obs[idx].to(dtype=self._ekf_dtype)
         p_tgt_sel = p_tgt_true[idx].to(dtype=self._ekf_dtype)
         z_true = self._ekf_measurement_from_positions(p_obs_sel, p_tgt_sel)
-        z_noise = self._ekf_meas_std_t.unsqueeze(0) * torch.randn(
-            (idx.shape[0], 2),
+        z_noise = self._ekf_meas_std_t.unsqueeze(0) * self._randn_for_env_indices(
+            idx,
+            (2,),
             dtype=self._ekf_dtype,
-            device=self.device,
         )
         z_meas = z_true + z_noise
         H, z_pred = self._ekf_linearization(role_key, x_sel, p_obs_sel)
@@ -2430,7 +2880,8 @@ class TorchVecEnv:
         PHt = torch.matmul(P_sel, H.transpose(-1, -2))
         S = torch.matmul(H, PHt) + self._ekf_R_t.unsqueeze(0)
         S = self._ekf_psd_enforce(S)
-        K = torch.matmul(PHt, torch.linalg.inv(S + 1e-12 * torch.eye(2, dtype=self._ekf_dtype, device=self.device).unsqueeze(0)))
+        S_eps = S + 1e-12 * self._ekf_I2_t.unsqueeze(0)
+        K = torch.linalg.solve(S_eps, PHt.transpose(-1, -2)).transpose(-1, -2)
         x_upd = x_sel + torch.matmul(K, innov.unsqueeze(-1)).squeeze(-1)
         IKH = self._ekf_I_t.unsqueeze(0) - torch.matmul(K, H)
         P_upd = torch.matmul(IKH, torch.matmul(P_sel, IKH.transpose(-1, -2)))
@@ -2538,13 +2989,23 @@ class TorchVecEnv:
         return self.obs
 
     def reset(self):
-        for env in self.envs:
-            env.reset()
-        self._sync_from_envs()
+        if self._fast_reset_enabled:
+            self._fast_reset_slots(torch.arange(self.num_envs, device=self.device), resample_opp=False)
+        else:
+            for idx in range(self.num_envs):
+                self._reset_env_slot(idx, resample_opp=False)
         self._refresh_obs()
         return self.obs
 
     def set_attr(self, name: str, value: Any):
+        if name == "curriculum_progress":
+            self.curriculum_progress = float(value)
+            if self._fast_reset_enabled:
+                self.envs[0].curriculum_progress = float(value)
+                return
+        if name == "k_cent" and self._fast_reset_enabled:
+            setattr(self, name, value)
+            return
         for env in self.envs:
             setattr(env, name, value)
 
@@ -2603,7 +3064,9 @@ class TorchVecEnv:
         *,
         active_mask: torch.Tensor | np.ndarray | None = None,
         auto_reset: bool = True,
+        emit_infos: bool = True,
     ):
+        self.last_step_stats = None
         need_def = reward_mode in ("def", "both")
         need_att = reward_mode in ("att", "both")
 
@@ -2641,7 +3104,13 @@ class TorchVecEnv:
             a1_cmd[weak_mask] = self._weak_scale_t[weak_mask, None] * a1_cmd[weak_mask]
             weak_noise = self._weak_noise_std_t[weak_mask]
             if torch.any(weak_noise > 0.0):
-                a1_cmd[weak_mask] = a1_cmd[weak_mask] + weak_noise[:, None] * torch.randn_like(a1_cmd[weak_mask])
+                weak_idx = torch.nonzero(weak_mask, as_tuple=False).flatten()
+                weak_noise_samples = self._randn_for_env_indices(
+                    weak_idx,
+                    (self.D,),
+                    dtype=self.dtype,
+                )
+                a1_cmd[weak_mask] = a1_cmd[weak_mask] + weak_noise[:, None] * weak_noise_samples
 
         x1 = self.state_t[:, : 2 * self.D]
         x2 = self.state_t[:, 2 * self.D : 4 * self.D]
@@ -2683,6 +3152,10 @@ class TorchVecEnv:
         meas_trP = np.zeros((self.num_envs,), dtype=np.float32)
         att_meas_innov = np.zeros((self.num_envs,), dtype=np.float32)
         att_meas_trP = np.zeros((self.num_envs,), dtype=np.float32)
+        meas_innov_t = None
+        meas_trP_t = None
+        att_meas_innov_t = None
+        att_meas_trP_t = None
 
         if self._batched_ekf_enabled:
             self._def_ekf_x_t, self._def_ekf_P_t = self._ekf_predict_batch(
@@ -2712,10 +3185,11 @@ class TorchVecEnv:
                 "attacker_observer",
                 update_mask,
             )
-            meas_innov = meas_innov_t.detach().cpu().numpy()
-            meas_trP = meas_trP_t.detach().cpu().numpy()
-            att_meas_innov = att_meas_innov_t.detach().cpu().numpy()
-            att_meas_trP = att_meas_trP_t.detach().cpu().numpy()
+            if emit_infos:
+                meas_innov = meas_innov_t.detach().cpu().numpy()
+                meas_trP = meas_trP_t.detach().cpu().numpy()
+                att_meas_innov = att_meas_innov_t.detach().cpu().numpy()
+                att_meas_trP = att_meas_trP_t.detach().cpu().numpy()
         elif self.use_kf:
             p1_np = p1.detach().cpu().numpy()
             v1_np = v1.detach().cpu().numpy()
@@ -2864,21 +3338,30 @@ class TorchVecEnv:
         p2_est_err_norm = None
         d1_belief_norm = None
         p1_est_err_norm = None
+        d2_belief_norm_t = None
+        p2_est_err_norm_t = None
+        d1_belief_norm_t = None
+        p1_est_err_norm_t = None
         if self._batched_ekf_enabled:
             p2_belief_t, _ = self._ekf_belief_state_batch(self._def_ekf_x_t, self._def_ekf_P_t, p2, v2)
             p1_belief_t, _ = self._ekf_belief_state_batch(self._att_ekf_x_t, self._att_ekf_P_t, p1, v1)
-            d2_belief_norm = (
+            d2_belief_norm_t = (
                 (p2_belief_t - self.center_t).square().sum(dim=-1) / radius_sq
-            ).detach().cpu().numpy()
-            p2_est_err_norm = (
+            ).to(dtype=self.dtype)
+            p2_est_err_norm_t = (
                 (p2_belief_t - p2).square().sum(dim=-1) / radius_sq
-            ).detach().cpu().numpy()
-            d1_belief_norm = (
+            ).to(dtype=self.dtype)
+            d1_belief_norm_t = (
                 (p1_belief_t - self.center_t).square().sum(dim=-1) / radius_sq
-            ).detach().cpu().numpy()
-            p1_est_err_norm = (
+            ).to(dtype=self.dtype)
+            p1_est_err_norm_t = (
                 (p1_belief_t - p1).square().sum(dim=-1) / radius_sq
-            ).detach().cpu().numpy()
+            ).to(dtype=self.dtype)
+            if emit_infos:
+                d2_belief_norm = d2_belief_norm_t.detach().cpu().numpy()
+                p2_est_err_norm = p2_est_err_norm_t.detach().cpu().numpy()
+                d1_belief_norm = d1_belief_norm_t.detach().cpu().numpy()
+                p1_est_err_norm = p1_est_err_norm_t.detach().cpu().numpy()
         elif self.use_kf:
             p1_np = p1.detach().cpu().numpy()
             v1_np = v1.detach().cpu().numpy()
@@ -2897,85 +3380,138 @@ class TorchVecEnv:
                     d1_belief_norm[i] = float(np.dot(p1_belief - env.center, p1_belief - env.center)) / (env.radius ** 2)
                     p1_est_err_norm[i] = float(np.dot(p1_belief - p1_np[i], p1_belief - p1_np[i])) / (env.radius ** 2)
 
-        d2_np = d2_reward.detach().cpu().numpy()
-        rel2_np = rel2.detach().cpu().numpy()
-        dock_gap_np = dock_gap.detach().cpu().numpy()
-        d1_true_np = d1_true_norm.detach().cpu().numpy()
-        d2_true_np = d2_true_norm.detach().cpu().numpy()
-        u_cmd_norm_def_np = torch.linalg.vector_norm(a1_cmd, dim=-1).detach().cpu().numpy()
-        u_cmd_norm_att_np = torch.linalg.vector_norm(a2_cmd, dim=-1).detach().cpu().numpy()
-        u_real_norm_def_np = torch.linalg.vector_norm(a1_real, dim=-1).detach().cpu().numpy()
-        u_real_norm_att_np = torch.linalg.vector_norm(a2_real, dim=-1).detach().cpu().numpy()
-        oob1_np = oob1.detach().cpu().numpy()
-        oob2_np = oob2_any.detach().cpu().numpy()
-        hit_target_np = hit_target.detach().cpu().numpy()
-        collision_np = collision.detach().cpu().numpy()
-        t_np = self._t_steps.detach().cpu().numpy()
-        radius_np = self.radius_t.detach().cpu().numpy()
-        meas_taken_np = None
-        if self.use_kf:
-            every = int(self._ekf_every) if self._batched_ekf_enabled else int(self.envs[0]._ukf_every)
-            every = max(1, every)
-            meas_taken_np = (t_np % every) == 0
-
-        fuel_frac_def_np = None
-        fuel_frac_att_np = None
-        thrust_def_np = None
-        thrust_att_np = None
-        mdot_def_np = None
-        mdot_att_np = None
-        if self.use_fuel:
-            fuel_frac_def_np = self._fuel_fractions()[0].detach().cpu().numpy()
-            fuel_frac_att_np = self._fuel_fractions()[1].detach().cpu().numpy()
-            thrust_def_np = thrust_def.detach().cpu().numpy()
-            thrust_att_np = thrust_att.detach().cpu().numpy()
-            mdot_def_np = mdot_def.detach().cpu().numpy()
-            mdot_att_np = mdot_att.detach().cpu().numpy()
-
-        infos = []
-        for i in range(self.num_envs):
-            info = {
-                "t": int(t_np[i]),
-                "d2_norm": float(d2_np[i]),
-                "rel2_norm": float(rel2_np[i]),
-                "dock_gap_norm": float(dock_gap_np[i]),
-                "oob_def": bool(oob1_np[i]),
-                "oob_att": bool(oob2_np[i]),
-                "hit_target": bool(hit_target_np[i]),
-                "arena_radius_m": float(radius_np[i]),
-                "d1_true_norm": float(d1_true_np[i]),
-                "d2_true_norm": float(d2_true_np[i]),
-                "collision": bool(collision_np[i]),
-                "u_cmd_norm_def": float(u_cmd_norm_def_np[i]),
-                "u_cmd_norm_att": float(u_cmd_norm_att_np[i]),
-                "u_real_norm_def": float(u_real_norm_def_np[i]),
-                "u_real_norm_att": float(u_real_norm_att_np[i]),
+        if not emit_infos:
+            active_mask_stats = active_mask_t
+            stats = {
+                "info_count": int(active_mask_stats.sum().item()),
+                "arena_radius_sum": self.radius_t[active_mask_stats].sum(dtype=torch.float64).detach(),
+                "d1_true_sq_m_sum": (d1_true_norm[active_mask_stats] * radius_sq[active_mask_stats]).sum(dtype=torch.float64).detach(),
+                "d2_true_sq_m_sum": (d2_true_norm[active_mask_stats] * radius_sq[active_mask_stats]).sum(dtype=torch.float64).detach(),
+                "d2_belief_sq_m_sum": (
+                    (
+                        d2_belief_norm_t[active_mask_stats]
+                        if d2_belief_norm_t is not None
+                        else d2_true_norm[active_mask_stats]
+                    )
+                    * radius_sq[active_mask_stats]
+                ).sum(dtype=torch.float64).detach(),
+                "p2_est_err_sq_m_sum": (
+                    torch.zeros((), dtype=torch.float64, device=self.device)
+                    if p2_est_err_norm_t is None
+                    else (p2_est_err_norm_t[active_mask_stats] * radius_sq[active_mask_stats]).sum(dtype=torch.float64).detach()
+                ),
+                "p1_est_err_sq_m_sum": (
+                    torch.zeros((), dtype=torch.float64, device=self.device)
+                    if p1_est_err_norm_t is None
+                    else (p1_est_err_norm_t[active_mask_stats] * radius_sq[active_mask_stats]).sum(dtype=torch.float64).detach()
+                ),
+                "meas_innov_sum": (
+                    meas_innov_t[active_mask_stats].sum(dtype=torch.float64).detach()
+                    if meas_innov_t is not None
+                    else torch.as_tensor(meas_innov, dtype=torch.float64, device=self.device)[active_mask_stats].sum().detach()
+                ),
+                "ukf_trPpos_sum": (
+                    meas_trP_t[active_mask_stats].sum(dtype=torch.float64).detach()
+                    if meas_trP_t is not None
+                    else torch.as_tensor(meas_trP, dtype=torch.float64, device=self.device)[active_mask_stats].sum().detach()
+                ),
+                "oob_def_sum": oob1[active_mask_stats].to(dtype=torch.float64).sum().detach(),
+                "oob_att_sum": oob2_any[active_mask_stats].to(dtype=torch.float64).sum().detach(),
+                "hit_target_sum": hit_target[active_mask_stats].to(dtype=torch.float64).sum().detach(),
+                "collision_sum": collision[active_mask_stats].to(dtype=torch.float64).sum().detach(),
             }
-            if self.use_kf:
-                info["meas_innov_sq"] = float(meas_innov[i])
-                info["ukf_trPpos"] = float(meas_trP[i])
-                info["att_meas_innov_sq"] = float(att_meas_innov[i])
-                info["att_ukf_trPpos"] = float(att_meas_trP[i])
-                info["meas_taken"] = bool(meas_taken_np[i])
-                info["att_meas_taken"] = bool(meas_taken_np[i])
-                if d2_belief_norm is not None:
-                    info["d2_belief_norm"] = float(d2_belief_norm[i])
-                if p2_est_err_norm is not None:
-                    info["p2_est_err_norm"] = float(p2_est_err_norm[i])
-                if d1_belief_norm is not None:
-                    info["d1_belief_norm"] = float(d1_belief_norm[i])
-                if p1_est_err_norm is not None:
-                    info["p1_est_err_norm"] = float(p1_est_err_norm[i])
             if self.use_fuel:
-                info["fuel_frac_def"] = float(np.clip(fuel_frac_def_np[i], 0.0, 1.0))
-                info["fuel_frac_att"] = float(np.clip(fuel_frac_att_np[i], 0.0, 1.0))
-                info["fuel_used_def"] = 1.0 - info["fuel_frac_def"]
-                info["fuel_used_att"] = 1.0 - info["fuel_frac_att"]
-                info["thrust_def"] = float(thrust_def_np[i])
-                info["thrust_att"] = float(thrust_att_np[i])
-                info["mdot_def"] = float(mdot_def_np[i])
-                info["mdot_att"] = float(mdot_att_np[i])
-            infos.append(info)
+                fuel_frac_def_t, fuel_frac_att_t = self._fuel_fractions()
+                stats["fuel_used_def_sum"] = (1.0 - fuel_frac_def_t[active_mask_stats]).sum(dtype=torch.float64).detach()
+                stats["fuel_used_att_sum"] = (1.0 - fuel_frac_att_t[active_mask_stats]).sum(dtype=torch.float64).detach()
+                stats["fuel_frac_def_sum"] = fuel_frac_def_t[active_mask_stats].sum(dtype=torch.float64).detach()
+                stats["fuel_frac_att_sum"] = fuel_frac_att_t[active_mask_stats].sum(dtype=torch.float64).detach()
+                stats["thrust_def_sum"] = thrust_def[active_mask_stats].sum(dtype=torch.float64).detach()
+                stats["thrust_att_sum"] = thrust_att[active_mask_stats].sum(dtype=torch.float64).detach()
+                stats["mdot_def_sum"] = mdot_def[active_mask_stats].sum(dtype=torch.float64).detach()
+                stats["mdot_att_sum"] = mdot_att[active_mask_stats].sum(dtype=torch.float64).detach()
+            self.last_step_stats = stats
+            infos = []
+        else:
+            d2_np = d2_reward.detach().cpu().numpy()
+            rel2_np = rel2.detach().cpu().numpy()
+            dock_gap_np = dock_gap.detach().cpu().numpy()
+            d1_true_np = d1_true_norm.detach().cpu().numpy()
+            d2_true_np = d2_true_norm.detach().cpu().numpy()
+            u_cmd_norm_def_np = torch.linalg.vector_norm(a1_cmd, dim=-1).detach().cpu().numpy()
+            u_cmd_norm_att_np = torch.linalg.vector_norm(a2_cmd, dim=-1).detach().cpu().numpy()
+            u_real_norm_def_np = torch.linalg.vector_norm(a1_real, dim=-1).detach().cpu().numpy()
+            u_real_norm_att_np = torch.linalg.vector_norm(a2_real, dim=-1).detach().cpu().numpy()
+            oob1_np = oob1.detach().cpu().numpy()
+            oob2_np = oob2_any.detach().cpu().numpy()
+            hit_target_np = hit_target.detach().cpu().numpy()
+            collision_np = collision.detach().cpu().numpy()
+            t_np = self._t_steps.detach().cpu().numpy()
+            radius_np = self.radius_t.detach().cpu().numpy()
+            meas_taken_np = None
+            if self.use_kf:
+                every = int(self._ekf_every) if self._batched_ekf_enabled else int(self.envs[0]._ukf_every)
+                every = max(1, every)
+                meas_taken_np = (t_np % every) == 0
+
+            fuel_frac_def_np = None
+            fuel_frac_att_np = None
+            thrust_def_np = None
+            thrust_att_np = None
+            mdot_def_np = None
+            mdot_att_np = None
+            if self.use_fuel:
+                fuel_frac_def_np = self._fuel_fractions()[0].detach().cpu().numpy()
+                fuel_frac_att_np = self._fuel_fractions()[1].detach().cpu().numpy()
+                thrust_def_np = thrust_def.detach().cpu().numpy()
+                thrust_att_np = thrust_att.detach().cpu().numpy()
+                mdot_def_np = mdot_def.detach().cpu().numpy()
+                mdot_att_np = mdot_att.detach().cpu().numpy()
+
+            infos = []
+            for i in range(self.num_envs):
+                info = {
+                    "t": int(t_np[i]),
+                    "d2_norm": float(d2_np[i]),
+                    "rel2_norm": float(rel2_np[i]),
+                    "dock_gap_norm": float(dock_gap_np[i]),
+                    "oob_def": bool(oob1_np[i]),
+                    "oob_att": bool(oob2_np[i]),
+                    "hit_target": bool(hit_target_np[i]),
+                    "arena_radius_m": float(radius_np[i]),
+                    "d1_true_norm": float(d1_true_np[i]),
+                    "d2_true_norm": float(d2_true_np[i]),
+                    "collision": bool(collision_np[i]),
+                    "u_cmd_norm_def": float(u_cmd_norm_def_np[i]),
+                    "u_cmd_norm_att": float(u_cmd_norm_att_np[i]),
+                    "u_real_norm_def": float(u_real_norm_def_np[i]),
+                    "u_real_norm_att": float(u_real_norm_att_np[i]),
+                }
+                if self.use_kf:
+                    info["meas_innov_sq"] = float(meas_innov[i])
+                    info["ukf_trPpos"] = float(meas_trP[i])
+                    info["att_meas_innov_sq"] = float(att_meas_innov[i])
+                    info["att_ukf_trPpos"] = float(att_meas_trP[i])
+                    info["meas_taken"] = bool(meas_taken_np[i])
+                    info["att_meas_taken"] = bool(meas_taken_np[i])
+                    if d2_belief_norm is not None:
+                        info["d2_belief_norm"] = float(d2_belief_norm[i])
+                    if p2_est_err_norm is not None:
+                        info["p2_est_err_norm"] = float(p2_est_err_norm[i])
+                    if d1_belief_norm is not None:
+                        info["d1_belief_norm"] = float(d1_belief_norm[i])
+                    if p1_est_err_norm is not None:
+                        info["p1_est_err_norm"] = float(p1_est_err_norm[i])
+                if self.use_fuel:
+                    info["fuel_frac_def"] = float(np.clip(fuel_frac_def_np[i], 0.0, 1.0))
+                    info["fuel_frac_att"] = float(np.clip(fuel_frac_att_np[i], 0.0, 1.0))
+                    info["fuel_used_def"] = 1.0 - info["fuel_frac_def"]
+                    info["fuel_used_att"] = 1.0 - info["fuel_frac_att"]
+                    info["thrust_def"] = float(thrust_def_np[i])
+                    info["thrust_att"] = float(thrust_att_np[i])
+                    info["mdot_def"] = float(mdot_def_np[i])
+                    info["mdot_att"] = float(mdot_att_np[i])
+                infos.append(info)
 
         done = torch.where(active_mask_t, done, torch.ones_like(done))
 
@@ -2992,13 +3528,15 @@ class TorchVecEnv:
                 self._att_ekf_P_t = torch.where(active_mask_t[:, None, None], self._att_ekf_P_t, prev_att_ekf_P)
 
         if auto_reset:
-            done_indices = torch.nonzero(done & active_mask_t, as_tuple=False).flatten().detach().cpu().tolist()
-            for idx in done_indices:
-                env = self.envs[idx]
-                if env.opp_resample == "episode":
-                    env.set_opp_domain(_sample_opp_domain(env.cfg))
-                env.reset()
-                self._sync_slot_from_env(idx)
+            done_idx_t = torch.nonzero(done & active_mask_t, as_tuple=False).flatten()
+            if done_idx_t.numel() > 0:
+                if self._fast_reset_enabled:
+                    self._fast_reset_slots(done_idx_t, resample_opp=self._opp_resample_episode)
+                else:
+                    done_indices = done_idx_t.detach().cpu().tolist()
+                    for idx in done_indices:
+                        env = self.envs[idx]
+                        self._reset_env_slot(idx, resample_opp=(env.opp_resample == "episode"))
 
         self._refresh_obs()
         return self.obs, r1, r2, done.to(dtype=self.dtype), infos
@@ -3016,6 +3554,9 @@ def collect_ic_history_from_vecenv(vec: VecEnv):
     def_pos : (N, D)
     att_pos : (M, D)
     """
+    if getattr(vec, "torch_backend", False) and hasattr(vec, "collect_ic_history"):
+        return vec.collect_ic_history()
+
     if hasattr(vec, "envs"):
         def_all = []
         att_all = []

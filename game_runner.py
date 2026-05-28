@@ -4,12 +4,14 @@
 
 from __future__ import annotations
 from typing import Dict, Any, List
+import os
 import time
 import numpy as np
 import torch
 
 from core.env import TorchVecEnv
 from core.safety_filter import project_box_halfspace_np, velocity_cbf_halfspace_np
+from core.utils import set_seed
 from paper_baseline_runner import _build_step_plant_single, _identity_R, _p3
 from rl_infer import RLPolicyDiff
 from ukf_estimator import KF_CV, _azel_from_body_vec, _body_bearing_from_world
@@ -231,11 +233,43 @@ def _pack_multi_agent_rollout(
     return out
 
 
+def _combine_reproducibility_seed(seeds: List[int]) -> int:
+    acc = 2166136261
+    for idx, seed in enumerate(seeds):
+        mix = (int(seed) + 0x9E3779B9 + idx * 0x85EBCA6B) & 0xFFFFFFFF
+        acc ^= mix
+        acc = (acc * 16777619) & 0xFFFFFFFF
+    return int(acc or 1)
+
+
+def _configure_cuda_reproducibility(seed: int) -> None:
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    set_seed(int(seed))
+    if not torch.cuda.is_available():
+        return
+    torch.cuda.manual_seed(int(seed))
+    torch.cuda.manual_seed_all(int(seed))
+    torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+    try:
+        torch.set_float32_matmul_precision("highest")
+    except Exception:
+        pass
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        torch.use_deterministic_algorithms(True)
+
+
 def run_batched_rhc_with_rl_and_collect_frames_3d(
     cfgs: List[Dict[str, Any]],
     *,
     steps: int,
     turn_len: int | None = None,
+    episode_seeds: List[int] | None = None,
 ) -> List[Dict[str, Any]]:
     if not cfgs:
         return []
@@ -259,6 +293,19 @@ def run_batched_rhc_with_rl_and_collect_frames_3d(
     t_fn0 = time.perf_counter()
     batch_size = len(cfgs)
     device = str(cfg0.get("device", "cpu"))
+    if episode_seeds is None:
+        episode_seeds = [int(cfg.get("seed", idx)) for idx, cfg in enumerate(cfgs)]
+    elif len(episode_seeds) != batch_size:
+        raise ValueError(
+            f"episode_seeds length={len(episode_seeds)} does not match batch_size={batch_size}."
+        )
+    else:
+        episode_seeds = [int(seed) for seed in episode_seeds]
+    repro_seed = _combine_reproducibility_seed(episode_seeds)
+    if torch.device(device).type == "cuda":
+        _configure_cuda_reproducibility(repro_seed)
+    else:
+        set_seed(repro_seed)
     deterministic = bool(cfg0.get("rl_eval_deterministic", True))
     stop_on_done = bool(cfg0.get("stop_on_done", True))
     use_kf = bool(cfg0.get("use_kf", False))
@@ -266,7 +313,7 @@ def run_batched_rhc_with_rl_and_collect_frames_3d(
     obs_expected = 5 * D + (2 if use_fuel else 0)
     meas_every = max(1, int((cfg0.get("ukf", {}) or {}).get("every", 1)))
 
-    vec = TorchVecEnv(cfgs, num_envs=batch_size, device=device)
+    vec = TorchVecEnv(cfgs, num_envs=batch_size, device=device, episode_seeds=episode_seeds)
     pol = RLPolicyDiff(cfg0, device=device)
     din_def, din_att = pol.verify_ckpt_compat()
     if din_def != obs_expected or din_att != obs_expected:

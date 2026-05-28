@@ -3,7 +3,6 @@ import gc
 import os
 import time
 from typing import Any, Dict
-from collections import Counter
 
 import numpy as np
 import torch
@@ -116,30 +115,31 @@ def _build_opponent_policy_mix(
         "opp_role": opp_role,
         "entries": entries,
         "probs": probs,
+        "probs_t": torch.as_tensor(probs, dtype=torch.float32, device=device),
         "resample": resample,
         "act_dim": act_dim,
     }
 
 
 def _sample_opponent_indices(mix_state, size: int):
-    return np.random.choice(len(mix_state["entries"]), size=size, p=mix_state["probs"]).astype(np.int64)
+    return torch.multinomial(mix_state["probs_t"], num_samples=size, replacement=True).to(dtype=torch.int64)
 
 
 @torch.no_grad()
 def _act_from_opponent_policy_mix(
     obs_batch: torch.Tensor,
     mix_state,
-    active_indices: np.ndarray,
+    active_indices,
     act_scale: float,
 ):
     opp_role = mix_state["opp_role"]
     act_dim = int(mix_state["act_dim"])
     out = torch.zeros((obs_batch.shape[0], act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
+    active_indices_t = torch.as_tensor(active_indices, dtype=torch.int64, device=obs_batch.device).reshape(-1)
 
-    unique_ids = np.unique(active_indices)
+    unique_ids = torch.unique(active_indices_t).detach().cpu().tolist()
     for idx in unique_ids:
-        mask_np = (active_indices == idx)
-        mask = torch.as_tensor(mask_np, dtype=torch.bool, device=obs_batch.device)
+        mask = active_indices_t == int(idx)
         entry = mix_state["entries"][int(idx)]
         net = entry["net"]
         dist = net.dist(obs_batch[mask], who=opp_role)
@@ -404,8 +404,25 @@ def train(cfg: Dict[str, Any]):
         print("[intercept_prior_train_only] ignored because prior_type!='intercept'")
 
     for upd in range(1, total_updates + 1):
-        term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
-        mix_counts_update = Counter()
+        if vec_is_torch:
+            term_counts = {
+                "oob_def": torch.zeros((), dtype=torch.float64, device=device),
+                "oob_att": torch.zeros((), dtype=torch.float64, device=device),
+                "hit_target": torch.zeros((), dtype=torch.float64, device=device),
+                "collision": torch.zeros((), dtype=torch.float64, device=device),
+            }
+        else:
+            term_counts = {"oob_def":0, "oob_att":0, "hit_target":0, "collision":0}
+        mix_counts_update = None
+        if opp_policy_mix is not None:
+            if vec_is_torch:
+                mix_counts_update = torch.zeros(
+                    (len(opp_policy_mix["entries"]),),
+                    dtype=torch.int64,
+                    device=device,
+                )
+            else:
+                mix_counts_update = np.zeros((len(opp_policy_mix["entries"]),), dtype=np.int64)
 
         if (opp_policy_mix is not None) and (opp_policy_mix["resample"] == "update"):
             mix_active_idx = _sample_opponent_indices(opp_policy_mix, num_envs)
@@ -458,35 +475,52 @@ def train(cfg: Dict[str, Any]):
 
 
         if vec_is_torch:
-            o_def = vec.obs_def.to(device=device, dtype=torch.float32)
-            o_att = vec.obs_att.to(device=device, dtype=torch.float32)
+            o_def = vec.obs_def.to(dtype=torch.float32)
+            o_att = vec.obs_att.to(dtype=torch.float32)
+            ep_ret_def = torch.zeros(num_envs, dtype=torch.float64, device=device)
+            ep_ret_att = torch.zeros(num_envs, dtype=torch.float64, device=device)
+            d1_true_sq_m_acc = torch.zeros((), dtype=torch.float64, device=device)
+            d2_true_sq_m_acc = torch.zeros((), dtype=torch.float64, device=device)
+            d2_belief_sq_m_acc = torch.zeros((), dtype=torch.float64, device=device)
+            arena_radius_acc = torch.zeros((), dtype=torch.float64, device=device)
+            p2_est_err_sq_m_acc = torch.zeros((), dtype=torch.float64, device=device)
+            p1_est_err_sq_m_acc = torch.zeros((), dtype=torch.float64, device=device)
+            meas_innov_acc = torch.zeros((), dtype=torch.float64, device=device)
+            trP_acc = torch.zeros((), dtype=torch.float64, device=device)
         else:
             o_def = torch.as_tensor(vec.obs_def, dtype=torch.float32, device=device)
             o_att = torch.as_tensor(vec.obs_att, dtype=torch.float32, device=device)
-        ep_ret_def = np.zeros(num_envs, dtype=np.float64)
-        ep_ret_att = np.zeros(num_envs, dtype=np.float64)
-
-        # accumulators for metrics over this update
-        d1_true_sq_m_acc = 0.0
-        d2_true_sq_m_acc = 0.0
-        d2_belief_sq_m_acc = 0.0
-        arena_radius_acc = 0.0
-        p2_est_err_sq_m_acc = 0.0
-        p1_est_err_sq_m_acc = 0.0
-        meas_innov_acc = 0.0
-        trP_acc = 0.0
+            ep_ret_def = np.zeros(num_envs, dtype=np.float64)
+            ep_ret_att = np.zeros(num_envs, dtype=np.float64)
+            d1_true_sq_m_acc = 0.0
+            d2_true_sq_m_acc = 0.0
+            d2_belief_sq_m_acc = 0.0
+            arena_radius_acc = 0.0
+            p2_est_err_sq_m_acc = 0.0
+            p1_est_err_sq_m_acc = 0.0
+            meas_innov_acc = 0.0
+            trP_acc = 0.0
         info_count = 0
 
         if cfg.get("fuel", {}).get("enable", False):
-            fuel_used_def_acc = 0.0
-            fuel_used_att_acc = 0.0
-            fuel_frac_def_acc = 0.0
-            fuel_frac_att_acc = 0.0
-
-            thrust_def_acc = 0.0
-            thrust_att_acc = 0.0
-            mdot_def_acc = 0.0
-            mdot_att_acc = 0.0
+            if vec_is_torch:
+                fuel_used_def_acc = torch.zeros((), dtype=torch.float64, device=device)
+                fuel_used_att_acc = torch.zeros((), dtype=torch.float64, device=device)
+                fuel_frac_def_acc = torch.zeros((), dtype=torch.float64, device=device)
+                fuel_frac_att_acc = torch.zeros((), dtype=torch.float64, device=device)
+                thrust_def_acc = torch.zeros((), dtype=torch.float64, device=device)
+                thrust_att_acc = torch.zeros((), dtype=torch.float64, device=device)
+                mdot_def_acc = torch.zeros((), dtype=torch.float64, device=device)
+                mdot_att_acc = torch.zeros((), dtype=torch.float64, device=device)
+            else:
+                fuel_used_def_acc = 0.0
+                fuel_used_att_acc = 0.0
+                fuel_frac_def_acc = 0.0
+                fuel_frac_att_acc = 0.0
+                thrust_def_acc = 0.0
+                thrust_att_acc = 0.0
+                mdot_def_acc = 0.0
+                mdot_att_acc = 0.0
             fuel_info_count = 0
 
         t_rollout0 = time.perf_counter()
@@ -526,15 +560,13 @@ def train(cfg: Dict[str, Any]):
                     a1,
                     a2,
                     reward_mode=reward_mode,
+                    emit_infos=False,
                 )
-                o2_def = vec.obs_def.to(device=device, dtype=torch.float32)
-                o2_att = vec.obs_att.to(device=device, dtype=torch.float32)
-                r1 = r1_step.to(device=device, dtype=torch.float32)
-                r2 = r2_step.to(device=device, dtype=torch.float32)
-                d = d_step.to(device=device, dtype=torch.float32)
-                r1_np = r1.detach().cpu().numpy()
-                r2_np = r2.detach().cpu().numpy()
-                d_np = d.detach().cpu().numpy()
+                o2_def = vec.obs_def.to(dtype=torch.float32)
+                o2_att = vec.obs_att.to(dtype=torch.float32)
+                r1 = r1_step.to(dtype=torch.float32)
+                r2 = r2_step.to(dtype=torch.float32)
+                d = d_step.to(dtype=torch.float32)
             else:
                 a1_np = a1.cpu().numpy()
                 a2_np = a2.cpu().numpy()
@@ -563,75 +595,127 @@ def train(cfg: Dict[str, Any]):
 
 
             if train_role == "def":
-                ep_ret_def += r1_np
+                if vec_is_torch:
+                    ep_ret_def += r1.to(dtype=ep_ret_def.dtype)
+                else:
+                    ep_ret_def += r1_np
 
             if train_role == "att":
-                ep_ret_att += r2_np
+                if vec_is_torch:
+                    ep_ret_att += r2.to(dtype=ep_ret_att.dtype)
+                else:
+                    ep_ret_att += r2_np
             
             o_def = o2_def
             o_att = o2_att
 
             if opp_policy_mix is not None:
-                mix_counts_update.update(int(i) for i in mix_active_idx.tolist())
-                if opp_policy_mix["resample"] == "episode":
-                    done_mask = d_np.astype(bool)
-                    if np.any(done_mask):
-                        mix_active_idx[done_mask] = _sample_opponent_indices(
-                            opp_policy_mix,
-                            int(done_mask.sum()),
-                        )
+                if vec_is_torch:
+                    mix_counts_update += torch.bincount(
+                        mix_active_idx,
+                        minlength=len(opp_policy_mix["entries"]),
+                    )
+                    if opp_policy_mix["resample"] == "episode":
+                        done_idx = torch.nonzero(d.to(dtype=torch.bool), as_tuple=False).flatten()
+                        if done_idx.numel() > 0:
+                            mix_active_idx[done_idx] = _sample_opponent_indices(
+                                opp_policy_mix,
+                                int(done_idx.numel()),
+                            )
+                else:
+                    mix_counts_update += np.bincount(
+                        mix_active_idx.detach().cpu().numpy(),
+                        minlength=len(opp_policy_mix["entries"]),
+                    )
+                    if opp_policy_mix["resample"] == "episode":
+                        done_mask = d_np.astype(bool)
+                        if np.any(done_mask):
+                            done_idx = torch.as_tensor(np.flatnonzero(done_mask), dtype=torch.int64)
+                            mix_active_idx[done_idx] = _sample_opponent_indices(
+                                opp_policy_mix,
+                                int(done_mask.sum()),
+                            )
 
-            # ---- accumulate truth / belief metrics from Env.info ----
-            for inf in infos:
-                # count every env-step
-                info_count += 1
-
-                # always accumulate if present
-                radius_m = float(inf.get("arena_radius_m", cfg["arena"]["r"]))
-                radius_sq_m = radius_m * radius_m
-                arena_radius_acc += radius_m
-
-                if "d1_true_norm" in inf:
-                    d1_true_sq_m_acc += float(inf["d1_true_norm"]) * radius_sq_m
-
-                if "d2_true_norm" in inf:
-                    d2_true_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
-
-                # belief distance: fall back safely
-                if "d2_belief_norm" in inf:
-                    d2_belief_sq_m_acc += float(inf["d2_belief_norm"]) * radius_sq_m
-                elif "d2_true_norm" in inf:
-                    d2_belief_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
-
-                if "p2_est_err_norm" in inf:
-                    p2_est_err_sq_m_acc += float(inf["p2_est_err_norm"]) * radius_sq_m
-                if "p1_est_err_norm" in inf:
-                    p1_est_err_sq_m_acc += float(inf["p1_est_err_norm"]) * radius_sq_m
-
-                if "meas_innov_sq" in inf:
-                    meas_innov_acc += inf["meas_innov_sq"]
-
-                if "ukf_trPpos" in inf:
-                    trP_acc += inf["ukf_trPpos"]
-
-                if inf.get("oob_def", False): term_counts["oob_def"] += 1
-                if inf.get("oob_att", False): term_counts["oob_att"] += 1
-                if inf.get("hit_target", False): term_counts["hit_target"] += 1
-                if inf.get("collision", False): term_counts["collision"] += 1
+            if vec_is_torch:
+                step_stats = getattr(vec, "last_step_stats", None)
+                if step_stats is None:
+                    raise RuntimeError("TorchVecEnv fast path did not populate last_step_stats.")
+                info_count += int(step_stats["info_count"])
+                arena_radius_acc += step_stats["arena_radius_sum"]
+                d1_true_sq_m_acc += step_stats["d1_true_sq_m_sum"]
+                d2_true_sq_m_acc += step_stats["d2_true_sq_m_sum"]
+                d2_belief_sq_m_acc += step_stats["d2_belief_sq_m_sum"]
+                p2_est_err_sq_m_acc += step_stats["p2_est_err_sq_m_sum"]
+                p1_est_err_sq_m_acc += step_stats["p1_est_err_sq_m_sum"]
+                meas_innov_acc += step_stats["meas_innov_sum"]
+                trP_acc += step_stats["ukf_trPpos_sum"]
+                term_counts["oob_def"] += step_stats["oob_def_sum"]
+                term_counts["oob_att"] += step_stats["oob_att_sum"]
+                term_counts["hit_target"] += step_stats["hit_target_sum"]
+                term_counts["collision"] += step_stats["collision_sum"]
 
                 if cfg.get("fuel", {}).get("enable", False):
-                    if "fuel_used_def" in inf:
-                        fuel_used_def_acc += inf["fuel_used_def"]
-                        fuel_used_att_acc += inf["fuel_used_att"]
-                        fuel_frac_def_acc += inf["fuel_frac_def"]
-                        fuel_frac_att_acc += inf["fuel_frac_att"]
+                    fuel_used_def_acc += step_stats["fuel_used_def_sum"]
+                    fuel_used_att_acc += step_stats["fuel_used_att_sum"]
+                    fuel_frac_def_acc += step_stats["fuel_frac_def_sum"]
+                    fuel_frac_att_acc += step_stats["fuel_frac_att_sum"]
+                    thrust_def_acc += step_stats["thrust_def_sum"]
+                    thrust_att_acc += step_stats["thrust_att_sum"]
+                    mdot_def_acc += step_stats["mdot_def_sum"]
+                    mdot_att_acc += step_stats["mdot_att_sum"]
+                    fuel_info_count += int(step_stats["info_count"])
+            else:
+                # ---- accumulate truth / belief metrics from Env.info ----
+                for inf in infos:
+                    # count every env-step
+                    info_count += 1
 
-                        thrust_def_acc += inf.get("thrust_def", 0.0)
-                        thrust_att_acc += inf.get("thrust_att", 0.0)
-                        mdot_def_acc += inf.get("mdot_def", 0.0)
-                        mdot_att_acc += inf.get("mdot_att", 0.0)
+                    # always accumulate if present
+                    radius_m = float(inf.get("arena_radius_m", cfg["arena"]["r"]))
+                    radius_sq_m = radius_m * radius_m
+                    arena_radius_acc += radius_m
 
-                        fuel_info_count += 1
+                    if "d1_true_norm" in inf:
+                        d1_true_sq_m_acc += float(inf["d1_true_norm"]) * radius_sq_m
+
+                    if "d2_true_norm" in inf:
+                        d2_true_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
+
+                    # belief distance: fall back safely
+                    if "d2_belief_norm" in inf:
+                        d2_belief_sq_m_acc += float(inf["d2_belief_norm"]) * radius_sq_m
+                    elif "d2_true_norm" in inf:
+                        d2_belief_sq_m_acc += float(inf["d2_true_norm"]) * radius_sq_m
+
+                    if "p2_est_err_norm" in inf:
+                        p2_est_err_sq_m_acc += float(inf["p2_est_err_norm"]) * radius_sq_m
+                    if "p1_est_err_norm" in inf:
+                        p1_est_err_sq_m_acc += float(inf["p1_est_err_norm"]) * radius_sq_m
+
+                    if "meas_innov_sq" in inf:
+                        meas_innov_acc += inf["meas_innov_sq"]
+
+                    if "ukf_trPpos" in inf:
+                        trP_acc += inf["ukf_trPpos"]
+
+                    if inf.get("oob_def", False): term_counts["oob_def"] += 1
+                    if inf.get("oob_att", False): term_counts["oob_att"] += 1
+                    if inf.get("hit_target", False): term_counts["hit_target"] += 1
+                    if inf.get("collision", False): term_counts["collision"] += 1
+
+                    if cfg.get("fuel", {}).get("enable", False):
+                        if "fuel_used_def" in inf:
+                            fuel_used_def_acc += inf["fuel_used_def"]
+                            fuel_used_att_acc += inf["fuel_used_att"]
+                            fuel_frac_def_acc += inf["fuel_frac_def"]
+                            fuel_frac_att_acc += inf["fuel_frac_att"]
+
+                            thrust_def_acc += inf.get("thrust_def", 0.0)
+                            thrust_att_acc += inf.get("thrust_att", 0.0)
+                            mdot_def_acc += inf.get("mdot_def", 0.0)
+                            mdot_att_acc += inf.get("mdot_att", 0.0)
+
+                            fuel_info_count += 1
 
 
             global_env_step += num_envs
@@ -689,8 +773,30 @@ def train(cfg: Dict[str, Any]):
 
 
         if upd % log_every == 0:
-            R_def_mean = ep_ret_def.mean()
-            R_att_mean = ep_ret_att.mean()
+            if vec_is_torch:
+                R_def_mean = float(ep_ret_def.mean().item())
+                R_att_mean = float(ep_ret_att.mean().item())
+                arena_radius_acc_value = float(arena_radius_acc.item())
+                d1_true_sq_m_acc_value = float(d1_true_sq_m_acc.item())
+                d2_true_sq_m_acc_value = float(d2_true_sq_m_acc.item())
+                d2_belief_sq_m_acc_value = float(d2_belief_sq_m_acc.item())
+                p2_est_err_sq_m_acc_value = float(p2_est_err_sq_m_acc.item())
+                p1_est_err_sq_m_acc_value = float(p1_est_err_sq_m_acc.item())
+                meas_innov_acc_value = float(meas_innov_acc.item())
+                trP_acc_value = float(trP_acc.item())
+                term_counts_log = {k: float(v.item()) for k, v in term_counts.items()}
+            else:
+                R_def_mean = ep_ret_def.mean()
+                R_att_mean = ep_ret_att.mean()
+                arena_radius_acc_value = arena_radius_acc
+                d1_true_sq_m_acc_value = d1_true_sq_m_acc
+                d2_true_sq_m_acc_value = d2_true_sq_m_acc
+                d2_belief_sq_m_acc_value = d2_belief_sq_m_acc
+                p2_est_err_sq_m_acc_value = p2_est_err_sq_m_acc
+                p1_est_err_sq_m_acc_value = p1_est_err_sq_m_acc
+                meas_innov_acc_value = meas_innov_acc
+                trP_acc_value = trP_acc
+                term_counts_log = term_counts
 
             tracked_metric_value = R_def_mean if train_role == "def" else R_att_mean
 
@@ -710,15 +816,15 @@ def train(cfg: Dict[str, Any]):
 
             # means over all steps collected this update
             if info_count > 0:
-                arena_radius_mean = arena_radius_acc / info_count
+                arena_radius_mean = arena_radius_acc_value / info_count
 
-                d1_true_mean = np.sqrt(d1_true_sq_m_acc / info_count)
-                d2_true_mean = np.sqrt(d2_true_sq_m_acc / info_count)
-                d2_belief_mean = np.sqrt(d2_belief_sq_m_acc / info_count)
-                p2_est_err_mean = np.sqrt(p2_est_err_sq_m_acc / info_count)
-                p1_est_err_mean = np.sqrt(p1_est_err_sq_m_acc / info_count)
-                meas_innov_mean = meas_innov_acc / info_count
-                trP_mean = trP_acc / info_count
+                d1_true_mean = np.sqrt(d1_true_sq_m_acc_value / info_count)
+                d2_true_mean = np.sqrt(d2_true_sq_m_acc_value / info_count)
+                d2_belief_mean = np.sqrt(d2_belief_sq_m_acc_value / info_count)
+                p2_est_err_mean = np.sqrt(p2_est_err_sq_m_acc_value / info_count)
+                p1_est_err_mean = np.sqrt(p1_est_err_sq_m_acc_value / info_count)
+                meas_innov_mean = meas_innov_acc_value / info_count
+                trP_mean = trP_acc_value / info_count
             else:
                 arena_radius_mean = 0.0
                 d1_true_mean = d2_true_mean = d2_belief_mean = 0.0
@@ -776,15 +882,24 @@ def train(cfg: Dict[str, Any]):
 
             if cfg.get("fuel", {}).get("enable", False):
                 if fuel_info_count > 0:
-                    fuel_used_def_mean = fuel_used_def_acc / fuel_info_count
-                    fuel_used_att_mean = fuel_used_att_acc / fuel_info_count
-                    fuel_frac_def_mean = fuel_frac_def_acc / fuel_info_count
-                    fuel_frac_att_mean = fuel_frac_att_acc / fuel_info_count
-
-                    thrust_def_mean = thrust_def_acc / fuel_info_count
-                    thrust_att_mean = thrust_att_acc / fuel_info_count
-                    mdot_def_mean = mdot_def_acc / fuel_info_count
-                    mdot_att_mean = mdot_att_acc / fuel_info_count
+                    if vec_is_torch:
+                        fuel_used_def_mean = float(fuel_used_def_acc.item()) / fuel_info_count
+                        fuel_used_att_mean = float(fuel_used_att_acc.item()) / fuel_info_count
+                        fuel_frac_def_mean = float(fuel_frac_def_acc.item()) / fuel_info_count
+                        fuel_frac_att_mean = float(fuel_frac_att_acc.item()) / fuel_info_count
+                        thrust_def_mean = float(thrust_def_acc.item()) / fuel_info_count
+                        thrust_att_mean = float(thrust_att_acc.item()) / fuel_info_count
+                        mdot_def_mean = float(mdot_def_acc.item()) / fuel_info_count
+                        mdot_att_mean = float(mdot_att_acc.item()) / fuel_info_count
+                    else:
+                        fuel_used_def_mean = fuel_used_def_acc / fuel_info_count
+                        fuel_used_att_mean = fuel_used_att_acc / fuel_info_count
+                        fuel_frac_def_mean = fuel_frac_def_acc / fuel_info_count
+                        fuel_frac_att_mean = fuel_frac_att_acc / fuel_info_count
+                        thrust_def_mean = thrust_def_acc / fuel_info_count
+                        thrust_att_mean = thrust_att_acc / fuel_info_count
+                        mdot_def_mean = mdot_def_acc / fuel_info_count
+                        mdot_att_mean = mdot_att_acc / fuel_info_count
                 else:
                     fuel_used_def_mean = fuel_used_att_mean = 0.0
                     fuel_frac_def_mean = fuel_frac_att_mean = 0.0
@@ -826,10 +941,18 @@ def train(cfg: Dict[str, Any]):
             metrics["update_time_s"].append(update_time_s)
             metrics["env_steps_per_sec"].append(env_steps_per_sec)
             if opp_policy_mix is not None:
-                total_mix = max(1, sum(mix_counts_update.values()))
+                total_mix = (
+                    max(1, int(mix_counts_update.sum().item()))
+                    if vec_is_torch
+                    else max(1, int(mix_counts_update.sum()))
+                )
                 mix_summary = []
                 for idx, entry in enumerate(opp_policy_mix["entries"]):
-                    frac = float(mix_counts_update.get(idx, 0)) / total_mix
+                    frac = (
+                        float(mix_counts_update[idx].item()) / total_mix
+                        if vec_is_torch
+                        else float(mix_counts_update[idx]) / total_mix
+                    )
                     metrics[mix_name_to_metric[entry["name"]]].append(frac)
                     mix_summary.append(f"{entry['name']}={frac:.2f}")
                 print("opp mix usage:", ", ".join(mix_summary))
@@ -904,9 +1027,9 @@ def train(cfg: Dict[str, Any]):
                     writer.add_scalar("ukf/trP_pos_mean", trP_mean, gs)
 
                 if info_count > 0:
-                    term_rates = {k: v / info_count for k, v in term_counts.items()}
+                    term_rates = {k: v / info_count for k, v in term_counts_log.items()}
                 else:
-                    term_rates = {k: 0.0 for k in term_counts}
+                    term_rates = {k: 0.0 for k in term_counts_log}
 
 
                 writer.add_scalar("term_rate/oob_def", term_rates["oob_def"], gs)

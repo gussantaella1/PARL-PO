@@ -59,6 +59,17 @@ def _parse_phase_list(text: str) -> set[int]:
     return phases
 
 
+def _parse_bool(value: str) -> bool:
+    key = str(value).strip().lower()
+    if key in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if key in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Could not parse boolean value {value!r}. Expected true/false."
+    )
+
+
 def _build_runtime_overrides(args, out_dir: str) -> dict:
     overrides = {}
 
@@ -81,6 +92,21 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
         overrides["k_dock"] = args.k_dock
     if args.train_ic_vmax is not None:
         overrides["train_ic_vmax"] = args.train_ic_vmax
+    if args.use_kf is not None:
+        overrides["use_kf"] = bool(args.use_kf)
+    if args.estimator_kind is not None:
+        if args.use_kf is False:
+            raise ValueError("--estimator_kind cannot be combined with --use_kf false.")
+        overrides["use_kf"] = True
+        overrides["estimator_kind"] = args.estimator_kind
+    if args.reward_type is not None:
+        overrides["reward_type"] = args.reward_type
+        if args.reward_type == "zero_sum_kf":
+            if overrides.get("use_kf") is False:
+                raise ValueError("--reward_type zero_sum_kf requires --use_kf true.")
+            overrides.setdefault("use_kf", True)
+        elif overrides.get("use_kf") is True:
+            raise ValueError("--reward_type zero_sum cannot be combined with --use_kf true.")
     if args.num_envs is not None:
         overrides["num_envs"] = args.num_envs
     if args.steps_per_env is not None:
@@ -128,6 +154,26 @@ def _parse_args():
     ap.add_argument("--k_pos", type=float, default=None, help="Override cfg['k_pos'].")
     ap.add_argument("--k_dock", type=float, default=None, help="Override cfg['k_dock'].")
     ap.add_argument("--train_ic_vmax", type=float, default=None, help="Override cfg['train_ic_vmax'].")
+    ap.add_argument(
+        "--use_kf",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool,
+        help="Override use_kf. Pass --use_kf, --use_kf true, or --use_kf false.",
+    )
+    ap.add_argument(
+        "--reward_type",
+        choices=("zero_sum", "zero_sum_kf"),
+        default=None,
+        help="Override cfg['reward_type']. zero_sum_kf enables the KF reward variant.",
+    )
+    ap.add_argument(
+        "--estimator_kind",
+        choices=("ukf", "ekf"),
+        default=None,
+        help="Force the enabled estimator kind. Setting this also enables the estimator.",
+    )
     ap.add_argument("--num_envs", type=int, default=None, help="Override cfg['num_envs'].")
     ap.add_argument("--steps_per_env", type=int, default=None, help="Override cfg['steps_per_env'].")
     ap.add_argument("--total_updates", type=int, default=None, help="Override cfg['total_updates'].")

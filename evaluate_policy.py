@@ -50,7 +50,7 @@ from matchup_runner import (
     SUPPORTED_BASELINE_OPPONENTS,
     run_rhc_with_policy_vs_baseline_collect_frames_3d,
 )
-from core.utils import resolve_start_radius_bounds
+from core.utils import resolve_start_radius_bounds, set_seed
 from dispersion import build_episode_cfg_and_x0
 
 
@@ -722,6 +722,18 @@ def _project_x0_velocities_to_vmax(x0: np.ndarray, D: int, vmax: float) -> np.nd
     vel *= scale
     out[:, D:2 * D] = vel
     return out
+
+
+def _combine_reproducibility_seed(seeds: List[int]) -> int:
+    """
+    Fold a list of episode seeds into one stable 32-bit seed for global torch/NumPy setup.
+    """
+    acc = 2166136261
+    for idx, seed in enumerate(seeds):
+        mix = (int(seed) + 0x9E3779B9 + idx * 0x85EBCA6B) & 0xFFFFFFFF
+        acc ^= mix
+        acc = (acc * 16777619) & 0xFFFFFFFF
+    return int(acc or 1)
 
 
 def _is_cuda_device(device: Any) -> bool:
@@ -2933,6 +2945,10 @@ def main():
             f"[eval] batched CUDA eval enabled: batch_size={eval_batch_size} "
             f"(device={cfg0.get('device')}, opponent_source={args.opponent_source})"
         )
+        log(
+            "[eval] CUDA reproducibility guards enabled: TF32 off, deterministic torch kernels "
+            "requested, and per-episode torch RNG streams seeded."
+        )
     else:
         eval_batch_size = 1
         if _is_cuda_device(cfg0.get("device", None)) and str(args.opponent_source).strip().lower() == "policy":
@@ -3093,9 +3109,12 @@ def main():
 
         if use_batched_cuda_eval:
             try:
+                batch_episode_seeds = [int(item["ep_seed"]) for item in pending_items]
+                set_seed(_combine_reproducibility_seed(batch_episode_seeds))
                 batch_outs = run_batched_rhc_with_rl_and_collect_frames_3d(
                     [item["cfg_run"] for item in pending_items],
                     steps=int(pending_items[0]["steps_run"]),
+                    episode_seeds=batch_episode_seeds,
                 )
                 if len(batch_outs) != len(pending_items):
                     raise RuntimeError(
@@ -3110,7 +3129,7 @@ def main():
 
         for item in pending_items:
             try:
-                np.random.seed(int(item["ep_seed"]))
+                set_seed(int(item["ep_seed"]))
                 out = _run_scalar_rollout(item["cfg_run"], int(item["steps_run"]))
                 _record_trial_result(item, out, None)
             except Exception as exc:
@@ -3121,7 +3140,7 @@ def main():
         t_trial0 = time.time()
         seed = int(args.seed + i)
 
-        np.random.seed(seed)
+        set_seed(seed)
         rng = np.random.default_rng(seed)
 
         cfg_trial, _x0_unused, ep_seed = build_episode_cfg_and_x0(
@@ -3135,7 +3154,7 @@ def main():
         if args.dt is not None:
             cfg_trial["dt"] = float(args.dt)
 
-        np.random.seed(int(ep_seed))
+        set_seed(int(ep_seed))
 
         if "T" in cfg_trial and cfg_trial["T"] is not None:
             cfg_trial["T"] = int(cfg_trial["T"])
@@ -3202,6 +3221,7 @@ def main():
 
         cfg_run = copy.deepcopy(cfg_trial)
         cfg_run["x0"] = np.asarray(x0, dtype=float).tolist()
+        cfg_run["seed"] = int(ep_seed)
         _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
         steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
