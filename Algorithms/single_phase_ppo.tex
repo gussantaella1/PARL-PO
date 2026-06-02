@@ -1,0 +1,54 @@
+\begin{algorithm}[H]
+\caption{Single-Phase PPO Update with Full-State Observations}
+\label{alg:ppo_full_obs}
+\begin{algorithmic}[1]
+\Require Learning role $r\in\{\textsc{def},\textsc{att}\}$, fixed opponent controller $\Pi_{\bar r}$, horizon $H$, vectorized environments $N$
+\Require Full-state observation maps $\mathrm{Obs}^{\mathrm{full}}_r,\mathrm{Obs}^{\mathrm{full}}_{\bar r}$, dynamics $\mathcal{D}(\cdot)$, reward $\mathcal{R}(\cdot)$
+\Ensure Updated policy parameters $\theta_r$
+
+\State \textbf{Initialize vectorized PPO training:}
+\State \hspace{1em} Initialize VecEnv($N$), configured dynamics, learning policy $\pi_{\theta_r}$, and value function $V_{\theta_r}$
+
+\For{$u=1,\dots,U$}
+  \State \textbf{Prepare a new rollout batch:}
+  \State \hspace{1em} Optionally decay learning rate and anneal environment coefficients
+  \State \hspace{1em} Initialize rollout buffer $\mathcal{B}_r$
+
+  \For{$t=1,\dots,H$ \textbf{in parallel over} $n=1,\dots,N$}
+    \State \textbf{Build full-state observations:}
+    \State \hspace{1em} $o_t^{r,(n)} \leftarrow \mathrm{Obs}^{\mathrm{full}}_r(x_t^{(n)})$
+    \State \hspace{1em} $o_t^{\bar r,(n)} \leftarrow \mathrm{Obs}^{\mathrm{full}}_{\bar r}(x_t^{(n)})$
+
+    \State \textbf{Select learner and opponent actions:}
+    \State \hspace{1em} $a_t^{r,(n)} \sim \pi_{\theta_r}(\cdot \mid o_t^{r,(n)})$
+    \State \hspace{1em} $a_t^{\bar r,(n)} \leftarrow \Pi_{\bar r}(o_t^{\bar r,(n)})$
+    \Comment{rule-based or deterministic frozen RL policy}
+
+    \State \textbf{Step the environment:}
+    \State \hspace{1em} $(o_{t+1}^{r,(n)}, r_t^{r,(n)}, d_t^{(n)}) \leftarrow \textsc{Step}(a_t^{r,(n)}, a_t^{\bar r,(n)})$
+
+    \State \textbf{Conceptually, this step entails:}
+    \State \hspace{2em} $x_{t+1}^{(n)} \leftarrow \mathcal{D}\!\left(x_t^{(n)}, a_t^{r,(n)}, a_t^{\bar r,(n)}\right)$
+    \Comment{propagate the true spacecraft state}
+    \State \hspace{2em} $r_t^{r,(n)} \leftarrow \mathcal{R}\!\left(x_{t+1}^{(n)}, a_t^{r,(n)}, a_t^{\bar r,(n)}\right)$
+    \Comment{evaluate the role-specific reward from the realized transition}
+    \State \hspace{2em} $d_t^{(n)} \leftarrow \mathrm{Done}\!\left(x_{t+1}^{(n)}\right)$
+    \Comment{check terminal conditions such as docking, interception, or boundary violation}
+    \State \hspace{2em} $o_{t+1}^{r,(n)} \leftarrow \mathrm{Obs}^{\mathrm{full}}_r(x_{t+1}^{(n)})$
+    \Comment{form the next observation from the updated true state}
+
+    \State \textbf{Store the rollout transition:}
+    \State \hspace{1em} Store $\big(o_t^{r,(n)}, a_t^{r,(n)}, \log \pi_{\theta_r}, V_{\theta_r}, r_t^{r,(n)}, d_t^{(n)}\big)$ in $\mathcal{B}_r$
+    \Comment{terminated environments are reset internally in the vectorized implementation}
+  \EndFor
+
+  \State \textbf{Compute returns and advantages from rewards:}
+  \State \hspace{1em} Bootstrap $V_{\theta_r}(o_{H+1}^r)$
+  \State \hspace{1em} Compute done-masked returns and GAE advantages from the stored rewards
+
+  \State \textbf{Update the policy and value function with PPO:}
+  \State \hspace{1em} Normalize advantages and optimize the PPO clipped surrogate objective
+  \State \hspace{1em} using policy loss, value loss, and entropy regularization for $E$ epochs
+\EndFor
+\end{algorithmic}
+\end{algorithm}

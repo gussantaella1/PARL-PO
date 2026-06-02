@@ -27,7 +27,6 @@ run_step "Training_Policy_0.5u_1vmax" \
     --out_dir Training_Policy_0.5u_1vmax \
     --device cuda \
     --vec_backend torch \
-    --train_ic_vmax 0.25 \
     --vmax 1.0 \
     --umax 0.5 \
     --k_pos 0.05 \
@@ -37,7 +36,7 @@ run_step "Training_Policy_0.5u_1vmax" \
 
 run_step "Training_Policy_0.5u_1.5vmax_1.5icvel" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1vmax \
+    --out_dir Training_Policy_0.5u_1.5vmax_1.5icvel \
     --device cuda \
     --vec_backend torch \
     --train_ic_vmax 1.50 \
@@ -45,29 +44,26 @@ run_step "Training_Policy_0.5u_1.5vmax_1.5icvel" \
     --umax 0.5 \
     --k_pos 0.05 \
     --k_dock 0.0125 \
-    --train_ic_vmax 1.0 \
     --steps_per_env 1024
 
 
-run_step "Training_Policy_2.0u_1.5vmax" \
-  env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1vmax \
-    --device cuda \
-    --vec_backend torch \
-    --train_ic_vmax 0.25 \
-    --vmax 1.5 \
-    --umax 2.0  \
-    --k_pos 0.1 \
-    --k_dock 0.025 \
-    --train_ic_vmax 1.50 \
-    --steps_per_env 512
+# run_step "Training_Policy_2.0u_1.5vmax" \
+#   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
+#     --out_dir Training_Policy_2.0u_1.5vmax \
+#     --device cuda \
+#     --vec_backend torch \
+#     --vmax 1.5 \
+#     --umax 2.0  \
+#     --k_pos 0.1 \
+#     --k_dock 0.025 \
+#     --train_ic_vmax 1.50 \
+#     --steps_per_env 512
 
 # run_step "Training_Policy_0.1u_1.5vmax" \
 #   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-#     --out_dir Training_Policy_0.5u_1vmax \
+#     --out_dir Training_Policy_0.1u_1.5vmax \
 #     --device cuda \
 #     --vec_backend torch \
-#     --train_ic_vmax 0.25 \
 #     --vmax 1.5 \
 #     --umax 0.1  \
 #     --k_pos 0.025 \

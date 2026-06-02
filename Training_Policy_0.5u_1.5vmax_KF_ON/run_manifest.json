@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-05-28T20:20:54.418882+00:00",
+  "created_utc": "2026-06-02T19:38:55.702579+00:00",
   "out_dir": "Training_Policy_0.5u_1.5vmax_KF_ON",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
@@ -18,7 +18,7 @@
       "train_ic_vmax": 1.0,
       "use_kf": true,
       "reward_type": "zero_sum_kf",
-      "estimator_kind": null,
+      "estimator_kind": "ekf",
       "num_envs": 256,
       "steps_per_env": 1024,
       "total_updates": 1000,
@@ -28,7 +28,7 @@
       "vec_backend": "torch",
       "vec_workers": null,
       "mp_start_method": null,
-      "ekf_jacobian_mode": null,
+      "ekf_jacobian_mode": "exact",
       "tb_logdir": null,
       "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_KF_ON",
       "disable_tensorboard": false
@@ -45,6 +45,7 @@
       "k_dock": 0.0125,
       "train_ic_vmax": 1.0,
       "use_kf": true,
+      "estimator_kind": "ekf",
       "reward_type": "zero_sum_kf",
       "num_envs": 256,
       "steps_per_env": 1024,
@@ -53,6 +54,9 @@
       "minibatch_size": 4096,
       "log_every": 10,
       "vec_backend": "torch",
+      "ukf": {
+        "ekf_jacobian_mode": "exact"
+      },
       "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_KF_ON"
     },
     "training config used": {
@@ -372,7 +376,7 @@
   "stages": [
     {
       "name": "PHASE0_train_def0",
-      "start_utc": "2026-05-28T20:20:54.429115+00:00",
+      "start_utc": "2026-06-02T19:38:55.713356+00:00",
       "meta": {
         "phase_name": "def0",
         "attacker_mode": "rule",
@@ -388,6 +392,7 @@
           "k_dock": 0.0125,
           "train_ic_vmax": 1.0,
           "use_kf": true,
+          "estimator_kind": "ekf",
           "reward_type": "zero_sum_kf",
           "num_envs": 256,
           "steps_per_env": 1024,
@@ -396,12 +401,15 @@
           "minibatch_size": 4096,
           "log_every": 10,
           "vec_backend": "torch",
+          "ukf": {
+            "ekf_jacobian_mode": "exact"
+          },
           "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_KF_ON",
           "hit_buffer_def": 0.25
         }
       },
-      "end_utc": "2026-05-28T20:32:50.077788+00:00",
-      "duration_s": 715.6486721260007
+      "end_utc": "2026-06-02T19:42:54.910271+00:00",
+      "duration_s": 239.19691393407993
     }
   ]
 }

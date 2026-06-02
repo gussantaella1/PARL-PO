@@ -1,0 +1,48 @@
+\begin{algorithm}[H]
+\caption{Velocity CBF-QP Saturation Filter}
+\label{alg:velocity-cbf-qp}
+\begin{algorithmic}[1]
+\State \textbf{Given:} nominal action $u_t^{\mathrm{nom}}$, agent state $(p_t,v_t)$, box bounds $-u_{\max}\le u\le u_{\max}$, speed limit $v_{\max}$, CBF gain $\alpha$, HCW mean motion $n$
+\State \textbf{Compute the barrier value:}
+\State \hspace{1em} $h_t \leftarrow v_{\max}^2-\|v_t\|_2^2$
+\State \textbf{Compute the HCW drift in the velocity channel:}
+\State \hspace{1em}
+\[
+f_v(p_t,v_t)\leftarrow
+\begin{bmatrix}
+3n^2 p_{x,t}+2n v_{y,t}\\
+-2n v_{x,t}\\
+-n^2 p_{z,t}
+\end{bmatrix}
+\]
+\State \textbf{Form the CBF half-space from $\dot h_t+\alpha h_t\ge 0$:}
+\State \hspace{1em}
+\[
+a_t \leftarrow 2v_t,\qquad
+b_t \leftarrow \alpha h_t - 2 v_t^\top f_v(p_t,v_t)
+\]
+\State \textbf{Pose the box-constrained projection:}
+\State \hspace{1em}
+\[
+u_t^\star \leftarrow
+\arg\min_{u}\ \tfrac12\|u-u_t^{\mathrm{nom}}\|_2^2
+\quad\text{s.t.}\quad
+a_t^\top u \le b_t,\ \ -u_{\max}\le u\le u_{\max}
+\]
+\State \textbf{Check whether the clipped nominal action is already feasible:}
+\State \hspace{1em} Clip $u_t^{\mathrm{nom}}$ to the box bounds; if the clipped action already satisfies $a_t^\top u \le b_t$, return it
+\State \textbf{Construct the box corner that minimizes the half-space left-hand side:}
+\State \hspace{1em} Let $u_{\min}$ have components $(u_{\min})_k=-u_{\max}$ if $(a_t)_k\ge 0$ and $(u_{\min})_k=+u_{\max}$ otherwise
+\State \textbf{Handle the infeasible case:}
+\State \hspace{1em} If $a_t^\top u_{\min}>b_t$, return the least-violating box action $u_t^\star\leftarrow u_{\min}$
+\State \textbf{Otherwise search the KKT multiplier:}
+\State \hspace{1em}
+\[
+u(\lambda)\leftarrow \mathrm{clip}\!\big(u_t^{\mathrm{nom}}-\lambda a_t,\ -u_{\max},\ u_{\max}\big)
+\]
+\State \textbf{Bracket and bisect $\lambda$:}
+\State \hspace{1em} Increase $\lambda$ until $a_t^\top u(\lambda)\le b_t$, then bisect on $\lambda$ to the desired tolerance
+\State \textbf{Return the projected feasible action:}
+\State \hspace{1em} $u_t^\star \leftarrow u(\lambda)$
+\end{algorithmic}
+\end{algorithm}

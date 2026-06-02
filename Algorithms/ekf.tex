@@ -1,0 +1,49 @@
+\begin{algorithm}[H]
+\caption{Agent-Centric Bearing-Only Kalman Filter Update}
+\label{alg:kf-methodology}
+\begin{algorithmic}[1]
+\State \textbf{Given:} HCW dynamics $(A,B)$, step size $\Delta t$, measurement period $m$, process noise $Q$, measurement noise $R$
+\State \textbf{Initialize the agent beliefs:}
+\State \hspace{1em} Initialize defender belief over attacker $(\hat{x}^{D\to A}_0,P^{D\to A}_0)$ and attacker belief over defender $(\hat{x}^{A\to D}_0,P^{A\to D}_0)$
+\State \textbf{Define the measurement model:}
+\State \hspace{1em} For observer $i$ and target $j$, let
+\[
+d_t^{i\to j}=p_t^j-p_t^i,\quad
+b_t^{i\to j}=R_{wb}^i\frac{d_t^{i\to j}}{\|d_t^{i\to j}\|_2},\quad
+h(p_t^i,R_{wb}^i,p_t^j)=
+\begin{bmatrix}
+\mathrm{atan2}(b_{y,t}^{i\to j},\,b_{x,t}^{i\to j})\\[2pt]
+\mathrm{atan2}\!\big(b_{z,t}^{i\to j},\,\sqrt{(b_{x,t}^{i\to j})^2+(b_{y,t}^{i\to j})^2}\big)
+\end{bmatrix}
+\]
+\For{$t=1,\dots,T$}
+  \State \textbf{Propagate the true defender and attacker states:}
+  \State \hspace{1em} Apply controls $u_t^{D},u_t^{A}$
+  \For{each observer-target pair $(i,j)\in\{(D,A),(A,D)\}$}
+    \State \textbf{Select the filter control input:}
+    \State \hspace{1em} $\tilde{u}_t^j\leftarrow \texttt{action\_access}$
+    \State \textbf{Predict the belief mean and covariance:}
+    \State \hspace{1em} $\hat{x}_{t|t-1}^{i\to j}\leftarrow A\hat{x}_{t-1|t-1}^{i\to j}+B\tilde{u}_t^j$
+    \State \hspace{1em} $P_{t|t-1}^{i\to j}\leftarrow A P_{t-1|t-1}^{i\to j} A^\top + Q + B\Sigma_u B^\top$
+    \If{$t \bmod m = 0$}
+      \State \textbf{Form the noisy bearing measurement:}
+      \State \hspace{1em} $z_t^{i\to j}\leftarrow h(p_t^i,R_{wb}^i,p_t^j)+\nu_t$, $\nu_t\sim\mathcal{N}(0,R)$
+      \State \textbf{Apply the EKF correction:}
+      \State \hspace{1em} Linearize $h$, compute innovation $y_t^{i\to j}=z_t^{i\to j}-\hat{z}_{t|t-1}^{i\to j}$, and update the belief
+      \State \textbf{Log the innovation and covariance diagnostics:}
+      \State \hspace{1em} Log $\|y_t^{i\to j}\|_2^2$ and $\mathrm{tr}(P^{i\to j}_{t,\mathrm{pos}})$
+    \EndIf
+    \If{belief diverges or leaves the allowed radius bound}
+      \State \textbf{Repair the divergent belief:}
+      \State \hspace{1em} Clip/reset belief and restore covariance to $P_0$
+    \EndIf
+  \EndFor
+  \State \textbf{Build the agent observations from truth and belief:}
+  \State \hspace{1em} Build each agent observation from true self-state and estimated opponent state
+  \State \textbf{Compute reward and termination from the true physical state:}
+  \State \hspace{1em} Evaluate reward and terminal conditions from the true propagated state
+\EndFor
+\State \textbf{Return the final beliefs and belief-space observations:}
+\State \hspace{1em} $(\hat{x}^{D\to A}_{T|T},P^{D\to A}_{T|T})$, $(\hat{x}^{A\to D}_{T|T},P^{A\to D}_{T|T})$, and the resulting belief-space agent observations
+\end{algorithmic}
+\end{algorithm}

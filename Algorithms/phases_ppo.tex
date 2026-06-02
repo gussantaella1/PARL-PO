@@ -1,0 +1,42 @@
+\begin{algorithm}[H]
+\caption{Phased Alternating Training Cycle with Opponent Randomization}
+\label{alg:ppo_phases}
+\begin{algorithmic}[1]
+\State \textbf{Phase 0: Train defender teacher $\pi_{def,0}$ against the rule-based attacker:}
+\State \hspace{1em} Build cfg with $\texttt{attacker\_mode}=\textsc{rule}$ and $\texttt{train\_role}=\textsc{def}$
+\State \hspace{1em} Do not use a checkpoint-based opponent mixture in this phase
+\State \hspace{1em} Train the defender teacher and retain checkpoint $\theta_{D0}$
+
+\State \textbf{Phase 1: Train attacker teacher $\pi_{att,1}$ against a frozen defender mixture based on $\pi_{def,0}$:}
+\State \hspace{1em} Build cfg with $\texttt{attacker\_mode}=\textsc{rl}$ and $\texttt{train\_role}=\textsc{att}$
+\State \hspace{1em} Load $\theta_{D0}$ and freeze defender parameters
+\State \hspace{1em} Define opponent variants from the same frozen defender checkpoint:
+\Statex \hspace{2em} full: $(\texttt{action\_scale},\texttt{noise\_std})=(1.0,0.0)$
+\Statex \hspace{2em} weak: $(0.25,0.05)$
+\Statex \hspace{2em} very-weak: $(0.0,0.0)$
+\State \hspace{1em} Set
+\Statex \hspace{2em}
+$\texttt{opp\_mix}\gets\{(\pi_{def,0}^{\text{full}},0.5),(\pi_{def,0}^{\text{weak}},0.3),(\pi_{def,0}^{\text{very\mbox{-}weak}},0.2)\}$
+\State \hspace{1em} Resample the active opponent variant from $\texttt{opp\_mix}$ at each episode
+\State \hspace{1em} Train the attacker teacher and retain checkpoint $\theta_{A1}$
+
+\State \textbf{Phase 2: Fine-tune defender teacher $\pi_{def,0}\!\rightarrow\!\pi_{def,1}$ against a frozen attacker mixture based on $\pi_{att,1}$:}
+\State \hspace{1em} Build cfg with $\texttt{attacker\_mode}=\textsc{rl}$ and $\texttt{train\_role}=\textsc{def}$
+\State \hspace{1em} Load $\theta_{D0}$ as the defender initialization
+\State \hspace{1em} Load $\theta_{A1}$ and freeze attacker parameters
+\State \hspace{1em} Define opponent variants from the same frozen attacker checkpoint:
+\Statex \hspace{2em} full: $(\texttt{action\_scale},\texttt{noise\_std})=(1.0,0.0)$
+\Statex \hspace{2em} weak: $(0.25,0.05)$
+\Statex \hspace{2em} very-weak: $(0.0,0.0)$
+\State \hspace{1em} Set
+\Statex \hspace{2em}
+$\texttt{opp\_mix}\gets\{(\pi_{att,1}^{\text{full}},0.5),(\pi_{att,1}^{\text{weak}},0.3),(\pi_{att,1}^{\text{very\mbox{-}weak}},0.2)\}$
+\State \hspace{1em} Resample the active opponent variant from $\texttt{opp\_mix}$ at each episode
+\State \hspace{1em} Train the defender teacher and retain checkpoint $\theta_{D1}$
+\State \textbf{Continue the alternating procedure for subsequent phases:}
+\State \hspace{1em} Repeat the same attacker-training and defender-training pattern with the most recent
+\State \hspace{1em} frozen opponent checkpoint(s) and the corresponding checkpoint-based opponent mixture
+\State \hspace{1em} until the final scheduled phase is reached
+\State \hspace{1em} (here, Phase 3 trains $\pi_{att,2}$ and Phase 4 trains $\pi_{def,2}$, yielding five phases total including Phase 0)
+\end{algorithmic}
+\end{algorithm}

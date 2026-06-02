@@ -1,0 +1,29 @@
+\begin{algorithm}[H]
+\caption{KF-On Modifications to Algorithm \ref{alg:ppo_full_obs}}
+\label{alg:ppo_kf_on}
+\begin{algorithmic}[1]
+\Require Estimator $\mathcal{E}$ with belief state $\hat{x}_t$ and measurement model $y_t$
+
+\State Run Algorithm \ref{alg:ppo_full_obs} unchanged, except replace the observation/reward portion of each rollout step by the following:
+
+\State \textbf{Maintain both truth and belief:}
+\State \hspace{1em} The simulator propagates the true state $x_t$, while the policy receives observations derived from the estimator state $\hat{x}_t$
+
+\State \textbf{Build estimator-based observations:}
+\State \hspace{1em} $o_t^r \leftarrow \mathrm{Obs}^{\mathrm{KF}}_r(x_t,\hat{x}_t)$
+\State \hspace{1em} $o_t^{\bar r} \leftarrow \mathrm{Obs}^{\mathrm{KF}}_{\bar r}(x_t,\hat{x}_t)$
+\Comment{Opponent-state entries are replaced by estimator beliefs when not directly observed}
+
+\State \textbf{Select actions exactly as in Algorithm \ref{alg:ppo_full_obs}}
+
+\State \textbf{Propagate truth, then update the estimator:}
+\State \hspace{1em} $x_{t+1} \leftarrow \mathcal{D}(x_t,a_t^r,a_t^{\bar r})$
+\State \hspace{1em} $\hat{x}_{t+1} \leftarrow \mathcal{E}(\hat{x}_t,a_t^r,a_t^{\bar r},y_{t+1})$
+
+\State \textbf{Compute reward from the true state:}
+\State \hspace{1em} $r_t^r \leftarrow \mathcal{R}(x_{t+1},a_t^r,a_t^{\bar r})$
+\Comment{Current KF-on training still uses true-state reward geometry}
+
+\State \textbf{Store the estimator-based observation in the rollout buffer, then continue with bootstrap, GAE, and PPO updates exactly as in Algorithm \ref{alg:ppo_full_obs}}
+\end{algorithmic}
+\end{algorithm}
