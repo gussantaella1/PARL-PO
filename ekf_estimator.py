@@ -13,6 +13,13 @@ except Exception:  # pragma: no cover - torch is expected in this repo, but keep
 from dyn_models import as_numpy_const, hcw_discrete_mats, hcw_mean_motion
 
 
+def _canonical_dyn_name(name: Any) -> str:
+    key = str(name or "cv").strip().lower()
+    if key in {"elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"}:
+        return "elliptic_ltv"
+    return key
+
+
 def _is_torch_tensor(value: Any) -> bool:
     return torch is not None and isinstance(value, torch.Tensor)
 
@@ -166,6 +173,7 @@ class AgentEKF:
         dt,
         dyn="cv",
         hcw=None,
+        ltv=None,
         jacobian_mode="exact",
         linearization_group="default",
         use_torch_backend: bool = False,
@@ -188,17 +196,40 @@ class AgentEKF:
         self._R = _psd_enforce(self._matrix_to_backend(R, shape=(2, 2)))
         self.dt = float(dt)
 
-        self._dyn = (dyn or "cv").lower()
+        self._dyn = _canonical_dyn_name(dyn)
         self._hcw_params = (hcw or {})
+        self._ltv_params = (ltv or {})
         self._jacobian_mode = self._normalize_jacobian_mode(jacobian_mode)
         self._linearization_group = str(linearization_group)
         self._Ad = None
         self._Bd = None
+        self._Ad_seq = None
+        self._Bd_seq = None
+        self._predict_step = 0
         if self._dyn == "hcw":
             n = hcw_mean_motion(self._hcw_params)
             Ad_mx, Bd_mx = hcw_discrete_mats(n, self.dt)
             self._Ad = self._matrix_to_backend(as_numpy_const(Ad_mx))
             self._Bd = self._matrix_to_backend(as_numpy_const(Bd_mx))
+        elif self._dyn == "elliptic_ltv":
+            Ad_seq = self._ltv_params.get("Ad_seq", None)
+            Bd_seq = self._ltv_params.get("Bd_seq", None)
+            if Ad_seq is None or Bd_seq is None:
+                raise ValueError("AgentEKF dyn='elliptic_ltv' requires ltv['Ad_seq'] and ltv['Bd_seq'].")
+            self._Ad_seq = self._to_backend(Ad_seq, copy=True)
+            self._Bd_seq = self._to_backend(Bd_seq, copy=True)
+            if self._Ad_seq.ndim != 3 or tuple(self._Ad_seq.shape[1:]) != (6, 6):
+                raise ValueError(
+                    f"Expected ltv['Ad_seq'] to have shape (N, 6, 6), got {tuple(self._Ad_seq.shape)}."
+                )
+            if self._Bd_seq.ndim != 3 or tuple(self._Bd_seq.shape[1:]) != (6, 3):
+                raise ValueError(
+                    f"Expected ltv['Bd_seq'] to have shape (N, 6, 3), got {tuple(self._Bd_seq.shape)}."
+                )
+            if int(self._Ad_seq.shape[0]) != int(self._Bd_seq.shape[0]):
+                raise ValueError(
+                    "ltv['Ad_seq'] and ltv['Bd_seq'] must have the same number of time steps."
+                )
 
     def _resolve_device(self, device: str | None):
         if torch is None:
@@ -334,7 +365,15 @@ class AgentEKF:
         B[3:6, 0:3] = dt * self._eye(3)
         return B
 
-    def linear_dynamics_mats(self, dt=None):
+    def _ltv_step_mats(self, step_index: int | None = None):
+        if self._Ad_seq is None or self._Bd_seq is None:
+            raise RuntimeError("LTV dynamics selected, but Ad/Bd sequences were not initialized.")
+        step = self._predict_step if step_index is None else int(step_index)
+        max_idx = int(self._Ad_seq.shape[0] - 1)
+        idx = min(max(step, 0), max_idx)
+        return self._Ad_seq[idx], self._Bd_seq[idx]
+
+    def linear_dynamics_mats(self, dt=None, step_index: int | None = None):
         if dt is None:
             dt = self.dt
         if self._dyn == "hcw":
@@ -345,6 +384,8 @@ class AgentEKF:
                 Bd6 = self._matrix_to_backend(as_numpy_const(Bd_mx))
             else:
                 Ad6, Bd6 = self._Ad, self._Bd
+        elif self._dyn == "elliptic_ltv":
+            Ad6, Bd6 = self._ltv_step_mats(step_index=step_index)
         else:
             Ad6, Bd6 = self.F(dt), self.B_accel(dt)
 
@@ -358,12 +399,12 @@ class AgentEKF:
         B[:6, :] = Bd6
         return A, B
 
-    def _f_backend(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None):
+    def _f_backend(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None, step_index: int | None = None):
         """
         Deterministic dynamics: x+ = A x + B u  (if u provided).
         If u_frame='body', convert u_body -> u_world using R_wb_tgt (world->body).
         """
-        A, B = self.linear_dynamics_mats(dt)
+        A, B = self.linear_dynamics_mats(dt, step_index=step_index)
         x_state = self._vector_to_backend(x)
         x_next = A @ x_state
         if u is not None:
@@ -377,8 +418,10 @@ class AgentEKF:
             x_next = x_next + B @ u_vec
         return x_next
 
-    def f(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None):
-        return self._to_numpy(self._f_backend(x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt))
+    def f(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None, step_index: int | None = None):
+        return self._to_numpy(
+            self._f_backend(x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt, step_index=step_index)
+        )
 
     def _h_backend(self, x, p_obs, R_wb):
         x_state = self._vector_to_backend(x)
@@ -504,9 +547,17 @@ class AgentEKF:
             self._Ad = self._matrix_to_backend(as_numpy_const(Ad_mx))
             self._Bd = self._matrix_to_backend(as_numpy_const(Bd_mx))
 
-        self._x = self._f_backend(self._x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt)
+        step_index = self._predict_step if self._dyn == "elliptic_ltv" else None
+        self._x = self._f_backend(
+            self._x,
+            dt=dt,
+            u=u,
+            u_frame=u_frame,
+            R_wb_tgt=R_wb_tgt,
+            step_index=step_index,
+        )
 
-        Ad, Bd = self.linear_dynamics_mats(dt)
+        Ad, Bd = self.linear_dynamics_mats(dt, step_index=step_index)
         Pp = Ad @ self._P @ Ad.transpose(-1, -2) + self._Q
 
         if u_cov is not None:
@@ -515,6 +566,8 @@ class AgentEKF:
 
         self._P = _psd_enforce(_symmetrize(Pp))
         self.dt = float(dt)
+        if self._dyn == "elliptic_ltv":
+            self._predict_step += 1
 
     def update(self, z, p_obs, R_wb):
         """

@@ -750,7 +750,14 @@ def _supports_batched_cuda_eval(cfg: Dict[str, Any], opponent_source: str) -> bo
         return False
     if int(cfg.get("num_attackers", 1)) != 1:
         return False
-    if str(cfg.get("dynamics", "hcw")).strip().lower() != "hcw":
+    dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
+    if dyn_name not in ("hcw", "elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+        return False
+    if (
+        dyn_name != "hcw"
+        and bool(cfg.get("use_kf", False))
+        and str(cfg.get("estimator_kind", "ukf")).strip().lower() != "ekf"
+    ):
         return False
     disp_params = ((cfg.get("dispersion", {}) or {}).get("params", {}) or {})
     if bool(disp_params.get("enabled", False)):

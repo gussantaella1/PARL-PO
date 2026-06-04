@@ -204,11 +204,21 @@ def velocity_cbf_halfspace_torch(
     if Ad_t is None or Bd_t is None:
         raise ValueError("Ad_t and Bd_t are required for the generic velocity CBF half-space.")
 
-    eye = torch.eye(2 * D, dtype=Ad_t.dtype, device=Ad_t.device)
-    Ac_t = (Ad_t - eye) / float(dt)
-    Bc_t = Bd_t / float(dt)
-    drift = torch.matmul(x, Ac_t[D : 2 * D, :].transpose(0, 1))
-    Gv = Bc_t[D : 2 * D, :]
-    a = 2.0 * torch.matmul(v, Gv)
+    if Ad_t.ndim == 2:
+        eye = torch.eye(2 * D, dtype=Ad_t.dtype, device=Ad_t.device)
+        Ac_t = (Ad_t - eye) / float(dt)
+        Bc_t = Bd_t / float(dt)
+        drift = torch.matmul(x, Ac_t[D : 2 * D, :].transpose(0, 1))
+        Gv = Bc_t[D : 2 * D, :]
+        a = 2.0 * torch.matmul(v, Gv)
+    elif Ad_t.ndim == 3:
+        eye = torch.eye(2 * D, dtype=Ad_t.dtype, device=Ad_t.device).unsqueeze(0)
+        Ac_t = (Ad_t - eye) / float(dt)
+        Bc_t = Bd_t / float(dt)
+        drift = torch.bmm(Ac_t[:, D : 2 * D, :], x.unsqueeze(-1)).squeeze(-1)
+        Gv = Bc_t[:, D : 2 * D, :]
+        a = 2.0 * torch.bmm(v.unsqueeze(1), Gv).squeeze(1)
+    else:
+        raise ValueError(f"Expected Ad_t to have ndim 2 or 3, got {Ad_t.ndim}.")
     b = float(alpha) * h - 2.0 * torch.sum(v * drift, dim=-1)
     return a, b

@@ -13,8 +13,8 @@ DRY_RUN=0
 SELECTED_RUN_DIRS=(
 
   # "Training_Policy_0.5u_1.5vmax_0.25_ic"
-  "Training_Policy_0.5u_1.5vmax"
-  # "Training_Policy_0.1u_1vmax"
+  # "Training_Policy_0.5u_1.5vmax"
+  "Training_Policy_0.1u_1vmax"
 
 
 

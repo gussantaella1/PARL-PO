@@ -708,11 +708,17 @@ class Env:
 
     def _resolve_estimator_dynamics(self) -> str:
         dyn_name = str(self.cfg.get("dynamics", "hcw")).strip().lower()
-        if dyn_name != "hcw":
+        if dyn_name in ("hcw",):
+            return "hcw"
+        if dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+            if self.estimator_kind == "ekf":
+                return "elliptic_ltv"
             raise ValueError(
                 f"{self.estimator_label} estimator currently requires cfg['dynamics']='hcw'; got '{dyn_name}'."
             )
-        return "hcw"
+        raise ValueError(
+            f"{self.estimator_label} estimator does not support cfg['dynamics']='{dyn_name}'."
+        )
 
     def _make_estimator(self, x0_est: np.ndarray, linearization_group: str = "default"):
         estimator_kwargs = {}
@@ -721,6 +727,15 @@ class Env:
             estimator_kwargs["linearization_group"] = linearization_group
             estimator_kwargs["use_torch_backend"] = self._ekf_use_torch
             estimator_kwargs["device"] = self.cfg.get("device", "cpu")
+        if self._estimator_dyn == "elliptic_ltv":
+            dyn_cfg = self.cfg.get("dyn", {}) or {}
+            Ad_seq = dyn_cfg.get("Ad_seq", None)
+            Bd_seq = dyn_cfg.get("Bd_seq", None)
+            if Ad_seq is None or Bd_seq is None:
+                raise ValueError(
+                    "EKF with dynamics='elliptic_ltv' requires cfg['dyn']['Ad_seq'] and cfg['dyn']['Bd_seq']."
+                )
+            estimator_kwargs["ltv"] = {"Ad_seq": Ad_seq, "Bd_seq": Bd_seq}
         return KF_CV(
             x0=x0_est,
             P0=self._ukf_P0.copy(),
@@ -2118,6 +2133,17 @@ class TorchVecEnv:
         self.center_t = torch.as_tensor(base.center, dtype=self.dtype, device=self.device)
         self.Ad_t = torch.as_tensor(base.Ad, dtype=self.dtype, device=self.device)
         self.Bd_t = torch.as_tensor(base.Bd, dtype=self.dtype, device=self.device)
+        dyn_cfg = (base.cfg.get("dyn", {}) or {})
+        self._dyn_type = str(dyn_cfg.get("type", "lti") or "lti").strip().lower()
+        self._Ad_seq_t = None
+        self._Bd_seq_t = None
+        if self._dyn_type == "ltv":
+            Ad_seq = dyn_cfg.get("Ad_seq", None)
+            Bd_seq = dyn_cfg.get("Bd_seq", None)
+            if Ad_seq is None or Bd_seq is None:
+                raise ValueError("TorchVecEnv requires cfg['dyn']['Ad_seq'] and ['Bd_seq'] for LTV dynamics.")
+            self._Ad_seq_t = torch.as_tensor(Ad_seq, dtype=self.dtype, device=self.device)
+            self._Bd_seq_t = torch.as_tensor(Bd_seq, dtype=self.dtype, device=self.device)
         self.u_lo_t = torch.tensor(self.u_lo, dtype=self.dtype, device=self.device)
         self.u_hi_t = torch.tensor(self.u_hi, dtype=self.dtype, device=self.device)
 
@@ -2171,6 +2197,7 @@ class TorchVecEnv:
             self._ekf_state_dim = int(base._ukf_state_dim)
             self._ekf_every = int(base._ukf_every)
             self._ekf_jacobian_mode = str(base._ekf_jacobian_mode)
+            self._ekf_dyn_name = str(getattr(base, "_estimator_dyn", "hcw"))
             self._kf_action_access = str(base._ukf_action_access)
             self._ukf_init_mean_pos_std = float(base._ukf_init_mean_pos_std)
             self._ukf_init_mean_vel_std = float(base._ukf_init_mean_vel_std)
@@ -2194,8 +2221,22 @@ class TorchVecEnv:
             self._ekf_I_t = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device)
             self._ekf_I3_t = torch.eye(3, dtype=self._ekf_dtype, device=self.device)
             self._ekf_I2_t = torch.eye(2, dtype=self._ekf_dtype, device=self.device)
+            self._ekf_Ad_seq_t = None
+            self._ekf_Bd_seq_t = None
             self._ekf_Ad_t = torch.as_tensor(base.Ad, dtype=self._ekf_dtype, device=self.device)
             self._ekf_Bd_t = torch.as_tensor(base.Bd, dtype=self._ekf_dtype, device=self.device)
+            if self._ekf_dyn_name == "elliptic_ltv":
+                dyn_cfg = base.cfg.get("dyn", {}) or {}
+                Ad_seq = dyn_cfg.get("Ad_seq", None)
+                Bd_seq = dyn_cfg.get("Bd_seq", None)
+                if Ad_seq is None or Bd_seq is None:
+                    raise ValueError(
+                        "Batched EKF with elliptic_ltv requires cfg['dyn']['Ad_seq'] and cfg['dyn']['Bd_seq']."
+                    )
+                self._ekf_Ad_seq_t = torch.as_tensor(Ad_seq, dtype=self._ekf_dtype, device=self.device)
+                self._ekf_Bd_seq_t = torch.as_tensor(Bd_seq, dtype=self._ekf_dtype, device=self.device)
+                self._ekf_Ad_t = self._ekf_Ad_seq_t[0]
+                self._ekf_Bd_t = self._ekf_Bd_seq_t[0]
             if self._ekf_state_dim == 9:
                 A9 = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device)
                 B9 = torch.zeros((self._ekf_state_dim, 3), dtype=self._ekf_dtype, device=self.device)
@@ -2204,6 +2245,15 @@ class TorchVecEnv:
                 B9[:6, :] = self._ekf_Bd_t
                 self._ekf_Ad_t = A9
                 self._ekf_Bd_t = B9
+                if self._ekf_Ad_seq_t is not None and self._ekf_Bd_seq_t is not None:
+                    steps = int(self._ekf_Ad_seq_t.shape[0])
+                    A9_seq = torch.eye(self._ekf_state_dim, dtype=self._ekf_dtype, device=self.device).unsqueeze(0).repeat(steps, 1, 1)
+                    B9_seq = torch.zeros((steps, self._ekf_state_dim, 3), dtype=self._ekf_dtype, device=self.device)
+                    A9_seq[:, :6, :6] = self._ekf_Ad_seq_t
+                    A9_seq[:, :6, 6:9] = self._ekf_Bd_seq_t
+                    B9_seq[:, :6, :] = self._ekf_Bd_seq_t
+                    self._ekf_Ad_seq_t = A9_seq
+                    self._ekf_Bd_seq_t = B9_seq
             self._def_ekf_x_t = torch.zeros(
                 (self.num_envs, self._ekf_state_dim),
                 dtype=self._ekf_dtype,
@@ -2670,14 +2720,48 @@ class TorchVecEnv:
         x2 = self.state_t[:, 2 * D : 4 * D]
         return x1[:, :D], x1[:, D:], x2[:, :D], x2[:, D:]
 
+    def _current_linear_dyn_mats(self):
+        if self._dyn_type == "ltv":
+            if self._Ad_seq_t is None or self._Bd_seq_t is None:
+                raise RuntimeError("LTV dynamics selected, but Ad/Bd sequences are unavailable.")
+            max_idx = int(self._Ad_seq_t.shape[0] - 1)
+            idx = torch.clamp(self._t_steps, min=0, max=max_idx)
+            return self._Ad_seq_t[idx], self._Bd_seq_t[idx]
+        return self.Ad_t, self.Bd_t
+
+    def _linear_step_batch(
+        self,
+        x: torch.Tensor,
+        u: torch.Tensor,
+        Ad_t: torch.Tensor,
+        Bd_t: torch.Tensor,
+    ) -> torch.Tensor:
+        if Ad_t.ndim == 2:
+            return torch.matmul(x, Ad_t.transpose(0, 1)) + torch.matmul(u, Bd_t.transpose(0, 1))
+        if Ad_t.ndim == 3:
+            return torch.bmm(Ad_t, x.unsqueeze(-1)).squeeze(-1) + torch.bmm(Bd_t, u.unsqueeze(-1)).squeeze(-1)
+        raise ValueError(f"Expected Ad_t to have ndim 2 or 3, got {Ad_t.ndim}.")
+
     def _fuel_fractions(self):
         fuel_frac_def = (self.m_def_t - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
         fuel_frac_att = (self.m_att_t - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
         return fuel_frac_def.clamp(0.0, 1.0), fuel_frac_att.clamp(0.0, 1.0)
 
-    def _apply_velocity_cbf_filter_batch(self, x: torch.Tensor, u_nom: torch.Tensor) -> torch.Tensor:
+    def _apply_velocity_cbf_filter_batch(
+        self,
+        x: torch.Tensor,
+        u_nom: torch.Tensor,
+        *,
+        Ad_t: torch.Tensor | None = None,
+        Bd_t: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if not self.velocity_cbf_enabled:
             return torch.clamp(u_nom, min=self.u_lo_t, max=self.u_hi_t)
+
+        if Ad_t is None:
+            Ad_t = self.Ad_t
+        if Bd_t is None:
+            Bd_t = self.Bd_t
 
         a, b = velocity_cbf_halfspace_torch(
             x,
@@ -2831,6 +2915,15 @@ class TorchVecEnv:
             return u_meas, cov
         return None, None
 
+    def _ekf_current_linear_dyn_mats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._ekf_Ad_seq_t is not None and self._ekf_Bd_seq_t is not None:
+            max_idx = int(self._ekf_Ad_seq_t.shape[0] - 1)
+            # The plant step already advanced self._t_steps before the EKF predict call,
+            # so the estimator needs the just-used transition at index (t-1).
+            idx = torch.clamp(self._t_steps - 1, min=0, max=max_idx)
+            return self._ekf_Ad_seq_t[idx], self._ekf_Bd_seq_t[idx]
+        return self._ekf_Ad_t, self._ekf_Bd_t
+
     def _ekf_predict_batch(
         self,
         x_state: torch.Tensor,
@@ -2838,14 +2931,23 @@ class TorchVecEnv:
         u_true: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         u_predict, u_cov = self._ekf_predict_control(u_true)
-        x_pred = torch.matmul(x_state, self._ekf_Ad_t.transpose(0, 1))
-        if u_predict is not None:
-            x_pred = x_pred + torch.matmul(u_predict, self._ekf_Bd_t.transpose(0, 1))
-        A = self._ekf_Ad_t.unsqueeze(0)
-        P_pred = torch.matmul(A, torch.matmul(P_state, A.transpose(-1, -2))) + self._ekf_Q_t.unsqueeze(0)
-        if u_cov is not None:
-            B = self._ekf_Bd_t.unsqueeze(0)
-            P_pred = P_pred + torch.matmul(B, torch.matmul(u_cov, B.transpose(-1, -2)))
+        Ad_t, Bd_t = self._ekf_current_linear_dyn_mats()
+        if Ad_t.ndim == 2:
+            x_pred = torch.matmul(x_state, Ad_t.transpose(0, 1))
+            if u_predict is not None:
+                x_pred = x_pred + torch.matmul(u_predict, Bd_t.transpose(0, 1))
+            A = Ad_t.unsqueeze(0)
+            P_pred = torch.matmul(A, torch.matmul(P_state, A.transpose(-1, -2))) + self._ekf_Q_t.unsqueeze(0)
+            if u_cov is not None:
+                B = Bd_t.unsqueeze(0)
+                P_pred = P_pred + torch.matmul(B, torch.matmul(u_cov, B.transpose(-1, -2)))
+        else:
+            x_pred = torch.bmm(Ad_t, x_state.unsqueeze(-1)).squeeze(-1)
+            if u_predict is not None:
+                x_pred = x_pred + torch.bmm(Bd_t, u_predict.unsqueeze(-1)).squeeze(-1)
+            P_pred = torch.bmm(Ad_t, torch.bmm(P_state, Ad_t.transpose(-1, -2))) + self._ekf_Q_t.unsqueeze(0)
+            if u_cov is not None:
+                P_pred = P_pred + torch.bmm(Bd_t, torch.bmm(u_cov, Bd_t.transpose(-1, -2)))
         return x_pred, self._ekf_psd_enforce(P_pred)
 
     def _ekf_update_batch(
@@ -3114,8 +3216,9 @@ class TorchVecEnv:
 
         x1 = self.state_t[:, : 2 * self.D]
         x2 = self.state_t[:, 2 * self.D : 4 * self.D]
-        a1_cmd = self._apply_velocity_cbf_filter_batch(x1, a1_cmd)
-        a2_cmd = self._apply_velocity_cbf_filter_batch(x2, a2_cmd)
+        cur_Ad_t, cur_Bd_t = self._current_linear_dyn_mats()
+        a1_cmd = self._apply_velocity_cbf_filter_batch(x1, a1_cmd, Ad_t=cur_Ad_t, Bd_t=cur_Bd_t)
+        a2_cmd = self._apply_velocity_cbf_filter_batch(x2, a2_cmd, Ad_t=cur_Ad_t, Bd_t=cur_Bd_t)
         if torch.any(none_mask):
             a1_cmd = a1_cmd.clone()
             a1_cmd[none_mask] = 0.0
@@ -3139,10 +3242,10 @@ class TorchVecEnv:
             mdot_def = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
             mdot_att = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
 
-        x1n = torch.matmul(x1, self.Ad_t.transpose(0, 1)) + torch.matmul(a1_real, self.Bd_t.transpose(0, 1))
+        x1n = self._linear_step_batch(x1, a1_real, cur_Ad_t, cur_Bd_t)
         if torch.any(none_mask):
             x1n = torch.where(none_mask[:, None], x1, x1n)
-        x2n = torch.matmul(x2, self.Ad_t.transpose(0, 1)) + torch.matmul(a2_real, self.Bd_t.transpose(0, 1))
+        x2n = self._linear_step_batch(x2, a2_real, cur_Ad_t, cur_Bd_t)
         self.state_t = torch.cat([x1n, x2n], dim=-1)
         self._t_steps = self._t_steps + 1
 

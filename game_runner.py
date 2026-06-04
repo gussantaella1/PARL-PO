@@ -16,6 +16,15 @@ from paper_baseline_runner import _build_step_plant_single, _identity_R, _p3
 from rl_infer import RLPolicyDiff
 from ukf_estimator import KF_CV, _azel_from_body_vec, _body_bearing_from_world
 
+_WARN_ONCE_MESSAGES: set[str] = set()
+
+
+def _warn_once(msg: str) -> None:
+    if msg in _WARN_ONCE_MESSAGES:
+        return
+    _WARN_ONCE_MESSAGES.add(msg)
+    print(msg)
+
 
 def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
     u = np.asarray(u, float).reshape(-1)
@@ -137,6 +146,48 @@ def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
     if key not in {"ukf", "ekf"}:
         raise ValueError(f"Unsupported estimator_kind='{kind}'. Expected 'ukf' or 'ekf'.")
     return key
+
+
+def _canonical_estimator_dyn_name(raw_name: Any) -> str:
+    key = str(raw_name or "hcw").strip().lower()
+    if key in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+        return "elliptic_ltv"
+    return key
+
+
+def _estimator_supports_dynamics(cfg: Dict[str, Any], dyn_name: str | None = None) -> bool:
+    estimator_kind = _normalize_estimator_kind(cfg)
+    canonical_dyn = _canonical_estimator_dyn_name(cfg.get("dynamics", "hcw") if dyn_name is None else dyn_name)
+    if canonical_dyn == "hcw":
+        return True
+    if canonical_dyn == "elliptic_ltv":
+        return estimator_kind == "ekf"
+    return False
+
+
+def _estimator_factory_args(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    canonical_dyn = _canonical_estimator_dyn_name(cfg.get("dynamics", "hcw"))
+    estimator_kind = _normalize_estimator_kind(cfg)
+    args: Dict[str, Any] = {}
+    if canonical_dyn == "hcw":
+        args["dyn"] = "hcw"
+        args["hcw"] = cfg.get("hcw", {})
+    elif canonical_dyn == "elliptic_ltv" and estimator_kind == "ekf":
+        dyn_cfg = dict(cfg.get("dyn", {}) or {})
+        Ad_seq = dyn_cfg.get("Ad_seq", None)
+        Bd_seq = dyn_cfg.get("Bd_seq", None)
+        if Ad_seq is None or Bd_seq is None:
+            raise ValueError(
+                "EKF with dynamics='elliptic_ltv' requires cfg['dyn']['Ad_seq'] and cfg['dyn']['Bd_seq']."
+            )
+        args["dyn"] = "elliptic_ltv"
+        args["ltv"] = {"Ad_seq": Ad_seq, "Bd_seq": Bd_seq}
+    else:
+        raise ValueError(
+            f"{estimator_kind.upper()} estimator does not support dynamics='{canonical_dyn}' in this runner."
+        )
+    args.update(_ekf_factory_kwargs(cfg, linearization_group=linearization_group))
+    return args
 
 
 def _ekf_factory_kwargs(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
@@ -274,21 +325,31 @@ def run_batched_rhc_with_rl_and_collect_frames_3d(
     if not cfgs:
         return []
 
+    def _canonical_batched_dyn_name(raw_name: Any) -> str:
+        key = str(raw_name or "hcw").strip().lower()
+        if key in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+            return "elliptic_ltv"
+        return key
+
     cfg0 = cfgs[0]
     D = int(cfg0.get("D", np.asarray(cfg0["x0"]).shape[1] // 2))
     num_attackers = int(cfg0.get("num_attackers", 1))
     if num_attackers != 1:
         raise NotImplementedError("Batched eval currently supports num_attackers == 1 only.")
 
-    dyn_name = str(cfg0.get("dynamics", "hcw")).lower()
-    if dyn_name != "hcw":
-        raise NotImplementedError("Batched eval currently supports HCW dynamics only.")
+    dyn_name = _canonical_batched_dyn_name(cfg0.get("dynamics", "hcw"))
+    if dyn_name not in ("hcw", "elliptic_ltv"):
+        raise NotImplementedError("Batched eval currently supports HCW and elliptic_ltv dynamics only.")
+    if dyn_name != "hcw" and bool(cfg0.get("use_kf", False)) and not _estimator_supports_dynamics(cfg0, dyn_name):
+        raise NotImplementedError("Batched elliptic_ltv eval currently requires estimator_kind=ekf when use_kf=True.")
 
     for cfg in cfgs:
         if int(cfg.get("num_attackers", 1)) != 1:
             raise NotImplementedError("Batched eval currently supports num_attackers == 1 only.")
-        if str(cfg.get("dynamics", "hcw")).lower() != dyn_name:
+        if _canonical_batched_dyn_name(cfg.get("dynamics", "hcw")) != dyn_name:
             raise ValueError("All batched rollout configs must share the same dynamics model.")
+        if dyn_name != "hcw" and bool(cfg.get("use_kf", False)) and not _estimator_supports_dynamics(cfg, dyn_name):
+            raise NotImplementedError("Batched elliptic_ltv eval currently requires estimator_kind=ekf when use_kf=True.")
 
     t_fn0 = time.perf_counter()
     batch_size = len(cfgs)
@@ -716,8 +777,10 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     dyn_name = str(cfg.get("dynamics", "hcw")).lower()
     use_kf = bool(cfg.get("use_kf", False))
     estimator_kind = _normalize_estimator_kind(cfg)
-    if use_kf and dyn_name != "hcw":
-        print(f"[warn] {estimator_kind.upper()} in this runner is HCW-only; disabling estimator for non-HCW dynamics.")
+    if use_kf and not _estimator_supports_dynamics(cfg, dyn_name):
+        _warn_once(
+            f"[warn] {estimator_kind.upper()} in this runner does not support dynamics='{_canonical_estimator_dyn_name(dyn_name)}'; disabling estimator."
+        )
         use_kf = False
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
@@ -764,8 +827,6 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
             P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
             Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
         Rm = np.diag([sigma_az**2, sigma_el**2])
-        hcw_params = cfg.get("hcw", {})
-
         for j in range(Na):
             xA6 = _x6_from_xD(xA_list[j])
             xA6_mean = xA6.copy()
@@ -779,9 +840,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
                 Rm,
                 dt,
                 kind=estimator_kind,
-                dyn="hcw",
-                hcw=hcw_params,
-                **_ekf_factory_kwargs(cfg, linearization_group=f"defender_to_attacker_{j}"),
+                **_estimator_factory_args(cfg, linearization_group=f"defender_to_attacker_{j}"),
             )
             ukf_list.append(ukf_j)
             xA_est_list[j] = _xD_from_x6(np.r_[ukf_j.x[:3], ukf_j.x[3:6]]).astype(np.float32)
@@ -1283,11 +1342,13 @@ def run_rhc_with_rl_and_collect_frames_3d(
             return x6.astype(np.float32)
         return np.array([x6[0], x6[1], x6[3], x6[4]], dtype=np.float32)
 
-    # -------------------- optional UKFs (HCW-only) --------------------
+    # -------------------- optional estimators --------------------
     use_kf = bool(cfg.get("use_kf", False))
     estimator_kind = _normalize_estimator_kind(cfg)
-    if use_kf and dyn_name != "hcw":
-        print(f"[warn] {estimator_kind.upper()} in this runner is HCW-only; disabling estimator for non-HCW dynamics.")
+    if use_kf and not _estimator_supports_dynamics(cfg, dyn_name):
+        _warn_once(
+            f"[warn] {estimator_kind.upper()} in this runner does not support dynamics='{_canonical_estimator_dyn_name(dyn_name)}'; disabling estimator."
+        )
         use_kf = False
 
     est_hist = None
@@ -1324,7 +1385,6 @@ def run_rhc_with_rl_and_collect_frames_3d(
             P0 = np.diag([pos_std0**2] * 3 + [vel_std0**2] * 3)
             Q = Q_scale * np.diag([1, 1, 1, 1, 1, 1])
         Rm = np.diag([sigma_az**2, sigma_el**2])
-        hcw_params = cfg.get("hcw", {})
 
         x2_6 = _x6_from_xD(x2)
         x1_6 = _x6_from_xD(x1)
@@ -1346,9 +1406,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 Rm,
                 dt,
                 kind=estimator_kind,
-                dyn="hcw",
-                hcw=hcw_params,
-                **_ekf_factory_kwargs(cfg, linearization_group="observer_1_to_2"),
+                **_estimator_factory_args(cfg, linearization_group="observer_1_to_2"),
             )
             if who in ("both", "1->2")
             else None
@@ -1361,9 +1419,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
                 Rm,
                 dt,
                 kind=estimator_kind,
-                dyn="hcw",
-                hcw=hcw_params,
-                **_ekf_factory_kwargs(cfg, linearization_group="observer_2_to_1"),
+                **_estimator_factory_args(cfg, linearization_group="observer_2_to_1"),
             )
             if who in ("both", "2->1")
             else None
@@ -1638,7 +1694,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         x1 = step_plant_single(x1, u1_real, k)
         x2 = step_plant_single(x2, u2_real, k)
 
-        # 5) UKF estimation (HCW-only)
+        # 5) optional estimator update
         if use_kf and est_hist is not None:
             idx = len(exec_xyz1)
             take = (idx % meas_every) == 0
