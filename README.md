@@ -128,7 +128,7 @@ For the standard scripted sweeps:
 You can pass explicit run specs to the eval launchers:
 
 ```bash
-./run_eval_50m_sequence_all "Training_Policy_2.0u_1vmax:elliptic_ltv"
+./run_eval_50m_sequence_all "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
 ```
 
 Each run spec accepts `run_dir:dynamics` or `run_dir|dynamics`. If dynamics is

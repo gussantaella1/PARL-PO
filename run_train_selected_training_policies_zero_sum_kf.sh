@@ -19,15 +19,15 @@ DRY_RUN=0
 # These may be top-level runs or nested paths such as Legacy_Runs/... .
 SELECTED_RUN_DIRS=(
 
-  # "Training_Policy_0.5u_1.5vmax_0.25_ic"
-  # "Training_Policy_0.5u_1.5vmax"
-  "Training_Policy_0.1u_1vmax"
+  # "Training_Policy_0.5u_1.5vmax_0.25_icVmax"
+  # "Training_Policy_0.5u_1.5vmax_1.0_icVmax"
+  "Training_Policy_0.1u_1vmax_0.05_icVmax"
 
 
 
   #Failed
-  # "Training_Policy_0.5u_1vmax"
-  # "Training_Policy_0.5u_1.5vmax_1.5icvel"
+  # "Failed_Runs/Training_Policy_0.5u_1vmax_1.0_icVmax"
+  # "Failed_Runs/Training_Policy_0.5u_1.5vmax_1.5_icVmax"
 
 
 #Ignored

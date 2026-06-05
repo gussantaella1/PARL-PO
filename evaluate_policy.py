@@ -1377,11 +1377,10 @@ def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndar
 
 def _classify_trial_outcome(row: Dict[str, Any]) -> str:
     """Internal helper for classify trial outcome."""
-    if int(row.get("num_att_errors", 0)) > 0 or int(row.get("trial_rollout_error_any", 0)) == 1 or row.get("att1_error"):
-        return "rollout_error"
+    if _row_has_rollout_error(row):
+        return "timeout_no_capture"
 
     pass_trial = int(row.get("pass_trial", 0))
-    collided = int(row.get("trial_collided_any", row.get("att1_collided", 0))) == 1
     attacker_hit = int(row.get("trial_attacker_hit_any", row.get("att1_attacker_hit", 0))) == 1
     att_term = int(row.get("trial_att_term_any", row.get("att1_att_term", 0))) == 1
     def_term = int(row.get("trial_def_term_any", row.get("att1_def_term", 0))) == 1
@@ -1389,12 +1388,9 @@ def _classify_trial_outcome(row: Dict[str, Any]) -> str:
     oi_viol_def = int(row.get("trial_oi_viol_def_any", row.get("att1_oi_viol_def", 0))) == 1
     att_oob = int(row.get("trial_att_oob_any", row.get("att1_att_oob", 0))) == 1
     def_oob = int(row.get("trial_def_oob_any", row.get("att1_def_oob", 0))) == 1
-    success_mode = str(row.get("trial_success_mode", row.get("att1_success_mode", ""))).strip().lower()
 
     if pass_trial:
-        if collided:
-            return "defender_capture"
-        return "defender_success"
+        return "defender_capture"
 
     if attacker_hit or oi_viol_att:
         return "attacker_hit_oi"
@@ -1404,29 +1400,27 @@ def _classify_trial_outcome(row: Dict[str, Any]) -> str:
         return "attacker_crashed_wall"
     if oi_viol_def:
         return "defender_hit_oi"
-    if collided:
-        return "collision_but_not_success"
-    if success_mode == "zero_sum_capture":
-        return "timeout_no_capture"
-    if success_mode == "legacy_verify":
-        return "capture_required_not_met"
-    return "unclassified_failure"
+    return "timeout_no_capture"
+
+
+def _row_has_rollout_error(row: Dict[str, Any]) -> bool:
+    """Return whether a trial row has rollout diagnostics indicating an error."""
+    return (
+        int(row.get("num_att_errors", 0)) > 0
+        or int(row.get("trial_rollout_error_any", 0)) == 1
+        or bool(row.get("att1_error"))
+    )
 
 
 def _outcome_pretty_name(label: str) -> str:
     """Internal helper for outcome pretty name."""
     pretty = {
         "defender_capture": "Defender capture",
-        "defender_success": "Defender success",
         "attacker_hit_oi": "Attacker hit OI",
         "defender_crashed_wall": "Defender crashed wall",
         "attacker_crashed_wall": "Attacker crashed wall",
         "defender_hit_oi": "Defender hit OI",
-        "collision_but_not_success": "Collision but not success",
         "timeout_no_capture": "Timeout / no capture",
-        "capture_required_not_met": "Capture required not met",
-        "rollout_error": "Rollout error",
-        "unclassified_failure": "Unclassified failure",
     }
     return pretty.get(str(label), str(label))
 
@@ -1435,16 +1429,11 @@ def _outcome_color(label: str) -> str:
     """Internal helper for outcome color."""
     palette = {
         "defender_capture": "#2ca02c",
-        "defender_success": "#1f77b4",
         "attacker_hit_oi": "#d62728",
         "defender_crashed_wall": "#9467bd",
         "attacker_crashed_wall": "#ff7f0e",
         "defender_hit_oi": "#8c564b",
-        "collision_but_not_success": "#e377c2",
         "timeout_no_capture": "#bcbd22",
-        "capture_required_not_met": "#17becf",
-        "rollout_error": "#7f7f7f",
-        "unclassified_failure": "#111111",
     }
     return palette.get(str(label), "#111111")
 
@@ -1459,29 +1448,19 @@ def _save_outcome_histogram(
 
     labels = [
         "defender_capture",
-        "defender_success",
         "attacker_hit_oi",
         "defender_crashed_wall",
         "attacker_crashed_wall",
         "defender_hit_oi",
-        "collision_but_not_success",
         "timeout_no_capture",
-        "capture_required_not_met",
-        "rollout_error",
-        "unclassified_failure",
     ]
     pretty = {
         "defender_capture": "Defender capture",
-        "defender_success": "Defender success",
         "attacker_hit_oi": "Attacker hit OI",
         "defender_crashed_wall": "Defender crashed wall",
         "attacker_crashed_wall": "Attacker crashed wall",
         "defender_hit_oi": "Defender hit OI",
-        "collision_but_not_success": "Collision but not success",
         "timeout_no_capture": "Timeout / no capture",
-        "capture_required_not_met": "Capture required not met",
-        "rollout_error": "Rollout error",
-        "unclassified_failure": "Unclassified failure",
     }
 
     counts = {k: 0 for k in labels}
@@ -2118,16 +2097,11 @@ def _save_success_vs_delta_v_plot(
 
     outcome_order = [
         "defender_capture",
-        "defender_success",
         "attacker_hit_oi",
         "defender_crashed_wall",
         "attacker_crashed_wall",
         "defender_hit_oi",
-        "collision_but_not_success",
         "timeout_no_capture",
-        "capture_required_not_met",
-        "rollout_error",
-        "unclassified_failure",
     ]
 
     grouped: Dict[str, List[Tuple[float, float, float]]] = {}
@@ -2320,7 +2294,7 @@ def _save_trajectory_overlay_plots(
     oi = cfg.get("oi", {}) or {}
     oi_enabled = bool(oi.get("enabled", False))
     oi_r = float(oi.get("r", 0.0)) if oi_enabled else 0.0
-    success_labels = {"defender_capture", "defender_success"}
+    success_labels = {"defender_capture"}
     timeout_labels = {"timeout_no_capture"}
 
     def _segments(plane: str, role_idx: int, group: str) -> List[np.ndarray]:
@@ -3516,7 +3490,7 @@ def main():
             "trial_loop": float(time.time() - t_loop0),
         },
         "outcome_breakdown": outcome_breakdown,
-        "rollout_error_cases_count": int(sum(1 for r in trial_rows if r.get("outcome_label") == "rollout_error")),
+        "rollout_error_cases_count": int(sum(1 for r in trial_rows if _row_has_rollout_error(r))),
         "notes": [
             "Rollouts use the RL runner for policy-vs-policy and the mixed matchup runner for policy-vs-baseline evaluation.",
             "This evaluation harness is now 1v1-only and mirrors the single-rollout notebook workflow.",
@@ -3528,6 +3502,7 @@ def main():
             "Delta-v metrics are computed from realized control norms (u_real) times dt, so they reflect executed per-step delta-v and trajectory-total delta-v.",
             "Trajectory overlay plots render all recorded trials with per-trajectory downsampling for plotting efficiency.",
             "When policy_role=att, success_rate remains the defender-centric pass metric; use policy_primary_metric or metrics_trial.attacker_hit_any_rate for attacker-side comparisons.",
+            "Outcome labels use reportable terminal categories only; rollout diagnostic errors are tracked separately via metrics_trial.rollout_error_any_rate and rollout_error_cases_count.",
         ],
         "metrics_trial": {
             "min_rel_dist": _metric_summary("trial_min_rel_dist"),
@@ -3608,7 +3583,7 @@ def main():
         for r in timeout_rows:
             w.writerow(r)
 
-    rollout_error_rows = [r for r in trial_rows if r.get("outcome_label") == "rollout_error"]
+    rollout_error_rows = [r for r in trial_rows if _row_has_rollout_error(r)]
     rollout_error_csv_path = out_dir / "rollout_error_cases.csv"
     if args.save_rollout_error_cases:
         with rollout_error_csv_path.open("w", newline="") as f:

@@ -6,8 +6,8 @@
 # naming, run-spec parsing, output suffixes, and warning behavior. Run specs
 # accept either of these forms:
 #
-#   Training_Policy_2.0u_1vmax:elliptic_ltv
-#   Training_Policy_2.0u_1vmax|elliptic_ltv
+#   Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv
+#   Training_Policy_2.0u_1vmax_1.0_icVmax|elliptic_ltv
 
 trim_whitespace() {
   local value="${1:-}"

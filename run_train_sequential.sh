@@ -30,9 +30,9 @@ run_step() {
   return 0
 }
 
-run_step "Training_Policy_0.5u_1vmax" \
+run_step "Training_Policy_0.5u_1vmax_1.0_icVmax" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1vmax \
+    --out_dir Training_Policy_0.5u_1vmax_1.0_icVmax \
     --device cuda \
     --vec_backend torch \
     --vmax 1.0 \
@@ -42,9 +42,9 @@ run_step "Training_Policy_0.5u_1vmax" \
     --train_ic_vmax 1.0 \
     --steps_per_env 1024
 
-run_step "Training_Policy_0.5u_1.5vmax_1.5icvel" \
+run_step "Training_Policy_0.5u_1.5vmax_1.5_icVmax" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1.5vmax_1.5icvel \
+    --out_dir Training_Policy_0.5u_1.5vmax_1.5_icVmax \
     --device cuda \
     --vec_backend torch \
     --train_ic_vmax 1.50 \
@@ -55,9 +55,9 @@ run_step "Training_Policy_0.5u_1.5vmax_1.5icvel" \
     --steps_per_env 1024
 
 
-# run_step "Training_Policy_2.0u_1.5vmax" \
+# run_step "Training_Policy_2.0u_1.5vmax_1.5_icVmax" \
 #   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-#     --out_dir Training_Policy_2.0u_1.5vmax \
+#     --out_dir Training_Policy_2.0u_1.5vmax_1.5_icVmax \
 #     --device cuda \
 #     --vec_backend torch \
 #     --vmax 1.5 \
