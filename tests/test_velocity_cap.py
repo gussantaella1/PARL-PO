@@ -1,3 +1,7 @@
+"""
+Regression tests for velocity-cap enforcement and rollout velocity reporting.
+"""
+
 import copy
 import sys
 import types
@@ -15,6 +19,8 @@ try:
 except ModuleNotFoundError:
     torch = types.ModuleType("torch")
     torch.Tensor = object
+    torch.Generator = type("Generator", (), {})
+    torch.dtype = type("dtype", (), {})
     torch.device = type("device", (), {})
     torch.float32 = object()
     torch.int64 = object()
@@ -56,6 +62,7 @@ else:
 
 
 def _base_cfg(factory):
+    """Internal helper for base cfg."""
     cfg = copy.deepcopy(factory())
     dim = 2 * int(cfg["D"])
     cfg["dyn"]["Ad"] = np.eye(dim, dtype=np.float32)
@@ -79,7 +86,9 @@ def _base_cfg(factory):
 
 
 class VelocityCapTests(unittest.TestCase):
+    """Test case for velocity-cap safety behavior and rollout diagnostics."""
     def _assert_no_hard_clip_after_reset_and_step(self, env_cls, cfg):
+        """Internal helper for assert no hard clip after reset and step."""
         env = env_cls(cfg)
         env.reset()
 
@@ -97,9 +106,11 @@ class VelocityCapTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(state[3 * D:4 * D]), vmax + 1e-6)
 
     def test_single_env_no_longer_hard_clips_velocity_state(self):
+        """Verify that single env no longer hard clips velocity state behaves as expected."""
         self._assert_no_hard_clip_after_reset_and_step(SingleEnv, _base_cfg(config_for_train_single))
 
     def test_rollout_step_helper_no_longer_hard_clips_velocity_state(self):
+        """Verify that rollout step helper no longer hard clips velocity state behaves as expected."""
         cfg = _base_cfg(config_for_train_single)
         step_plant_single, _, _ = _build_step_plant_single(cfg, steps=2, D=int(cfg["D"]))
         D = int(cfg["D"])
@@ -110,6 +121,7 @@ class VelocityCapTests(unittest.TestCase):
         self.assertGreater(np.linalg.norm(x_next[D:2 * D]), vmax + 1e-6)
 
     def test_single_env_velocity_cbf_filter_blocks_outward_accel(self):
+        """Verify that single env velocity cbf filter blocks outward accel behaves as expected."""
         cfg = _base_cfg(config_for_train_single)
         cfg["safety_filter"]["vmax"] = 1.0
         env = SingleEnv(cfg)
@@ -125,6 +137,7 @@ class VelocityCapTests(unittest.TestCase):
 
     @unittest.skipIf(plot_rollout_velocity is None, "matplotlib is not installed in this environment")
     def test_plot_rollout_velocity_reads_state_history(self):
+        """Verify that plot rollout velocity reads state history behaves as expected."""
         D = 3
         vmax = 2.5
         states = np.array(

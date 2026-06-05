@@ -1,3 +1,7 @@
+"""
+Orbital dynamics, coordinate-frame, and discretization helpers for HCW, elliptic LTV, and two-body models.
+"""
+
 # dyn_models.py
 from __future__ import annotations
 import numpy as np
@@ -5,16 +9,19 @@ import casadi as ca
 
 # -------------------- small helpers --------------------
 def _unit(v, eps: float = 1e-12):
+    """Internal helper for unit."""
     v = np.asarray(v, float); n = np.linalg.norm(v)
     return v / (n + eps)
 
 def _skew(w):
+    """Internal helper for skew."""
     wx, wy, wz = w
     return np.array([[0, -wz,  wy],
                      [wz,  0, -wx],
                      [-wy, wx,  0]], float)
 
 def minimal_rotation(a, b, eps: float = 1e-9):
+    """Handle minimal rotation for this workflow."""
     a = _unit(a); b = _unit(b)
     v = np.cross(a, b); s = np.linalg.norm(v); c = float(np.dot(a, b))
     if s < eps:
@@ -27,6 +34,7 @@ def minimal_rotation(a, b, eps: float = 1e-9):
 
 def frame_from_axis_continuous(axis, R_prev=None, align: str = "x",
                                world_up=np.array([0.0, 0.0, 1.0])):
+    """Handle frame from axis continuous for this workflow."""
     a = _unit(np.asarray(axis, float))
     up = _unit(np.asarray(world_up, float))
     if R_prev is not None:
@@ -59,6 +67,7 @@ def frame_from_axis_continuous(axis, R_prev=None, align: str = "x",
         return np.vstack([x_b, y_b, a])
 
 def world_to_body_R(axis, D: int = 3, align: str = "x", up=(0.0, 0.0, 1.0)):
+    """Handle world to body  r for this workflow."""
     axis = _unit(axis); up = _unit(np.asarray(up, float))
     if D == 2:
         x_b = axis; y_b = np.array([-axis[1], axis[0]])
@@ -75,6 +84,7 @@ def world_to_body_R(axis, D: int = 3, align: str = "x", up=(0.0, 0.0, 1.0)):
     return np.vstack([x_b, y_b, z_b])
 
 def apply_roll_about_axis(R_wb, phi: float, align: str = "x"):
+    """Apply roll about axis to the current config, state, or rollout data."""
     x_b, y_b, z_b = R_wb[0], R_wb[1], R_wb[2]
     c, s = np.cos(phi), np.sin(phi)
     if align == "x":
@@ -84,10 +94,12 @@ def apply_roll_about_axis(R_wb, phi: float, align: str = "x"):
     return np.vstack([x_p, y_p, z_b])
 
 def dims_from_D(D: int):
+    """Handle dims from  d for this workflow."""
     assert D in (2,3)
     return 2*D, D
 
 def as_numpy_const(M):
+    """Handle as numpy const for this workflow."""
     if isinstance(M, np.ndarray): return M.astype(float)
     try:
         return np.array(M.full(), dtype=float)
@@ -104,12 +116,14 @@ def as_numpy_const(M):
 
 # -------------------- HCW (and discretization) --------------------
 def hcw_mean_motion(hcw_cfg: dict):
+    """Handle hcw mean motion for this workflow."""
     if "n" in hcw_cfg: return float(hcw_cfg["n"])
     mu = float(hcw_cfg.get("mu", 3.986004418e14))
     r0 = float(hcw_cfg["r0"])
     return float(np.sqrt(mu / (r0**3)))
 
 def _discretize_linear(Ac, Bc, dt, series_terms=18):
+    """Internal helper for discretize linear."""
     nx = int(Ac.shape[0]); nu = int(Bc.shape[1])
     Ac_np = as_numpy_const(Ac); Bc_np = as_numpy_const(Bc)
     M = np.block([[Ac_np,              Bc_np],
@@ -125,6 +139,7 @@ def _discretize_linear(Ac, Bc, dt, series_terms=18):
     return ca.MX(Ad_np), ca.MX(Bd_np)
 
 def hcw_discrete_mats(n: float, dt: float):
+    """Handle hcw discrete mats for this workflow."""
     n = float(n)
     Ac = ca.MX.zeros(6,6)
     Ac[0,3] = 1.0; Ac[1,4] = 1.0; Ac[2,5] = 1.0
@@ -135,6 +150,7 @@ def hcw_discrete_mats(n: float, dt: float):
 
 # -------------------- attitude augmentation & bounds --------------------
 def augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg):
+    """Handle augment  a b for att for this workflow."""
     Ad_tr = ca.MX(Ad_tr); Bd_tr = ca.MX(Bd_tr)
     nx_tr = Ad_tr.size1(); nu_tr = Bd_tr.size2()
     n_att = 3; n_ctrl = 3
@@ -150,6 +166,7 @@ def augment_AB_for_att(Ad_tr, Bd_tr, dt, att_cfg):
     return Ad_aug, Bd_aug, idx
 
 def augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg):
+    """Handle augment bounds with att for this workflow."""
     x_lb = np.asarray(x_lb, float).ravel(); x_ub = np.asarray(x_ub, float).ravel()
     u_lb = np.asarray(u_lb, float).ravel(); u_ub = np.asarray(u_ub, float).ravel()
     phi_lim   = att_cfg.get("phi_lim",   (-np.pi, np.pi))
@@ -165,6 +182,7 @@ def augment_bounds_with_att(x_lb, x_ub, u_lb, u_ub, att_cfg):
     return x_lb, x_ub, u_lb, u_ub
 
 def pad_x0_with_att(x0_row, att_cfg, D):
+    """Handle pad x0 with att for this workflow."""
     x0_row = np.asarray(x0_row, float).ravel()
     phi0   = att_cfg.get("phi0", 0.0)
     theta0 = att_cfg.get("theta0", 0.0)
@@ -173,6 +191,7 @@ def pad_x0_with_att(x0_row, att_cfg, D):
 
 # -------------------- env/bounds --------------------
 def make_bounds(cfg: dict):
+    """Handle make bounds for this workflow."""
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx, nu = dims_from_D(D)
     sf_cfg = dict(cfg.get("safety_filter", {}) or {})
@@ -205,15 +224,18 @@ def make_bounds(cfg: dict):
 # Kepler helpers
 # ----------------------------
 def _R1(a):
+    """Internal helper for r1."""
     ca, sa = np.cos(a), np.sin(a)
     return np.array([[1,0,0],[0,ca,-sa],[0,sa,ca]], dtype=float)
 
 def _R3(a):
+    """Internal helper for r3."""
     ca, sa = np.cos(a), np.sin(a)
     return np.array([[ca,-sa,0],[sa,ca,0],[0,0,1]], dtype=float)
 
 def _kepler_E_from_M(M, e, tol=1e-12, it=50):
     # Newton solve: E - e sinE = M
+    """Internal helper for kepler  e from  m."""
     E = M if e < 0.8 else np.pi
     for _ in range(it):
         f = E - e*np.sin(E) - M
@@ -226,16 +248,19 @@ def _kepler_E_from_M(M, e, tol=1e-12, it=50):
 
 def _nu_from_E(E, e):
     # true anomaly
+    """Internal helper for nu from  e."""
     s = np.sqrt(1+e)*np.sin(E/2)
     c = np.sqrt(1-e)*np.cos(E/2)
     return 2*np.arctan2(s, c)
 
 def _M_from_nu(nu, e):
     # convert nu -> E -> M
+    """Internal helper for m from nu."""
     E = 2*np.arctan2(np.sqrt(1-e)*np.sin(nu/2), np.sqrt(1+e)*np.cos(nu/2))
     return E - e*np.sin(E)
 
 def rv_from_orbital_elements(mu, a, e, inc, raan, argp, nu):
+    """Handle rv from orbital elements for this workflow."""
     p = a*(1 - e**2)
     r = p/(1 + e*np.cos(nu))
 
@@ -248,6 +273,7 @@ def rv_from_orbital_elements(mu, a, e, inc, raan, argp, nu):
     return r_I, v_I
 
 def rtn_dcm_from_rv(r_I, v_I):
+    """Handle rtn dcm from rv for this workflow."""
     rhat = r_I / np.linalg.norm(r_I)
     h = np.cross(r_I, v_I)
     nhat = h / np.linalg.norm(h)
@@ -259,6 +285,7 @@ def rtn_dcm_from_rv(r_I, v_I):
 
 def omega_rtn_from_rv(r_I, v_I):
     # angular rate magnitude = |h| / r^2, along +N
+    """Handle omega rtn from rv for this workflow."""
     h = np.cross(r_I, v_I)
     r = np.linalg.norm(r_I)
     w = np.linalg.norm(h) / (r*r)
@@ -319,6 +346,7 @@ def chief_orbit_cache_rtn(chief_orbit: dict, dt: float, N: int):
 # Two-body RK4 step in inertial, state kept in RTN
 # ----------------------------
 def _two_body_acc(mu, r):
+    """Internal helper for two body acc."""
     rn = np.linalg.norm(r)
     return -mu * r / (rn**3)
 
@@ -345,6 +373,7 @@ def two_body_step_rtn(x6, u3, k, cache):
     aU_I = CR2I @ u3
 
     def f(state):
+        """Evaluate the process model for one prediction step."""
         r = state[:3]
         v = state[3:]
         a = _two_body_acc(mu, r) + aU_I

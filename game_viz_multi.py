@@ -1,3 +1,7 @@
+"""
+Visualization helpers for multi-agent 3D rollouts, animations, and diagnostic plots.
+"""
+
 # game_viz_multi.py
 from __future__ import annotations
 
@@ -56,11 +60,13 @@ def _as3_hist(hist):
     return out
 
 def _legend_clean(handles):
+    """Internal helper for legend clean."""
     pairs = [(h, getattr(h, "get_label", lambda: "")()) for h in handles if h is not None]
     pairs = [(h, lab) for (h, lab) in pairs if lab and not str(lab).startswith('_')]
     return [h for (h, _) in pairs], [lab for (_, lab) in pairs]
 
 def _normalize_oi_list(oi_cfg):
+    """Normalize oi list into the canonical representation used here."""
     if not oi_cfg:
         return []
     if isinstance(oi_cfg, (list, tuple)):
@@ -68,6 +74,7 @@ def _normalize_oi_list(oi_cfg):
     return [oi_cfg] if bool(oi_cfg.get("enabled", True)) else []
 
 def draw_object_of_interest(ax, oi, D=3, res=24):
+    """Draw object of interest on the current Matplotlib axes."""
     cx = float(oi.get("cx", 0.0))
     cy = float(oi.get("cy", 0.0))
     cz = float(oi.get("cz", 0.0)) if D == 3 else 0.0
@@ -107,10 +114,12 @@ def draw_object_of_interest(ax, oi, D=3, res=24):
     return arts
 
 def _label_axes_3d(ax, scale: float | None = None, unit: str = "m", label_only: bool = True):
+    """Internal helper for label axes 3d."""
     import numpy as np
     from matplotlib.ticker import FuncFormatter
 
     def _pow10_str(s):
+        """Internal helper for pow10 str."""
         k = int(round(np.log10(s)))
         return r"$10^{%d}$" % k
 
@@ -138,12 +147,14 @@ def _label_axes_3d(ax, scale: float | None = None, unit: str = "m", label_only: 
 # -------------------- triads --------------------
 
 def make_body_axes_artists_3d(ax, colors=('tab:red','tab:green','tab:blue'), lw=2, alpha=0.9):
+    """Handle make body axes artists 3d for this workflow."""
     bx, = ax.plot([], [], [], '-', lw=lw, alpha=alpha, color=colors[0])
     by, = ax.plot([], [], [], '-', lw=lw, alpha=alpha, color=colors[1])
     bz, = ax.plot([], [], [], '-', lw=lw, alpha=alpha, color=colors[2])
     return dict(bx=bx, by=by, bz=bz)
 
 def update_body_axes_artists_3d(lines, p, R_wb, L=(0.4,0.4,0.6)):
+    """Handle update body axes artists 3d for this workflow."""
     p = np.asarray(p, float)
     x_b, y_b, z_b = R_wb[0], R_wb[1], R_wb[2]
     ends = [p + L[0]*x_b, p + L[1]*y_b, p + L[2]*z_b]
@@ -155,6 +166,7 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
                      labels=('x_b (boresight)','y_b','z_b'),
                      loc='lower left', ncol=1, title='Body axes',
                      keep_legend=None):
+    """Handle add triad legend for this workflow."""
     proxies = [Line2D([0], [0], lw=2, color=c, label=lab) for c, lab in zip(colors, labels)]
     leg_axes = ax.legend(proxies, labels, loc=loc, ncol=ncol, title=title)
     if keep_legend is not None:
@@ -167,6 +179,7 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
 # -------------------- FOV drawings (cone + pinhole frustum) --------------------
 
 def draw_fov_cone_3d(ax, x_def, fov_cfg, n=24, color='C1', alpha=0.12, align="x", R_wb=None):
+    """Draw fov cone 3d on the current Matplotlib axes."""
     p0 = np.asarray(x_def[:3], float)
 
     if R_wb is None:
@@ -200,6 +213,7 @@ def draw_camera_frustum_3d(ax, x_def, cam_cfg, color='C2', alpha=0.10,
                            draw_edges=True, draw_rays=True,
                            lw=1.0, rim_alpha=0.55, ray_alpha=0.35,
                            R_wb=None):
+    """Draw camera frustum 3d on the current Matplotlib axes."""
     p_cam = np.asarray(x_def[:3], float)
     align = cam_cfg.get("align", "x")
 
@@ -210,6 +224,7 @@ def draw_camera_frustum_3d(ax, x_def, cam_cfg, color='C2', alpha=0.10,
         R_wc = np.asarray(R_wb, float)
 
     def cam_to_world(Pc):
+        """Handle cam to world for this workflow."""
         return (R_wc.T @ Pc.T).T + p_cam[None, :]
 
     W, H = float(cam_cfg["W"]), float(cam_cfg["H"])
@@ -282,6 +297,7 @@ def _discover_exec_series(frames_dict: dict):
 
 
 def _discover_plan_series(frames_dict: dict, N: int):
+    """Internal helper for discover plan series."""
     if "plan_hist_all" in frames_dict and frames_dict["plan_hist_all"] is not None:
         plan_raw = frames_dict["plan_hist_all"]
         if isinstance(plan_raw, (list, tuple)) and len(plan_raw) == N:
@@ -471,6 +487,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
 
     fov_art = {"coll": None, "rim": None, "edges": []}
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ("coll","rim"):
             art = fov_art.get(k)
             if art is not None:
@@ -483,6 +500,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
         fov_art["edges"] = []
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         seq = att_all[agent]
         if not seq or idx >= len(seq) or "R" not in seq[idx]:
             return np.eye(3, dtype=float)
@@ -490,6 +508,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
         return R if R.shape == (3,3) else np.eye(3, dtype=float)
 
     def _set_fov(p, R_wb, idx):
+        """Internal helper for set fov."""
         if not fov_enabled:
             _clear_fov(); return
         col = fov_cfg.get("color","C1")
@@ -518,10 +537,12 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
             fov_art["coll"], fov_art["rim"] = coll, rim
 
     def _set3d(ln, xs, ys, zs):
+        """Internal helper for set3d."""
         ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
     # meas rays helper
     def _meas_ray(p_obs, R_wb, az, el, Lm):
+        """Internal helper for meas ray."""
         c = np.cos(el)
         v_b = np.array([c*np.cos(az), c*np.sin(az), np.sin(el)])
         v_w = R_wb.T @ v_b
@@ -531,6 +552,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
     L_meas = float(viz_cfg.get("meas_len", cfg.get("camera", {}).get("far", 15.0)))
 
     def init():
+        """Handle init for this workflow."""
         for a in range(N):
             plan_lns[a].set_data([], []); plan_lns[a].set_3d_properties([])
             exec_lns[a].set_data([], []); exec_lns[a].set_3d_properties([])
@@ -549,6 +571,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
 
     def update(f):
         # plans/execs/dots
+        """Assimilate a measurement into the estimator belief."""
         for a in range(N):
             if plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
@@ -622,6 +645,7 @@ def animate_rollout_3d_multi(frames_dict, save_path="traj_3D.gif", fps=20, cfg=N
 def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout (multi)",
                                  show_fov=True, show_axes=True, triads="fov",
                                  perf_skip_fov_every: int = 1):
+    """Handle interactive rollout 3d multi for this workflow."""
     import ipywidgets as W
     from IPython.display import display
 
@@ -728,6 +752,7 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
 
     fov_art = {"coll": None, "rim": None, "edges": []}
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ("coll","rim"):
             art = fov_art.get(k)
             if art is not None:
@@ -740,6 +765,7 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
         fov_art["edges"] = []
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         seq = att_all[agent]
         if not seq or idx >= len(seq) or "R" not in seq[idx]:
             return np.eye(3, dtype=float)
@@ -747,6 +773,7 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
         return R if R.shape == (3,3) else np.eye(3, dtype=float)
 
     def _set_fov(p, R_wb, idx):
+        """Internal helper for set fov."""
         _clear_fov()
         if not fov_enabled:
             return
@@ -769,6 +796,7 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
 
     # meas rays helper
     def _meas_ray(p_obs, R_wb, az, el, Lm):
+        """Internal helper for meas ray."""
         c = np.cos(el)
         v_b = np.array([c*np.cos(az), c*np.sin(az), np.sin(el)])
         v_w = R_wb.T @ v_b
@@ -791,9 +819,11 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
     W.jslink((play, "value"), (s_frame, "value"))
 
     def _set3d(ln, xs, ys, zs):
+        """Internal helper for set3d."""
         ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
     def redraw(f):
+        """Handle redraw for this workflow."""
         for a in range(N):
             if t_plan.value and plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
@@ -867,6 +897,7 @@ def interactive_rollout_3d_multi(frames_dict, cfg, title="Interactive 3D rollout
 
 def plot_rollout_thrust_u_multi(frames_dict, cfg=None, agent: int = 1, show: bool = True):
     # Prefer N-aware arrays in u_cmd_all
+    """Plot rollout thrust u multi using the current metrics or rollout data."""
     if "u_cmd_all" in frames_dict and frames_dict["u_cmd_all"] is not None:
         u_all = frames_dict["u_cmd_all"]
         if isinstance(u_all, (list, tuple)) and 0 <= agent-1 < len(u_all):
@@ -903,6 +934,7 @@ def plot_rollout_thrust_u_multi(frames_dict, cfg=None, agent: int = 1, show: boo
 
 
 def plot_rollout_velocity_multi(frames_dict, cfg=None, agent: int = 1, show: bool = True, title: str | None = None):
+    """Plot rollout velocity multi using the current metrics or rollout data."""
     from game_viz import plot_rollout_velocity
 
     return plot_rollout_velocity(
@@ -922,6 +954,7 @@ def plot_rollout_center_distance_multi(
     title: str | None = None,
     show_oi_radius: bool = True,
 ):
+    """Plot rollout center distance multi using the current metrics or rollout data."""
     import numpy as np
     import matplotlib.pyplot as plt
 
@@ -957,6 +990,7 @@ def plot_rollout_center_distance_multi(
         oi_cfg = cfg.get("oi", None)
 
         def _normalize_oi_list(oi_cfg):
+            """Normalize oi list into the canonical representation used here."""
             if not oi_cfg:
                 return []
             if isinstance(oi_cfg, (list, tuple)):

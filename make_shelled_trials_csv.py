@@ -13,19 +13,16 @@ Outputs rows with:
 Notes:
 - Uses Fibonacci-sphere directions for uniform-ish points per shell.
 - Defender/attacker pairing can be antipodal or index-offset to enforce separation.
-"""
 
-"""
-python make_shelled_trials_csv.py \
-  --config_module config_rl \
-  --out shelled_trials.csv \
-  --pos_scale 0.95 \
-  --num_shells 12 \
-  --pts_per_shell 256 \
-  --pairing offset \
-  --random_rotate_dirs
-
-
+Example:
+  python make_shelled_trials_csv.py \
+    --config_module config_rl \
+    --out shelled_trials.csv \
+    --pos_scale 0.95 \
+    --num_shells 12 \
+    --pts_per_shell 256 \
+    --pairing offset \
+    --random_rotate_dirs
 """
 
 from __future__ import annotations
@@ -40,6 +37,7 @@ import numpy as np
 
 
 def get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
+    """Handle get center and radius for this workflow."""
     ar = cfg.get("arena", {}) or {}
     cx, cy = float(ar.get("cx", 0.0)), float(ar.get("cy", 0.0))
     cz = float(ar.get("cz", 0.0)) if D == 3 else 0.0
@@ -82,6 +80,7 @@ def fibonacci_sphere(n: int, rng: np.random.Generator | None = None) -> np.ndarr
 
 
 def main():
+    """Parse command-line arguments and run this script."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--config_module", default="config_rl",
                     help="Module with config_for_eval() (default: config_rl).")
@@ -146,6 +145,7 @@ def main():
     trial_idx = 0
 
     def add_row(p_def, v_def, p_att, v_att):
+        """Handle add row for this workflow."""
         nonlocal trial_idx
         rows.append({
             "trial": trial_idx,

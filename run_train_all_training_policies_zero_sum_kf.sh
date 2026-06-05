@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+#
+# Replay every top-level Training_Policy* run as a KF-enabled zero-sum run.
+#
+# The script reads each parent run_manifest.json, reconstructs the original
+# rl_loop.py command, then appends the KF/reward overrides needed for the
+# *_KF_ON rerun. It skips runs that already have the target suffix, runs without
+# manifests, and target directories that already exist.
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -19,6 +26,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 run_step() {
+  # Print the command in dry-run mode, otherwise run it and continue on failure.
   local name="$1"
   shift
 

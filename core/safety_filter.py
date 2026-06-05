@@ -1,3 +1,7 @@
+"""
+Velocity-cap safety filters that project nominal accelerations into safe box and CBF constraints.
+"""
+
 from __future__ import annotations
 
 from typing import Tuple

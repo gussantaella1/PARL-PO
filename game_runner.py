@@ -1,3 +1,7 @@
+"""
+Rollout runner that executes trained RL policies under HCW, elliptic LTV, or nonlinear two-body dynamics.
+"""
+
 # game_runner.py
 # RL-only rollout for Diff-Nash policy; supports HCW (LTI), elliptic LTV, and two-body nonlinear.
 # No attitude/FOV (identity stubs)
@@ -20,6 +24,7 @@ _WARN_ONCE_MESSAGES: set[str] = set()
 
 
 def _warn_once(msg: str) -> None:
+    """Internal helper for warn once."""
     if msg in _WARN_ONCE_MESSAGES:
         return
     _WARN_ONCE_MESSAGES.add(msg)
@@ -27,6 +32,7 @@ def _warn_once(msg: str) -> None:
 
 
 def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
+    """Internal helper for u3 from action."""
     u = np.asarray(u, float).reshape(-1)
     if D == 3:
         return u[:3]
@@ -34,6 +40,7 @@ def _u3_from_action(u: np.ndarray, D: int) -> np.ndarray:
 
 
 def _v3_from_state(x: np.ndarray, D: int) -> np.ndarray:
+    """Internal helper for v3 from state."""
     x = np.asarray(x, float).reshape(-1)
     v = np.zeros(3, dtype=float)
     v[:D] = x[D:2 * D]
@@ -47,6 +54,7 @@ def _build_velocity_cbf_filter(
     dt: float,
     umax: float,
 ):
+    """Build velocity cbf filter for the current workflow."""
     sf_cfg = dict(cfg.get("safety_filter", {}) or {})
     enabled = bool(sf_cfg.get("enabled", False))
     u_lo = -float(umax)
@@ -54,6 +62,7 @@ def _build_velocity_cbf_filter(
 
     if not enabled:
         def _no_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+            """Internal helper for no filter."""
             return np.clip(np.asarray(u_nom, dtype=float).reshape(D,), u_lo, u_hi).astype(np.float32)
         return _no_filter
 
@@ -96,6 +105,7 @@ def _build_velocity_cbf_filter(
         Bd = np.asarray(Bd, dtype=float)
 
     def _apply_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+        """Apply filter to the current config, state, or rollout data."""
         u_nom = np.asarray(u_nom, dtype=float).reshape(D,)
         a, b = velocity_cbf_halfspace_np(
             np.asarray(p, dtype=float).reshape(D,),
@@ -115,6 +125,7 @@ def _build_velocity_cbf_filter(
 
 
 def _normalize_kf_action_access(mode: Any) -> str:
+    """Normalize kf action access into the canonical representation used here."""
     key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
     if key == "groundtruth":
         key = "ground_truth"
@@ -127,6 +138,7 @@ def _normalize_kf_action_access(mode: Any) -> str:
 
 
 def _normalize_kf_control_noise_std(noise_std: Any, default_std: float) -> np.ndarray:
+    """Normalize kf control noise std into the canonical representation used here."""
     arr = np.asarray(noise_std if noise_std is not None else default_std, dtype=float)
     if arr.ndim == 0:
         std = np.full(3, float(arr), dtype=float)
@@ -141,6 +153,7 @@ def _normalize_kf_control_noise_std(noise_std: Any, default_std: float) -> np.nd
 
 
 def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
+    """Normalize estimator kind into the canonical representation used here."""
     kind = cfg.get("estimator_kind", "ukf")
     key = str(kind).strip().lower()
     if key not in {"ukf", "ekf"}:
@@ -149,6 +162,7 @@ def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
 
 
 def _canonical_estimator_dyn_name(raw_name: Any) -> str:
+    """Convert estimator dyn name into its canonical internal spelling."""
     key = str(raw_name or "hcw").strip().lower()
     if key in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
         return "elliptic_ltv"
@@ -156,6 +170,7 @@ def _canonical_estimator_dyn_name(raw_name: Any) -> str:
 
 
 def _estimator_supports_dynamics(cfg: Dict[str, Any], dyn_name: str | None = None) -> bool:
+    """Internal helper for estimator supports dynamics."""
     estimator_kind = _normalize_estimator_kind(cfg)
     canonical_dyn = _canonical_estimator_dyn_name(cfg.get("dynamics", "hcw") if dyn_name is None else dyn_name)
     if canonical_dyn == "hcw":
@@ -166,6 +181,7 @@ def _estimator_supports_dynamics(cfg: Dict[str, Any], dyn_name: str | None = Non
 
 
 def _estimator_factory_args(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    """Internal helper for estimator factory args."""
     canonical_dyn = _canonical_estimator_dyn_name(cfg.get("dynamics", "hcw"))
     estimator_kind = _normalize_estimator_kind(cfg)
     args: Dict[str, Any] = {}
@@ -191,6 +207,7 @@ def _estimator_factory_args(cfg: Dict[str, Any], linearization_group: str) -> Di
 
 
 def _ekf_factory_kwargs(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    """Internal helper for ekf factory kwargs."""
     if _normalize_estimator_kind(cfg) != "ekf":
         return {}
     ukf_cfg = cfg.get("ukf", {})
@@ -208,6 +225,7 @@ def _kf_predict_control(
     control_meas_std: np.ndarray | None = None,
     control_limit: float | None = None,
 ):
+    """Internal helper for kf predict control."""
     if ground_truth_u is None:
         return None, None
     u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
@@ -224,6 +242,7 @@ def _kf_predict_control(
 
 
 def _normalize_angle(a: float) -> float:
+    """Normalize angle into the canonical representation used here."""
     return (float(a) + np.pi) % (2.0 * np.pi) - np.pi
 
 
@@ -247,6 +266,7 @@ def _pack_multi_agent_rollout(
     thrust_all=None,
     mdot_all=None,
 ) -> Dict[str, Any]:
+    """Pack multi agent rollout into the dictionary format expected by downstream plotting and metrics."""
     out: Dict[str, Any] = {
         "num_attackers": max(0, len(exec_xyz_all) - 1),
         "plan_hist_all": plan_hist_all,
@@ -285,6 +305,7 @@ def _pack_multi_agent_rollout(
 
 
 def _combine_reproducibility_seed(seeds: List[int]) -> int:
+    """Internal helper for combine reproducibility seed."""
     acc = 2166136261
     for idx, seed in enumerate(seeds):
         mix = (int(seed) + 0x9E3779B9 + idx * 0x85EBCA6B) & 0xFFFFFFFF
@@ -294,6 +315,7 @@ def _combine_reproducibility_seed(seeds: List[int]) -> int:
 
 
 def _configure_cuda_reproducibility(seed: int) -> None:
+    """Internal helper for configure cuda reproducibility."""
     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     set_seed(int(seed))
     if not torch.cuda.is_available():
@@ -322,10 +344,12 @@ def run_batched_rhc_with_rl_and_collect_frames_3d(
     turn_len: int | None = None,
     episode_seeds: List[int] | None = None,
 ) -> List[Dict[str, Any]]:
+    """Run batched rhc with rl and collect frames 3d and return rollout frames, controls, and summary data."""
     if not cfgs:
         return []
 
     def _canonical_batched_dyn_name(raw_name: Any) -> str:
+        """Convert batched dyn name into its canonical internal spelling."""
         key = str(raw_name or "hcw").strip().lower()
         if key in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
             return "elliptic_ltv"
@@ -395,15 +419,19 @@ def run_batched_rhc_with_rl_and_collect_frames_3d(
     )
 
     def _state_np() -> np.ndarray:
+        """Internal helper for state np."""
         return vec.state_t.detach().cpu().numpy()
 
     def _p3_from_slice(x_slice: np.ndarray) -> tuple[float, float, float]:
+        """Internal helper for p3 from slice."""
         return _p3(np.asarray(x_slice, dtype=np.float32), D)
 
     def _v3_from_slice(x_slice: np.ndarray) -> tuple[float, float, float]:
+        """Internal helper for v3 from slice."""
         return tuple(map(float, _v3_from_state(np.asarray(x_slice, dtype=np.float32), D)))
 
     def _current_estimator_snapshot():
+        """Internal helper for current estimator snapshot."""
         if not use_kf:
             return None
         if vec._batched_ekf_enabled:
@@ -644,6 +672,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
     steps: int | None = None,
     turn_len: int | None = None,
 ):
+    """Run the internal rhc with rl and collect frames 3d multi implementation used by the public entry point."""
     t_fn0 = time.perf_counter()
 
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
@@ -722,6 +751,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         Tmax: float,
         Isp: float,
     ):
+        """Apply propulsion to the current config, state, or rollout data."""
         a_cmd = np.asarray(a_cmd, dtype=float)
 
         if m <= m_dry + 1e-9:
@@ -748,6 +778,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         m_def_cur: float | None,
         m_att_cur: List[float | None],
     ) -> np.ndarray:
+        """Build train obs for the current workflow."""
         pD = xD_vec[:D]
         vD = xD_vec[D:2 * D]
         parts: List[np.ndarray] = [pD - center]
@@ -784,12 +815,14 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         use_kf = False
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        """Internal helper for x6 from x d."""
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
         if D == 3:
             return xD.astype(np.float32)
         return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
 
     def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        """Internal helper for x d from x6."""
         x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
         if D == 3:
             return x6.astype(np.float32)
@@ -877,6 +910,7 @@ def _run_rhc_with_rl_and_collect_frames_3d_multi(
         fuel_depleted_def: bool,
         fuel_depleted_att: List[bool],
     ):
+        """Handle check done for this workflow."""
         pD = xD_vec[:D]
         pA_list = [xA[:D] for xA in xA_vecs]
 
@@ -1146,6 +1180,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
     steps: int | None = None,
     turn_len: int | None = None,
 ):
+    """Run rhc with rl and collect frames 3d and return rollout frames, controls, and summary data."""
     t_fn0 = time.perf_counter()
     # -------------------- basics & dims --------------------
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
@@ -1232,6 +1267,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         Tmax: float,
         Isp: float,
     ):
+        """Apply propulsion to the current config, state, or rollout data."""
         a_cmd = np.asarray(a_cmd, dtype=float)
 
         if m <= m_dry + 1e-9:
@@ -1260,6 +1296,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         m_def_cur: float | None,
         m_att_cur: float | None,
     ) -> np.ndarray:
+        """Build train obs for the current workflow."""
         p1 = x1_vec[:D]
         v1 = x1_vec[D:2 * D]
         p2 = x2_vec[:D]
@@ -1284,6 +1321,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         return obs
 
     def build_student_sigma_feat():
+        """Build student sigma feat for the current workflow."""
         if use_kf and (ukf12 is not None):
             P = np.asarray(ukf12.P, dtype=np.float32)
             P_rel = P[: 2 * D, : 2 * D]
@@ -1303,6 +1341,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
 
     # -------------------- tiny helpers for animator compatibility --------------------
     def _p3_row(x_row):
+        """Internal helper for p3 row."""
         return (
             (float(x_row[0]), float(x_row[1]), float(x_row[2]))
             if D == 3
@@ -1310,6 +1349,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         )
 
     def _p3_vec(x_vec):
+        """Internal helper for p3 vec."""
         return (
             (float(x_vec[0]), float(x_vec[1]), float(x_vec[2]))
             if D == 3
@@ -1317,12 +1357,15 @@ def run_rhc_with_rl_and_collect_frames_3d(
         )
 
     def _v3_vec(x_vec):
+        """Internal helper for v3 vec."""
         return tuple(map(float, _v3_from_state(x_vec, D)))
 
     def _identity_R():
+        """Internal helper for identity  r."""
         return np.eye(3, dtype=float)
 
     def _u3(uD: np.ndarray):
+        """Internal helper for u3."""
         uD = np.asarray(uD, float).reshape(-1)
         if D == 3:
             return uD[:3]
@@ -1331,12 +1374,14 @@ def run_rhc_with_rl_and_collect_frames_3d(
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        """Internal helper for x6 from x d."""
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
         if D == 3:
             return xD.astype(np.float32)
         return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
 
     def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        """Internal helper for x d from x6."""
         x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
         if D == 3:
             return x6.astype(np.float32)
@@ -1490,6 +1535,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         raise ValueError(f"Unknown dynamics '{cfg.get('dynamics')}'")
 
     def step_plant_single(xD: np.ndarray, uD: np.ndarray, k: int) -> np.ndarray:
+        """Handle step plant single for this workflow."""
         x6 = _x6_from_xD(xD)
         u3 = _u3(uD)
 
@@ -1525,6 +1571,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
         fuel_depleted_def: bool,
         fuel_depleted_att: bool,
     ):
+        """Handle check done for this workflow."""
         p1 = x1_vec[:D]
         p2 = x2_vec[:D]
 
@@ -1700,6 +1747,7 @@ def run_rhc_with_rl_and_collect_frames_3d(
             take = (idx % meas_every) == 0
 
             def _to3_pos(xD):
+                """Internal helper for to3 pos."""
                 p = np.zeros(3, dtype=float)
                 p[:D] = np.asarray(xD[:D], float)
                 return p

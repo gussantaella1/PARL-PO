@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+#
+# Replay selected Training_Policy folders as KF-enabled zero-sum runs.
+#
+# This is the safer, hand-curated version of run_train_all_training_policies_zero_sum_kf.sh.
+# Uncomment entries in SELECTED_RUN_DIRS when you want to replay only a few parent
+# runs, and use EXTRA_OVERRIDES for last-mile CLI changes without touching
+# config_rl.py or the source manifest.
 set -uo pipefail
 
 cd "$(dirname "$0")"
@@ -58,6 +65,7 @@ if [[ $# -ne 0 ]]; then
 fi
 
 run_step() {
+  # Print the command in dry-run mode, otherwise run it and continue on failure.
   local name="$1"
   shift
 

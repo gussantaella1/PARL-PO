@@ -1,3 +1,7 @@
+"""
+Training and initial-condition plotting utilities for policy runs and comparisons.
+"""
+
 
 import importlib
 import os
@@ -72,6 +76,7 @@ def plot_training_metrics(
     saved_paths : list[str]  (empty if out_dir is None)
     """
     def _as_1d(x):
+        """Internal helper for as 1d."""
         x = np.asarray(x)
         if x.ndim == 0:
             return x.reshape(1).astype(float)
@@ -80,6 +85,7 @@ def plot_training_metrics(
         return x.astype(float)
 
     def _smooth_series(y, method="none", param=0.2):
+        """Internal helper for smooth series."""
         y = _as_1d(y)
         if method is None or method == "none":
             return y
@@ -114,6 +120,7 @@ def plot_training_metrics(
             raise ValueError("No recognizable metrics keys found to infer x-axis.")
 
     def _plot_if(ax, key, label=None):
+        """Plot if using the current metrics or rollout data."""
         if key not in metrics:
             return False
         y = _smooth_series(metrics[key], method=smooth, param=smooth_param)
@@ -280,6 +287,7 @@ def plot_compare_phases(
     ax = plt.gca()
 
     def _as_1d(x):
+        """Internal helper for as 1d."""
         x = np.asarray(x)
         if x.ndim == 0:
             return x.reshape(1).astype(float)
@@ -288,6 +296,7 @@ def plot_compare_phases(
         return x.astype(float)
 
     def _smooth_series(y, method="none", param=0.2):
+        """Internal helper for smooth series."""
         y = _as_1d(y)
         if method is None or method == "none":
             return y
@@ -347,6 +356,7 @@ def plot_compare_phases(
     return fig, saved_path
 
 def _draw_circle(ax, radius, center_xy=(0.0, 0.0), **kwargs):
+    """Draw circle on the current Matplotlib axes."""
     th = np.linspace(0.0, 2.0 * np.pi, 400)
     x = center_xy[0] + radius * np.cos(th)
     y = center_xy[1] + radius * np.sin(th)
@@ -366,6 +376,7 @@ def _plot_ic_projection(
     alpha_att=0.15,
     s=4,
 ):
+    """Plot ic projection using the current metrics or rollout data."""
     i, j = dims
     center = np.zeros(3, dtype=float) if center is None else np.asarray(center, dtype=float)
 
@@ -500,6 +511,7 @@ def plot_ic_support_from_cfg(
     out_path: str | None = None,
     show: bool = False,
 ):
+    """Plot ic support from cfg using the current metrics or rollout data."""
     def_pos, att_pos = sample_ic_support(cfg, n_scenes=n_scenes, seed=seed)
     return plot_ic_samples(
         def_pos,
@@ -518,6 +530,7 @@ def plot_ic_used_from_npz(
     out_path: str | None = None,
     show: bool = False,
 ):
+    """Plot ic used from npz using the current metrics or rollout data."""
     data = np.load(npz_path)
     def_pos = data["def_pos"]
     att_pos = data["att_pos"]

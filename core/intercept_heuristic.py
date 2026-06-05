@@ -1,3 +1,7 @@
+"""
+Intercept-prior helpers that point policies toward coasting attacker intercept locations.
+"""
+
 from __future__ import annotations
 
 import math
@@ -6,6 +10,7 @@ import numpy as np
 
 
 def clamp_intercept_mix(value: float) -> float:
+    """Handle clamp intercept mix for this workflow."""
     return float(min(1.0, max(0.0, float(value))))
 
 

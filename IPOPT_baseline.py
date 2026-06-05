@@ -1,3 +1,7 @@
+"""
+IPOPT-style baseline rollout helpers for comparing learned policies against a constrained one-step optimizer.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -19,6 +23,7 @@ from paper_baseline_runner import (
 
 @dataclass
 class IPOPTBaselineParams:
+    """Configuration values for the IPOPT-style comparison baseline."""
     br_iters: int = 12
     subproblem_max_iter: int = 100
     tol: float = 1e-4
@@ -28,6 +33,7 @@ class IPOPTBaselineParams:
 
 
 def _ipopt_params_from_cfg(cfg: Dict[str, Any]) -> IPOPTBaselineParams:
+    """Internal helper for ipopt params from cfg."""
     p = IPOPTBaselineParams()
     d = cfg.get("ipopt_baseline", {}) or {}
     for k, v in d.items():
@@ -37,21 +43,25 @@ def _ipopt_params_from_cfg(cfg: Dict[str, Any]) -> IPOPTBaselineParams:
 
 
 def _project_box(u: np.ndarray, umax: float) -> np.ndarray:
+    """Project box into the constrained space used by the controller."""
     return np.clip(np.asarray(u, dtype=float), -float(umax), float(umax))
 
 
 def _flatten_actions(u_list: List[np.ndarray]) -> np.ndarray:
+    """Flatten per-agent action arrays into one optimization vector."""
     if not u_list:
         return np.zeros((0,), dtype=float)
     return np.concatenate([np.asarray(u, dtype=float).reshape(-1) for u in u_list], axis=0)
 
 
 def _unflatten_actions(vec: np.ndarray, D: int, n_players: int) -> List[np.ndarray]:
+    """Convert flattened action vectors back into per-agent action arrays."""
     arr = np.asarray(vec, dtype=float).reshape(n_players, D)
     return [arr[i].astype(np.float32) for i in range(n_players)]
 
 
 def _finite_diff_grad(fun, x: np.ndarray, eps: float) -> np.ndarray:
+    """Estimate grad with finite differences."""
     x = np.asarray(x, dtype=float).reshape(-1)
     grad = np.zeros_like(x)
     for i in range(x.size):
@@ -70,6 +80,7 @@ def _solve_box_subproblem(
     umax: float,
     params: IPOPTBaselineParams,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Internal helper for solve box subproblem."""
     x0 = _project_box(x0, umax).astype(float)
     bounds = [(-float(umax), float(umax))] * x0.size
     last_err: str | None = None
@@ -141,6 +152,7 @@ def solve_one_step_ipopt_team_ppo_zero_sum(
     ppo_params,
     umax: float,
 ) -> Tuple[np.ndarray, List[np.ndarray], Dict[str, Any]]:
+    """Handle solve one step ipopt team ppo zero sum for this workflow."""
     params = _ipopt_params_from_cfg(cfg)
     D = int(np.asarray(xD).size // 2)
     nA = len(xA_list)
@@ -156,6 +168,7 @@ def solve_one_step_ipopt_team_ppo_zero_sum(
         uA_list_cur = _unflatten_actions(uA_vec, D, nA)
 
         def att_obj(z: np.ndarray) -> float:
+            """Handle att obj for this workflow."""
             z = _project_box(z, umax)
             uA_list_z = _unflatten_actions(z, D, nA)
             g = _ppo_security_value_g(
@@ -176,6 +189,7 @@ def solve_one_step_ipopt_team_ppo_zero_sum(
         uA_new, att_info = _solve_box_subproblem(fun=att_obj, x0=uA_vec, umax=umax, params=params)
 
         def def_obj(z: np.ndarray) -> float:
+            """Handle def obj for this workflow."""
             z = _project_box(z, umax)
             g = _ppo_security_value_g(
                 xD=xD,
@@ -238,6 +252,7 @@ def _run_rollout(
     steps: int | None,
     turn_len: int | None,
 ) -> Dict[str, Any]:
+    """Run the internal rollout implementation used by the public entry point."""
     D = int(cfg.get("D", np.asarray(cfg["x0"]).shape[1] // 2))
     nx = 2 * D
     T_horizon = int(cfg["T"])
@@ -405,6 +420,7 @@ def run_rhc_with_ipopt_game_1v1_collect_frames_3d(
     steps: int | None = None,
     turn_len: int | None = None,
 ):
+    """Run rhc with ipopt game 1v1 collect frames 3d and return rollout frames, controls, and summary data."""
     return _run_rollout(cfg=cfg, n_attackers=1, steps=steps, turn_len=turn_len)
 
 
@@ -413,6 +429,7 @@ def run_rhc_with_ipopt_game_1v2_collect_frames_3d(
     steps: int | None = None,
     turn_len: int | None = None,
 ):
+    """Run rhc with ipopt game 1v2 collect frames 3d and return rollout frames, controls, and summary data."""
     return _run_rollout(cfg=cfg, n_attackers=2, steps=steps, turn_len=turn_len)
 
 

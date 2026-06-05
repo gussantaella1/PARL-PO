@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
+#
+# Run a hand-picked sequence of PPO training jobs from the repository root.
+#
+# This is the small manual launcher I use when I want to train a couple of
+# policies back-to-back without editing config_rl.py. Each run_step call owns one
+# policy folder, passes explicit CLI overrides to rl_loop.py, and keeps going if
+# one long CUDA job is interrupted or killed.
 set -uo pipefail
 
 cd "$(dirname "$0")"
 
 run_step() {
+  # Keep the sequence moving even if one experiment exits nonzero.
   local name="$1"
   shift
 

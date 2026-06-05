@@ -1,3 +1,7 @@
+"""
+Rule-based attacker controllers used for warm starts, baselines, and non-learning opponents.
+"""
+
 from typing import Any, Dict, List
 
 import numpy as np
@@ -15,6 +19,7 @@ class AttackerRuleController:
         * else                       -> smooth inverse-square repulsion
     """
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         D = int(cfg["D"])
         self.D = D
         ar = cfg["arena"]
@@ -62,6 +67,7 @@ class AttackerRuleController:
         )
 
     def u_center(self, p2: np.ndarray, v2: np.ndarray) -> np.ndarray:
+        """Handle u center for this workflow."""
         x2 = np.concatenate([p2, v2])
         # Next-step position error relative to center (E2)
         E2 = (self.Ad @ x2)[:self.D] - self.center
@@ -143,6 +149,7 @@ class AttackerRuleController:
         return np.stack(u_list, axis=0).astype(np.float32)
 
     def _torch_params(self, device: torch.device, dtype: torch.dtype):
+        """Internal helper for torch params."""
         key = (device.type, device.index, dtype)
         cached = self._torch_param_cache.get(key)
         if cached is None:

@@ -1,3 +1,7 @@
+"""
+Training, evaluation, checkpointing, opponent mixing, and distillation orchestration for staged PPO runs.
+"""
+
 import copy
 import gc
 import os
@@ -24,9 +28,11 @@ from core.freeze_utils import freeze_module_, snapshot_state_dict, assert_frozen
 
 
 def _cpu_state_dict(m: torch.nn.Module) -> dict:
+    """Internal helper for cpu state dict."""
     return {k: v.detach().cpu() for k, v in m.state_dict().items()}
 
 def _save_role_checkpoint(ppo, train_role: str, path: str):
+    """Save role checkpoint into the current output directory."""
     if train_role == "def":
         net = ppo.def_net
     elif train_role == "att":
@@ -41,6 +47,7 @@ def _save_role_checkpoint(ppo, train_role: str, path: str):
 
 
 def _normalize_probs(entries):
+    """Normalize probs into the canonical representation used here."""
     probs = np.asarray([float(e.get("prob", 0.0)) for e in entries], dtype=float)
     if np.all(probs <= 0.0):
         probs = np.full((len(entries),), 1.0 / max(1, len(entries)), dtype=float)
@@ -58,6 +65,7 @@ def _load_frozen_policy(
     device: str,
     ckpt_path: str,
 ):
+    """Load frozen policy from disk, a manifest, or a checkpoint payload."""
     net = ActorCriticDiff(obs_dim, act_dim, cfg).to(device)
     state = torch.load(ckpt_path, map_location=device)
     net.load_state_dict(state)
@@ -73,6 +81,7 @@ def _build_opponent_policy_mix(
     device: str,
     train_role: str,
 ):
+    """Build opponent policy mix for the current workflow."""
     mix = cfg.get("opp_mix", {}) or {}
     policy_entries = list(mix.get("policies", []) or [])
     if not policy_entries:
@@ -122,6 +131,7 @@ def _build_opponent_policy_mix(
 
 
 def _sample_opponent_indices(mix_state, size: int):
+    """Sample opponent indices for training, evaluation, or rollout initialization."""
     return torch.multinomial(mix_state["probs_t"], num_samples=size, replacement=True).to(dtype=torch.int64)
 
 
@@ -132,6 +142,7 @@ def _act_from_opponent_policy_mix(
     active_indices,
     act_scale: float,
 ):
+    """Internal helper for act from opponent policy mix."""
     opp_role = mix_state["opp_role"]
     act_dim = int(mix_state["act_dim"])
     out = torch.zeros((obs_batch.shape[0], act_dim), dtype=obs_batch.dtype, device=obs_batch.device)
@@ -165,10 +176,12 @@ def _act_from_opponent_policy_mix(
 
 
 def _role_obs_batch(role: str, obs_def: torch.Tensor, obs_att: torch.Tensor) -> torch.Tensor:
+    """Internal helper for role obs batch."""
     return obs_def if role == "def" else obs_att
 
 
 def _deep_merge_dict(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    """Internal helper for deep merge dict."""
     out = copy.deepcopy(base)
     for key, value in extra.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
@@ -179,6 +192,7 @@ def _deep_merge_dict(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, A
 
 
 def _make_vec_env(cfg: Dict[str, Any], num_envs: int, device: str):
+    """Internal helper for make vec env."""
     backend = str(cfg.get("vec_backend", "sync")).lower()
     if backend == "sync":
         return VecEnv(lambda: Env(cfg), num_envs)
@@ -195,6 +209,7 @@ def _make_vec_env(cfg: Dict[str, Any], num_envs: int, device: str):
 
 
 def _set_vec_attr(vec, name: str, value: Any):
+    """Internal helper for set vec attr."""
     if hasattr(vec, "set_attr"):
         vec.set_attr(name, value)
         return
@@ -203,6 +218,7 @@ def _set_vec_attr(vec, name: str, value: Any):
 
 
 def _tb_run_name(cfg: Dict[str, Any], phase_name: str, suffix: str) -> str:
+    """Internal helper for tb run name."""
     prefix = cfg.get("tb_run_prefix") or cfg.get("tb_run_name")
     if not prefix:
         checkpoint_dir = cfg.get("checkpoint_dir") or "training_run"
@@ -210,6 +226,7 @@ def _tb_run_name(cfg: Dict[str, Any], phase_name: str, suffix: str) -> str:
     return f"{prefix}_{phase_name}_{suffix}"
 
 def train(cfg: Dict[str, Any]):
+    """Run the configured staged PPO training workflow."""
     set_seed(cfg["seed"])
     if bool(cfg.get("use_kf", False)) and str(cfg.get("estimator_kind", "ukf")).lower() == "ekf":
         ekf_mode = str(cfg.get("ukf", {}).get("ekf_jacobian_mode", "exact")).strip().lower().replace("-", "_")
@@ -1115,7 +1132,9 @@ def train(cfg: Dict[str, Any]):
 
 
 def evaluate(ppo: PPO, cfg: Dict[str, Any], episodes: int = 2):
+    """Run a policy evaluation rollout and return summary metrics."""
     def _pad_xyz(series: np.ndarray) -> np.ndarray:
+        """Internal helper for pad xyz."""
         arr = np.asarray(series, dtype=float)
         if arr.ndim != 2:
             raise ValueError(f"Expected state series with shape (T, D), got {arr.shape}.")

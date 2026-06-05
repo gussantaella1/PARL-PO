@@ -1,8 +1,12 @@
+"""
+Standalone one-step IPOPT/CasADi Nash solver retained for experiments and not used by the main training loop.
+"""
+
 # nash_ipopt_solver.py
 # -------------------------------------------------------------
 # One-step approximate Nash equilibrium solver using IPOPT/CasADi.
 #
-# Intended to be called from DiffNashLayer as:
+# Historical experiment usage looked like:
 #
 #   from nash_ipopt_solver import solve_nash_ipopt
 #   u1_opt, u2_opt = solve_nash_ipopt(x1, x2, params)
@@ -10,6 +14,8 @@
 # where:
 #   - x1, x2 are np.ndarray of shape (2D,) -> [p, v]
 #   - params is a dict containing dynamics, arena, and weight settings.
+#
+# The current PPO/KF training and evaluation stack does not import this module.
 # -------------------------------------------------------------
 
 from __future__ import annotations

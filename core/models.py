@@ -1,3 +1,7 @@
+"""
+Actor-critic policy networks and optional differentiable priors used by PPO and inference.
+"""
+
 import math
 from typing import Any, Dict
 
@@ -11,11 +15,14 @@ from core.utils import logprob_squashed, squash_action
 # DiffLS Layer & Actor-Critic
 # =============================================================
 def _obs_extra_dim_from_cfg(cfg: Dict[str, Any]) -> int:
+    """Internal helper for obs extra dim from cfg."""
     return 0
 
 
 class _SingleAttackerObsLayer(nn.Module):
+    """Feature adapter that splits single-attacker observations into policy-friendly tensors."""
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__()
         self.D = int(cfg["D"])
         self.use_fuel = bool(cfg.get("fuel", {}).get("enable", False))
@@ -30,6 +37,7 @@ class _SingleAttackerObsLayer(nn.Module):
         self.feature_dim = 4 * self.D + (2 if self.use_fuel else 0) + self.extra_obs_dim
 
     def _split_obs(self, obs: torch.Tensor):
+        """Internal helper for split obs."""
         D = self.D
         base_dim = 5 * D
         expected = base_dim + (2 if self.use_fuel else 0) + self.extra_obs_dim
@@ -66,6 +74,7 @@ class _SingleAttackerObsLayer(nn.Module):
         fatt: torch.Tensor | None,
         extras: torch.Tensor,
     ) -> torch.Tensor:
+        """Pack feats into the dictionary format expected by downstream plotting and metrics."""
         if self.use_fuel:
             return torch.cat([p1c, p2c, v1, v2, fdef, fatt, extras], dim=-1)
         return torch.cat([p1c, p2c, v1, v2, extras], dim=-1)
@@ -95,6 +104,7 @@ class DiffLSLayer(_SingleAttackerObsLayer):
         p2c = p2 - center
     """
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__(cfg)
         self.ridge = float(cfg.get("prior_ridge", 1e-2))
 
@@ -139,6 +149,7 @@ class DiffLSLayer(_SingleAttackerObsLayer):
         return u
 
     def forward(self, obs: torch.Tensor, who: str):
+        """Run the module forward pass."""
         p1c, p2c, rel, v1, v2, fdef, fatt, extras = self._split_obs(obs)
 
         u_def_prior = self._one_step_prior(p1c, v1)
@@ -160,6 +171,7 @@ class InterceptPriorLayer(_SingleAttackerObsLayer):
         obs = [p1c, p2c, rel, v1, v2, f_def, f_att]   if fuel enabled
     """
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__(cfg)
         Ad = np.asarray(cfg["dyn"]["Ad"], dtype=np.float32)
         if Ad.shape != (2 * self.D, 2 * self.D):
@@ -174,6 +186,7 @@ class InterceptPriorLayer(_SingleAttackerObsLayer):
         self.intercept_gain = float(intercept_cfg.get("gain", 2.0))
 
     def _rollout_coasting_state(self, x: torch.Tensor, steps: float) -> torch.Tensor:
+        """Internal helper for rollout coasting state."""
         steps_f = max(0.0, float(steps))
         lo = int(math.floor(steps_f))
         hi = int(math.ceil(steps_f))
@@ -190,6 +203,7 @@ class InterceptPriorLayer(_SingleAttackerObsLayer):
         return (1.0 - alpha) * x_lo + alpha * x_hi
 
     def _intercept_target(self, p_att_c: torch.Tensor, v_att: torch.Tensor) -> torch.Tensor:
+        """Internal helper for intercept target."""
         if self.intercept_mix <= 0.0:
             return p_att_c
 
@@ -207,12 +221,14 @@ class InterceptPriorLayer(_SingleAttackerObsLayer):
         p_att_c: torch.Tensor,
         v_att: torch.Tensor,
     ) -> torch.Tensor:
+        """Internal helper for defender intercept prior."""
         target = self._intercept_target(p_att_c, v_att)
         delta = target - p_def_c
         delta_norm = delta.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         return (self.intercept_gain * delta) / delta_norm
 
     def forward(self, obs: torch.Tensor, who: str):
+        """Run the module forward pass."""
         p1c, p2c, rel, v1, v2, fdef, fatt, extras = self._split_obs(obs)
         u_def_prior = self._defender_intercept_prior(p1c, p2c, v2)
         u_att_prior = torch.zeros_like(u_def_prior)
@@ -230,9 +246,11 @@ class NoPriorLayer(_SingleAttackerObsLayer):
         obs = [p1c, p2c, rel, v1, v2, f_def, f_att]   if fuel enabled
     """
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__(cfg)
 
     def forward(self, obs: torch.Tensor, who: str):
+        """Run the module forward pass."""
         B, D = obs.shape[0], self.D
         device, dtype = obs.device, obs.dtype
 
@@ -245,7 +263,9 @@ class NoPriorLayer(_SingleAttackerObsLayer):
 
 
 class ActorCriticDiff(nn.Module):
+    """Actor-critic network with optional differentiable prior layers for action means."""
     def __init__(self, obs_dim: int, act_dim: int, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__()
         hidden = 128
 
@@ -284,6 +304,7 @@ class ActorCriticDiff(nn.Module):
         self.prior_blend_att = float(cfg.get("prior_blend_att", 0.0))
 
     def set_prior_blend(self, who: str, value: float) -> None:
+        """Handle set prior blend for this workflow."""
         blend = clamp_intercept_mix(value)
         if who == "def":
             self.prior_blend_def = blend
@@ -294,6 +315,7 @@ class ActorCriticDiff(nn.Module):
         raise ValueError(f"Unknown role for prior blend: {who!r}")
 
     def get_prior_blend(self, who: str) -> float:
+        """Handle get prior blend for this workflow."""
         if who == "def":
             return float(self.prior_blend_def)
         if who == "att":
@@ -301,6 +323,7 @@ class ActorCriticDiff(nn.Module):
         raise ValueError(f"Unknown role for prior blend: {who!r}")
 
     def dist(self, obs: torch.Tensor, who: str):
+        """Build the policy action distribution for a batch of observations."""
         feats, u_prior = self.layer(obs, who)
         h = self.pi(feats)
         mu_res = self.mu_res(h)
@@ -314,10 +337,12 @@ class ActorCriticDiff(nn.Module):
         return torch.distributions.Normal(mu, std)
 
     def value(self, obs: torch.Tensor):
+        """Estimate the value function for a batch of observations."""
         return self.vf(obs).squeeze(-1)
 
     @torch.no_grad()
     def act(self, obs: torch.Tensor, who: str, act_scale: float):
+        """Choose an action for the current observation or state."""
         dist = self.dist(obs, who)
         u_raw = dist.rsample()
         a_env = squash_action(u_raw, act_scale)

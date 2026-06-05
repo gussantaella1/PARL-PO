@@ -1,3 +1,7 @@
+"""
+3D geometry and compatibility helpers for camera/FOV checks and legacy Kalman-filter calls.
+"""
+
 # game_3dutils.py
 # Dedicated 3D utilities and entrypoints. Depends on game_sharedutils.
 from __future__ import annotations
@@ -14,15 +18,6 @@ from dyn_models import (
     make_bounds,
 )
 
-
-
-import importlib, game_3dutils, Archive.neos_path_game as neos_path_game#,rl_infer, game_costs
-importlib.reload(game_3dutils)
-# importlib.reload(game_costs)
-importlib.reload(neos_path_game)
-# importlib.reload(rl_infer)
-
-# Keep only module-level imports and always reference via the module
 import ukf_estimator, ekf_estimator
 import importlib
 importlib.reload(ukf_estimator)
@@ -46,21 +41,7 @@ __all__ = [
     "animate_rollout_3d", "interactive_rollout_3d"
 ]
 
-try:
-    from Archive.neos_path_game import (
-        build_mcp_two_player_one_shot,
-        solve_with_local_path,
-        extract_trajectories,
-    )
-
-
-    HAS_PATH = True
-except Exception:
-    HAS_PATH = False
-
-
-
-# ---- PATH/MCP: path-inequality builders (h(k) >= 0) -------------------------
+# ---- Legacy inequality builders (h(k) >= 0) ---------------------------------
 def build_h_builders(cfg, nx, D):
     """
     Return a list of callables h(m,k) >= 0 built from whatever keys
@@ -70,6 +51,7 @@ def build_h_builders(cfg, nx, D):
     funcs = []
 
     def _x(m, agent, k, j):
+        """Internal helper for x."""
         return m.x1[k, j] if agent == 1 else m.x2[k, j]
 
     # -------- arena --------
@@ -81,7 +63,9 @@ def build_h_builders(cfg, nx, D):
         R2 = float(ar.get("r", 1.0))**2
 
         def _sphere_h(agent):
+            """Internal helper for sphere h."""
             def h(m,k,_a=agent,_cx=cx,_cy=cy,_cz=cz,_R2=R2):
+                """Evaluate the measurement model at the provided state."""
                 px = _x(m,_a,k,0) - _cx
                 py = _x(m,_a,k,1) - _cy if D >= 2 else 0.0
                 pz = _x(m,_a,k,2) - _cz if D == 3 else 0.0
@@ -94,6 +78,7 @@ def build_h_builders(cfg, nx, D):
     if sep is not None:
         d2 = float(sep)**2
         def h_sep(m,k,_d2=d2):
+            """Handle h sep for this workflow."""
             s = 0
             for j in range(D):
                 s += (_x(m,1,k,j) - _x(m,2,k,j))**2
@@ -109,7 +94,9 @@ def build_h_builders(cfg, nx, D):
         vmax2 = float(raw_vmax)**2
         vel_idx = list(range(D, 2*D))
         def _speed_h(agent):
+            """Internal helper for speed h."""
             def h(m,k,_a=agent,_v=vel_idx,_v2=vmax2):
+                """Evaluate the measurement model at the provided state."""
                 vsq = 0
                 for j in _v:
                     vsq += (m.x1[k,j] if _a == 1 else m.x2[k,j])**2
@@ -134,6 +121,7 @@ def build_h_builders(cfg, nx, D):
             if agent not in avoid_by:
                 continue
             def _h_oi(m,k,_a=agent,_oc=tuple(oc),_r2=r2):
+                """Internal helper for h oi."""
                 s = 0.0
                 for j in range(D):
                     s += (_x(m,_a,k,j) - _oc[j])**2
@@ -160,6 +148,7 @@ class KF_CV:
     - update(z, p_obs, R_wb, **kwargs)
     """
     def __init__(self, x0, P0, Q, R, dt, kind='auto', **kwargs):
+        """Store configuration and initialize the runtime state for this object."""
         kind = (kind or 'auto').lower()
 
         has_ukf = (AgentUKF is not None)
@@ -180,13 +169,16 @@ class KF_CV:
             raise RuntimeError("Neither AgentUKF nor AgentEKF is importable.")
 
     def __getattr__(self, name):
+        """Forward missing attributes to the wrapped compatibility object."""
         return getattr(self._impl, name)
 
     def predict(self, dt=None, u=None, **kwargs):
+        """Propagate the estimator belief through the dynamics model."""
         f = getattr(self._impl, 'predict')
         return f(dt=dt, u=u, **_filter_kwargs(f, kwargs))
 
     def update(self, z, p_obs, R_wb, **kwargs):
+        """Assimilate a measurement into the estimator belief."""
         f = getattr(self._impl, 'update')
         return f(z, p_obs=p_obs, R_wb=R_wb, **_filter_kwargs(f, kwargs))
 

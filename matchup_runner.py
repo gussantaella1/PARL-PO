@@ -1,3 +1,7 @@
+"""
+Rollout runner for policy-versus-baseline matchups across paper, game-theory, IPOPT, and rule opponents.
+"""
+
 from __future__ import annotations
 
 import time
@@ -33,6 +37,7 @@ SUPPORTED_BASELINE_OPPONENTS = ("paper", "game_theory", "ipopt", "rule")
 
 
 def _v3_from_state(xD: np.ndarray, D: int) -> np.ndarray:
+    """Internal helper for v3 from state."""
     xD = np.asarray(xD, float).reshape(-1)
     if D == 3:
         return np.array([xD[3], xD[4], xD[5]], dtype=float)
@@ -40,6 +45,7 @@ def _v3_from_state(xD: np.ndarray, D: int) -> np.ndarray:
 
 
 def _normalize_kf_action_access(mode: Any) -> str:
+    """Normalize kf action access into the canonical representation used here."""
     key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
     if key == "groundtruth":
         key = "ground_truth"
@@ -52,6 +58,7 @@ def _normalize_kf_action_access(mode: Any) -> str:
 
 
 def _normalize_kf_control_noise_std(noise_std: Any, default_std: float) -> np.ndarray:
+    """Normalize kf control noise std into the canonical representation used here."""
     arr = np.asarray(noise_std if noise_std is not None else default_std, dtype=float)
     if arr.ndim == 0:
         std = np.full(3, float(arr), dtype=float)
@@ -66,6 +73,7 @@ def _normalize_kf_control_noise_std(noise_std: Any, default_std: float) -> np.nd
 
 
 def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
+    """Normalize estimator kind into the canonical representation used here."""
     kind = cfg.get("estimator_kind", "ukf")
     key = str(kind).strip().lower()
     if key not in {"ukf", "ekf"}:
@@ -74,6 +82,7 @@ def _normalize_estimator_kind(cfg: Dict[str, Any]) -> str:
 
 
 def _ekf_factory_kwargs(cfg: Dict[str, Any], linearization_group: str) -> Dict[str, Any]:
+    """Internal helper for ekf factory kwargs."""
     if _normalize_estimator_kind(cfg) != "ekf":
         return {}
     ukf_cfg = cfg.get("ukf", {})
@@ -91,6 +100,7 @@ def _kf_predict_control(
     control_meas_std: np.ndarray | None = None,
     control_limit: float | None = None,
 ):
+    """Internal helper for kf predict control."""
     if ground_truth_u is None:
         return None, None
     u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
@@ -107,10 +117,12 @@ def _kf_predict_control(
 
 
 def _normalize_angle(a: float) -> float:
+    """Normalize angle into the canonical representation used here."""
     return (float(a) + np.pi) % (2.0 * np.pi) - np.pi
 
 
 def _project_box(u: np.ndarray, umax: float) -> np.ndarray:
+    """Project box into the constrained space used by the controller."""
     return np.clip(np.asarray(u, dtype=float), -float(umax), float(umax))
 
 
@@ -121,6 +133,7 @@ def _build_velocity_cbf_filter(
     dt: float,
     umax: float,
 ):
+    """Build velocity cbf filter for the current workflow."""
     sf_cfg = dict(cfg.get("safety_filter", {}) or {})
     enabled = bool(sf_cfg.get("enabled", False))
     u_lo = -float(umax)
@@ -128,6 +141,7 @@ def _build_velocity_cbf_filter(
 
     if not enabled:
         def _no_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+            """Internal helper for no filter."""
             return np.clip(np.asarray(u_nom, dtype=float).reshape(D,), u_lo, u_hi).astype(np.float32)
         return _no_filter
 
@@ -170,6 +184,7 @@ def _build_velocity_cbf_filter(
         Bd = np.asarray(Bd, dtype=float)
 
     def _apply_filter(p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+        """Apply filter to the current config, state, or rollout data."""
         u_nom = np.asarray(u_nom, dtype=float).reshape(D,)
         a, b = velocity_cbf_halfspace_np(
             np.asarray(p, dtype=float).reshape(D,),
@@ -189,6 +204,7 @@ def _build_velocity_cbf_filter(
 
 
 def _finite_diff_grad(fun, x: np.ndarray, eps: float) -> np.ndarray:
+    """Estimate grad with finite differences."""
     x = np.asarray(x, dtype=float).reshape(-1)
     grad = np.zeros_like(x)
     for i in range(x.size):
@@ -201,6 +217,7 @@ def _finite_diff_grad(fun, x: np.ndarray, eps: float) -> np.ndarray:
 
 
 def _as_action_list(actions: Any, D: int, n_expected: int) -> List[np.ndarray]:
+    """Internal helper for as action list."""
     if isinstance(actions, (list, tuple)):
         out = [np.asarray(a, dtype=float).reshape(-1) for a in actions]
     else:
@@ -221,12 +238,14 @@ def _as_action_list(actions: Any, D: int, n_expected: int) -> List[np.ndarray]:
 
 
 def _flatten_action_list(actions: List[np.ndarray]) -> np.ndarray:
+    """Flatten per-agent action arrays into one optimization vector."""
     if not actions:
         return np.zeros((0,), dtype=np.float32)
     return np.concatenate([np.asarray(a, dtype=np.float32).reshape(-1) for a in actions], axis=0)
 
 
 def _unflatten_actions(u_vec: np.ndarray, D: int, n_actions: int) -> List[np.ndarray]:
+    """Convert flattened action vectors back into per-agent action arrays."""
     u_vec = np.asarray(u_vec, dtype=float).reshape(-1)
     if u_vec.size != D * n_actions:
         raise ValueError(f"Expected flattened action dim {D * n_actions}, got {u_vec.size}.")
@@ -234,6 +253,7 @@ def _unflatten_actions(u_vec: np.ndarray, D: int, n_actions: int) -> List[np.nda
 
 
 def _restore_action_shape(actions: List[np.ndarray]) -> np.ndarray | List[np.ndarray]:
+    """Internal helper for restore action shape."""
     if len(actions) == 1:
         return np.asarray(actions[0], dtype=np.float32)
     return [np.asarray(a, dtype=np.float32) for a in actions]
@@ -254,6 +274,7 @@ def _paper_best_response(
     ppo_obj,
     umax: float,
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    """Internal helper for paper best response."""
     paper_params = _paper_params_from_cfg(cfg)
     obj_mode = _baseline_objective_mode(cfg)
     game_mode = _pick_paper_game_mode(cfg)
@@ -348,6 +369,7 @@ def _paper_best_response(
     ]
 
     def objective(uA_list: List[np.ndarray]) -> float:
+        """Handle objective for this workflow."""
         if obj_mode == "paper":
             if game_mode == "paper_ne":
                 _, Jp = _paper_payoffs(
@@ -391,6 +413,7 @@ def _paper_best_response(
         )
 
     def nearest_idx(U, u):
+        """Handle nearest idx for this workflow."""
         return int(np.argmin([float(np.linalg.norm(ui - u)) for ui in U]))
 
     idx_a = [nearest_idx(Ua[i], uA_prev[i]) for i in range(nA)]
@@ -454,6 +477,7 @@ def _gametheory_best_response(
     ppo_obj,
     umax: float,
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    """Internal helper for gametheory best response."""
     params = _gt_params_from_cfg(cfg)
     D = int(np.asarray(xD).reshape(-1).size // 2)
     nA = len(xA_list)
@@ -464,6 +488,7 @@ def _gametheory_best_response(
         fixed_u_policy_list = _as_action_list(fixed_u_policy, D, nA)
 
         def objective(uD_vec: np.ndarray) -> float:
+            """Handle objective for this workflow."""
             return float(
                 _ppo_security_value_g(
                     xD=xD,
@@ -489,6 +514,7 @@ def _gametheory_best_response(
         fixed_u_def = np.asarray(fixed_u_policy, dtype=float).reshape(-1)
 
         def objective(uA_vec: np.ndarray) -> float:
+            """Handle objective for this workflow."""
             uA_list = _unflatten_actions(_project_box(uA_vec, umax), D, nA)
             return float(
                 _ppo_security_value_g(
@@ -551,6 +577,7 @@ def _ipopt_best_response(
     ppo_obj,
     umax: float,
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    """Internal helper for ipopt best response."""
     params = _ipopt_params_from_cfg(cfg)
     D = int(np.asarray(xD).reshape(-1).size // 2)
     nA = len(xA_list)
@@ -561,6 +588,7 @@ def _ipopt_best_response(
         fixed_u_policy_list = _as_action_list(fixed_u_policy, D, nA)
 
         def objective(uD_vec: np.ndarray) -> float:
+            """Handle objective for this workflow."""
             g = _ppo_security_value_g(
                 xD=xD,
                 xA_list=xA_list,
@@ -582,6 +610,7 @@ def _ipopt_best_response(
         fixed_u_def = np.asarray(fixed_u_policy, dtype=float).reshape(-1)
 
         def objective(uA_vec: np.ndarray) -> float:
+            """Handle objective for this workflow."""
             g = _ppo_security_value_g(
                 xD=xD,
                 xA_list=xA_list,
@@ -619,6 +648,7 @@ def _rule_best_response(
     xD: np.ndarray,
     xA_list: List[np.ndarray],
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    """Internal helper for rule best response."""
     if baseline_role != "att":
         raise ValueError("opponent_baseline='rule' is only supported for attacker-side baselines.")
 
@@ -658,6 +688,7 @@ def _solve_baseline_best_response(
     ppo_obj,
     umax: float,
 ) -> Tuple[np.ndarray | List[np.ndarray], Dict[str, Any]]:
+    """Internal helper for solve baseline best response."""
     if opponent_baseline == "rule":
         return _rule_best_response(
             cfg=cfg,
@@ -720,6 +751,7 @@ def _baseline_should_resolve(
     k: int,
     turn_len: int,
 ) -> bool:
+    """Internal helper for baseline should resolve."""
     if k == 0:
         return True
     if opponent_baseline == "rule":
@@ -757,6 +789,7 @@ def _pack_multi_agent_rollout(
     thrust_all=None,
     mdot_all=None,
 ) -> Dict[str, Any]:
+    """Pack multi agent rollout into the dictionary format expected by downstream plotting and metrics."""
     out: Dict[str, Any] = {
         "num_attackers": max(0, len(exec_xyz_all) - 1),
         "plan_hist_all": plan_hist_all,
@@ -802,6 +835,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
     steps: int | None = None,
     turn_len: int | None = None,
 ) -> Dict[str, Any]:
+    """Run the internal rhc with policy vs baseline collect frames 3d multi implementation used by the public entry point."""
     t_fn0 = time.perf_counter()
 
     policy_role = str(policy_role).lower()
@@ -885,6 +919,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         Tmax: float,
         Isp: float,
     ):
+        """Apply propulsion to the current config, state, or rollout data."""
         a_cmd = np.asarray(a_cmd, dtype=float)
 
         if m <= m_dry + 1e-9:
@@ -910,6 +945,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         m_def_cur: float | None,
         m_att_cur: List[float | None],
     ) -> np.ndarray:
+        """Build train obs for the current workflow."""
         pD = xD_vec[:D]
         vD = xD_vec[D:2 * D]
         parts: List[np.ndarray] = [pD - center]
@@ -985,6 +1021,7 @@ def _run_rhc_with_policy_vs_baseline_collect_frames_3d_multi(
         fuel_depleted_def: bool,
         fuel_depleted_att: List[bool],
     ):
+        """Handle check done for this workflow."""
         pD = xD_vec[:D]
         pA_list = [xA[:D] for xA in xA_vecs]
 
@@ -1266,6 +1303,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     steps: int | None = None,
     turn_len: int | None = None,
 ) -> Dict[str, Any]:
+    """Run rhc with policy vs baseline collect frames 3d and return rollout frames, controls, and summary data."""
     t_fn0 = time.perf_counter()
 
     policy_role = str(policy_role).lower()
@@ -1357,6 +1395,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         Tmax: float,
         Isp: float,
     ):
+        """Apply propulsion to the current config, state, or rollout data."""
         a_cmd = np.asarray(a_cmd, dtype=float)
 
         if m <= m_dry + 1e-9:
@@ -1385,6 +1424,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         m_def_cur: float | None,
         m_att_cur: float | None,
     ) -> np.ndarray:
+        """Build train obs for the current workflow."""
         p1 = x1_vec[:D]
         v1 = x1_vec[D:2 * D]
         p2 = x2_vec[:D]
@@ -1412,18 +1452,21 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
     arena_r = float(cfg.get("arena", {}).get("r", 1.0))
 
     def _u3(uD: np.ndarray):
+        """Internal helper for u3."""
         uD = np.asarray(uD, float).reshape(-1)
         if D == 3:
             return uD[:3]
         return np.array([uD[0], uD[1], 0.0], dtype=float)
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        """Internal helper for x6 from x d."""
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
         if D == 3:
             return xD.astype(np.float32)
         return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
 
     def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        """Internal helper for x d from x6."""
         x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
         if D == 3:
             return x6.astype(np.float32)
@@ -1537,6 +1580,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         meas_std_az = meas_std_el = None
 
     def build_student_sigma_feat():
+        """Build student sigma feat for the current workflow."""
         if use_kf and (ukf12 is not None):
             P = np.asarray(ukf12.P, dtype=np.float32)
             P_rel = P[: 2 * D, : 2 * D]
@@ -1580,6 +1624,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         fuel_depleted_def: bool,
         fuel_depleted_att: bool,
     ):
+        """Handle check done for this workflow."""
         p1 = x1_vec[:D]
         p2 = x2_vec[:D]
 
@@ -1781,6 +1826,7 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
             take = (idx % meas_every) == 0
 
             def _to3_pos(xD_local):
+                """Internal helper for to3 pos."""
                 p = np.zeros(3, dtype=float)
                 p[:D] = np.asarray(xD_local[:D], float)
                 return p

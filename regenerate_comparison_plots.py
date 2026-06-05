@@ -23,6 +23,7 @@ PHASE_SPECS = [
 
 
 def _existing_phase_metrics(run_dir: Path):
+    """Internal helper for existing phase metrics."""
     defender = []
     attacker = []
     combined = []
@@ -42,6 +43,7 @@ def _existing_phase_metrics(run_dir: Path):
 
 
 def _plot_group(group, ylabel: str, title: str, out_dir: Path, filename: str, smooth: str, smooth_param: float):
+    """Plot group using the current metrics or rollout data."""
     if len(group) < 2:
         return None
     _, saved_path = plot_compare_phases(
@@ -59,6 +61,7 @@ def _plot_group(group, ylabel: str, title: str, out_dir: Path, filename: str, sm
 
 
 def main():
+    """Parse command-line arguments and run this script."""
     ap = argparse.ArgumentParser(
         description="Regenerate staged training comparison plots from a completed run folder.",
     )

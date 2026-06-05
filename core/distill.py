@@ -1,3 +1,7 @@
+"""
+Teacher-student distillation utilities for converting privileged teacher policies into deployable partial-observation students.
+"""
+
 from __future__ import annotations
 
 import copy
@@ -21,14 +25,17 @@ from core.controllers import AttackerRuleController
 
 
 def _build_dyn_for_cfg(cfg: Dict[str, Any]):
+    """Build dyn for cfg for the current workflow."""
     return build_dyn_impl(cfg)
 
 
 def _env_cls_for_cfg(cfg: Dict[str, Any]):
+    """Internal helper for env cls for cfg."""
     return EnvImpl
 
 
 def _num_attackers(cfg: Dict[str, Any]) -> int:
+    """Internal helper for num attackers."""
     num_attackers = max(1, int(cfg.get("num_attackers", 1)))
     if num_attackers != 1:
         raise ValueError("Distillation now supports only the 1v1 setting (num_attackers=1).")
@@ -36,11 +43,13 @@ def _num_attackers(cfg: Dict[str, Any]) -> int:
 
 
 def _actor_critic_cls(cfg: Dict[str, Any]):
+    """Internal helper for actor critic cls."""
     _num_attackers(cfg)
     return ActorCriticDiffSingle
 
 
 def _obs_dim_from_cfg(cfg: Dict[str, Any]) -> int:
+    """Internal helper for obs dim from cfg."""
     D = int(cfg["D"])
     _num_attackers(cfg)
     fuel_dim = 2 if cfg.get("fuel", {}).get("enable", False) else 0
@@ -48,6 +57,7 @@ def _obs_dim_from_cfg(cfg: Dict[str, Any]) -> int:
 
 
 def _permute_obs_np(obs: np.ndarray, D: int, Na: int, attacker_idx: int) -> np.ndarray:
+    """Internal helper for permute obs np."""
     _ = (D, attacker_idx)
     if Na != 1:
         raise ValueError("Observation permutation is unavailable outside the 1v1 setting.")
@@ -55,6 +65,7 @@ def _permute_obs_np(obs: np.ndarray, D: int, Na: int, attacker_idx: int) -> np.n
 
 
 def _relative_state_from_obs(obs: np.ndarray, D: int, Na: int) -> np.ndarray:
+    """Internal helper for relative state from obs."""
     obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
     if Na != 1:
         raise ValueError("Relative-state extraction now supports only the 1v1 setting.")
@@ -65,6 +76,7 @@ def _relative_state_from_obs(obs: np.ndarray, D: int, Na: int) -> np.ndarray:
 
 
 def _load_checkpoint_payload(path: str, map_location, label: str):
+    """Load checkpoint payload from disk, a manifest, or a checkpoint payload."""
     try:
         return torch.load(path, map_location=map_location)
     except pickle.UnpicklingError as exc:
@@ -102,6 +114,7 @@ class PrivilegedFutureIntentEncoder(nn.Module):
       3-layer MLP with [512, 256, 128] hidden units -> latent z (default 8D).
     """
     def __init__(self, traj_dim: int, latent_dim: int = 8):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(traj_dim, 512), nn.ELU(),
@@ -112,6 +125,7 @@ class PrivilegedFutureIntentEncoder(nn.Module):
 
     def forward(self, future_rel_traj: torch.Tensor) -> torch.Tensor:
         # future_rel_traj: (B, H+1, rel_dim)
+        """Run the module forward pass."""
         B = future_rel_traj.shape[0]
         x = future_rel_traj.reshape(B, -1)
         return self.net(x)
@@ -136,6 +150,7 @@ class PartialObsStudentPolicy(nn.Module):
         lstm_hidden: int = 256,
         act_scale: float = 1.0,
     ):
+        """Store configuration and initialize the runtime state for this object."""
         super().__init__()
         self.xhat_dim = xhat_dim
         self.sigma_dim = sigma_dim
@@ -162,6 +177,7 @@ class PartialObsStudentPolicy(nn.Module):
         self.mu_raw = nn.Linear(128, act_dim)
 
     def init_hidden(self, batch_size: int, device: torch.device):
+        """Create an initial recurrent hidden state for the requested batch size."""
         h0 = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
         c0 = torch.zeros(1, batch_size, self.lstm_hidden, device=device)
         return (h0, c0)
@@ -173,6 +189,7 @@ class PartialObsStudentPolicy(nn.Module):
         u_prev_t: torch.Tensor,     # (B, act_dim)
         hidden: Tuple[torch.Tensor, torch.Tensor],
     ):
+        """Advance the environment by one control step and return the transition data."""
         enc_in = torch.cat([xhat_rel_t, sigma_t, u_prev_t], dim=-1)   # (B, *)
         enc_in = enc_in.unsqueeze(1)                                  # (B, 1, *)
         enc_out, hidden = self.encoder(enc_in, hidden)                # (B, 1, H)
@@ -192,6 +209,7 @@ class PartialObsStudentPolicy(nn.Module):
         u_prev_seq: torch.Tensor,    # (B, T, act_dim)
         hidden: Tuple[torch.Tensor, torch.Tensor],
     ):
+        """Handle forward chunk for this workflow."""
         enc_in = torch.cat([xhat_rel_seq, sigma_seq, u_prev_seq], dim=-1)
         enc_out, hidden = self.encoder(enc_in, hidden)
         zhat_seq = self.z_head(enc_out)
@@ -209,6 +227,7 @@ class PartialObsStudentPolicy(nn.Module):
 
 @dataclass
 class DAggerEpisode:
+    """Container for one DAgger-style distillation episode."""
     xhat_rel: torch.Tensor   # (T, xhat_dim)
     sigma: torch.Tensor      # (T, sigma_dim)
     u_prev: torch.Tensor     # (T, act_dim)
@@ -217,6 +236,7 @@ class DAggerEpisode:
 
 
 def _iter_tbptt_chunks(ep: DAggerEpisode, chunk_len: int):
+    """Internal helper for iter tbptt chunks."""
     T = ep.xhat_rel.shape[0]
     for t0 in range(0, T, chunk_len):
         t1 = min(T, t0 + chunk_len)
@@ -231,6 +251,7 @@ def _iter_tbptt_chunks(ep: DAggerEpisode, chunk_len: int):
 
 @dataclass
 class RecurrentDistillEpisode:
+    """Container for one recurrent distillation episode with hidden-state training chunks."""
     xhat_rel: torch.Tensor   # (T, xhat_dim)
     sigma: torch.Tensor      # (T, sigma_dim)
     u_prev: torch.Tensor     # (T, act_dim)
@@ -240,6 +261,7 @@ class RecurrentDistillEpisode:
 
 
 def _iter_recurrent_chunks(ep: RecurrentDistillEpisode, chunk_len: int):
+    """Internal helper for iter recurrent chunks."""
     T = ep.xhat_rel.shape[0]
     for t0 in range(0, T, chunk_len):
         t1 = min(T, t0 + chunk_len)
@@ -276,6 +298,7 @@ def _future_window_tensor(rel_seq: torch.Tensor, lookahead_H: int) -> torch.Tens
 # =========================================================
 
 def _extract_state_dict(payload: Any, allowed_keys: List[str]) -> Optional[Dict[str, torch.Tensor]]:
+    """Extract state dict from the provided config, checkpoint, or rollout structure."""
     if not isinstance(payload, dict):
         return None
 
@@ -396,6 +419,7 @@ def _load_policy_if_needed(
     device: torch.device,
     missing_msg: str,
 ):
+    """Load policy if needed from disk, a manifest, or a checkpoint payload."""
     if ckpt_path is None:
         raise RuntimeError(missing_msg)
 
@@ -524,6 +548,7 @@ def _policy_action_from_obs(
     act_scale: float,
     who: str,
 ) -> np.ndarray:
+    """Internal helper for policy action from obs."""
     o = torch.as_tensor(np.asarray(obs, dtype=np.float32)[None, :], dtype=torch.float32, device=device)
     with torch.no_grad():
         dist = policy.dist(o, who=who)
@@ -542,6 +567,7 @@ def _teacher_action_env(
     Na: int,
     attacker_idx: int = 0,
 ) -> np.ndarray:
+    """Internal helper for teacher action env."""
     obs_policy = np.asarray(full_obs, dtype=np.float32)
     who = "def"
     if distill_role == "att":
@@ -559,6 +585,7 @@ def _teacher_attacker_team_actions_env(
     D: int,
     Na: int,
 ) -> np.ndarray:
+    """Internal helper for teacher attacker team actions env."""
     acts = [
         _policy_action_from_obs(
             teacher_policy,
@@ -586,6 +613,7 @@ def _opponent_action_env(
     D: int,
     Na: int,
 ) -> np.ndarray:
+    """Internal helper for opponent action env."""
     if distill_role == "def" and attacker_mode == "rule":
         if rule_ctrl is None:
             raise RuntimeError("Rule-based attacker opponent requested but rule controller is not initialized.")
@@ -638,6 +666,7 @@ def _future_rel_traj_from_env(
     Na: int,
     attacker_idx: int = 0,
 ) -> np.ndarray:
+    """Internal helper for future rel traj from env."""
     try:
         env_roll = copy.deepcopy(env)
     except Exception:
@@ -712,6 +741,7 @@ def _teacher_intent_label(
     latent_dim: int,
     device: torch.device,
 ) -> np.ndarray:
+    """Internal helper for teacher intent label."""
     if teacher_intent is None:
         return _sim_intent_from_future_rel_traj(future_rel_np, latent_dim=latent_dim)
 
@@ -726,6 +756,7 @@ def distill_from_teacher_paper_recurrent(
     out_path: str = "ppo_def_kf_distilled.pt",
 ):
 
+    """Handle distill from teacher paper recurrent for this workflow."""
     cfg = copy.deepcopy(cfg)
     Na = _num_attackers(cfg)
     cfg["use_kf"] = True
@@ -845,6 +876,7 @@ def distill_from_teacher_paper_recurrent(
         raise ValueError(f"Unsupported distill_paper_intent_loss: {intent_loss}")
 
     def beta_at(iter_idx: int) -> float:
+        """Handle beta at for this workflow."""
         if dagger_decay_iters <= 0:
             return float(dagger_beta_end)
         alpha = min(1.0, max(0.0, iter_idx / float(dagger_decay_iters)))
@@ -1233,6 +1265,7 @@ def distill_from_teacher(
     teacher_ckpt_path: str,
     out_path: str = "ppo_def_kf_distilled.pt",
 ):
+    """Handle distill from teacher for this workflow."""
     method = str(cfg.get("distill_method", "modern")).lower()
     if method in {"modern", "default", "paper_modern", "berkeley"}:
         return distill_from_teacher_modern(

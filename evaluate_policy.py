@@ -2,11 +2,11 @@
 """
 evaluate_policy.py
 
-Statistical verification harness for your Diff-Nash RL rollout runner:
+Monte Carlo verification harness for trained pursuit-evasion policies.
 
-  - game_runner_diff.run_rhc_with_rl_and_collect_frames_3d(cfg, steps=...)
-
-This version is aligned with your current game_runner_diff.py.
+The main policy-vs-policy path calls game_runner.py. Baseline comparisons go
+through matchup_runner.py, which keeps the paper/game-theory/IPOPT/rule opponent
+logic out of the main RL rollout path.
 
 Outputs (all written under --out_dir):
   - results.json : aggregate stats + Wilson CI on pass rate
@@ -20,9 +20,9 @@ Grid options:
   4) --sample_ic                              [random sampling, no CSV]
   5) default: use cfg['x0']                   [single IC]
 
-NEW:
-  - --auto_shell_grid creates discrete testing points on concentric spherical shells
-    inside the arena, without needing CSV files.
+The shell-grid options are the workhorse for repeatable evals: they create
+discrete testing points on concentric spherical shells inside the arena without
+needing a pre-generated CSV file.
 """
 
 from __future__ import annotations
@@ -41,7 +41,6 @@ from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 
-# IMPORTANT: must match your CURRENT runner
 from game_runner import (
     run_batched_rhc_with_rl_and_collect_frames_3d,
     run_rhc_with_rl_and_collect_frames_3d,
@@ -118,6 +117,7 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
 # ------------------------- ckpt overrides -------------------------
 
 def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
+    """Apply ckpt overrides to the current config, state, or rollout data."""
     if def_path is not None:
         dp = str(Path(def_path))
         cfg["def_ckpt_path"] = dp
@@ -136,6 +136,7 @@ def _apply_ckpt_overrides(cfg, def_path=None, att_path=None):
 
 
 def _parse_bool(value: str) -> bool:
+    """Parse bool into the form expected by this module."""
     key = str(value).strip().lower()
     if key in {"1", "true", "t", "yes", "y", "on"}:
         return True
@@ -147,6 +148,7 @@ def _parse_bool(value: str) -> bool:
 
 
 def _parse_scalar_or_vector(value: str) -> float | List[float]:
+    """Parse scalar or vector into the form expected by this module."""
     parts = [p.strip() for p in str(value).split(",") if p.strip()]
     if not parts:
         raise argparse.ArgumentTypeError("Expected a scalar or comma-separated list of floats.")
@@ -157,6 +159,7 @@ def _parse_scalar_or_vector(value: str) -> float | List[float]:
 
 
 def _normalize_attacker_mode(value: Any) -> str:
+    """Normalize attacker mode into the canonical representation used here."""
     key = str(value).strip().lower()
     if key in {"rl", "train"}:
         return "rl"
@@ -169,6 +172,7 @@ def _normalize_attacker_mode(value: Any) -> str:
 
 
 def _require_existing_file(path_str: Optional[str], label: str) -> None:
+    """Internal helper for require existing file."""
     if path_str is None:
         raise RuntimeError(f"Missing required {label} path.")
     p = Path(path_str).expanduser()
@@ -178,6 +182,7 @@ def _require_existing_file(path_str: Optional[str], label: str) -> None:
 
 
 def _validate_eval_inputs(args: argparse.Namespace, cfg: Dict[str, Any]) -> None:
+    """Internal helper for validate eval inputs."""
     if args.trials_in is not None:
         _require_existing_file(args.trials_in, "trials_in CSV")
     if args.def_trials_in is not None:
@@ -309,11 +314,13 @@ def _load_att_csv(path: str, D: int) -> List[Dict[str, float]]:
 # ------------------------- row helpers -------------------------
 
 def _has_entity_xyz(row: Dict[str, float], prefix: str, D: int) -> bool:
+    """Internal helper for has entity xyz."""
     axes = ["x", "y", "z"][:D]
     return all(f"{prefix}_{ax}" in row for ax in axes)
 
 
 def _entity_state_from_row(row: Dict[str, float], prefix: str, D: int) -> np.ndarray:
+    """Internal helper for entity state from row."""
     axes = ["x", "y", "z"][:D]
     missing = [f"{prefix}_{ax}" for ax in axes if f"{prefix}_{ax}" not in row]
     if missing:
@@ -326,6 +333,7 @@ def _entity_state_from_row(row: Dict[str, float], prefix: str, D: int) -> np.nda
 
 
 def _row_num_attackers(row: Dict[str, float], D: int) -> int:
+    """Internal helper for row num attackers."""
     n = 0
     while _has_entity_xyz(row, f"att{n + 1}", D):
         n += 1
@@ -333,6 +341,7 @@ def _row_num_attackers(row: Dict[str, float], D: int) -> int:
 
 
 def _copy_attacker_state(row: Dict[str, float], src_idx: int, dst_idx: int, D: int) -> Dict[str, float]:
+    """Internal helper for copy attacker state."""
     axes = ["x", "y", "z"][:D]
     src = f"att{src_idx}"
     dst = f"att{dst_idx}"
@@ -347,6 +356,7 @@ def _copy_attacker_state(row: Dict[str, float], src_idx: int, dst_idx: int, D: i
 
 
 def _attacker_states_from_row(row: Dict[str, float], D: int, num_attackers: int) -> List[np.ndarray]:
+    """Internal helper for attacker states from row."""
     available = _row_num_attackers(row, D)
     if available < num_attackers:
         raise RuntimeError(
@@ -360,6 +370,7 @@ def _expand_attacker_team_rows(
     D: int,
     num_attackers: int,
 ) -> List[Dict[str, float]]:
+    """Internal helper for expand attacker team rows."""
     if num_attackers <= 1 or not att_rows:
         return att_rows
 
@@ -399,6 +410,7 @@ def _expand_attacker_team_rows(
 
 
 def _build_paired_x0(row: Dict[str, float], D: int, num_attackers: int) -> np.ndarray:
+    """Build paired x0 for the current workflow."""
     xs = [_entity_state_from_row(row, "def", D)]
     xs.extend(_attacker_states_from_row(row, D, num_attackers))
     return np.stack(xs, axis=0)
@@ -410,6 +422,7 @@ def _build_cartesian_x0(
     D: int,
     num_attackers: int,
 ) -> np.ndarray:
+    """Build cartesian x0 for the current workflow."""
     xs = [_entity_state_from_row(def_row, "def", D)]
     xs.extend(_attacker_states_from_row(att_row, D, num_attackers))
     return np.stack(xs, axis=0)
@@ -418,6 +431,7 @@ def _build_cartesian_x0(
 # ------------------------- stats -------------------------
 
 def wilson_ci(k: int, n: int, alpha: float = 0.05) -> Tuple[float, float]:
+    """Handle wilson ci for this workflow."""
     if n <= 0:
         return (0.0, 1.0)
     from statistics import NormalDist
@@ -430,6 +444,7 @@ def wilson_ci(k: int, n: int, alpha: float = 0.05) -> Tuple[float, float]:
 
 
 def _quantiles(x: np.ndarray, qs=(0.0, 0.25, 0.5, 0.75, 1.0)) -> Dict[str, float]:
+    """Internal helper for quantiles."""
     x = np.asarray(x, dtype=float)
     if x.size == 0:
         return {f"q{int(100*q):02d}": float("nan") for q in qs}
@@ -438,6 +453,7 @@ def _quantiles(x: np.ndarray, qs=(0.0, 0.25, 0.5, 0.75, 1.0)) -> Dict[str, float
 
 
 def _numeric_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
+    """Internal helper for numeric summary from values."""
     x = np.asarray(vals, dtype=float).reshape(-1)
     x = x[np.isfinite(x)]
     n = int(x.size)
@@ -465,6 +481,7 @@ def _numeric_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
 
 
 def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[str, Any]:
+    """Internal helper for binary summary from values."""
     x = np.asarray(vals, dtype=float).reshape(-1)
     x = x[np.isfinite(x)]
     if x.size:
@@ -499,6 +516,7 @@ def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[s
 
 
 def _binary_ci_errorbars(stats: Dict[str, Any]) -> Tuple[float, float]:
+    """Internal helper for binary ci errorbars."""
     mean = float(stats.get("mean", float("nan")))
     ci = stats.get("ci_wilson", {}) or {}
     lo = float(ci.get("lo", float("nan")))
@@ -509,6 +527,7 @@ def _binary_ci_errorbars(stats: Dict[str, Any]) -> Tuple[float, float]:
 
 
 def _event_time_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
+    """Internal helper for event time summary from values."""
     x = np.asarray(vals, dtype=float).reshape(-1)
     x = x[np.isfinite(x)]
     x = x[x >= 0.0]
@@ -516,6 +535,7 @@ def _event_time_summary_from_values(vals: np.ndarray) -> Dict[str, float]:
 
 
 def _cli_option_strings(argv: List[str]) -> set[str]:
+    """Internal helper for cli option strings."""
     present: set[str] = set()
     for tok in argv[1:]:
         if tok == "--":
@@ -531,6 +551,7 @@ def _apply_parser_defaults_from_cfg(
     defaults: Dict[str, Any],
     argv: List[str],
 ) -> List[str]:
+    """Apply parser defaults from cfg to the current config, state, or rollout data."""
     if not defaults:
         return []
 
@@ -551,6 +572,7 @@ def _apply_parser_defaults_from_cfg(
 # ------------------------- config helpers -------------------------
 
 def _load_json_dict(path: Path) -> Dict[str, Any]:
+    """Load json dict from disk, a manifest, or a checkpoint payload."""
     with open(path, "r") as f:
         data = json.load(f)
     if not isinstance(data, dict):
@@ -564,6 +586,7 @@ def _resolve_run_manifest_path(
     def_ckpt_path: Optional[str],
     att_ckpt_path: Optional[str],
 ) -> Optional[Path]:
+    """Resolve run manifest path from explicit inputs, config values, and defaults."""
     if run_manifest is not None:
         path = Path(run_manifest).expanduser()
         if not path.is_file():
@@ -597,6 +620,7 @@ def _resolve_run_manifest_path(
 
 
 def _extract_manifest_training_cfg(manifest: Dict[str, Any], manifest_path: Path) -> Dict[str, Any]:
+    """Extract manifest training cfg from the provided config, checkpoint, or rollout structure."""
     configs = manifest.get("configs") or {}
     if not isinstance(configs, dict):
         raise RuntimeError(f"Manifest {manifest_path} is missing a dict-valued 'configs' section.")
@@ -620,6 +644,7 @@ def _load_base_cfg(
     args: argparse.Namespace,
     mod: Any,
 ) -> Tuple[Dict[str, Any], str, Optional[Path]]:
+    """Load base cfg from disk, a manifest, or a checkpoint payload."""
     manifest_path = _resolve_run_manifest_path(
         run_manifest=args.run_manifest,
         run_dir=args.run_dir,
@@ -638,6 +663,7 @@ def _load_base_cfg(
 
 
 def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
+    """Internal helper for get center and radius."""
     ar = cfg.get("arena", {}) or {}
     cx, cy = float(ar.get("cx", 0.0)), float(ar.get("cy", 0.0))
     cz = float(ar.get("cz", 0.0)) if D == 3 else 0.0
@@ -686,6 +712,7 @@ def _resolve_shell_plan_radius(
 
 
 def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Apply x0 jitter to the current config, state, or rollout data."""
     jit = cfg.get("x0_jitter", {}) or {}
     pos_j = float(jit.get("pos", 0.0))
     vel_j = float(jit.get("vel", 0.0))
@@ -697,6 +724,7 @@ def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generat
 
 
 def _resolve_rollout_vmax(cfg: Dict[str, Any]) -> Optional[float]:
+    """Resolve rollout vmax from explicit inputs, config values, and defaults."""
     sf_cfg = cfg.get("safety_filter", {}) or {}
     raw_vmax = sf_cfg.get("vmax", None)
     if raw_vmax is None:
@@ -710,6 +738,7 @@ def _resolve_rollout_vmax(cfg: Dict[str, Any]) -> Optional[float]:
 
 
 def _project_x0_velocities_to_vmax(x0: np.ndarray, D: int, vmax: float) -> np.ndarray:
+    """Project x0 velocities to vmax into the constrained space used by the controller."""
     out = np.asarray(x0, dtype=float).copy()
     if not np.isfinite(vmax) or vmax <= 0.0:
         return out
@@ -737,6 +766,7 @@ def _combine_reproducibility_seed(seeds: List[int]) -> int:
 
 
 def _is_cuda_device(device: Any) -> bool:
+    """Internal helper for is cuda device."""
     if device is None:
         return False
     key = str(device).strip().lower()
@@ -744,6 +774,7 @@ def _is_cuda_device(device: Any) -> bool:
 
 
 def _supports_batched_cuda_eval(cfg: Dict[str, Any], opponent_source: str) -> bool:
+    """Internal helper for supports batched cuda eval."""
     if not _is_cuda_device(cfg.get("device", None)):
         return False
     if str(opponent_source).strip().lower() != "policy":
@@ -848,6 +879,7 @@ def _rows_from_positions(prefix: str, positions: np.ndarray) -> List[Dict[str, f
 
 
 def _radius_key(val: float, ndigits: int = 6) -> float:
+    """Internal helper for radius key."""
     return round(float(val), ndigits)
 
 
@@ -857,6 +889,7 @@ def _shell_radius_from_row(
     D: int,
     center: np.ndarray,
 ) -> float:
+    """Internal helper for shell radius from row."""
     p = _entity_state_from_row(row, prefix, D)[:D]
     return float(np.linalg.norm(p - center))
 
@@ -867,6 +900,7 @@ def _format_shell_radius_counts(
     D: int,
     center: np.ndarray,
 ) -> str:
+    """Internal helper for format shell radius counts."""
     counts: Dict[float, int] = {}
     for row in rows:
         key = _radius_key(_shell_radius_from_row(row, prefix, D, center))
@@ -880,6 +914,7 @@ def _format_valid_shell_pair_counts(
     att_rows: List[Dict[str, float]],
     valid_pair_indices: List[Tuple[int, int]],
 ) -> str:
+    """Internal helper for format valid shell pair counts."""
     D = int(cfg.get("D", 3))
     center, _arena_r = _get_center_and_radius(cfg, D)
     def_radii = [_radius_key(_shell_radius_from_row(row, "def", D, center)) for row in def_rows]
@@ -906,6 +941,7 @@ def _make_paired_rows_from_def_att(
     D: int,
     num_attackers: int,
 ) -> List[Dict[str, float]]:
+    """Internal helper for make paired rows from def att."""
     n_pair = min(len(def_rows), len(att_rows), int(n))
     axes = ["x", "y", "z"][:D]
     out: List[Dict[str, float]] = []
@@ -922,6 +958,7 @@ def _make_paired_rows_from_def_att(
 
 
 def _default_radial_advantage_margin(cfg: Dict[str, Any]) -> float:
+    """Internal helper for default radial advantage margin."""
     oi_r = float((cfg.get("oi", {}) or {}).get("r", 0.0))
     percent_advantage_defender = float(cfg.get("percent_advantage_defender", 0.75))
     radial_margin = float(percent_advantage_defender * np.pi * 2.0 * oi_r)
@@ -931,6 +968,7 @@ def _default_radial_advantage_margin(cfg: Dict[str, Any]) -> float:
 
 
 def _radial_advantage_scale(cfg: Dict[str, Any]) -> float:
+    """Internal helper for radial advantage scale."""
     raw_scale = cfg.get("advantage_scale", 1.0)
     if raw_scale is None:
         return 1.0
@@ -941,10 +979,12 @@ def _radial_advantage_scale(cfg: Dict[str, Any]) -> float:
 
 
 def _radial_advantage_margin(cfg: Dict[str, Any]) -> float:
+    """Internal helper for radial advantage margin."""
     return float(_default_radial_advantage_margin(cfg) * _radial_advantage_scale(cfg))
 
 
 def _advantage_constraint_satisfied(r_def: float, r_atts: List[float], radial_margin: float) -> bool:
+    """Internal helper for advantage constraint satisfied."""
     if radial_margin >= 0.0:
         return all(r_def <= (r_att - radial_margin) for r_att in r_atts)
 
@@ -959,6 +999,7 @@ def _valid_def_att_pair_indices(
     num_attackers: int,
     require_training_advantage: bool = False,
 ) -> List[Tuple[int, int]]:
+    """Internal helper for valid def att pair indices."""
     D = int(cfg.get("D", 3))
     center, _arena_r = _get_center_and_radius(cfg, D)
     radial_margin = _radial_advantage_margin(cfg)
@@ -1003,6 +1044,7 @@ def _paired_rows_from_pair_indices(
     D: int,
     num_attackers: int,
 ) -> List[Dict[str, float]]:
+    """Internal helper for paired rows from pair indices."""
     axes = ["x", "y", "z"][:D]
     out: List[Dict[str, float]] = []
     for di, ai in pair_indices[:max(0, int(n))]:
@@ -1020,6 +1062,7 @@ def _paired_rows_from_pair_indices(
 # ------------------------- scenario generation (random sampling) -------------------------
 
 def _sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: float) -> np.ndarray:
+    """Sample uniform ball for training, evaluation, or rollout initialization."""
     D = center.size
     v = rng.normal(size=D)
     v = v / (np.linalg.norm(v) + 1e-12)
@@ -1034,6 +1077,7 @@ def _sample_in_shell(
     r_min: float,
     r_max: float,
 ) -> np.ndarray:
+    """Sample in shell for training, evaluation, or rollout initialization."""
     if r_max < r_min:
         raise ValueError(f"Invalid shell: r_min={r_min} > r_max={r_max}")
 
@@ -1323,6 +1367,7 @@ def _sample_x0(
 # ------------------------- metrics -------------------------
 
 def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Extract positions from the provided config, checkpoint, or rollout structure."""
     p1 = np.asarray(out["exec1_xyz"], dtype=float)
     p2 = np.asarray(out["exec2_xyz"], dtype=float)
     p1 = p1[:, :max(3, D)]
@@ -1331,6 +1376,7 @@ def _extract_positions(out: Dict[str, Any], D: int) -> Tuple[np.ndarray, np.ndar
 
 
 def _classify_trial_outcome(row: Dict[str, Any]) -> str:
+    """Internal helper for classify trial outcome."""
     if int(row.get("num_att_errors", 0)) > 0 or int(row.get("trial_rollout_error_any", 0)) == 1 or row.get("att1_error"):
         return "rollout_error"
 
@@ -1368,6 +1414,7 @@ def _classify_trial_outcome(row: Dict[str, Any]) -> str:
 
 
 def _outcome_pretty_name(label: str) -> str:
+    """Internal helper for outcome pretty name."""
     pretty = {
         "defender_capture": "Defender capture",
         "defender_success": "Defender success",
@@ -1385,6 +1432,7 @@ def _outcome_pretty_name(label: str) -> str:
 
 
 def _outcome_color(label: str) -> str:
+    """Internal helper for outcome color."""
     palette = {
         "defender_capture": "#2ca02c",
         "defender_success": "#1f77b4",
@@ -1406,6 +1454,7 @@ def _save_outcome_histogram(
     trial_rows: List[Dict[str, Any]],
     alpha: float = 0.05,
 ) -> Dict[str, Any]:
+    """Save outcome histogram into the current output directory."""
     import matplotlib.pyplot as plt
 
     labels = [
@@ -1498,6 +1547,7 @@ def _save_outcome_histogram(
 
 
 def _downsample_xyz_path(xyz: np.ndarray, max_points: int = 256) -> np.ndarray:
+    """Internal helper for downsample xyz path."""
     arr = np.asarray(xyz, dtype=float)
     if arr.ndim != 2 or arr.size == 0:
         return np.zeros((0, 3), dtype=np.float32)
@@ -1510,6 +1560,7 @@ def _downsample_xyz_path(xyz: np.ndarray, max_points: int = 256) -> np.ndarray:
 
 
 def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute trial metrics from the provided rollout or config data."""
     D = int(cfg.get("D", 3))
     center, arena_r = _get_center_and_radius(cfg, D)
 
@@ -1661,6 +1712,7 @@ def _compute_trial_metrics(cfg: Dict[str, Any], out: Dict[str, Any]) -> Dict[str
 # ------------------------- plotting -------------------------
 
 def _extract_single_attacker_rollout(out: Dict[str, Any], attacker_idx: int) -> Dict[str, Any]:
+    """Extract single attacker rollout from the provided config, checkpoint, or rollout structure."""
     exec_xyz_all = out.get("exec_xyz_all", None)
     u_cmd_norm_all = out.get("u_cmd_norm_all", None)
 
@@ -1701,6 +1753,7 @@ def _extract_single_attacker_rollout(out: Dict[str, Any], attacker_idx: int) -> 
 
 
 def _rollout_num_steps(out: Dict[str, Any]) -> int:
+    """Internal helper for rollout num steps."""
     p1 = np.asarray(out.get("exec1_xyz", []), dtype=float)
     if p1.ndim == 0 or p1.size == 0:
         return 0
@@ -1708,6 +1761,7 @@ def _rollout_num_steps(out: Dict[str, Any]) -> int:
 
 
 def _min_non_negative(vals: List[Any]) -> int:
+    """Internal helper for min non negative."""
     finite = []
     for v in vals:
         try:
@@ -1720,6 +1774,7 @@ def _min_non_negative(vals: List[Any]) -> int:
 
 
 def _mean_metric(per_att_metrics: List[Dict[str, Any]], key: str) -> float:
+    """Internal helper for mean metric."""
     vals = []
     for m in per_att_metrics:
         try:
@@ -1732,9 +1787,11 @@ def _mean_metric(per_att_metrics: List[Dict[str, Any]], key: str) -> float:
 
 
 def _extract_kf_trial_metrics(out: Dict[str, Any], D: int) -> Dict[str, Any]:
+    """Extract kf trial metrics from the provided config, checkpoint, or rollout structure."""
     metrics: Dict[str, Any] = {}
 
     def _pos_err_metrics(est_key: str, true_key: str, prefix: str) -> None:
+        """Internal helper for pos err metrics."""
         est = np.asarray(out.get(est_key, []), dtype=float)
         true = np.asarray(out.get(true_key, []), dtype=float)
         if est.ndim != 2 or true.ndim != 2 or est.size == 0 or true.size == 0:
@@ -1751,6 +1808,7 @@ def _extract_kf_trial_metrics(out: Dict[str, Any], D: int) -> Dict[str, Any]:
         metrics[f"{prefix}_pos_err_final"] = float(err[-1])
 
     def _measurement_metrics(meas_key: str, innov_key: str, trp_key: str, prefix: str) -> None:
+        """Internal helper for measurement metrics."""
         meas = out.get(meas_key, None)
         if isinstance(meas, list):
             n_total = max(0, len(meas) - 1)
@@ -1779,6 +1837,7 @@ def _extract_kf_trial_metrics(out: Dict[str, Any], D: int) -> Dict[str, Any]:
 
 
 def _aggregate_trial_metrics(per_att_metrics: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Internal helper for aggregate trial metrics."""
     if not per_att_metrics:
         return {
             "trial_rollout_error_any": 1,
@@ -1836,6 +1895,7 @@ def _save_start_plots(
     marker_size: float = 45.0,
     alpha: float = 0.05,
 ) -> None:
+    """Save start plots into the current output directory."""
     import matplotlib.pyplot as plt
 
     if D != 3:
@@ -1852,9 +1912,11 @@ def _save_start_plots(
     # helpers
     # -------------------------
     def _set_equal(ax):
+        """Internal helper for set equal."""
         ax.set_aspect("equal", adjustable="box")
 
     def _draw_circle(ax, plane: str, r: float, label: str = None, lw: float = 1.2):
+        """Draw circle on the current Matplotlib axes."""
         cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
         if plane == "xy":
             circ = plt.Circle((cx, cy), r, fill=False, linewidth=lw)
@@ -1870,6 +1932,7 @@ def _save_start_plots(
             raise ValueError(f"unknown plane={plane}")
 
     def _decorate(ax, plane: str, title: str, xlabel: str, ylabel: str):
+        """Internal helper for decorate."""
         ax.set_title(title)
         ax.set_xlabel(f"{xlabel} (m)")
         ax.set_ylabel(f"{ylabel} (m)")
@@ -1885,6 +1948,7 @@ def _save_start_plots(
         _set_equal(ax)
 
     def _coords(arr: np.ndarray, plane: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Internal helper for coords."""
         if plane == "xy":
             return arr[:, 0], arr[:, 1]
         if plane == "xz":
@@ -1944,6 +2008,7 @@ def _save_start_plots(
     # 2) Success-rate overlays
     # -------------------------
     def _key(p, nd=6):
+        """Internal helper for key."""
         return (round(float(p[0]), nd), round(float(p[1]), nd), round(float(p[2]), nd))
 
 
@@ -2047,6 +2112,7 @@ def _save_success_vs_delta_v_plot(
     out_dir: Path,
     trial_rows: List[Dict[str, Any]],
 ) -> Optional[str]:
+    """Save success vs delta v plot into the current output directory."""
     import matplotlib.pyplot as plt
     from matplotlib.lines import Line2D
 
@@ -2156,6 +2222,7 @@ def _save_time_to_event_histograms(
     trial_rows: List[Dict[str, Any]],
     dt: float,
 ) -> Optional[str]:
+    """Save time to event histograms into the current output directory."""
     import matplotlib.pyplot as plt
 
     if not np.isfinite(dt) or dt <= 0.0:
@@ -2236,6 +2303,7 @@ def _save_trajectory_overlay_plots(
     cfg: Dict[str, Any],
     trajectory_records: List[Tuple[str, np.ndarray, np.ndarray]],
 ) -> List[str]:
+    """Save trajectory overlay plots into the current output directory."""
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
     from matplotlib.lines import Line2D
@@ -2256,6 +2324,7 @@ def _save_trajectory_overlay_plots(
     timeout_labels = {"timeout_no_capture"}
 
     def _segments(plane: str, role_idx: int, group: str) -> List[np.ndarray]:
+        """Internal helper for segments."""
         segs: List[np.ndarray] = []
         for outcome_label, def_xyz, att_xyz in trajectory_records:
             if group == "success":
@@ -2278,6 +2347,7 @@ def _save_trajectory_overlay_plots(
         return segs
 
     def _draw_circle(ax, plane: str, r: float, label: Optional[str] = None, lw: float = 1.2) -> None:
+        """Draw circle on the current Matplotlib axes."""
         cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
         if plane == "xy":
             circ = plt.Circle((cx, cy), r, fill=False, linewidth=lw)
@@ -2291,6 +2361,7 @@ def _save_trajectory_overlay_plots(
                 ax.text(cx + r, cz, label, fontsize=8, va="center")
 
     def _decorate(ax, plane: str, title: str, ylabel: str) -> None:
+        """Internal helper for decorate."""
         ax.set_title(title)
         ax.set_xlabel("x (m)")
         ax.set_ylabel(ylabel)
@@ -2306,6 +2377,7 @@ def _save_trajectory_overlay_plots(
             ax.set_ylim(float(center[2] - 1.05 * arena_r), float(center[2] + 1.05 * arena_r))
 
     def _save_plane(plane: str, filename: str, ylabel: str) -> str:
+        """Save plane into the current output directory."""
         success_def = _segments(plane, 0, "success")
         success_att = _segments(plane, 1, "success")
         timeout_def = _segments(plane, 0, "timeout")
@@ -2370,9 +2442,11 @@ def _save_kf_eval_plots(
     trial_rows: List[Dict[str, Any]],
     estimator_label: str,
 ) -> List[str]:
+    """Save kf eval plots into the current output directory."""
     import matplotlib.pyplot as plt
 
     def _vals(name: str) -> np.ndarray:
+        """Internal helper for vals."""
         vals = []
         for row in trial_rows:
             try:
@@ -2384,6 +2458,7 @@ def _save_kf_eval_plots(
         return np.asarray(vals, dtype=float)
 
     def _save_summary_barplot(filename: str, title: str, items: List[Tuple[str, str]]) -> Optional[str]:
+        """Save summary barplot into the current output directory."""
         labels: List[str] = []
         means: List[float] = []
         stds: List[float] = []
@@ -2468,7 +2543,9 @@ def _save_kf_eval_plots(
 # ------------------------- main -------------------------
 
 def main():
+    """Parse command-line arguments and run this script."""
     def log(msg: str) -> None:
+        """Handle log for this workflow."""
         print(msg, flush=True)
 
     ap = argparse.ArgumentParser()
@@ -2970,6 +3047,7 @@ def main():
     pending_items: List[Dict[str, Any]] = []
 
     def _maybe_log_first_rollout(i_trial: int, out: Dict[str, Any]) -> None:
+        """Internal helper for maybe log first rollout."""
         nonlocal first_out_logged
         if first_out_logged or not args.print_first_out_keys:
             return
@@ -2998,6 +3076,7 @@ def main():
             log(f"[eval] first rollout sanity: rel_dist start={d0:.3f} end={dT:.3f}")
 
     def _record_trial_result(item: Dict[str, Any], out: Optional[Dict[str, Any]], error: Optional[Exception]) -> None:
+        """Internal helper for record trial result."""
         nonlocal passes
 
         i_trial = int(item["trial"])
@@ -3100,6 +3179,7 @@ def main():
             )
 
     def _run_scalar_rollout(cfg_run: Dict[str, Any], steps_run: int) -> Dict[str, Any]:
+        """Run the internal scalar rollout implementation used by the public entry point."""
         if args.opponent_source == "policy":
             return run_rhc_with_rl_and_collect_frames_3d(cfg_run, steps=steps_run)
         return run_rhc_with_policy_vs_baseline_collect_frames_3d(
@@ -3110,6 +3190,7 @@ def main():
         )
 
     def _flush_pending_items() -> None:
+        """Internal helper for flush pending items."""
         nonlocal pending_items
         if not pending_items:
             return
@@ -3265,6 +3346,7 @@ def main():
     lo, hi = wilson_ci(k, n, alpha=float(args.alpha))
 
     def _col(name: str) -> np.ndarray:
+        """Internal helper for col."""
         vals = []
         for r in trial_rows:
             v = r.get(name, float("nan"))
@@ -3281,20 +3363,24 @@ def main():
     outcome_breakdown = _save_outcome_histogram(out_dir, trial_rows, alpha=float(args.alpha))
 
     def _metric_summary(name: str) -> Dict[str, float]:
+        """Internal helper for metric summary."""
         vals = _col(name)
         return _numeric_summary_from_values(vals)
 
 
     def _rate_value_and_stats(name: str) -> Tuple[float, Dict[str, Any]]:
+        """Internal helper for rate value and stats."""
         stats = _binary_summary_from_values(_col(name), alpha=float(args.alpha))
         return float(stats["mean"]), stats
 
 
     def _event_time_summary(name: str) -> Dict[str, float]:
+        """Internal helper for event time summary."""
         return _event_time_summary_from_values(_col(name))
 
 
     def _attacker_metric_block(prefix: str) -> Dict[str, Any]:
+        """Internal helper for attacker metric block."""
         attacker_hit_rate, attacker_hit_rate_stats = _rate_value_and_stats(f"{prefix}_attacker_hit")
         collision_rate, collision_rate_stats = _rate_value_and_stats(f"{prefix}_collided")
         att_term_rate, att_term_rate_stats = _rate_value_and_stats(f"{prefix}_att_term")

@@ -1,3 +1,7 @@
+"""
+Regression tests that compare vectorized EKF behavior against scalar environments.
+"""
+
 import copy
 import unittest
 
@@ -6,6 +10,9 @@ try:
     import torch
 except ModuleNotFoundError:
     torch = None
+else:
+    if not hasattr(torch, "Generator") or not hasattr(torch, "as_tensor"):
+        torch = None
 
 from config_rl import build_dyn, config_for_train
 
@@ -19,6 +26,7 @@ else:
 
 
 def _deterministic_ekf_cfg():
+    """Internal helper for deterministic ekf cfg."""
     cfg = copy.deepcopy(config_for_train())
     cfg["device"] = "cpu"
     cfg["use_kf"] = True
@@ -47,8 +55,11 @@ def _deterministic_ekf_cfg():
 
 
 class TorchVecEkfTests(unittest.TestCase):
+    """Test case for matching torch-vectorized EKF behavior to scalar environment behavior."""
+
     @unittest.skipIf(torch is None, "torch is not installed in this environment")
     def test_torch_vec_ekf_matches_scalar_env_for_deterministic_step(self):
+        """Verify that torch vec ekf matches scalar env for deterministic step behaves as expected."""
         cfg = _deterministic_ekf_cfg()
         set_seed(7)
         scalar_env = Env(copy.deepcopy(cfg))

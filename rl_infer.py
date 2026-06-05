@@ -1,3 +1,7 @@
+"""
+Checkpoint loading and batched action inference for trained teacher and student policies.
+"""
+
 #rl_infer.py
 
 from __future__ import annotations
@@ -17,6 +21,7 @@ from core.models import ActorCriticDiff
 
 
 def _load_checkpoint_payload(path: str, map_location, label: str):
+    """Load checkpoint payload from disk, a manifest, or a checkpoint payload."""
     try:
         return torch.load(path, map_location=map_location)
     except pickle.UnpicklingError as exc:
@@ -62,6 +67,7 @@ class RLPolicyDiff:
         load_defender: bool = True,
         load_attacker: bool = True,
     ):
+        """Store configuration and initialize the runtime state for this object."""
         self.cfg = copy.deepcopy(cfg)
 
         if device == "cuda" and not torch.cuda.is_available():
@@ -195,6 +201,7 @@ class RLPolicyDiff:
     # ------------------------------------------------------------------
     @staticmethod
     def _pick(cfg: Dict[str, Any], keys, default):
+        """Internal helper for pick."""
         for k in keys:
             v = cfg.get(k, None)
             if v:
@@ -253,11 +260,13 @@ class RLPolicyDiff:
 
     @staticmethod
     def _extract_student_state_dict(payload: Any) -> Optional[Dict[str, torch.Tensor]]:
+        """Extract student state dict from the provided config, checkpoint, or rollout structure."""
         if isinstance(payload, dict) and isinstance(payload.get("student_state_dict"), dict):
             return payload["student_state_dict"]
         return None
 
     def _build_student_model(self, payload: Any) -> PartialObsStudentPolicy:
+        """Build student model for the current workflow."""
         meta = payload.get("meta", {}) if isinstance(payload, dict) else {}
         payload_cfg = payload.get("cfg", {}) if isinstance(payload, dict) else {}
         latent_dim = int(meta.get("latent_dim", payload_cfg.get("distill_latent_dim", 8)))
@@ -277,6 +286,7 @@ class RLPolicyDiff:
         payload: Any,
         name: str = "NET",
     ) -> None:
+        """Load net checkpoint from payload from disk, a manifest, or a checkpoint payload."""
         sd = self._extract_state_dict(payload)
         sd = self._strip_ignored_keys(sd)
 
@@ -293,6 +303,7 @@ class RLPolicyDiff:
         payload: Any,
         name: str = "STUDENT",
     ) -> None:
+        """Load student checkpoint from disk, a manifest, or a checkpoint payload."""
         sd = self._extract_student_state_dict(payload)
         if sd is None:
             raise RuntimeError(f"{name} checkpoint is not a recognized student checkpoint.")
@@ -305,6 +316,7 @@ class RLPolicyDiff:
             )
 
     def _validate_obs(self, obs: np.ndarray, who: str) -> np.ndarray:
+        """Internal helper for validate obs."""
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         expected = self.obs_dim_def if who == "def" else self.obs_dim_att
         if obs_np.shape[0] != expected:
@@ -319,11 +331,13 @@ class RLPolicyDiff:
         return obs_np
 
     def _resolve_deterministic(self, deterministic: Optional[bool]) -> bool:
+        """Resolve deterministic from explicit inputs, config values, and defaults."""
         if deterministic is None:
             return self.use_mean_at_eval
         return bool(deterministic)
 
     def _validate_obs_batch_torch(self, obs_batch: torch.Tensor | np.ndarray, who: str) -> torch.Tensor:
+        """Internal helper for validate obs batch torch."""
         if isinstance(obs_batch, torch.Tensor):
             obs_t = obs_batch.to(device=self.device, dtype=torch.float32)
         else:
@@ -343,6 +357,7 @@ class RLPolicyDiff:
         obs: np.ndarray,
         sigma_feat: Optional[np.ndarray],
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Internal helper for student features."""
         obs_np = np.asarray(obs, dtype=np.float32).reshape(-1)
         rel = obs_np[2 * self.D : 3 * self.D]
         v1 = obs_np[3 * self.D : 4 * self.D]
@@ -365,6 +380,7 @@ class RLPolicyDiff:
         obs_batch: torch.Tensor,
         sigma_feat: Optional[torch.Tensor | np.ndarray],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Internal helper for student features batch torch."""
         rel = obs_batch[:, 2 * self.D : 3 * self.D]
         v1 = obs_batch[:, 3 * self.D : 4 * self.D]
         v2 = obs_batch[:, 4 * self.D : 5 * self.D]
@@ -401,6 +417,7 @@ class RLPolicyDiff:
         hidden: Tuple[torch.Tensor, torch.Tensor],
         u_prev: np.ndarray,
     ) -> Tuple[np.ndarray, Tuple[torch.Tensor, torch.Tensor], np.ndarray]:
+        """Internal helper for act one student."""
         xhat_rel, sigma_np = self._student_features(obs, sigma_feat)
 
         xhat_t = torch.as_tensor(xhat_rel[None, :], dtype=torch.float32, device=self.device)
@@ -423,6 +440,7 @@ class RLPolicyDiff:
         u_prev: Optional[torch.Tensor | np.ndarray],
         who: str,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
+        """Internal helper for act student batch torch."""
         obs_t = self._validate_obs_batch_torch(obs_batch, who=who)
         xhat_t, sigma_t = self._student_features_batch_torch(obs_t, sigma_feat)
         batch_size = int(obs_t.shape[0])
@@ -462,6 +480,7 @@ class RLPolicyDiff:
         who: str,
         deterministic: Optional[bool],
     ) -> np.ndarray:
+        """Internal helper for act one obs."""
         obs_np = self._validate_obs(obs, who=who)
         deterministic = self._resolve_deterministic(deterministic)
 
@@ -485,6 +504,7 @@ class RLPolicyDiff:
         who: str,
         deterministic: Optional[bool],
     ) -> torch.Tensor:
+        """Internal helper for act batch obs torch."""
         obs_t = self._validate_obs_batch_torch(obs_batch, who=who)
         deterministic = self._resolve_deterministic(deterministic)
 
@@ -515,6 +535,7 @@ class RLPolicyDiff:
         hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         u_prev: Optional[torch.Tensor | np.ndarray] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        """Handle act def batch torch for this workflow."""
         if self.def_net is None:
             raise RuntimeError("Defender policy was not loaded in RLPolicyDiff.")
         if self.def_is_student:
@@ -537,6 +558,7 @@ class RLPolicyDiff:
         hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         u_prev: Optional[torch.Tensor | np.ndarray] = None,
     ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]], Optional[torch.Tensor]]:
+        """Handle act att batch torch for this workflow."""
         obs_t = self._validate_obs_batch_torch(obs_batch, who="att")
 
         if self.attacker_mode == "rl":

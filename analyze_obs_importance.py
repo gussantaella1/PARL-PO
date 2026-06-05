@@ -1,3 +1,7 @@
+"""
+Observation-importance analysis for trained PPO policies using gradients and feature ablations.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -13,6 +17,7 @@ from rl_infer import RLPolicyDiff
 
 
 def _load_json_dict(path: Path) -> Dict[str, Any]:
+    """Load json dict from disk, a manifest, or a checkpoint payload."""
     try:
         payload = json.loads(path.read_text())
     except FileNotFoundError as exc:
@@ -26,6 +31,7 @@ def _load_json_dict(path: Path) -> Dict[str, Any]:
 
 
 def _extract_manifest_training_cfg(manifest: Dict[str, Any], manifest_path: Path) -> Dict[str, Any]:
+    """Extract manifest training cfg from the provided config, checkpoint, or rollout structure."""
     configs = manifest.get("configs") or {}
     if not isinstance(configs, dict):
         raise RuntimeError(f"Manifest {manifest_path} is missing a dict-valued 'configs' section.")
@@ -50,6 +56,7 @@ def _resolve_run_manifest_path(
     run_dir: Optional[str],
     ckpt_path: str,
 ) -> Path:
+    """Resolve run manifest path from explicit inputs, config values, and defaults."""
     if run_manifest:
         return Path(run_manifest).expanduser().resolve()
     if run_dir:
@@ -67,16 +74,19 @@ def _resolve_run_manifest_path(
 
 
 def _build_dyn_for_cfg(cfg: Dict[str, Any]) -> None:
+    """Build dyn for cfg for the current workflow."""
     from config_rl import build_dyn
     build_dyn(cfg)
 
 
 def _env_cls_for_cfg(cfg: Dict[str, Any]):
+    """Internal helper for env cls for cfg."""
     from core.env import Env
     return Env
 
 
 def _set_global_seed(seed: int) -> None:
+    """Internal helper for set global seed."""
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -84,6 +94,7 @@ def _set_global_seed(seed: int) -> None:
 
 
 def _reset_recurrent_state(wrapper: RLPolicyDiff) -> None:
+    """Internal helper for reset recurrent state."""
     if getattr(wrapper, "def_is_student", False):
         wrapper.def_hidden = wrapper.def_net.init_hidden(batch_size=1, device=wrapper.device)
         wrapper.def_u_prev = np.zeros((wrapper.act_dim,), dtype=np.float32)
@@ -93,6 +104,7 @@ def _reset_recurrent_state(wrapper: RLPolicyDiff) -> None:
 
 
 def _observation_groups(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Internal helper for observation groups."""
     if int(cfg.get("num_attackers", 1)) != 1:
         raise NotImplementedError("This analysis script currently supports only num_attackers=1.")
 
@@ -144,6 +156,7 @@ def _target_outputs(
     policy_role: str,
     obs_batch: torch.Tensor,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Internal helper for target outputs."""
     if policy_role == "def":
         model = wrapper.def_net
         is_student = bool(wrapper.def_is_student)
@@ -193,17 +206,20 @@ def _collect_observations(
     deterministic: bool,
     seed: int,
 ) -> np.ndarray:
+    """Internal helper for collect observations."""
     Env = _env_cls_for_cfg(cfg)
     env = Env(cfg)
     rng = np.random.default_rng(seed + 17)
     observations: List[np.ndarray] = []
 
     def _random_action() -> np.ndarray:
+        """Internal helper for random action."""
         umax = float(cfg.get("umax", 1.0))
         D = int(cfg.get("D", 3))
         return rng.uniform(-umax, umax, size=(D,)).astype(np.float32)
 
     def _zero_action() -> np.ndarray:
+        """Internal helper for zero action."""
         D = int(cfg.get("D", 3))
         return np.zeros((D,), dtype=np.float32)
 
@@ -256,6 +272,7 @@ def _compute_gradient_scores(
     *,
     batch_size: int,
 ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """Compute gradient scores from the provided rollout or config data."""
     device = wrapper.device
     obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
     n = obs_t.shape[0]
@@ -309,6 +326,7 @@ def _compute_ablation_scores(
     *,
     batch_size: int,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """Compute ablation scores from the provided rollout or config data."""
     device = wrapper.device
     baseline = obs_np.mean(axis=0, keepdims=True).astype(np.float32)
     obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
@@ -359,6 +377,7 @@ def _summarize_groups(
     action_ablate: Dict[str, float],
     value_ablate: Dict[str, float],
 ) -> List[Dict[str, Any]]:
+    """Internal helper for summarize groups."""
     summary: List[Dict[str, Any]] = []
     for group in groups:
         idx = group["indices"]
@@ -393,6 +412,7 @@ def _print_summary(
     value_available: bool,
     sample_count: int,
 ) -> None:
+    """Internal helper for print summary."""
     print(f"Collected {sample_count} observation samples.")
     print("")
     print("Ranked observation groups")
@@ -424,6 +444,7 @@ def _print_summary(
 
 
 def _parse_args() -> argparse.Namespace:
+    """Parse args into the form expected by this module."""
     ap = argparse.ArgumentParser(
         description=(
             "Rank observation groups by how much they influence a policy's action and value. "
@@ -465,6 +486,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    """Parse command-line arguments and run this script."""
     args = _parse_args()
     ckpt_path = str(Path(args.ckpt_path).expanduser().resolve())
     manifest_path = _resolve_run_manifest_path(args.run_manifest, args.run_dir, ckpt_path)

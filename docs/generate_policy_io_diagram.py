@@ -1,3 +1,7 @@
+"""
+Diagram generator for the policy input-output documentation in docs/.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -11,6 +15,7 @@ OUT_PATH = ROOT / "policy_io_diagram.png"
 
 
 def add_box(ax, x, y, w, h, text, fc, ec="#243042", fontsize=12, dashed=False, weight="regular"):
+    """Handle add box for this workflow."""
     box = FancyBboxPatch(
         (x, y),
         w,
@@ -36,6 +41,7 @@ def add_box(ax, x, y, w, h, text, fc, ec="#243042", fontsize=12, dashed=False, w
 
 
 def add_arrow(ax, start, end, color="#243042", lw=2.0, dashed=False, connectionstyle="arc3"):
+    """Handle add arrow for this workflow."""
     arr = FancyArrowPatch(
         start,
         end,
@@ -50,10 +56,12 @@ def add_arrow(ax, start, end, color="#243042", lw=2.0, dashed=False, connections
 
 
 def add_label(ax, x, y, text, fontsize=14, color="#243042", weight="bold", ha="left"):
+    """Handle add label for this workflow."""
     ax.text(x, y, text, fontsize=fontsize, color=color, weight=weight, ha=ha, va="center")
 
 
 def main():
+    """Parse command-line arguments and run this script."""
     fig, ax = plt.subplots(figsize=(18, 10), dpi=200)
     fig.patch.set_facecolor("#f7f3ea")
     ax.set_facecolor("#f7f3ea")

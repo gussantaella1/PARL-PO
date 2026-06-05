@@ -1,3 +1,7 @@
+"""
+PPO update logic for defender and attacker policy phases.
+"""
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +17,9 @@ from core.utils import atanh, squash_action, logprob_squashed
 # PPO Core (defender learns; attacker optionally rule-based)
 # =============================================================
 class PPO:
+    """PPO optimizer wrapper for defender-only and attacker-only training phases."""
     def __init__(self, obs_dim: int, act_dim: int, cfg: Dict[str, Any], device="cpu"):
+        """Store configuration and initialize the runtime state for this object."""
         self.cfg       = cfg
         self.device    = device
         self.clip_eps  = cfg["clip_eps"]
@@ -136,6 +142,7 @@ class PPO:
                     obs: torch.Tensor, act_env: torch.Tensor,
                     old_logp: torch.Tensor, old_val: torch.Tensor,
                     adv: torch.Tensor, ret: torch.Tensor, who: str):
+        """Internal helper for update one."""
         B = obs.shape[0]
         for _ in range(self.epochs):
             idx = torch.randperm(B, device=obs.device)  # <-- shuffle indices on same device
@@ -169,11 +176,13 @@ class PPO:
                 opt.step()
 
     def update_defender_only(self, buf_def: RolloutBuffer):
+        """Handle update defender only for this workflow."""
         advD, retD = compute_gae_from_buffer(buf_def, self.gamma, self.lam)
         oD, aD, lpD, vD, _, _ = buf_def.get()
         self._update_one(self.def_net, self.def_opt, oD, aD, lpD, vD, advD, retD, who="def")
 
     def update_attacker_only(self, buf_att: RolloutBuffer):
+        """Handle update attacker only for this workflow."""
         advA, retA = compute_gae_from_buffer(buf_att, self.gamma, self.lam)
         oA, aA, lpA, vA, _, _ = buf_att.get()
         self._update_one(self.att_net, self.att_opt, oA, aA, lpA, vA, advA, retA, who="att")

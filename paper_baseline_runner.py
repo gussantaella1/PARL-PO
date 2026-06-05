@@ -1,3 +1,7 @@
+"""
+Paper-derived baseline policies, payoff solvers, and rollout wrappers used for comparison studies.
+"""
+
 # paper_baseline_runner.py
 # Paper: Multiple to one orbital pursuit: https://ieeexplore.ieee.org/document/10700692
 
@@ -37,6 +41,7 @@ from core.safety_filter import project_box_halfspace_np, velocity_cbf_halfspace_
 @dataclass
 class PaperParams:
     # Strategy-space discretization (Eq. 15 idea)
+    """Configuration values for the paper-derived baseline controller."""
     Nup: int = 3                 # pursuer grid half-width
     Nue: int = 3                 # evader grid half-width
     dup: float = 1e-3            # pursuer accel grid unit
@@ -146,6 +151,7 @@ def _paper_parameter_check(
     checks: List[Dict[str, Any]] = []
 
     def add_check(name: str, actual: float | int, expected: float | int, tol: float = 1e-12):
+        """Handle add check for this workflow."""
         match = abs(float(actual) - float(expected)) <= tol
         checks.append(
             {
@@ -255,6 +261,7 @@ def _baseline_objective_mode(cfg: Dict[str, Any]) -> str:
 
 
 def _velocity_cbf_params_from_cfg(cfg: Dict[str, Any]) -> Tuple[bool, float, float, str, float | None]:
+    """Internal helper for velocity cbf params from cfg."""
     sf_cfg = dict(cfg.get("safety_filter", {}) or {})
     enabled = bool(sf_cfg.get("enabled", False))
     alpha = float(sf_cfg.get("alpha", 5.0))
@@ -282,6 +289,7 @@ def _velocity_cbf_params_from_cfg(cfg: Dict[str, Any]) -> Tuple[bool, float, flo
 @dataclass
 class PPOObjectiveParams:
     # Core zero-sum step reward used in core/env.py
+    """Weights and numerical settings for PPO-shaped baseline objectives."""
     k_pos: float = 1.0
     k_dock: float = 0.0
     lD: float = 0.0
@@ -321,9 +329,11 @@ class PPOObjectiveParams:
 
 
 def _ppo_obj_params_from_cfg(cfg: Dict[str, Any]) -> PPOObjectiveParams:
+    """Internal helper for ppo obj params from cfg."""
     return PPOObjectiveParams()
 
 def _populate_ppo_obj_from_cfg(cfg: Dict[str, Any], p: PPOObjectiveParams) -> PPOObjectiveParams:
+    """Internal helper for populate ppo obj from cfg."""
     oi = cfg.get("oi", {}) or {}
     att_reward = cfg.get("att_reward", {}) or {}
     zero_sum = cfg.get("zero_sum_reward", {}) or {}
@@ -411,12 +421,14 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
     dyn_type = None
 
     def _u3(uD: np.ndarray):
+        """Internal helper for u3."""
         uD = np.asarray(uD, float).reshape(-1)
         if D == 3:
             return uD[:3]
         return np.array([uD[0], uD[1], 0.0], dtype=float)
 
     def _x6_from_xD(xD: np.ndarray) -> np.ndarray:
+        """Internal helper for x6 from x d."""
         xD = np.asarray(xD, dtype=np.float32).reshape(-1)
         if D == 3:
             return xD.astype(np.float32)
@@ -424,6 +436,7 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
         return np.array([xD[0], xD[1], 0.0, xD[2], xD[3], 0.0], dtype=np.float32)
 
     def _xD_from_x6(x6: np.ndarray) -> np.ndarray:
+        """Internal helper for x d from x6."""
         x6 = np.asarray(x6, dtype=np.float32).reshape(-1)
         if D == 3:
             return x6.astype(np.float32)
@@ -435,6 +448,7 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
         Ad_now: np.ndarray | None,
         Bd_now: np.ndarray | None,
     ) -> np.ndarray:
+        """Internal helper for maybe filter u."""
         uD = np.asarray(uD, dtype=np.float32).reshape(-1)
         if not sf_enabled:
             return uD
@@ -491,6 +505,7 @@ def _build_step_plant_single(cfg: Dict[str, Any], steps: int, D: int):
         raise ValueError(f"Unknown dynamics '{cfg.get('dynamics')}'")
 
     def step_plant_single(xD: np.ndarray, uD: np.ndarray, k: int) -> np.ndarray:
+        """Handle step plant single for this workflow."""
         x6 = _x6_from_xD(xD)
         if dyn_type == "lti":
             uD_eff = _maybe_filter_u(xD, uD, Ad, Bd)
@@ -573,6 +588,7 @@ def _action_grid(u_prev: np.ndarray, du: float, N: int, umax: float, grid_mode: 
 # ============================================================
 
 def _dist_metrics(pE: np.ndarray, pP: List[np.ndarray]) -> Tuple[float, float]:
+    """Internal helper for dist metrics."""
     d_list = [float(np.linalg.norm(pi - pE)) for pi in pP]
     return float(min(d_list)), float(sum(d_list))
 
@@ -725,6 +741,7 @@ def _solve_one_step_ne_ars(
     Up = [_action_grid(uP_prev[i], params.dup, params.Nup, umax_p, params.grid_mode) for i in range(nP)]
 
     def _nearest_idx(U: List[np.ndarray], u: np.ndarray) -> int:
+        """Internal helper for nearest idx."""
         d = [float(np.linalg.norm(ui - u)) for ui in U]
         return int(np.argmin(d))
 
@@ -734,9 +751,11 @@ def _solve_one_step_ne_ars(
     seen = set()
 
     def _profile_key(ie: int, ip: List[int]) -> Tuple[int, Tuple[int, ...]]:
+        """Internal helper for profile key."""
         return (ie, tuple(int(x) for x in ip))
 
     def _best_resp_p(i: int, ie: int, ip: List[int]) -> int:
+        """Internal helper for best resp p."""
         best_j = None
         best_idx = ip[i]
         for a_idx, ui in enumerate(Up[i]):
@@ -751,6 +770,7 @@ def _solve_one_step_ne_ars(
         return best_idx
 
     def _best_resp_e(ie: int, ip: List[int]) -> int:
+        """Internal helper for best resp e."""
         best_j = None
         best_idx = ie
         for a_idx, ue in enumerate(Ue):
@@ -901,6 +921,7 @@ def _solve_one_step_minimax_security(
     Up = [_action_grid(uP_prev[i], params.dup, params.Nup, umax_p, params.grid_mode) for i in range(nP)]
 
     def _nearest_idx(U: List[np.ndarray], u: np.ndarray) -> int:
+        """Internal helper for nearest idx."""
         d = [float(np.linalg.norm(ui - u)) for ui in U]
         return int(np.argmin(d))
 
@@ -953,14 +974,17 @@ def _solve_one_step_minimax_security(
     seen = set()
 
     def _profile_key(ie: int, ip: List[int]) -> Tuple[int, Tuple[int, ...]]:
+        """Internal helper for profile key."""
         return (ie, tuple(int(x) for x in ip))
 
     def _g_for_indices(ie: int, ip: List[int]) -> float:
+        """Internal helper for g for indices."""
         uE = Ue[ie]
         uP = [Up[i][ip[i]] for i in range(nP)]
         return _paper_security_g(xE, xP, uE, uP, k, step_plant_single, params, umax_e, umax_p)
 
     def _best_resp_p(i: int, ie: int, ip: List[int]) -> int:
+        """Internal helper for best resp p."""
         best_g = None
         best_idx = ip[i]
         for a_idx, ui in enumerate(Up[i]):
@@ -973,6 +997,7 @@ def _solve_one_step_minimax_security(
         return best_idx
 
     def _best_resp_e(ie: int, ip: List[int]) -> int:
+        """Internal helper for best resp e."""
         best_g = None
         best_idx = ie
         uP = [Up[j][ip[j]] for j in range(nP)]
@@ -1065,12 +1090,14 @@ def _solve_controls_paper(
 # ============================================================
 
 def _wall_penalty(p: np.ndarray, center: np.ndarray, R: float, soft_wall: float, wallK: float) -> float:
+    """Internal helper for wall penalty."""
     rho = float(np.linalg.norm(p - center) / (R + 1e-12))
     gap = max(0.0, rho - float(soft_wall))
     return float((gap * gap) * wallK)
 
 
 def _def_keepout_penalty(p_def: np.ndarray, center: np.ndarray, oi_r: float, buf: float, coef: float) -> float:
+    """Internal helper for def keepout penalty."""
     if oi_r <= 0.0 or coef <= 0.0:
         return 0.0
     d = float(np.linalg.norm(p_def - center))
@@ -1082,6 +1109,7 @@ def _def_keepout_penalty(p_def: np.ndarray, center: np.ndarray, oi_r: float, buf
 
 
 def _pick_threat_attacker(pA_list: List[np.ndarray], center: np.ndarray, mode: str) -> int:
+    """Internal helper for pick threat attacker."""
     mode = (mode or "idx0").lower()
     if mode in ("idx0", "primary", "first"):
         return 0
@@ -1097,6 +1125,7 @@ def _ppo_terminal_adjustment(
     params: PPOObjectiveParams,
     primary_idx: int,
 ) -> Tuple[float, Dict[str, Any]]:
+    """Internal helper for ppo terminal adjustment."""
     eps = 1e-12
     oi_r_norm = float(params.oi_radius_m) / (float(R) + eps) if R > 0.0 else 0.0
 
@@ -1161,6 +1190,7 @@ def _ppo_security_value_g(
     params: PPOObjectiveParams,
     umax: float,
 ) -> float:
+    """Internal helper for ppo security value g."""
     D = int(xD.size // 2)
     eps = 1e-12
 
@@ -1170,6 +1200,7 @@ def _ppo_security_value_g(
         pD: np.ndarray,
         pA: List[np.ndarray],
     ) -> float:
+        """Internal helper for ppo step reward g."""
         ith = _pick_threat_attacker(pA, center, params.threat_mode)
         d2_prev = float(np.dot(pA_prev[ith] - center, pA_prev[ith] - center)) / (R * R + eps)
         d2 = float(np.dot(pA[ith] - center, pA[ith] - center)) / (R * R + eps)
@@ -1321,6 +1352,7 @@ def _solve_one_step_minmax_team_ppo_oi(
     Ua = [_action_grid(uA_prev[i], paper_params.dup, paper_params.Nup, umax, paper_params.grid_mode) for i in range(nA)]
 
     def _nearest_idx(U, u):
+        """Internal helper for nearest idx."""
         d = [float(np.linalg.norm(ui - u)) for ui in U]
         return int(np.argmin(d))
 
@@ -1330,9 +1362,11 @@ def _solve_one_step_minmax_team_ppo_oi(
     seen = set()
 
     def _key(id_d: int, id_a: List[int]) -> Tuple[int, Tuple[int, ...]]:
+        """Internal helper for key."""
         return (int(id_d), tuple(int(x) for x in id_a))
 
     def _best_resp_att(i: int, id_d: int, id_a: List[int]) -> int:
+        """Internal helper for best resp att."""
         best = None
         best_idx = id_a[i]
         for a_idx, ui in enumerate(Ua[i]):
@@ -1351,6 +1385,7 @@ def _solve_one_step_minmax_team_ppo_oi(
         return best_idx
 
     def _best_resp_def(id_d: int, id_a: List[int]) -> int:
+        """Internal helper for best resp def."""
         best = None
         best_idx = id_d
         uA = [Ua[j][id_a[j]] for j in range(nA)]
@@ -1421,6 +1456,7 @@ def _solve_one_step_minmax_team_ppo_oi(
 # ============================================================
 
 def _p3(xD: np.ndarray, D: int):
+    """Internal helper for p3."""
     xD = np.asarray(xD, float).reshape(-1)
     if D == 3:
         return (float(xD[0]), float(xD[1]), float(xD[2]))
@@ -1428,10 +1464,12 @@ def _p3(xD: np.ndarray, D: int):
 
 
 def _identity_R():
+    """Internal helper for identity  r."""
     return np.eye(3, dtype=float)
 
 
 def _pad3(u: np.ndarray, D: int) -> np.ndarray:
+    """Internal helper for pad3."""
     u = np.asarray(u, float).reshape(-1)
     if D == 3:
         return np.array([u[0], u[1], u[2]], float)
@@ -1439,6 +1477,7 @@ def _pad3(u: np.ndarray, D: int) -> np.ndarray:
 
 
 def _v3(xD: np.ndarray, D: int) -> np.ndarray:
+    """Internal helper for v3."""
     xD = np.asarray(xD, float).reshape(-1)
     if D == 3:
         return np.array([xD[3], xD[4], xD[5]], float)

@@ -1,3 +1,7 @@
+"""
+Rollout storage and generalized advantage estimation used by the PPO training loop.
+"""
+
 import torch
 
 
@@ -5,7 +9,9 @@ import torch
 # PPO Storage & Advantage
 # =============================================================
 class RolloutBuffer:
+    """Fixed-shape PPO rollout buffer with tensors for observations, actions, rewards, and advantages."""
     def __init__(self, obs_dim, act_dim, num_envs, horizon, device):
+        """Store configuration and initialize the runtime state for this object."""
         self.N, self.T = num_envs, horizon
         self.device = device
         self.obs  = torch.zeros(self.T, self.N, obs_dim, device=device)
@@ -18,6 +24,7 @@ class RolloutBuffer:
         self.ptr = 0
 
     def add(self, obs, act, logp, val, rew, done):
+        """Append one transition batch to the rollout buffer."""
         t = self.ptr
 
         # Make rollout data "dead" (no grad graph can leak into PPO update)
@@ -32,9 +39,11 @@ class RolloutBuffer:
 
 
     def finalize(self, next_val):
+        """Compute returns and advantages after the rollout is complete."""
         self.next_val = next_val
 
     def get(self):
+        """Yield minibatches from the stored rollout data."""
         B = self.T * self.N
         obs  = self.obs.reshape(B, -1)
         act  = self.act.reshape(B, -1)
@@ -46,6 +55,7 @@ class RolloutBuffer:
 
 
 def compute_gae_from_buffer(buf: RolloutBuffer, gamma: float, lam: float):
+    """Compute gae from buffer from the provided rollout or config data."""
     T, N = buf.T, buf.N
     device = buf.device
     adv = torch.zeros(T, N, device=device)

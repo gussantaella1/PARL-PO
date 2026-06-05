@@ -1,3 +1,7 @@
+"""
+Run logging helpers for configs, stage events, and JSON manifests.
+"""
+
 import json
 import os
 import platform
@@ -11,6 +15,7 @@ from pathlib import Path
 #Logger utils:
 
 def _utc_now():
+    """Internal helper for utc now."""
     return datetime.now(timezone.utc).isoformat()
 
 def _to_jsonable(x):
@@ -64,7 +69,9 @@ def _to_jsonable(x):
     return {"__type__": type(x).__name__, "__repr__": repr(x)}
 
 class RunLogger:
+    """JSON-backed logger for run configs and high-level stage events."""
     def __init__(self, out_dir: str, filename: str = "run_manifest.json"):
+        """Store configuration and initialize the runtime state for this object."""
         self.out_dir = out_dir
         self.path = os.path.join(out_dir, filename)
 
@@ -81,10 +88,12 @@ class RunLogger:
         self.flush()  # create file immediately
 
     def set_config(self, key: str, cfg_obj):
+        """Attach the final resolved configuration to the run log."""
         self.data["configs"][key] = _to_jsonable(cfg_obj)
         self.flush()
 
     def flush(self):
+        """Write the current run log state to disk."""
         os.makedirs(self.out_dir, exist_ok=True)
         tmp = self.path + ".tmp"
         with open(tmp, "w") as f:
@@ -93,6 +102,7 @@ class RunLogger:
 
     @contextmanager
     def stage(self, name: str, **meta):
+        """Record a named stage transition in the run log."""
         rec = {
             "name": name,
             "start_utc": _utc_now(),

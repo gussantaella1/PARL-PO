@@ -1,3 +1,7 @@
+"""
+Single-environment and vectorized pursuit-evasion environments used by training, evaluation, and rollout scripts.
+"""
+
 from typing import Any, Callable, Dict, List
 
 import copy
@@ -31,6 +35,7 @@ class Env:
     Terminal bonus at done: r_def += β d2 - 0.10 d1, r_att -= β d2.
     """
     def __init__(self, cfg: Dict[str, Any]):
+        """Store configuration and initialize the runtime state for this object."""
         self.cfg = cfg
         self.num_attackers = int(cfg.get("num_attackers", 1))
         self.D = int(cfg["D"])
@@ -365,9 +370,11 @@ class Env:
         self._apply_arena_radius(self.radius)
 
     def set_opp_domain(self, mode: str):
+        """Handle set opp domain for this workflow."""
         self.opp_domain = str(mode)
 
     def _apply_velocity_cbf_filter(self, p: np.ndarray, v: np.ndarray, u_nom: np.ndarray) -> np.ndarray:
+        """Apply velocity cbf filter to the current config, state, or rollout data."""
         u_nom = np.asarray(u_nom, dtype=float).reshape(self.D,)
         if not self.velocity_cbf_enabled:
             return np.clip(u_nom, self.u_lo, self.u_hi)
@@ -387,11 +394,13 @@ class Env:
         return project_box_halfspace_np(u_nom, self.u_lo, self.u_hi, a, b)
 
     def _reward_normalization_radius(self) -> float:
+        """Internal helper for reward normalization radius."""
         if self.reward_normalize_radius_m is not None:
             return float(self.reward_normalize_radius_m)
         return float(self.radius)
 
     def _normalize_arena_radius_stages(self, raw_stages: Any) -> list[dict[str, Any]]:
+        """Normalize arena radius stages into the canonical representation used here."""
         if raw_stages is None:
             return []
         if not isinstance(raw_stages, (list, tuple)):
@@ -508,6 +517,7 @@ class Env:
         } for stage in fraction_stages]
 
     def _apply_arena_radius(self, radius: float):
+        """Apply arena radius to the current config, state, or rollout data."""
         self.radius = float(radius)
         self.oi_radius_norm = self.oi_radius / self.radius if self.radius > 0 else 0.0
         reward_norm_radius = self._reward_normalization_radius()
@@ -522,9 +532,11 @@ class Env:
         self._arena_term_limit = self.margin if self.normalize_reward else self.margin * self.radius
 
     def _arena_radius_schedule(self) -> str:
+        """Internal helper for arena radius schedule."""
         return str(self.arena_radius_knob.get("schedule", "linear")).strip().lower()
 
     def _get_arena_radius_stages(self) -> list[dict[str, Any]]:
+        """Internal helper for get arena radius stages."""
         if self._arena_radius_stages is None:
             self._arena_radius_stages = self._normalize_arena_radius_stages(
                 self.arena_radius_knob.get("stages")
@@ -532,6 +544,7 @@ class Env:
         return self._arena_radius_stages
 
     def _current_arena_stage(self) -> dict[str, Any]:
+        """Internal helper for current arena stage."""
         stages = self._get_arena_radius_stages()
         if not stages:
             raise ValueError(
@@ -548,9 +561,11 @@ class Env:
         return stages[-1]
 
     def _staged_arena_radius(self) -> float:
+        """Internal helper for staged arena radius."""
         return float(self._current_arena_stage()["radius"])
 
     def _current_stage_shell_overrides(self) -> dict[str, Any]:
+        """Internal helper for current stage shell overrides."""
         if not self.arena_radius_knob_enabled:
             return {}
         if self._arena_radius_schedule() not in ("staged", "stage", "piecewise"):
@@ -558,6 +573,7 @@ class Env:
         return dict(self._current_arena_stage().get("shell_overrides", {}) or {})
 
     def _resolve_episode_shell_bounds(self, arena_radius: float, *, who: str) -> tuple[float, float]:
+        """Resolve episode shell bounds from explicit inputs, config values, and defaults."""
         return resolve_start_radius_bounds(
             self.cfg,
             arena_radius,
@@ -566,6 +582,7 @@ class Env:
         )
 
     def _scheduled_arena_radius(self) -> float:
+        """Internal helper for scheduled arena radius."""
         if not self.arena_radius_knob_enabled:
             return self._base_arena_radius
         start_radius = float(self.arena_radius_knob.get("start_radius_m", self._base_arena_radius))
@@ -584,6 +601,7 @@ class Env:
         return start_radius + progress * (final_radius - start_radius)
 
     def _sample_arena_radius(self) -> float:
+        """Sample arena radius for training, evaluation, or rollout initialization."""
         active_radius = self._scheduled_arena_radius()
         if not self.arena_radius_knob_enabled:
             return active_radius
@@ -607,6 +625,7 @@ class Env:
         return float(np.random.uniform(lo, hi))
 
     def _belief_state(self, p2_true: np.ndarray, v2_true: np.ndarray):
+        """Internal helper for belief state."""
         if (not self.use_kf) or (self.ukf is None):
             return p2_true, v2_true
 
@@ -636,6 +655,7 @@ class Env:
         return p2_bel, v2_bel
 
     def _attacker_belief_state(self, p1_true: np.ndarray, v1_true: np.ndarray):
+        """Internal helper for attacker belief state."""
         if (not self.use_kf) or (self.att_ukf is None):
             return p1_true, v1_true
 
@@ -665,9 +685,11 @@ class Env:
         return p1_bel, v1_bel
 
     def _center_belief(self) -> np.ndarray:
+        """Internal helper for center belief."""
         return self.center.copy()
 
     def _normalize_kf_action_access(self, mode: Any) -> str:
+        """Normalize kf action access into the canonical representation used here."""
         key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
         if key == "groundtruth":
             key = "ground_truth"
@@ -679,6 +701,7 @@ class Env:
         return key
 
     def _normalize_kf_control_noise_std(self, noise_std: Any) -> np.ndarray:
+        """Normalize kf control noise std into the canonical representation used here."""
         arr = np.asarray(noise_std, dtype=float)
         if arr.ndim == 0:
             std = np.full(3, float(arr), dtype=float)
@@ -692,6 +715,7 @@ class Env:
         return np.maximum(std, 0.0)
 
     def _reward_geom_from_sqdist(self, sqdist: float) -> float:
+        """Internal helper for reward geom from sqdist."""
         sqdist = max(float(sqdist), 0.0)
         if not self.normalize_reward:
             return sqdist
@@ -700,6 +724,7 @@ class Env:
         return sqdist / max(self._reward_geom_scale, 1e-9)
 
     def _normalize_estimator_kind(self, kind: Any) -> str:
+        """Normalize estimator kind into the canonical representation used here."""
         key = str(kind).strip().lower()
         valid = {"ukf", "ekf"}
         if key not in valid:
@@ -707,6 +732,7 @@ class Env:
         return key
 
     def _resolve_estimator_dynamics(self) -> str:
+        """Resolve estimator dynamics from explicit inputs, config values, and defaults."""
         dyn_name = str(self.cfg.get("dynamics", "hcw")).strip().lower()
         if dyn_name in ("hcw",):
             return "hcw"
@@ -721,6 +747,7 @@ class Env:
         )
 
     def _make_estimator(self, x0_est: np.ndarray, linearization_group: str = "default"):
+        """Internal helper for make estimator."""
         estimator_kwargs = {}
         if self.estimator_kind == "ekf":
             estimator_kwargs["jacobian_mode"] = self._ekf_jacobian_mode
@@ -749,6 +776,7 @@ class Env:
         )
 
     def _kf_predict_control(self, ground_truth_u: np.ndarray | None):
+        """Internal helper for kf predict control."""
         if ground_truth_u is None:
             return None, None
         u_true = np.asarray(ground_truth_u, dtype=float).reshape(3)
@@ -764,6 +792,7 @@ class Env:
         return None, None
 
     def reset(self) -> np.ndarray:
+        """Reset the environment state and return fresh observations."""
         self.t = 0
         self._apply_arena_radius(self._sample_arena_radius())
         mode = self.train_ic_mode
@@ -792,6 +821,7 @@ class Env:
             min_sep = self.train_min_sep
 
             def sample_in_ball(r_min, r_max):
+                """Sample in ball for training, evaluation, or rollout initialization."""
                 d = np.random.normal(size=(self.D,))
                 d /= (np.linalg.norm(d) + 1e-9)
                 u = np.random.rand()
@@ -837,6 +867,7 @@ class Env:
             min_sep = self.train_min_sep
 
             def sample_in_shell(r_min, r_max):
+                """Sample in shell for training, evaluation, or rollout initialization."""
                 if r_max < r_min:
                     raise ValueError(f"Invalid shell: r_min={r_min} > r_max={r_max}")
 
@@ -1509,6 +1540,7 @@ class Env:
 
 
     def _obs_def(self) -> np.ndarray:
+        """Internal helper for obs def."""
         p1, v1, pA_list, vA_list = self._unpack(self.state)
 
         if self.use_kf and (self.ukf is not None) and self.num_attackers == 1:
@@ -1554,6 +1586,7 @@ class Env:
         return obs
 
     def _obs_att(self) -> np.ndarray:
+        """Internal helper for obs att."""
         p1, v1, pA_list, vA_list = self._unpack(self.state)
         p2 = pA_list[0]
         v2 = vA_list[0]
@@ -1576,9 +1609,11 @@ class Env:
         return np.concatenate(parts).astype(np.float32)
 
     def get_obs_pair(self):
+        """Return defender and attacker observations for the current state."""
         return self._obs_def(), self._obs_att()
 
     def _obs(self) -> np.ndarray:
+        """Internal helper for obs."""
         return self._obs_def()
 
 
@@ -1636,6 +1671,7 @@ class Env:
 
 
     def _unpack(self, s: np.ndarray):
+        """Unpack the compact state representation into named state blocks."""
         D = self.D
         Na = self.num_attackers
 
@@ -1750,9 +1786,11 @@ class Env:
 # Vectorized env (single-process)
 # =============================================================
 class VecEnv:
+    """Synchronous Python vector environment wrapper around multiple scalar environments."""
     torch_backend = False
 
     def __init__(self, make_env: Callable[[], Env], num_envs: int):
+        """Store configuration and initialize the runtime state for this object."""
         self.envs: List[Env] = [make_env() for _ in range(num_envs)]
         self.num_envs = num_envs
 
@@ -1764,6 +1802,7 @@ class VecEnv:
         self._refresh_obs(reset_envs=True)
 
     def _refresh_obs(self, reset_envs: bool = False):
+        """Internal helper for refresh obs."""
         obs_def = []
         obs_att = []
         for e in self.envs:
@@ -1777,14 +1816,17 @@ class VecEnv:
         self.obs = self.obs_def
 
     def reset(self):
+        """Reset the environment state and return fresh observations."""
         self._refresh_obs(reset_envs=True)
         return self.obs
 
     def set_attr(self, name: str, value: Any):
+        """Set an attribute across all managed environments."""
         for e in self.envs:
             setattr(e, name, value)
 
     def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
+        """Advance the environment by one control step and return the transition data."""
         obs_next = []
         obs_att_next = []
         r1, r2, done, info = [], [], [], []
@@ -1805,10 +1847,12 @@ class VecEnv:
         return self.obs, np.array(r1), np.array(r2), np.array(done, dtype=np.float32), info
 
     def close(self):
+        """Release worker processes or other runtime resources."""
         return None
 
 
 def _vec_chunk_sizes(num_envs: int, num_workers: int) -> List[int]:
+    """Internal helper for vec chunk sizes."""
     num_workers = max(1, min(int(num_workers), int(num_envs)))
     base, rem = divmod(int(num_envs), num_workers)
     sizes = []
@@ -1820,6 +1864,7 @@ def _vec_chunk_sizes(num_envs: int, num_workers: int) -> List[int]:
 
 
 def _subproc_start_method(start_method: str | None) -> str:
+    """Internal helper for subproc start method."""
     if start_method is not None:
         return str(start_method)
 
@@ -1832,6 +1877,7 @@ def _subproc_start_method(start_method: str | None) -> str:
 
 
 def _subproc_vec_worker(conn, cfg: Dict[str, Any], num_envs: int, worker_idx: int):
+    """Internal helper for subproc vec worker."""
     vec = None
     try:
         cfg_local = copy.deepcopy(cfg)
@@ -1873,6 +1919,7 @@ def _subproc_vec_worker(conn, cfg: Dict[str, Any], num_envs: int, worker_idx: in
 
 
 class SubprocVecEnv:
+    """Multiprocess vector environment wrapper for CPU rollouts."""
     torch_backend = False
 
     def __init__(
@@ -1882,6 +1929,7 @@ class SubprocVecEnv:
         num_workers: int | None = None,
         start_method: str | None = None,
     ):
+        """Store configuration and initialize the runtime state for this object."""
         self.cfg = copy.deepcopy(cfg)
         self.num_envs = int(num_envs)
         requested_workers = num_workers
@@ -1912,6 +1960,7 @@ class SubprocVecEnv:
         self._refresh_obs(reset_envs=False)
 
     def _refresh_obs(self, reset_envs: bool = False):
+        """Internal helper for refresh obs."""
         cmd = "reset" if reset_envs else "get_obs"
         for conn in self._conns:
             conn.send((cmd, None))
@@ -1923,15 +1972,18 @@ class SubprocVecEnv:
         return self.obs
 
     def reset(self):
+        """Reset the environment state and return fresh observations."""
         return self._refresh_obs(reset_envs=True)
 
     def set_attr(self, name: str, value: Any):
+        """Set an attribute across all managed environments."""
         for conn in self._conns:
             conn.send(("set_attr", (name, value)))
         for conn in self._conns:
             conn.recv()
 
     def step(self, a1_env: np.ndarray, aA_env: np.ndarray, reward_mode: str = "both"):
+        """Advance the environment by one control step and return the transition data."""
         if self._closed:
             raise RuntimeError("SubprocVecEnv is already closed.")
 
@@ -1954,6 +2006,7 @@ class SubprocVecEnv:
         return self.obs, r1, r2, done, info
 
     def collect_ic_history(self):
+        """Collect recorded initial-condition history from the managed environments."""
         for conn in self._conns:
             conn.send(("get_ic_history", None))
 
@@ -1968,6 +2021,7 @@ class SubprocVecEnv:
         return def_pos, att_pos
 
     def close(self):
+        """Release worker processes or other runtime resources."""
         if self._closed:
             return None
 
@@ -1995,6 +2049,7 @@ class SubprocVecEnv:
         return None
 
     def __del__(self):
+        """Release owned resources when Python garbage-collects this object."""
         try:
             self.close()
         except Exception:
@@ -2002,6 +2057,7 @@ class SubprocVecEnv:
 
 
 def _opp_mode_code(mode: str) -> int:
+    """Internal helper for opp mode code."""
     key = str(mode)
     if key == "none":
         return 1
@@ -2028,6 +2084,7 @@ class TorchVecEnv:
         device: str | torch.device,
         episode_seeds: List[int] | None = None,
     ):
+        """Store configuration and initialize the runtime state for this object."""
         self.device = torch.device(device)
         cfg_list = None
         if isinstance(cfg, list):
@@ -2300,6 +2357,7 @@ class TorchVecEnv:
         self.reset()
 
     def _make_torch_generator(self, seed: int) -> torch.Generator:
+        """Internal helper for make torch generator."""
         gen_device = self.device
         try:
             gen = torch.Generator(device=gen_device)
@@ -2309,6 +2367,7 @@ class TorchVecEnv:
         return gen
 
     def _env_reset_seed(self, idx: int, *, offset: int = 0) -> int:
+        """Internal helper for env reset seed."""
         return int(self._episode_seeds[idx] + 1_000_003 * int(self._reset_counts[idx]) + int(offset))
 
     def _randn_for_env_indices(
@@ -2318,6 +2377,7 @@ class TorchVecEnv:
         *,
         dtype: torch.dtype,
     ) -> torch.Tensor:
+        """Internal helper for randn for env indices."""
         idx_t = torch.as_tensor(env_indices, dtype=torch.int64).reshape(-1)
         if idx_t.numel() == 0:
             return torch.empty((0,) + tuple(shape_tail), dtype=dtype, device=self.device)
@@ -2335,6 +2395,7 @@ class TorchVecEnv:
         return torch.stack(rows, dim=0)
 
     def _sample_opp_mode_codes(self, count: int) -> torch.Tensor:
+        """Sample opp mode codes for training, evaluation, or rollout initialization."""
         if count <= 0:
             return torch.empty((0,), dtype=torch.int64, device=self.device)
         if len(self._opp_domain_modes) == 1:
@@ -2356,6 +2417,7 @@ class TorchVecEnv:
         return codes
 
     def _sample_shell_positions(self, r_min: torch.Tensor, r_max: torch.Tensor) -> torch.Tensor:
+        """Sample shell positions for training, evaluation, or rollout initialization."""
         if torch.any(r_max < r_min):
             raise ValueError("Invalid shell bounds passed to _sample_shell_positions.")
         count = int(r_min.shape[0])
@@ -2368,6 +2430,7 @@ class TorchVecEnv:
         return self.center_t.unsqueeze(0) + radii[:, None] * dirs
 
     def _sample_arena_radius_batch(self, count: int) -> torch.Tensor:
+        """Sample arena radius batch for training, evaluation, or rollout initialization."""
         probe = self.envs[0]
         active_radius = float(probe._scheduled_arena_radius())
         if not probe.arena_radius_knob_enabled:
@@ -2402,10 +2465,12 @@ class TorchVecEnv:
         default_frac: float,
         overrides: Dict[str, Any] | None,
     ) -> torch.Tensor:
+        """Resolve shell bound array from explicit inputs, config values, and defaults."""
         frac_key = f"r_{who}_{bound}"
         meter_key = f"{frac_key}_m"
 
         def _radius_from_fraction(frac_value: Any, source_key: str) -> torch.Tensor:
+            """Internal helper for radius from fraction."""
             frac = float(frac_value)
             if frac > 1.0 + 1e-9:
                 raise ValueError(
@@ -2440,6 +2505,7 @@ class TorchVecEnv:
         return radius
 
     def _resolve_shell_bounds_batch(self, radii: torch.Tensor, *, who: str) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve shell bounds batch from explicit inputs, config values, and defaults."""
         overrides = self.envs[0]._current_stage_shell_overrides()
         return (
             self._resolve_shell_bound_array(radii, who=who, bound="min", default_frac=0.0, overrides=overrides),
@@ -2447,6 +2513,7 @@ class TorchVecEnv:
         )
 
     def _record_ic_batch(self, p1: torch.Tensor, p2: torch.Tensor) -> None:
+        """Internal helper for record ic batch."""
         if not self.record_ic_history:
             return
         def_np = p1.detach().cpu().numpy().astype(np.float32, copy=True)
@@ -2464,6 +2531,7 @@ class TorchVecEnv:
             self._ic_history_att_count -= int(removed.shape[0])
 
     def collect_ic_history(self):
+        """Collect recorded initial-condition history from the managed environments."""
         if self._ic_history_def_chunks or self._ic_history_att_chunks:
             def_pos = (
                 np.concatenate(self._ic_history_def_chunks, axis=0)
@@ -2490,6 +2558,7 @@ class TorchVecEnv:
         return def_pos, att_pos
 
     def _fast_reset_slots(self, indices: torch.Tensor, *, resample_opp: bool) -> None:
+        """Internal helper for fast reset slots."""
         idx_t = torch.as_tensor(indices, dtype=torch.int64, device=self.device).reshape(-1)
         count = int(idx_t.numel())
         if count == 0:
@@ -2655,6 +2724,7 @@ class TorchVecEnv:
         self._record_ic_batch(p1, p2)
 
     def _reset_env_slot(self, idx: int, *, resample_opp: bool) -> None:
+        """Internal helper for reset env slot."""
         env = self.envs[idx]
         if resample_opp:
             if self._use_per_env_torch_generators:
@@ -2667,6 +2737,7 @@ class TorchVecEnv:
         self._sync_slot_from_env(idx)
 
     def _sync_slot_from_env(self, idx: int):
+        """Internal helper for sync slot from env."""
         env = self.envs[idx]
         self.state_t[idx] = torch.as_tensor(np.asarray(env.state, dtype=np.float32), dtype=self.dtype, device=self.device)
         self._t_steps[idx] = int(env.t)
@@ -2709,18 +2780,21 @@ class TorchVecEnv:
                 )
 
     def _sync_from_envs(self, indices: List[int] | None = None):
+        """Internal helper for sync from envs."""
         if indices is None:
             indices = list(range(self.num_envs))
         for idx in indices:
             self._sync_slot_from_env(int(idx))
 
     def _split_state(self):
+        """Internal helper for split state."""
         D = self.D
         x1 = self.state_t[:, : 2 * D]
         x2 = self.state_t[:, 2 * D : 4 * D]
         return x1[:, :D], x1[:, D:], x2[:, :D], x2[:, D:]
 
     def _current_linear_dyn_mats(self):
+        """Internal helper for current linear dyn mats."""
         if self._dyn_type == "ltv":
             if self._Ad_seq_t is None or self._Bd_seq_t is None:
                 raise RuntimeError("LTV dynamics selected, but Ad/Bd sequences are unavailable.")
@@ -2736,6 +2810,7 @@ class TorchVecEnv:
         Ad_t: torch.Tensor,
         Bd_t: torch.Tensor,
     ) -> torch.Tensor:
+        """Internal helper for linear step batch."""
         if Ad_t.ndim == 2:
             return torch.matmul(x, Ad_t.transpose(0, 1)) + torch.matmul(u, Bd_t.transpose(0, 1))
         if Ad_t.ndim == 3:
@@ -2743,6 +2818,7 @@ class TorchVecEnv:
         raise ValueError(f"Expected Ad_t to have ndim 2 or 3, got {Ad_t.ndim}.")
 
     def _fuel_fractions(self):
+        """Internal helper for fuel fractions."""
         fuel_frac_def = (self.m_def_t - self.mdry_def) / (self.m0_def - self.mdry_def + 1e-9)
         fuel_frac_att = (self.m_att_t - self.mdry_att) / (self.m0_att - self.mdry_att + 1e-9)
         return fuel_frac_def.clamp(0.0, 1.0), fuel_frac_att.clamp(0.0, 1.0)
@@ -2755,6 +2831,7 @@ class TorchVecEnv:
         Ad_t: torch.Tensor | None = None,
         Bd_t: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Apply velocity cbf filter batch to the current config, state, or rollout data."""
         if not self.velocity_cbf_enabled:
             return torch.clamp(u_nom, min=self.u_lo_t, max=self.u_hi_t)
 
@@ -2777,9 +2854,11 @@ class TorchVecEnv:
         return project_box_halfspace_torch(u_nom, self.u_lo_t, self.u_hi_t, a, b)
 
     def _ekf_symmetrize(self, M: torch.Tensor) -> torch.Tensor:
+        """Internal helper for ekf symmetrize."""
         return 0.5 * (M + M.transpose(-1, -2))
 
     def _ekf_psd_enforce(self, M: torch.Tensor, floor: float = 1e-12) -> torch.Tensor:
+        """Internal helper for ekf psd enforce."""
         M = self._ekf_symmetrize(M)
         diag = torch.diagonal(M, dim1=-2, dim2=-1)
         if torch.any(diag < floor):
@@ -2801,6 +2880,7 @@ class TorchVecEnv:
         return M
 
     def _ekf_normalize_angle(self, a: torch.Tensor) -> torch.Tensor:
+        """Internal helper for ekf normalize angle."""
         return torch.remainder(a + np.pi, 2.0 * np.pi) - np.pi
 
     def _ekf_measurement_from_positions(
@@ -2808,6 +2888,7 @@ class TorchVecEnv:
         p_obs: torch.Tensor,
         p_tgt: torch.Tensor,
     ) -> torch.Tensor:
+        """Internal helper for ekf measurement from positions."""
         r = p_tgt - p_obs
         n = torch.linalg.vector_norm(r, dim=-1, keepdim=True)
         zero_mask = n.squeeze(-1) < 1e-12
@@ -2827,6 +2908,7 @@ class TorchVecEnv:
         x_state: torch.Tensor,
         p_obs: torch.Tensor,
     ) -> torch.Tensor:
+        """Internal helper for ekf measurement jacobian."""
         p = x_state[:, :3]
         r = p - p_obs
         n = torch.linalg.vector_norm(r, dim=-1, keepdim=True)
@@ -2875,6 +2957,7 @@ class TorchVecEnv:
         x_state: torch.Tensor,
         p_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal helper for ekf linearization."""
         if self._ekf_jacobian_mode == "exact":
             H = self._ekf_measurement_jacobian(x_state, p_obs)
             z_pred = self._ekf_measurement_from_positions(p_obs, x_state[:, :3])
@@ -2898,6 +2981,7 @@ class TorchVecEnv:
         self,
         u_true: torch.Tensor,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Internal helper for ekf predict control."""
         u_true = u_true.to(dtype=self._ekf_dtype)
         if self._kf_action_access == "ground_truth":
             return u_true, None
@@ -2916,6 +3000,7 @@ class TorchVecEnv:
         return None, None
 
     def _ekf_current_linear_dyn_mats(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal helper for ekf current linear dyn mats."""
         if self._ekf_Ad_seq_t is not None and self._ekf_Bd_seq_t is not None:
             max_idx = int(self._ekf_Ad_seq_t.shape[0] - 1)
             # The plant step already advanced self._t_steps before the EKF predict call,
@@ -2930,6 +3015,7 @@ class TorchVecEnv:
         P_state: torch.Tensor,
         u_true: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal helper for ekf predict batch."""
         u_predict, u_cov = self._ekf_predict_control(u_true)
         Ad_t, Bd_t = self._ekf_current_linear_dyn_mats()
         if Ad_t.ndim == 2:
@@ -2959,6 +3045,7 @@ class TorchVecEnv:
         role_key: str,
         update_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Internal helper for ekf update batch."""
         meas_innov = torch.zeros((self.num_envs,), dtype=self.dtype, device=self.device)
         trP = torch.diagonal(P_state[:, :3, :3], dim1=-2, dim2=-1).sum(dim=-1).to(dtype=self.dtype)
         if not torch.any(update_mask):
@@ -3000,6 +3087,7 @@ class TorchVecEnv:
         p_true: torch.Tensor,
         v_true: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Internal helper for ekf belief state batch."""
         p_bel = x_state[:, : self.D].clone()
         v_bel = x_state[:, self.D : 2 * self.D].clone()
         center = self.center_t.to(dtype=self._ekf_dtype)
@@ -3030,6 +3118,7 @@ class TorchVecEnv:
         return p_bel.to(dtype=self.dtype), v_bel.to(dtype=self.dtype)
 
     def _refresh_obs(self):
+        """Internal helper for refresh obs."""
         p1, v1, p2, v2 = self._split_state()
 
         if self._batched_ekf_enabled:
@@ -3091,6 +3180,7 @@ class TorchVecEnv:
         return self.obs
 
     def reset(self):
+        """Reset the environment state and return fresh observations."""
         if self._fast_reset_enabled:
             self._fast_reset_slots(torch.arange(self.num_envs, device=self.device), resample_opp=False)
         else:
@@ -3100,6 +3190,7 @@ class TorchVecEnv:
         return self.obs
 
     def set_attr(self, name: str, value: Any):
+        """Set an attribute across all managed environments."""
         if name == "curriculum_progress":
             self.curriculum_progress = float(value)
             if self._fast_reset_enabled:
@@ -3112,6 +3203,7 @@ class TorchVecEnv:
             setattr(env, name, value)
 
     def get_student_sigma_features(self) -> torch.Tensor | None:
+        """Handle get student sigma features for this workflow."""
         if not self.use_kf:
             return None
 
@@ -3141,6 +3233,7 @@ class TorchVecEnv:
         Tmax: float,
         Isp: float,
     ):
+        """Apply propulsion batch to the current config, state, or rollout data."""
         alive = m > (m_dry + 1e-9)
         F_req = a_cmd * m[:, None]
         F_req_norm = torch.linalg.vector_norm(F_req, dim=-1)
@@ -3168,6 +3261,7 @@ class TorchVecEnv:
         auto_reset: bool = True,
         emit_infos: bool = True,
     ):
+        """Advance the environment by one control step and return the transition data."""
         self.last_step_stats = None
         need_def = reward_mode in ("def", "both")
         need_att = reward_mode in ("att", "both")
@@ -3645,6 +3739,7 @@ class TorchVecEnv:
         return self.obs, r1, r2, done.to(dtype=self.dtype), infos
 
     def close(self):
+        """Release worker processes or other runtime resources."""
         return None
 
 
@@ -3722,6 +3817,7 @@ def sample_ic_support(
 
 
 def _sample_opp_domain(cfg: Dict[str, Any]) -> str:
+    """Sample opp domain for training, evaluation, or rollout initialization."""
     mix = cfg.get("opp_mix", None)
     if not mix:
         return "def0"

@@ -1,3 +1,7 @@
+"""
+Command-line entry point for building a distillation config and launching teacher-student training.
+"""
+
 from __future__ import annotations
 
 import json
@@ -63,6 +67,7 @@ DISTILL_RUN: Dict[str, Any] = {
 
 
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    """Internal helper for deep update."""
     for key, value in src.items():
         if isinstance(value, dict) and isinstance(dst.get(key), dict):
             _deep_update(dst[key], value)
@@ -72,6 +77,7 @@ def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Build distill cfg for the current workflow."""
     cfg = config_for_train(
         attacker_mode=run_cfg["attacker_mode"],
         train_role=run_cfg["train_role"],
@@ -94,6 +100,7 @@ def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def main() -> None:
+    """Parse command-line arguments and run this script."""
     run_cfg = dict(DISTILL_RUN)
     cfg = build_distill_cfg(run_cfg)
 

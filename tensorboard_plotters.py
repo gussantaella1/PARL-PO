@@ -1,3 +1,7 @@
+"""
+TensorBoard scalar readers and plotting helpers for comparing training curves.
+"""
+
 import os
 import glob
 import numpy as np
@@ -14,11 +18,13 @@ def find_event_dirs(root):
     return dirs
 
 def list_scalar_tags(event_dir):
+    """List scalar tags present in a TensorBoard event directory."""
     ea = event_accumulator.EventAccumulator(event_dir, size_guidance={event_accumulator.SCALARS: 0})
     ea.Reload()
     return ea.Tags().get("scalars", [])
 
 def read_scalar(event_dir, tag):
+    """Read one scalar time series from TensorBoard event files."""
     ea = event_accumulator.EventAccumulator(event_dir, size_guidance={event_accumulator.SCALARS: 0})
     ea.Reload()
     ev = ea.Scalars(tag)
@@ -34,6 +40,7 @@ def read_scalar(event_dir, tag):
     return uniq_steps, vals[uniq_idx]
 
 def ema(y, alpha=0.9):
+    """Compute an exponential moving average for a scalar sequence."""
     y = np.asarray(y, dtype=np.float64)
     if len(y) == 0:
         return y
@@ -109,6 +116,7 @@ def plot_composite(
     grid_size=300,
     title=None
 ):
+    """Plot composite using the current metrics or rollout data."""
     run_dirs = find_event_dirs(exp_logdir)
     if len(run_dirs) == 0:
         raise FileNotFoundError(f"No TensorBoard event files found under: {exp_logdir}")

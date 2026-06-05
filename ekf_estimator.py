@@ -1,3 +1,7 @@
+"""
+Extended Kalman filter implementation for bearing-style relative navigation measurements.
+"""
+
 # ekf_estimator.py
 from __future__ import annotations
 
@@ -14,6 +18,7 @@ from dyn_models import as_numpy_const, hcw_discrete_mats, hcw_mean_motion
 
 
 def _canonical_dyn_name(name: Any) -> str:
+    """Convert dyn name into its canonical internal spelling."""
     key = str(name or "cv").strip().lower()
     if key in {"elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"}:
         return "elliptic_ltv"
@@ -21,10 +26,12 @@ def _canonical_dyn_name(name: Any) -> str:
 
 
 def _is_torch_tensor(value: Any) -> bool:
+    """Internal helper for is torch tensor."""
     return torch is not None and isinstance(value, torch.Tensor)
 
 
 def _symmetrize(M):
+    """Internal helper for symmetrize."""
     if _is_torch_tensor(M):
         return 0.5 * (M + M.transpose(-1, -2))
     return 0.5 * (M + M.T)
@@ -43,6 +50,7 @@ def _psd_enforce(M, floor: float = 1e-12):
 
 
 def _normalize_angle(a):
+    """Normalize angle into the canonical representation used here."""
     if _is_torch_tensor(a):
         return torch.remainder(a + np.pi, 2.0 * np.pi) - np.pi
     return (a + np.pi) % (2.0 * np.pi) - np.pi
@@ -72,6 +80,7 @@ def _body_bearing_from_world(p_obs, R_wb, p_tgt):
 
 
 def _azel_from_body_vec(vb):
+    """Internal helper for azel from body vec."""
     if _is_torch_tensor(vb):
         x, y, z = vb.unbind()
         rho = torch.sqrt(torch.clamp(x * x + y * y, min=1e-18))
@@ -89,47 +98,59 @@ class _BackendArrayView:
     """NumPy-friendly facade over the EKF's internal state/covariance tensors."""
 
     def __init__(self, owner: "AgentEKF", attr_name: str):
+        """Store configuration and initialize the runtime state for this object."""
         self._owner = owner
         self._attr_name = attr_name
 
     def _value(self):
+        """Internal helper for value."""
         return getattr(self._owner, self._attr_name)
 
     @property
     def shape(self):
+        """Handle shape for this workflow."""
         return tuple(self._value().shape)
 
     @property
     def size(self) -> int:
+        """Handle size for this workflow."""
         return int(self._value().numel() if _is_torch_tensor(self._value()) else self._value().size)
 
     @property
     def ndim(self) -> int:
+        """Handle ndim for this workflow."""
         return int(self._value().ndim)
 
     @property
     def dtype(self):
+        """Handle dtype for this workflow."""
         return self._value().dtype
 
     def copy(self):
+        """Handle copy for this workflow."""
         return np.array(self, copy=True)
 
     def __array__(self, dtype=None):
+        """Expose this backend value as a NumPy array when NumPy asks for it."""
         arr = self._owner._to_numpy(self._value())
         if dtype is not None:
             arr = arr.astype(dtype, copy=False)
         return arr
 
     def __getitem__(self, key):
+        """Read an item from the current backend value."""
         return self._owner._backend_value_to_python(self._value()[key])
 
     def __setitem__(self, key, value):
+        """Write an item into the current backend value."""
         self._owner._assign_backend_slice(self._attr_name, key, value)
 
     def __len__(self):
+        """Return the length of the current backend value."""
         return len(self._value())
 
     def __repr__(self):
+        """Return a compact debug representation for this wrapper."""
         return repr(np.asarray(self))
 
 
@@ -160,6 +181,7 @@ class AgentEKF:
 
     @staticmethod
     def _numel(value: Any) -> int:
+        """Internal helper for numel."""
         if _is_torch_tensor(value):
             return int(value.numel())
         return int(np.asarray(value).size)
@@ -179,6 +201,7 @@ class AgentEKF:
         use_torch_backend: bool = False,
         device: str | None = None,
     ):
+        """Store configuration and initialize the runtime state for this object."""
         self._use_torch_backend = bool(use_torch_backend)
         self._device = self._resolve_device(device) if self._use_torch_backend else None
         self._torch_dtype = torch.float64 if torch is not None else None
@@ -232,6 +255,7 @@ class AgentEKF:
                 )
 
     def _resolve_device(self, device: str | None):
+        """Resolve device from explicit inputs, config values, and defaults."""
         if torch is None:
             raise RuntimeError("EKF torch backend requested, but PyTorch could not be imported.")
         resolved = torch.device(device or "cpu")
@@ -242,6 +266,7 @@ class AgentEKF:
         return resolved
 
     def _to_backend(self, value: Any, *, copy: bool = False):
+        """Internal helper for to backend."""
         if self._use_torch_backend:
             if _is_torch_tensor(value):
                 out = value.to(device=self._device, dtype=self._torch_dtype)
@@ -251,10 +276,12 @@ class AgentEKF:
         return np.array(value, dtype=float, copy=copy) if copy else np.asarray(value, dtype=float)
 
     def _vector_to_backend(self, value: Any):
+        """Internal helper for vector to backend."""
         out = self._to_backend(value, copy=True).reshape(-1)
         return out
 
     def _matrix_to_backend(self, value: Any, shape: tuple[int, int] | None = None):
+        """Internal helper for matrix to backend."""
         out = self._to_backend(value, copy=True)
         if out.ndim != 2:
             raise ValueError(f"Expected a matrix, got ndim={out.ndim}.")
@@ -263,11 +290,13 @@ class AgentEKF:
         return out
 
     def _to_numpy(self, value: Any) -> np.ndarray:
+        """Internal helper for to numpy."""
         if _is_torch_tensor(value):
             return value.detach().cpu().numpy().copy()
         return np.asarray(value, dtype=float).copy()
 
     def _backend_value_to_python(self, value: Any):
+        """Internal helper for backend value to python."""
         if _is_torch_tensor(value):
             if value.ndim == 0:
                 return float(value.item())
@@ -278,6 +307,7 @@ class AgentEKF:
         return arr.copy()
 
     def _assign_backend_slice(self, attr_name: str, key: Any, value: Any):
+        """Internal helper for assign backend slice."""
         target = getattr(self, attr_name)
         if self._use_torch_backend:
             target[key] = self._to_backend(value)
@@ -285,21 +315,25 @@ class AgentEKF:
             target[key] = np.asarray(value, dtype=float)
 
     def _zeros(self, shape: tuple[int, ...]):
+        """Internal helper for zeros."""
         if self._use_torch_backend:
             return torch.zeros(shape, dtype=self._torch_dtype, device=self._device)
         return np.zeros(shape, dtype=float)
 
     def _eye(self, n: int):
+        """Internal helper for eye."""
         if self._use_torch_backend:
             return torch.eye(n, dtype=self._torch_dtype, device=self._device)
         return np.eye(n, dtype=float)
 
     @property
     def x(self):
+        """Handle x for this workflow."""
         return _BackendArrayView(self, "_x")
 
     @x.setter
     def x(self, value):
+        """Handle x for this workflow."""
         x_new = self._vector_to_backend(value)
         if self._numel(x_new) != self.n:
             raise ValueError(f"Expected x to have length {self.n}.")
@@ -307,29 +341,36 @@ class AgentEKF:
 
     @property
     def P(self):
+        """Handle p for this workflow."""
         return _BackendArrayView(self, "_P")
 
     @P.setter
     def P(self, value):
+        """Handle p for this workflow."""
         self._P = _psd_enforce(self._matrix_to_backend(value, shape=(self.n, self.n)))
 
     @property
     def Q(self):
+        """Handle q for this workflow."""
         return _BackendArrayView(self, "_Q")
 
     @Q.setter
     def Q(self, value):
+        """Handle q for this workflow."""
         self._Q = _psd_enforce(self._matrix_to_backend(value, shape=(self.n, self.n)))
 
     @property
     def R(self):
+        """Handle r for this workflow."""
         return _BackendArrayView(self, "_R")
 
     @R.setter
     def R(self, value):
+        """Handle r for this workflow."""
         self._R = _psd_enforce(self._matrix_to_backend(value, shape=(2, 2)))
 
     def _normalize_jacobian_mode(self, mode):
+        """Normalize jacobian mode into the canonical representation used here."""
         key = str(mode).strip().lower().replace("-", "_").replace(" ", "_")
         if key in {"frozen_first", "frozen_global"}:
             return "frozen"
@@ -340,14 +381,17 @@ class AgentEKF:
 
     @classmethod
     def clear_global_linearization_cache(cls):
+        """Handle clear global linearization cache for this workflow."""
         cls._GLOBAL_LINEARIZATION_CACHE.clear()
 
     def _global_linearization_key(self):
+        """Internal helper for global linearization key."""
         backend_key = "torch" if self._use_torch_backend else "numpy"
         device_key = str(self._device) if self._use_torch_backend else "cpu"
         return (self._linearization_group, self.n, self._dyn, float(self.dt), backend_key, device_key)
 
     def F(self, dt=None):
+        """Return the current discrete state-transition matrix."""
         if dt is None:
             dt = self.dt
         F = self._eye(6)
@@ -366,6 +410,7 @@ class AgentEKF:
         return B
 
     def _ltv_step_mats(self, step_index: int | None = None):
+        """Internal helper for ltv step mats."""
         if self._Ad_seq is None or self._Bd_seq is None:
             raise RuntimeError("LTV dynamics selected, but Ad/Bd sequences were not initialized.")
         step = self._predict_step if step_index is None else int(step_index)
@@ -374,6 +419,7 @@ class AgentEKF:
         return self._Ad_seq[idx], self._Bd_seq[idx]
 
     def linear_dynamics_mats(self, dt=None, step_index: int | None = None):
+        """Return the linear dynamics matrices used by the estimator or plant step."""
         if dt is None:
             dt = self.dt
         if self._dyn == "hcw":
@@ -419,11 +465,13 @@ class AgentEKF:
         return x_next
 
     def f(self, x, dt=None, u=None, u_frame="world", R_wb_tgt=None, step_index: int | None = None):
+        """Evaluate the process model for one prediction step."""
         return self._to_numpy(
             self._f_backend(x, dt=dt, u=u, u_frame=u_frame, R_wb_tgt=R_wb_tgt, step_index=step_index)
         )
 
     def _h_backend(self, x, p_obs, R_wb):
+        """Internal helper for h backend."""
         x_state = self._vector_to_backend(x)
         p_tgt = x_state[:3]
         p_obs_b = self._vector_to_backend(p_obs)
@@ -435,6 +483,7 @@ class AgentEKF:
         return np.array([az, el], dtype=float)
 
     def h(self, x, p_obs, R_wb):
+        """Evaluate the measurement model at the provided state."""
         return self._to_numpy(self._h_backend(x, p_obs, R_wb))
 
     def _H_pos_backend(self, x, p_obs, R_wb):
@@ -510,15 +559,18 @@ class AgentEKF:
         return H
 
     def H_pos(self, x, p_obs, R_wb):
+        """Handle h pos for this workflow."""
         return self._to_numpy(self._H_pos_backend(x, p_obs, R_wb))
 
     def _compute_measurement_linearization(self, x_ref, p_obs, R_wb):
+        """Compute measurement linearization from the provided rollout or config data."""
         H = self._H_pos_backend(x_ref, p_obs, R_wb)
         x_ref_b = self._vector_to_backend(x_ref)
         offset = self._h_backend(x_ref_b, p_obs, R_wb) - H @ x_ref_b
         return {"H": H, "offset": offset}
 
     def _get_measurement_linearization(self, x, p_obs, R_wb):
+        """Internal helper for get measurement linearization."""
         if self._jacobian_mode == "exact":
             return None
 
@@ -528,6 +580,7 @@ class AgentEKF:
         return self._GLOBAL_LINEARIZATION_CACHE[key]
 
     def measurement_prediction(self, p_obs, R_wb):
+        """Handle measurement prediction for this workflow."""
         linearization = self._get_measurement_linearization(self._x, p_obs, R_wb)
         if linearization is None:
             return self._to_numpy(self._h_backend(self._x, p_obs, R_wb))

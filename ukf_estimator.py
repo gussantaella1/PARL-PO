@@ -1,3 +1,7 @@
+"""
+Unscented Kalman filter implementation for relative navigation and bearing measurements.
+"""
+
 # ukf_estimator.py
 from __future__ import annotations
 import numpy as np
@@ -39,6 +43,7 @@ def _safe_cholesky(A: np.ndarray, jitter: float = 1e-10, max_tries: int = 5) -> 
     return np.linalg.cholesky(A)  # last attempt may still raise
 
 def _symmetrize(M: np.ndarray) -> np.ndarray:
+    """Internal helper for symmetrize."""
     return 0.5 * (M + M.T)
 
 def _psd_enforce(M: np.ndarray, floor: float = 1e-10) -> np.ndarray:
@@ -75,6 +80,7 @@ def _safe_inv_2x2(S: np.ndarray,
 
 
 def _normalize_angle(a: float) -> float:
+    """Normalize angle into the canonical representation used here."""
     return (a + np.pi) % (2*np.pi) - np.pi
 
 def _sigma_points(x: np.ndarray, P: np.ndarray, c_scale: float):
@@ -102,12 +108,14 @@ def _body_bearing_from_world(p_obs: np.ndarray, R_wb: np.ndarray, p_tgt: np.ndar
     return R_wb @ b_w
 
 def _azel_from_body_vec(vb: np.ndarray):
+    """Internal helper for azel from body vec."""
     x, y, z = vb
     az = np.arctan2(y, x)
     el = np.arctan2(z, np.sqrt(max(x*x + y*y, 1e-18)))
     return az, el
 
 def _body_vec_from_azel(az: float, el: float):
+    """Internal helper for body vec from azel."""
     c = np.cos(el)
     return np.array([c*np.cos(az), c*np.sin(az), np.sin(el)], float)
 
@@ -129,6 +137,7 @@ class AgentUKF:
     def __init__(self, x0, P0, Q, R, dt,
                  alpha=1e-3, beta=2.0, kappa=0.0,
                  dyn='cv', hcw=None):
+        """Store configuration and initialize the runtime state for this object."""
         self.x  = np.asarray(x0, float).reshape(-1)
         if self.x.size not in (6, 9):
             raise ValueError(f"AgentUKF expects 6D or 9D state, got {self.x.size}.")
@@ -153,12 +162,14 @@ class AgentUKF:
 
     # ---- CV matrices (legacy) ----
     def F(self, dt=None):
+        """Return the current discrete state-transition matrix."""
         if dt is None: dt = self.dt
         F = np.eye(6)
         F[0,3]=dt; F[1,4]=dt; F[2,5]=dt
         return F
 
     def B_accel(self, dt=None):
+        """Return the acceleration-input matrix for the current dynamics model."""
         if dt is None: dt = self.dt
         B = np.zeros((6,3))
         B[0:3, 0:3] = 0.5 * (dt**2) * np.eye(3)
@@ -166,6 +177,7 @@ class AgentUKF:
         return B
 
     def linear_dynamics_mats(self, dt=None):
+        """Return the linear dynamics matrices used by the estimator or plant step."""
         if dt is None:
             dt = self.dt
         if self._dyn == 'hcw':
@@ -191,6 +203,7 @@ class AgentUKF:
 
     # ---- measurement model (bearing in observer BODY frame) ----
     def h(self, x, p_obs, R_wb):
+        """Evaluate the measurement model at the provided state."""
         p_tgt = x[:3]
         v_b = _body_bearing_from_world(p_obs, R_wb, p_tgt)
         az, el = _azel_from_body_vec(v_b)
@@ -198,6 +211,7 @@ class AgentUKF:
 
     # ---- dynamics step used by sigma-point propagation ----
     def f(self, x, dt=None, u=None, u_frame='world', R_wb_tgt=None):
+        """Evaluate the process model for one prediction step."""
         if dt is None: dt = self.dt
         u_world = None
         if u is not None:
@@ -215,6 +229,7 @@ class AgentUKF:
 
     # ---- UKF time update ----
     def predict(self, dt=None, u=None, u_cov=None, u_frame='world', R_wb_tgt=None):
+        """Propagate the estimator belief through the dynamics model."""
         if dt is None: dt = self.dt
         self.P = _psd_enforce(self.P)
 
@@ -251,6 +266,7 @@ class AgentUKF:
 
     # ---- UKF measurement update (bearing) ----
     def update(self, z, p_obs, R_wb):
+        """Assimilate a measurement into the estimator belief."""
         self.P = _psd_enforce(self.P)
         Xi = _sigma_points(self.x, self.P, self._c)
         Zsig = np.array([ self.h(xi, p_obs, R_wb) for xi in Xi ])

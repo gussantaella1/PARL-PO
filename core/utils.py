@@ -1,3 +1,7 @@
+"""
+General numerical helpers shared across training, inference, and evaluation.
+"""
+
 import math
 from typing import Any, Dict, Tuple
 
@@ -10,6 +14,7 @@ import torch.nn.functional as F
 # =============================================================
 
 def set_seed(seed: int):
+    """Handle set seed for this workflow."""
     torch.manual_seed(seed)
     np.random.seed(seed)
 
@@ -39,6 +44,7 @@ def resolve_start_radius_bounds(
         raise ValueError(f"Unsupported shell owner {who!r}; expected 'def' or 'att'.")
 
     def _radius_from_fraction(frac_value: Any, source_key: str) -> float:
+        """Internal helper for radius from fraction."""
         frac = float(frac_value)
         if frac > 1.0 + 1e-9:
             raise ValueError(
@@ -48,6 +54,7 @@ def resolve_start_radius_bounds(
         return frac * float(arena_radius)
 
     def _resolve(bound: str, default_frac: float) -> float:
+        """Internal helper for resolve."""
         frac_key = f"r_{who}_{bound}"
         meter_key = f"{frac_key}_m"
 
@@ -81,17 +88,20 @@ def resolve_start_radius_bounds(
 
 
 def atanh(x: torch.Tensor) -> torch.Tensor:
+    """Handle atanh for this workflow."""
     x = torch.clamp(x, -0.999999, 0.999999)
     return 0.5 * (torch.log1p(x) - torch.log1p(-x))
 
 
 def squash_action(u_raw: torch.Tensor, act_scale: float) -> torch.Tensor:
+    """Handle squash action for this workflow."""
     return torch.tanh(u_raw) * act_scale
 
 
 def logprob_squashed(dist: torch.distributions.Normal, u_raw: torch.Tensor) -> torch.Tensor:
     # Stable tanh-squash correction:
     # log(1 - tanh(u)^2) = 2 * (log 2 - u - softplus(-2u))
+    """Handle logprob squashed for this workflow."""
     logp = dist.log_prob(u_raw).sum(-1)
     correction = (2.0 * (math.log(2.0) - u_raw - F.softplus(-2.0 * u_raw))).sum(-1)
     return logp - correction

@@ -1,3 +1,7 @@
+"""
+Initial-condition and parameter-dispersion helpers for Monte Carlo rollouts.
+"""
+
 # dispersion.py
 from __future__ import annotations
 import copy
@@ -5,6 +9,7 @@ import numpy as np
 from typing import Any, Dict, Optional, Tuple
 
 def get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
+    """Handle get center and radius for this workflow."""
     ar = cfg.get("arena", {}) or {}
     cx, cy = float(ar.get("cx", 0.0)), float(ar.get("cy", 0.0))
     cz = float(ar.get("cz", 0.0)) if D == 3 else 0.0
@@ -12,6 +17,7 @@ def get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, floa
     return np.array([cx, cy, cz], dtype=float)[:D], r
 
 def sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: float) -> np.ndarray:
+    """Sample uniform ball for training, evaluation, or rollout initialization."""
     D = center.size
     v = rng.normal(size=D)
     v = v / (np.linalg.norm(v) + 1e-12)
@@ -20,6 +26,7 @@ def sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: fl
     return center + rad * v
 
 def apply_x0_jitter(x0: np.ndarray, rng: np.random.Generator, pos_sigma: float, vel_sigma: float, D: int) -> np.ndarray:
+    """Apply x0 jitter to the current config, state, or rollout data."""
     out = x0.copy().astype(float)
     if pos_sigma > 0:
         out[:, :D] += rng.normal(size=out[:, :D].shape) * pos_sigma
@@ -28,6 +35,7 @@ def apply_x0_jitter(x0: np.ndarray, rng: np.random.Generator, pos_sigma: float, 
     return out
 
 def apply_param_dispersion(cfg: Dict[str, Any], rng: np.random.Generator) -> None:
+    """Apply param dispersion to the current config, state, or rollout data."""
     disp = cfg.get("dispersion", {})
     p = (disp.get("params", {}) or {})
     if not p.get("enabled", False):
@@ -70,6 +78,7 @@ def apply_noise_cfg(cfg: Dict[str, Any]) -> None:
     cfg["proc_acc_sigma"] = float(proc.get("acc_sigma", 0.0))
 
 def build_episode_cfg_and_x0(cfg0: Dict[str, Any], episode_idx: int, trials_row: Optional[Dict[str, float]] = None):
+    """Build episode cfg and x0 for the current workflow."""
     cfg = copy.deepcopy(cfg0)
     disp = cfg.get("dispersion", {}) or {}
     D = int(cfg.get("D", 3))

@@ -1,3 +1,7 @@
+"""
+Small checks for freezing PyTorch modules and catching accidental changes to frozen policies.
+"""
+
 import importlib
 
 
@@ -52,6 +56,7 @@ def max_state_dict_diff(snap: dict, m: torch.nn.Module) -> float:
 
 @torch.no_grad()
 def assert_frozen_unchanged(snap: dict, m: torch.nn.Module, name: str, tol: float = 0.0):
+    """Handle assert frozen unchanged for this workflow."""
     d = max_state_dict_diff(snap, m)
     if d > tol:
         raise RuntimeError(f"[FREEZE CHECK FAILED] {name} changed! max|Δ|={d:.3e} > tol={tol:.3e}")
@@ -59,6 +64,7 @@ def assert_frozen_unchanged(snap: dict, m: torch.nn.Module, name: str, tol: floa
 
 @torch.no_grad()
 def assert_deterministic_action(ppo, obs_batch: torch.Tensor, who: str, tol: float = 0.0):
+    """Handle assert deterministic action for this workflow."""
     a1, _, _ = ppo.act(obs_batch, who=who, deterministic=True)
     a2, _, _ = ppo.act(obs_batch, who=who, deterministic=True)
     d = (a1 - a2).abs().max().item()

@@ -1,6 +1,10 @@
 # mcp_baseline_runner.py
 """
-MCP baseline runner for the balloon-capture / trajectory-game experiments.
+Historical MCP baseline runner for balloon-capture / trajectory-game experiments.
+
+This file is not part of the current PPO/KF training or evaluation workflow. It
+is kept as an optional comparison experiment for the old PATH/ASL setup, so it is
+documented but intentionally isolated from game_runner.py and evaluate_policy.py.
 
 The 1v1 path now mirrors the older Julia setup much more closely:
   - open-loop dynamic game over a control sequence
@@ -43,6 +47,7 @@ else:
 
 @dataclass
 class MCPParams:
+    """Configuration values for the historical MCP/PATH baseline runner."""
     mode: str = "balloon_capture"        # balloon-style open-loop dynamic game
     solver: str = "path"                 # retained for config compatibility
     executable: Optional[str] = None     # explicit solver binary, e.g. ~/Research/path_5/ampl/pathampl
@@ -98,6 +103,7 @@ class MCPParams:
 
 
 def _mcp_params_from_cfg(cfg: Dict[str, Any]) -> MCPParams:
+    """Internal helper for mcp params from cfg."""
     p = MCPParams()
     d = cfg.get("mcp", {}) or {}
     for k, v in d.items():
@@ -122,6 +128,7 @@ def _softplus_expr(x, kappa: float):
     #   softplus(z) = max(z, 0) + log(1 + exp(-|z|))
     # with z = kappa * x, and max(z, 0) = (z + |z|) / 2.
     # This keeps the exponential argument <= 0 and avoids overflow in Pyomo AD.
+    """Internal helper for softplus expr."""
     kappa = float(kappa)
     z = kappa * x
     z_abs = abs(z)
@@ -130,6 +137,7 @@ def _softplus_expr(x, kappa: float):
 
 
 def _smooth_hinge_sq(x, kappa: float):
+    """Internal helper for smooth hinge sq."""
     sp = _softplus_expr(x, kappa)
     return sp * sp
 
@@ -145,10 +153,12 @@ def _softmin_expr(vals: List, tau: float):
 
 def _rho_expr(p_list: List, center: np.ndarray, R: float):
     # p_list are pyomo expressions for each coord
+    """Internal helper for rho expr."""
     return pyo.sqrt(sum((p_list[i] - float(center[i])) ** 2 for i in range(len(p_list))) + 1e-12) / (float(R) + 1e-12)
 
 
 def _wall_penalty_expr(p_list: List, center: np.ndarray, R: float, soft_wall: float, wallK: float, kappa: float):
+    """Internal helper for wall penalty expr."""
     rho = _rho_expr(p_list, center, R)
     return float(wallK) * _smooth_hinge_sq(rho - float(soft_wall), kappa)
 
@@ -166,10 +176,12 @@ def _keepout_penalty_expr(p_def_list: List, center: np.ndarray, oi_r_m: float, b
 
 
 def _dot_expr(v_list: List):
+    """Internal helper for dot expr."""
     return sum(v_list[i] * v_list[i] for i in range(len(v_list)))
 
 
 def _stationarity_eq(expr: Any, var: Any):
+    """Internal helper for stationarity eq."""
     d_expr = differentiate(expr, wrt=var, mode=Modes.reverse_symbolic)
     if isinstance(d_expr, (int, float, np.floating)):
         if abs(float(d_expr)) <= 1e-12:
@@ -179,6 +191,7 @@ def _stationarity_eq(expr: Any, var: Any):
 
 
 def _stationarity_residual(expr: Any, var: Any):
+    """Internal helper for stationarity residual."""
     d_expr = differentiate(expr, wrt=var, mode=Modes.reverse_symbolic)
     if isinstance(d_expr, (int, float, np.floating)):
         return 0.0 * var + float(d_expr)
@@ -186,6 +199,7 @@ def _stationarity_residual(expr: Any, var: Any):
 
 
 def _bounded_stationarity_comp(var: Any, lb: float, ub: float, expr: Any):
+    """Internal helper for bounded stationarity comp."""
     return mpec.complements(
         pyo.inequality(lb, var, ub),
         _stationarity_residual(expr, var) == 0,
@@ -197,6 +211,7 @@ def _normalize_control_guess(
     horizon_steps: int,
     shape_tail: Tuple[int, ...],
 ) -> np.ndarray:
+    """Normalize control guess into the canonical representation used here."""
     base_shape = (horizon_steps,) + tuple(shape_tail)
     if u_prev is None:
         return np.zeros(base_shape, dtype=float)
@@ -218,6 +233,7 @@ def _normalize_control_guess(
 
 
 def _shift_plan_guess(arr: Optional[np.ndarray], shift: int) -> Optional[np.ndarray]:
+    """Internal helper for shift plan guess."""
     if arr is None:
         return None
     out = np.asarray(arr, dtype=float)
@@ -239,6 +255,7 @@ def _rollout_linear_guess(
     Ad_seq: List[np.ndarray],
     Bd_seq: List[np.ndarray],
 ) -> np.ndarray:
+    """Internal helper for rollout linear guess."""
     x0 = np.asarray(x0, dtype=float).reshape(-1)
     xs = np.zeros((len(u_guess) + 1, x0.shape[0]), dtype=float)
     xs[0] = x0
@@ -248,14 +265,17 @@ def _rollout_linear_guess(
 
 
 def _eval_var_grid(var: Any, idx0: range, idx1: range) -> np.ndarray:
+    """Internal helper for eval var grid."""
     return np.array([[float(pyo.value(var[i, j])) for j in idx1] for i in idx0], dtype=float)
 
 
 def _eval_var_vec_grid(var: Any, idx0: range) -> np.ndarray:
+    """Internal helper for eval var vec grid."""
     return np.array([float(pyo.value(var[i])) for i in idx0], dtype=float)
 
 
 def _eval_state_sequence_np(seq: List[List[Any]]) -> np.ndarray:
+    """Internal helper for eval state sequence np."""
     out = np.zeros((len(seq), len(seq[0])), dtype=float)
     for t, row in enumerate(seq):
         for j, expr in enumerate(row):
@@ -264,6 +284,7 @@ def _eval_state_sequence_np(seq: List[List[Any]]) -> np.ndarray:
 
 
 def _solve_with_pathampl(model: Any, mcpp: MCPParams):
+    """Internal helper for solve with pathampl."""
     exe = mcpp.executable or os.environ.get("PATHAMPL") or "pathampl"
     solver = pyo.SolverFactory("asl")
     solver.options["solver"] = exe
@@ -275,6 +296,7 @@ def _solve_with_pathampl(model: Any, mcpp: MCPParams):
 
 
 def _is_path_success(res: Any) -> bool:
+    """Internal helper for is path success."""
     if res is None:
         return False
     status = str(getattr(res.solver, "status", "")).lower()
@@ -287,6 +309,7 @@ def _is_path_success(res: Any) -> bool:
 
 
 def _defender_umax_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
+    """Internal helper for defender umax from cfg."""
     if mcpp.defender_umax is not None:
         return float(mcpp.defender_umax)
     mcp_cfg = cfg.get("mcp", {}) or {}
@@ -296,6 +319,7 @@ def _defender_umax_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
 
 
 def _attacker_umax_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
+    """Internal helper for attacker umax from cfg."""
     if mcpp.attacker_umax is not None:
         return float(mcpp.attacker_umax)
     mcp_cfg = cfg.get("mcp", {}) or {}
@@ -305,6 +329,7 @@ def _attacker_umax_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
 
 
 def _solve_mcp_model(model: Any, mcpp: MCPParams):
+    """Internal helper for solve mcp model."""
     solver_name = str(mcpp.solver or "path").lower()
     if solver_name == "path":
         solver = pyo.SolverFactory("asl")
@@ -329,6 +354,7 @@ def _solve_mcp_model(model: Any, mcpp: MCPParams):
 
 
 def _ensure_step_mats(cfg: Dict[str, Any]) -> None:
+    """Internal helper for ensure step mats."""
     if str(cfg.get("dynamics", "")).lower() in ("double_integrator", "balloon_capture", "planar_double_integrator"):
         return
     dyn = cfg.get("dyn", {}) if isinstance(cfg.get("dyn", {}), dict) else {}
@@ -346,6 +372,7 @@ def _terminal_info_numpy(
     cfg: Dict[str, Any],
     primary_idx: int = 0,
 ) -> Dict[str, Any]:
+    """Internal helper for terminal info numpy."""
     R = float(cfg.get("arena", {}).get("r", 30.0))
     eps = 1e-12
     margin = float(cfg.get("arena_terminate_margin", 1.0))
@@ -464,6 +491,7 @@ def _extract_step_mats(cfg: Dict[str, Any], k: int, D: int) -> Tuple[np.ndarray,
 
 
 def _step_lti(x: np.ndarray, u: np.ndarray, Ad: np.ndarray, Bd: np.ndarray) -> np.ndarray:
+    """Internal helper for step lti."""
     return (Ad @ x + Bd @ u).astype(np.float32)
 
 
@@ -472,10 +500,12 @@ def _step_lti(x: np.ndarray, u: np.ndarray, Ad: np.ndarray, Bd: np.ndarray) -> n
 # ============================================================
 
 def _norm_sqr_expr(v: List) -> Any:
+    """Internal helper for norm sqr expr."""
     return sum(v_i * v_i for v_i in v)
 
 
 def _target_center(cfg: Dict[str, Any], D: int) -> np.ndarray:
+    """Internal helper for target center."""
     oi = cfg.get("oi", {}) or {}
     if bool(oi.get("enabled", True)):
         return np.array(
@@ -490,18 +520,21 @@ def _target_center(cfg: Dict[str, Any], D: int) -> np.ndarray:
 
 
 def _target_radius_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
+    """Internal helper for target radius from cfg."""
     if mcpp.target_radius is not None:
         return float(mcpp.target_radius)
     return 0.1
 
 
 def _def_att_sep_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
+    """Internal helper for def att sep from cfg."""
     if mcpp.defender_attacker_sep is not None:
         return float(mcpp.defender_attacker_sep)
     return 1.5
 
 
 def _att_att_sep_from_cfg(cfg: Dict[str, Any], mcpp: MCPParams) -> float:
+    """Internal helper for att att sep from cfg."""
     if mcpp.attacker_attacker_sep is not None:
         return float(mcpp.attacker_attacker_sep)
     return 1.5
@@ -516,6 +549,7 @@ def _balloon_stage_cost_1v1(
     center: np.ndarray,
     mcpp: MCPParams,
 ) -> Tuple[Any, Any]:
+    """Internal helper for balloon stage cost 1v1."""
     x_att_dist = [p_att[i] - float(center[i]) for i in range(len(p_att))]
     x_att_dist_def = [p_att[i] - p_def[i] for i in range(len(p_att))]
 
@@ -550,6 +584,7 @@ def _balloon_stage_cost_1v2_team(
     center: np.ndarray,
     mcpp: MCPParams,
 ) -> Tuple[Any, Any]:
+    """Internal helper for balloon stage cost 1v2 team."""
     x2_dist = [p_att_a[i] - float(center[i]) for i in range(len(p_def))]
     x3_dist = [p_att_b[i] - float(center[i]) for i in range(len(p_def))]
     x2_dist_def = [p_att_a[i] - p_def[i] for i in range(len(p_def))]
@@ -605,6 +640,7 @@ def _build_zero_sum_g_1v1(
     cfg: Dict[str, Any],
     mcpp: MCPParams,
 ) -> Any:
+    """Build zero sum g 1v1 for the current workflow."""
     mcp_cfg = cfg.get("mcp", {}) or {}
     k_pos = float(cfg.get("k_pos", cfg.get("step_pos_coef", 0.0)))
     k_dock = float(cfg.get("k_dock", 0.0))
@@ -664,6 +700,7 @@ def solve_one_step_mcp_1v1(
     u1_prev: Optional[np.ndarray] = None,
     u2_prev: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Handle solve one step mcp 1v1 for this workflow."""
     if pyo is None or mpec is None or differentiate is None:
         raise RuntimeError(
             f"Pyomo MPEC is not available in this environment: {_PYO_IMPORT_ERR}\n"
@@ -691,6 +728,7 @@ def solve_one_step_mcp_1v1(
     last_exc: Optional[Exception] = None
 
     def _attempt_1v1(horizon_steps: int, use_env_constraints: bool):
+        """Internal helper for attempt 1v1."""
         u1_guess = _normalize_control_guess(u1_prev, horizon_steps, (D,))
         u2_guess = _normalize_control_guess(u2_prev, horizon_steps, (D,))
 
@@ -732,17 +770,21 @@ def solve_one_step_mcp_1v1(
         m.mu_u2_hi = pyo.Var(m.Ku, m.I, domain=pyo.NonNegativeReals)
 
         def g_ic1_expr(_m, i):
+            """Handle g ic1 expr for this workflow."""
             return _m.x1[0, i] - float(x1[i])
 
         def g_ic2_expr(_m, i):
+            """Handle g ic2 expr for this workflow."""
             return _m.x2[0, i] - float(x2[i])
 
         def g_dyn1_expr(_m, t, i):
+            """Handle g dyn1 expr for this workflow."""
             return _m.x1[t + 1, i] - sum(float(Ad_seq[t][i, j]) * _m.x1[t, j] for j in _m.S) - sum(
                 float(Bd_seq[t][i, j]) * _m.u1[t, j] for j in _m.I
             )
 
         def g_dyn2_expr(_m, t, i):
+            """Handle g dyn2 expr for this workflow."""
             return _m.x2[t + 1, i] - sum(float(Ad_seq[t][i, j]) * _m.x2[t, j] for j in _m.S) - sum(
                 float(Bd_seq[t][i, j]) * _m.u2[t, j] for j in _m.I
             )
@@ -818,6 +860,7 @@ def solve_one_step_mcp_1v1(
         m.J2 = pyo.Expression(expr=sum(stage_costs_2) / float(horizon_steps))
 
         def eq_grad_lam_1(_m, var, t_hint):
+            """Handle eq grad lam 1 for this workflow."""
             out = 0.0
             if t_hint == 0:
                 for j in _m.S:
@@ -833,6 +876,7 @@ def solve_one_step_mcp_1v1(
             return out
 
         def eq_grad_lam_2(_m, var, t_hint):
+            """Handle eq grad lam 2 for this workflow."""
             out = 0.0
             if t_hint == 0:
                 for j in _m.S:
@@ -848,6 +892,7 @@ def solve_one_step_mcp_1v1(
             return out
 
         def ineq_grad(_m, var, t_hint):
+            """Handle ineq grad for this workflow."""
             out = _m.mu_sep[t_hint] * differentiate(_m.h_sep[t_hint], wrt=var, mode=Modes.reverse_symbolic)
             if target_radius > 0.0:
                 out += _m.mu_keepout[t_hint] * differentiate(_m.h_keepout[t_hint], wrt=var, mode=Modes.reverse_symbolic)
@@ -985,6 +1030,7 @@ def solve_one_step_mcp_1v2_team(
     u1_prev: Optional[np.ndarray] = None,
     u2_prev: Optional[np.ndarray] = None,   # shape (2, D) or flat (2D,)
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Handle solve one step mcp 1v2 team for this workflow."""
     if pyo is None or mpec is None or differentiate is None:
         raise RuntimeError(
             f"Pyomo MPEC is not available in this environment: {_PYO_IMPORT_ERR}\n"
@@ -1230,6 +1276,7 @@ def solve_one_step_mcp_1v2_team(
 # ============================================================
 
 def _p3(xD: np.ndarray, D: int):
+    """Internal helper for p3."""
     xD = np.asarray(xD, float).reshape(-1)
     if D == 3:
         return (float(xD[0]), float(xD[1]), float(xD[2]))
@@ -1237,10 +1284,12 @@ def _p3(xD: np.ndarray, D: int):
 
 
 def _identity_R():
+    """Internal helper for identity  r."""
     return np.eye(3, dtype=float)
 
 
 def _pad3(u: np.ndarray, D: int):
+    """Internal helper for pad3."""
     u = np.asarray(u, float).reshape(-1)
     return np.array([u[0], u[1], u[2] if D == 3 else 0.0], dtype=float)
 
@@ -1310,6 +1359,7 @@ def run_rhc_with_mcp_game_1v1_collect_frames_3d(
     active_plan_len = 0
 
     def _plan_xyz(plan_x: np.ndarray, step_idx: int) -> List[Tuple[float, float, float]]:
+        """Internal helper for plan xyz."""
         tail = np.asarray(plan_x[max(0, step_idx):, :D], dtype=float)
         if tail.shape[0] == 0:
             tail = np.asarray(plan_x[-1:, :D], dtype=float)

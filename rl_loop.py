@@ -1,15 +1,16 @@
 """
 rl_loop.py
 ===================================
-Single-file training & evaluation where **only the defender is learned (PPO)**
-and the **attacker is a deterministic rule-based controller** that (a) drives to the
-center and (b) repels away from the defender under HCW dynamics.
+Command-line driver for the staged PPO training sequence.
+
+This file is intentionally thin: the real training logic lives in core/train_eval.py,
+while this script chooses which phase to run, applies command-line overrides, and
+checks that prerequisite checkpoints exist before a later phase starts.
 
 Key points
 ----------
-- Single source of truth for config via: from config_rl import config_for_train, config_for_eval, build_dyn
-- Clean attacker swap: set cfg["attacker_mode"] to "rule" (default) or "rl"
-- Differentiable one-step ridge prior (DiffLS-style) blended into actor mean
+- Single source of truth for config via: from config_rl import config_for_train
+- Phase 0/2/4 train or distill defenders; phase 1/3 train attackers
 - Runtime overrides for outputs, device, rollout sizing, and vectorized env backend
 """
 
@@ -26,6 +27,7 @@ from core.logger_utils import RunLogger
 
 
 def _merge_dicts(base: dict, extra: dict) -> dict:
+    """Internal helper for merge dicts."""
     out = dict(base)
     for key, value in extra.items():
         if isinstance(value, dict) and isinstance(out.get(key), dict):
@@ -36,6 +38,7 @@ def _merge_dicts(base: dict, extra: dict) -> dict:
 
 
 def _build_phase_cfg(attacker_mode: str, train_role: str, extra_cfg: dict | None = None) -> dict:
+    """Build phase cfg for the current workflow."""
     extra_cfg = dict(extra_cfg or {})
     return config_for_train(
         attacker_mode=attacker_mode,
@@ -45,6 +48,7 @@ def _build_phase_cfg(attacker_mode: str, train_role: str, extra_cfg: dict | None
 
 
 def _parse_phase_list(text: str) -> set[int]:
+    """Parse phase list into the form expected by this module."""
     phases = set()
     for chunk in str(text).split(","):
         chunk = chunk.strip()
@@ -60,6 +64,7 @@ def _parse_phase_list(text: str) -> set[int]:
 
 
 def _parse_bool(value: str) -> bool:
+    """Parse bool into the form expected by this module."""
     key = str(value).strip().lower()
     if key in {"1", "true", "t", "yes", "y", "on"}:
         return True
@@ -71,6 +76,7 @@ def _parse_bool(value: str) -> bool:
 
 
 def _build_runtime_overrides(args, out_dir: str) -> dict:
+    """Build runtime overrides for the current workflow."""
     overrides = {}
 
     if args.device is not None:
@@ -142,6 +148,7 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
 
 
 def _parse_args():
+    """Parse args into the form expected by this module."""
     ap = argparse.ArgumentParser(
         description="Run the staged PPO training loop with optional runtime overrides.",
     )
@@ -205,6 +212,7 @@ def _parse_args():
 
 
 def _require_checkpoint(path: str, label: str):
+    """Internal helper for require checkpoint."""
     if not os.path.exists(path):
         raise FileNotFoundError(
             f"Required checkpoint for {label} was not found: {path}. "

@@ -1,3 +1,7 @@
+"""
+Visualization helpers for single-attacker 3D rollouts, animations, and diagnostic plots.
+"""
+
 # game_viz.py
 from __future__ import annotations
 import numpy as np
@@ -12,6 +16,7 @@ import re
 
 # Lazy-import heavy libs to keep core light
 def _mpl3d():
+    """Internal helper for mpl3d."""
     import matplotlib.pyplot as plt
     from mpl_toolkits.mplot3d.art3d import Poly3DCollection
     from matplotlib.lines import Line2D
@@ -96,6 +101,7 @@ def draw_object_of_interest(ax, oi, D=3, res=24):
 
 # --- artists & legends ---
 def make_body_axes_artists_3d(ax, colors=('tab:red','tab:green','tab:blue'), lw=2, alpha=0.9):
+    """Handle make body axes artists 3d for this workflow."""
     plt, _, _ = _mpl3d()
     bx, = ax.plot([], [], [], '-', lw=lw, alpha=alpha, color=colors[0])
     by, = ax.plot([], [], [], '-', lw=lw, alpha=alpha, color=colors[1])
@@ -103,6 +109,7 @@ def make_body_axes_artists_3d(ax, colors=('tab:red','tab:green','tab:blue'), lw=
     return dict(bx=bx, by=by, bz=bz)
 
 def update_body_axes_artists_3d(lines, p, R_wb, L=(0.4,0.4,0.6)):
+    """Handle update body axes artists 3d for this workflow."""
     p = np.asarray(p, float); x_b, y_b, z_b = R_wb[0], R_wb[1], R_wb[2]
     ends = [p + L[0]*x_b, p + L[1]*y_b, p + L[2]*z_b]
     for (ln, q) in zip((lines['bx'], lines['by'], lines['bz']), ends):
@@ -113,6 +120,7 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
                      labels=('x_b (boresight)','y_b','z_b'),
                      loc='lower left', ncol=1, title='Body axes',
                      keep_legend=None):
+    """Handle add triad legend for this workflow."""
     plt, _, Line2D = _mpl3d()
     proxies = [Line2D([0], [0], lw=2, color=c, label=lab) for c, lab in zip(colors, labels)]
     leg_axes = ax.legend(proxies, labels, loc=loc, ncol=ncol, title=title)
@@ -124,6 +132,7 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
 
 # --- fov geometry drawing (cones/frustums) ---
 def draw_fov_cone_3d(ax, x_def, fov_cfg, n=24, color='C1', alpha=0.12, align="x"):
+    """Draw fov cone 3d on the current Matplotlib axes."""
     plt, Poly3DCollection, _ = _mpl3d()
     p0   = np.asarray(x_def[:3], float)
     axis = _unit(np.asarray(fov_cfg.get("axis_override", [1,0,0]) if False else ax.viewLim, float))  # placeholder to avoid lints
@@ -185,6 +194,7 @@ def draw_camera_frustum_3d(ax, x_def, axis=None, cam_cfg=None,
         R_wc = np.asarray(R_wb, float)
 
     def cam_to_world(Pc):
+        """Handle cam to world for this workflow."""
         return (R_wc.T @ Pc.T).T + p_cam[None, :]
 
     # --- intrinsics / depth bounds ---
@@ -234,6 +244,7 @@ def draw_camera_frustum_3d(ax, x_def, axis=None, cam_cfg=None,
 
 def _image_corners_px(W, H):
     # (u, v) pixel corners in order: TL, TR, BR, BL
+    """Internal helper for image corners px."""
     return np.array([[0,   0],
                      [W-1, 0],
                      [W-1, H-1],
@@ -287,6 +298,7 @@ def _label_axes_3d(ax, scale: float | None = None, unit: str = "m", label_only: 
     from matplotlib.ticker import FuncFormatter
 
     def _pow10_str(s):
+        """Internal helper for pow10 str."""
         k = int(round(np.log10(s)))
         return r"$10^{%d}$" % k
 
@@ -316,6 +328,7 @@ def _label_axes_3d(ax, scale: float | None = None, unit: str = "m", label_only: 
 
 def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
                        show_fov=True, show_axes=True):
+    """Handle animate rollout 3d for this workflow."""
     import shutil
     from matplotlib import animation
     from matplotlib.animation import FFMpegWriter, PillowWriter
@@ -439,13 +452,16 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     fov_art = {'coll': None, 'rim': None, 'edges': []}
 
     def _pos3(p_like):
+        """Internal helper for pos3."""
         p = np.asarray(p_like, float).ravel()
         return p[:3] if p.size >= 3 else np.array([p[0], p[1], 0.0], float)
 
     def _def_pos(f):
+        """Internal helper for def pos."""
         return exec2[f] if agent_id == 2 else exec1[f]
 
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ('coll','rim'):
             art = fov_art.get(k)
             if art is not None:
@@ -458,6 +474,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         fov_art['edges'] = []
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         key = "exec_att1" if agent == 1 else "exec_att2"
         L = frames_dict.get(key)
         if not L or idx >= len(L) or "R" not in L[idx]:
@@ -469,6 +486,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
 
     def _set_fov(p, R_wb, idx):
+        """Internal helper for set fov."""
         if not (show_fov and fov_cfg.get("enabled", False)):
             _clear_fov(); return
         col = fov_cfg.get("color","C1")
@@ -496,6 +514,7 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             fov_art['coll'], fov_art['rim'] = coll, rim
 
     def init():
+        """Handle init for this workflow."""
         for ln in (plan1_ln, plan2_ln, exe1_ln, exe2_ln, dot1, dot2,
                    est12_ln, est21_ln, me12_ln, me21_ln):
             if ln is not None:
@@ -508,7 +527,9 @@ def animate_rollout_3d(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         return []
 
     def update(f):
+        """Assimilate a measurement into the estimator belief."""
         def _set3d(ln, xs, ys, zs):
+            """Internal helper for set3d."""
             if ln is not None:
                 ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
@@ -587,10 +608,12 @@ def interactive_rollout_3d(
     show_axes=True,
     perf_skip_fov_every: int = 1,
 ):
+    """Handle interactive rollout 3d for this workflow."""
     import ipywidgets as W
     from IPython.display import display
 
     def _legend_clean(handles):
+        """Internal helper for legend clean."""
         H = []
         for h in handles:
             if h is None:
@@ -601,6 +624,7 @@ def interactive_rollout_3d(
         return H, [h.get_label() for h in H]
 
     def _as3_hist(seq):
+        """Internal helper for as3 hist."""
         if not seq:
             return []
         if seq and seq[0] and len(seq[0][0]) == 2:
@@ -608,6 +632,7 @@ def interactive_rollout_3d(
         return seq
 
     def _as3_exec(seq):
+        """Internal helper for as3 exec."""
         if not seq:
             return []
         if seq and len(seq[0]) == 2:
@@ -706,6 +731,7 @@ def interactive_rollout_3d(
 
     def _blank_line3d(ln):
         # NaNs are the safest "no geometry" sentinel for 3D lines
+        """Internal helper for blank line3d."""
         ln.set_data([np.nan], [np.nan])
         ln.set_3d_properties([np.nan])
 
@@ -723,6 +749,7 @@ def interactive_rollout_3d(
     fov_art = {"coll": None, "rim": None, "edges": []}
 
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ("coll", "rim"):
             art = fov_art.get(k)
             if art is not None:
@@ -739,10 +766,12 @@ def interactive_rollout_3d(
         fov_art["edges"] = []
 
     def _pos3(p_like):
+        """Internal helper for pos3."""
         p = np.asarray(p_like, float).ravel()
         return p[:3] if p.size >= 3 else np.array([p[0], p[1], 0.0], float)
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         key = "exec_att1" if agent == 1 else "exec_att2"
         L = frames_dict.get(key)
         if not L or idx >= len(L) or "R" not in L[idx]:
@@ -754,10 +783,12 @@ def interactive_rollout_3d(
 
 
     def _set3d(ln, xs, ys, zs):
+        """Internal helper for set3d."""
         if ln is not None:
             ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
     def _meas_ray(p_obs, R_wb, az, el, L):
+        """Internal helper for meas ray."""
         c = np.cos(el)
         v_b = np.array([c * np.cos(az), c * np.sin(az), np.sin(el)])
         v_w = R_wb.T @ v_b
@@ -765,6 +796,7 @@ def interactive_rollout_3d(
         return p_obs, pF
 
     def _draw_fov(idx, p, R_wb):
+        """Draw fov on the current Matplotlib axes."""
         _clear_fov()
         if not (t_fov.value and fov_cfg.get("enabled", False)):
             return
@@ -810,6 +842,7 @@ def interactive_rollout_3d(
     leg_axes = None
 
     def build_main_legend(include_est=False):
+        """Build main legend for the current workflow."""
         nonlocal leg_main
         if leg_main is not None:
             try:
@@ -826,6 +859,7 @@ def interactive_rollout_3d(
             ax.add_artist(leg_axes)
 
     def ensure_triad_legend():
+        """Handle ensure triad legend for this workflow."""
         nonlocal leg_axes
         if leg_axes is None:
             proxies = [Line2D([0], [0], lw=2, color=c, label=lab)
@@ -844,6 +878,7 @@ def interactive_rollout_3d(
         ensure_triad_legend()
 
     def redraw(f):
+        """Handle redraw for this workflow."""
         if t_plan.value and plan_hist1:
             ph1 = plan_hist1[min(f, len(plan_hist1) - 1)]
             if ph1: xs, ys, zs = zip(*ph1); _set3d(plan1_ln, xs, ys, zs)
@@ -922,6 +957,7 @@ def interactive_rollout_3d(
     s_elev.observe(lambda ch: redraw(s_frame.value), names="value")
 
     def _rebuild_and_redraw(_=None):
+        """Internal helper for rebuild and redraw."""
         build_main_legend(include_est=t_est.value)
         redraw(s_frame.value)
 
@@ -978,11 +1014,13 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     # 2D→3D coercion
     def _as3_hist(seq):
+        """Internal helper for as3 hist."""
         if not seq: return []
         if seq and seq[0] and len(seq[0][0]) == 2:
             return [[(x, y, 0.0) for (x, y) in fr] for fr in seq]
         return seq
     def _as3_exec(seq):
+        """Internal helper for as3 exec."""
         if not seq: return []
         if seq and len(seq[0]) == 2:
             return [(x, y, 0.0) for (x, y) in seq]
@@ -1111,6 +1149,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     # legend
     def _legend_clean(H):
+        """Internal helper for legend clean."""
         out = []
         for h in H:
             if h is None: continue
@@ -1123,6 +1162,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
     # FOV artists
     fov_art = {'coll': None, 'rim': None, 'edges': []}
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ('coll','rim'):
             art = fov_art.get(k)
             if art is not None:
@@ -1135,6 +1175,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         fov_art['edges'] = []
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         L = att_all[agent]
         if not L or idx >= len(L) or "R" not in L[idx]:
             raise KeyError(f"Missing attitude for agent {agent+1} at frame {idx}")
@@ -1144,6 +1185,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         return R
 
     def _set_fov(p, R_wb, idx):
+        """Internal helper for set fov."""
         if not (show_fov and fov_enabled):
             _clear_fov(); return
         col = fov_cfg.get("color","C1")
@@ -1168,10 +1210,12 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
             fov_art['coll'], fov_art['rim'] = coll, rim
 
     def _set3d(ln, xs, ys, zs):
+        """Internal helper for set3d."""
         if ln is not None:
             ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
     def init():
+        """Handle init for this workflow."""
         for ln in plan_lns + exec_lns + list(est_lns.values()) + list(meas_lns.values()):
             if ln is not None:
                 ln.set_data([], []); ln.set_3d_properties([])
@@ -1187,6 +1231,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
 
     def update(f):
         # plans + exec + dots
+        """Assimilate a measurement into the estimator belief."""
         for a in range(N):
             if plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
@@ -1210,6 +1255,7 @@ def animate_rollout_3d_N(frames_dict, save_path="traj_3D.gif", fps=20, cfg=None,
         # estimates + meas
         if est_pairs:
             def _meas_ray(p_obs, R_wb, az, el, Lm):
+                """Internal helper for meas ray."""
                 c = np.cos(el)
                 v_b = np.array([c*np.cos(az), c*np.sin(az), np.sin(el)])
                 v_w = R_wb.T @ v_b
@@ -1274,6 +1320,7 @@ def interactive_rollout_3d_N(
     triads="fov",                # "fov" (only defender), "all", or "none"
     perf_skip_fov_every: int = 1
 ):
+    """Handle interactive rollout 3d  n for this workflow."""
     import re
     import numpy as np
     import matplotlib.pyplot as plt
@@ -1296,11 +1343,13 @@ def interactive_rollout_3d_N(
 
     # 2D→3D coercion (matches animator)
     def _as3_hist(seq):
+        """Internal helper for as3 hist."""
         if not seq: return []
         if seq and seq[0] and len(seq[0][0]) == 2:
             return [[(x, y, 0.0) for (x, y) in fr] for fr in seq]
         return seq
     def _as3_exec(seq):
+        """Internal helper for as3 exec."""
         if not seq: return []
         if seq and len(seq[0]) == 2:
             return [(x, y, 0.0) for (x, y) in seq]
@@ -1378,6 +1427,7 @@ def interactive_rollout_3d_N(
         "tab:pink","tab:gray","tab:olive","tab:cyan"
     ]
     def _set3d(ln, xs, ys, zs):
+        """Internal helper for set3d."""
         if ln is not None:
             ln.set_data(xs, ys); ln.set_3d_properties(zs)
 
@@ -1422,6 +1472,7 @@ def interactive_rollout_3d_N(
 
     # main legend
     def _legend_clean(H):
+        """Internal helper for legend clean."""
         out = []
         for h in H:
             if h is None: continue
@@ -1442,6 +1493,7 @@ def interactive_rollout_3d_N(
 
     fov_art = {"coll": None, "rim": None, "edges": []}
     def _clear_fov():
+        """Internal helper for clear fov."""
         for k in ("coll","rim"):
             art = fov_art.get(k)
             if art is not None:
@@ -1454,6 +1506,7 @@ def interactive_rollout_3d_N(
         fov_art["edges"] = []
 
     def _R_exec(agent, idx):
+        """Internal helper for r exec."""
         L = att_all[agent]
         if not L or idx >= len(L) or "R" not in L[idx]:
             raise KeyError(f"Missing attitude for agent {agent+1} at frame {idx}")
@@ -1463,6 +1516,7 @@ def interactive_rollout_3d_N(
         return R
 
     def _set_fov(p, R_wb, idx):
+        """Internal helper for set fov."""
         _clear_fov()
         if not (fov_on and show_fov): return
         col = fov_cfg.get("color","C1")
@@ -1495,6 +1549,7 @@ def interactive_rollout_3d_N(
 
     def redraw(f):
         # plans + execs + dots
+        """Handle redraw for this workflow."""
         for a in range(N):
             if t_plan.value and plan_all[a] and f < len(plan_all[a]) and plan_all[a][f]:
                 xs, ys, zs = zip(*plan_all[a][f]); _set3d(plan_lns[a], xs, ys, zs)
@@ -1588,6 +1643,7 @@ def add_triad_legend(ax, colors=('tab:red','tab:green','tab:blue'),
                      labels=('x_b (boresight)', 'y_b', 'z_b'),
                      loc='lower left', ncol=1, title='Body axes',
                      keep_legend=None):
+    """Handle add triad legend for this workflow."""
     proxies = [Line2D([0], [0], lw=2, color=c, label=lab) for c, lab in zip(colors, labels)]
     leg_axes = ax.legend(proxies, labels, loc=loc, ncol=ncol, title=title)
     if keep_legend is not None:
@@ -1653,6 +1709,7 @@ def plot_rollout_thrust_u(
     """
 
     def _as_u_array(u_like):
+        """Internal helper for as u array."""
         if u_like is None:
             return None
         U = np.asarray(u_like, dtype=float)
@@ -1666,6 +1723,7 @@ def plot_rollout_thrust_u(
     def _maybe_pick_rollout(obj):
         # If obj is a list of rollouts (e.g. list length K where each is (T,3)),
         # select rollout_idx.
+        """Internal helper for maybe pick rollout."""
         if rollout_idx is None:
             return obj
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
@@ -1676,6 +1734,7 @@ def plot_rollout_thrust_u(
         return obj
 
     def _first_present(keys):
+        """Internal helper for first present."""
         for k in keys:
             if k in frames_dict and frames_dict[k] is not None:
                 return k, frames_dict[k]
@@ -1791,6 +1850,7 @@ def plot_rollout_delta_v(
     """
 
     def _as_u_array(u_like):
+        """Internal helper for as u array."""
         if u_like is None:
             return None
         U = np.asarray(u_like, dtype=float)
@@ -1801,6 +1861,7 @@ def plot_rollout_delta_v(
         return U[:, :3]
 
     def _maybe_pick_rollout(obj):
+        """Internal helper for maybe pick rollout."""
         if rollout_idx is None:
             return obj
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
@@ -1811,6 +1872,7 @@ def plot_rollout_delta_v(
         return obj
 
     def _pick_agent_series(container, agent: int):
+        """Internal helper for pick agent series."""
         container = _maybe_pick_rollout(container)
         a0 = agent - 1
         if isinstance(container, (list, tuple)):
@@ -1823,6 +1885,7 @@ def plot_rollout_delta_v(
         return None
 
     def _infer_dt():
+        """Internal helper for infer dt."""
         if dt is not None:
             return float(dt)
         if cfg is None:
@@ -1838,6 +1901,7 @@ def plot_rollout_delta_v(
         return None
 
     def _get_control_for_agent(agent: int):
+        """Internal helper for get control for agent."""
         n_aware_preferred = ("u_real_all", "u_cmd_all", "u_all", "act_all", "actions_all")
         n_aware_fallback = ("u_cmd_all", "u_all", "act_all", "actions_all", "u_real_all")
         generic_preferred = ("u_real", "u_cmd", "u", "u_hist", "act", "actions", "u_cmd_xyz")
@@ -1965,6 +2029,7 @@ def plot_rollout_velocity(
     """
 
     def _as_xyz_array(v_like):
+        """Internal helper for as xyz array."""
         if v_like is None:
             return None
         V = np.asarray(v_like, dtype=float)
@@ -1977,6 +2042,7 @@ def plot_rollout_velocity(
         return V[:, :3]
 
     def _maybe_pick_rollout(obj):
+        """Internal helper for maybe pick rollout."""
         if rollout_idx is None:
             return obj
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
@@ -1987,6 +2053,7 @@ def plot_rollout_velocity(
         return obj
 
     def _pick_agent_series(container):
+        """Internal helper for pick agent series."""
         container = _maybe_pick_rollout(container)
         a = agent - 1
         if isinstance(container, (list, tuple)):
@@ -1999,12 +2066,14 @@ def plot_rollout_velocity(
         return None
 
     def _first_present(keys):
+        """Internal helper for first present."""
         for k in keys:
             if k in frames_dict and frames_dict[k] is not None:
                 return frames_dict[k]
         return None
 
     def _infer_state_layout(S):
+        """Internal helper for infer state layout."""
         if cfg is not None:
             try:
                 D_cfg = int(cfg.get("D", 3))
@@ -2024,6 +2093,7 @@ def plot_rollout_velocity(
         return None, None
 
     def _series_from_state_history(container, *, want_velocity: bool):
+        """Internal helper for series from state history."""
         if container is None:
             return None
         S = np.asarray(_maybe_pick_rollout(container), dtype=float)
@@ -2038,6 +2108,7 @@ def plot_rollout_velocity(
         return _as_xyz_array(S[:, start:stop])
 
     def _infer_dt():
+        """Internal helper for infer dt."""
         if dt is not None:
             return float(dt)
         if cfg is not None:
@@ -2164,6 +2235,7 @@ def plot_rollout_center_distance(
     import matplotlib.pyplot as plt
 
     def _maybe_pick_rollout(obj):
+        """Internal helper for maybe pick rollout."""
         if rollout_idx is None:
             return obj
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
@@ -2188,6 +2260,7 @@ def plot_rollout_center_distance(
         return None
 
     def _infer_dt():
+        """Internal helper for infer dt."""
         if dt is not None:
             return float(dt)
         if cfg is None:
@@ -2203,6 +2276,7 @@ def plot_rollout_center_distance(
         return None
 
     def _infer_center():
+        """Internal helper for infer center."""
         if center is not None:
             c = np.asarray(center, float).ravel()
             if c.size == 2:
@@ -2242,6 +2316,7 @@ def plot_rollout_center_distance(
         exec_all = _maybe_pick_rollout(frames_dict["exec_all"])
 
     def _get_exec_for_agent(a1_indexed: int):
+        """Internal helper for get exec for agent."""
         a0 = a1_indexed - 1
 
         if isinstance(exec_all, (list, tuple)) and 0 <= a0 < len(exec_all):
@@ -2365,6 +2440,7 @@ def plot_rollout_relative_distance(
     a_i, a_j = int(agents[0]), int(agents[1])
 
     def _maybe_pick_rollout(obj):
+        """Internal helper for maybe pick rollout."""
         if rollout_idx is None:
             return obj
         if isinstance(obj, (list, tuple)) and len(obj) > 0:
@@ -2392,6 +2468,7 @@ def plot_rollout_relative_distance(
         return None
 
     def _infer_dt():
+        """Internal helper for infer dt."""
         if dt is not None:
             return float(dt)
         if cfg is None:
@@ -2414,6 +2491,7 @@ def plot_rollout_relative_distance(
         exec_all = _maybe_pick_rollout(frames_dict["exec_all"])
 
     def _get_exec_for_agent(a1_indexed: int):
+        """Internal helper for get exec for agent."""
         a0 = a1_indexed - 1
 
         # Preferred: N-agent container

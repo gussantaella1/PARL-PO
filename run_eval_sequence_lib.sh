@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 
-# Shared helpers for the Monte Carlo sequence runner scripts.
-# Run specs accept either:
+# Shared helpers for the Monte Carlo evaluation sequence scripts.
+#
+# The distance-specific launchers source this file so they agree on dynamics
+# naming, run-spec parsing, output suffixes, and warning behavior. Run specs
+# accept either of these forms:
+#
 #   Training_Policy_2.0u_1vmax:elliptic_ltv
 #   Training_Policy_2.0u_1vmax|elliptic_ltv
 
