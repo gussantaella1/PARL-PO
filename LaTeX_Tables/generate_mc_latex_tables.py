@@ -24,6 +24,7 @@ import csv
 import json
 import math
 import re
+import shutil
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -47,17 +48,42 @@ PHASES = (
     ("def2/att2", "def2_vs_att2", r"$\pi_{\mathrm{def},2}$ vs $\pi_{\mathrm{att},2}$"),
 )
 
-OUTCOMES = (
-    ("defender_capture", "Def. capture"),
-    ("attacker_hit_oi", "Att. hit OI"),
-    ("defender_hit_oi", "Def. hit OI"),
-    ("defender_crashed_wall", "Def. wall"),
-    ("attacker_crashed_wall", "Att. wall"),
-    ("timeout_no_capture", "Timeout"),
+OUTCOME_GROUPS = (
+    (
+        "Defender wins",
+        (
+            ("defender_capture", "Def. capture"),
+            ("attacker_crashed_wall", "Att. wall"),
+        ),
+    ),
+    (
+        "Attacker wins",
+        (
+            ("attacker_hit_oi", "Att. hit OI"),
+            ("defender_hit_oi", "Def. hit OI"),
+            ("defender_crashed_wall", "Def. wall"),
+        ),
+    ),
+    (
+        "Ties",
+        (
+            ("timeout_no_capture", "Timeout"),
+        ),
+    ),
 )
 
 BOLD_OUTCOMES = {"defender_capture", "attacker_hit_oi"}
 TABLE_FONT_SIZE = r"\footnotesize"
+TABLE_PLACEMENT = "H"
+TABLE_RESIZE_WIDTH = r"\dimexpr\textwidth+0.5in\relax"
+TABLE_COLSEP = "1pt"
+MERGED_THESIS_FILENAME = "merged_thesis_tables.tex"
+TRAINING_CURVE_FILENAME = "compare__R_mean__def0_vs_att1_vs_def1_vs_att2_vs_def2.png"
+KF_ON_SUFFIX = "_KF_ON"
+THESIS_SELECTIONS = (
+    ("HCW", "hcw", (20, 100)),
+    ("Elliptic LTV", "elliptic_ltv", (20, 100)),
+)
 
 
 @dataclass(frozen=True)
@@ -391,49 +417,62 @@ def spec_has_any_data(spec: TableSpec) -> bool:
     return any(load_result(spec, matchup) is not None for _, matchup, _ in PHASES)
 
 
-def render_table(spec: TableSpec) -> str:
-    phase_results = {
+def training_identifier(params: Dict[str, str]) -> str:
+    return (
+        r"$u_{\max} = "
+        + latex_escape(params["umax"])
+        + r"$, $v_{\max} = "
+        + latex_escape(params["vmax"])
+        + r"$, $v_{\max}^{\mathrm{IC}} = "
+        + latex_escape(params["ic_vmax"])
+        + r"$"
+    )
+
+
+def phase_results_for_spec(spec: TableSpec) -> Dict[str, Optional[Dict[str, Any]]]:
+    return {
         matchup: load_result(spec, matchup)
         for _, matchup, _ in PHASES
     }
-    caption = (
-        "Monte Carlo outcomes for "
-        + r"\texttt{"
-        + latex_escape(spec.display_run_dir)
-        + r"}, "
-        + f"{spec.radius_m} m, {spec.dynamics_label}, {spec.kf_label}. "
-        + r"Cells are count; \% [95\% Wilson CI]."
+
+
+def phase_column_headers() -> str:
+    return " & ".join(
+        r"{\boldmath\textbf{" + phase_label + r"}}"
+        for _, _, phase_label in PHASES
     )
-    label = "tab:mc-" + label_slug(
-        f"{spec.display_run_dir}-{spec.radius_m}m-{spec.dynamics}-"
-        f"{'kf-on' if spec.use_kf else 'kf-off'}"
-    )
-    cols = " & ".join(phase_label for _, _, phase_label in PHASES)
+
+
+def render_outcome_tabular(spec: TableSpec) -> str:
+    phase_results = phase_results_for_spec(spec)
+    cols = phase_column_headers()
 
     lines = [
-        r"\begin{table}[t]",
-        r"\centering",
-        TABLE_FONT_SIZE,
-        r"\setlength{\tabcolsep}{2pt}",
-        r"\caption{" + caption + r"}",
-        r"\label{" + label + r"}",
-        r"\resizebox{\textwidth}{!}{%",
         r"\begin{tabular}{@{}lcccc@{}}",
         r"\toprule",
-        "Outcome & " + cols + r" \\",
+        r"\textbf{Outcome} & " + cols + r" \\",
         r"\midrule",
     ]
 
-    for outcome, display in OUTCOMES:
-        cells = [
-            outcome_cell(phase_results[matchup], outcome)
-            for _, matchup, _ in PHASES
-        ]
-        row_label = latex_escape(display)
-        if outcome in BOLD_OUTCOMES:
-            row_label = r"\textbf{" + row_label + "}"
-            cells = [bold_cell(cell) for cell in cells]
-        lines.append(row_label + " & " + " & ".join(cells) + r" \\")
+    for group_label, outcomes in OUTCOME_GROUPS:
+        lines.extend(
+            [
+                r"\addlinespace[0.25em]",
+                r"\multicolumn{5}{@{}l@{}}{\underline{\textit{"
+                + latex_escape(group_label)
+                + r":}}} \\",
+            ]
+        )
+        for outcome, display in outcomes:
+            cells = [
+                outcome_cell(phase_results[matchup], outcome)
+                for _, matchup, _ in PHASES
+            ]
+            row_label = latex_escape(display)
+            if outcome in BOLD_OUTCOMES:
+                row_label = r"\textbf{" + row_label + "}"
+                cells = [bold_cell(cell) for cell in cells]
+            lines.append(row_label + " & " + " & ".join(cells) + r" \\")
 
     lines.extend(
         [
@@ -442,19 +481,51 @@ def render_table(spec: TableSpec) -> str:
             r"Step time & \multicolumn{4}{l@{}}{"
             + combined_step_time_cell(phase_results)
             + r"} \\",
-        ]
-    )
-
-    lines.extend(
-        [
             r"\bottomrule",
             r"\end{tabular}%",
-            r"}",
-            r"\end{table}",
-            "",
         ]
     )
     return "\n".join(lines)
+
+
+def render_table(spec: TableSpec, policy_caption: Optional[str] = None) -> str:
+    policy_desc = (
+        policy_caption
+        if policy_caption is not None
+        else r"\texttt{" + latex_escape(spec.display_run_dir) + r"}"
+    )
+    caption = (
+        "Monte Carlo outcomes for "
+        + policy_desc
+        + ", "
+        + f"{spec.radius_m} m, {spec.dynamics_label}, {spec.kf_label}. "
+        + r"Cells are count; \% [95\% Wilson CI]."
+    )
+    label = "tab:mc-" + label_slug(
+        f"{spec.display_run_dir}-{spec.radius_m}m-{spec.dynamics}-"
+        f"{'kf-on' if spec.use_kf else 'kf-off'}"
+    )
+
+    lines = [
+        rf"\begin{{table}}[{TABLE_PLACEMENT}]",
+        r"\centering",
+        TABLE_FONT_SIZE,
+        rf"\setlength{{\tabcolsep}}{{{TABLE_COLSEP}}}",
+        r"\caption{" + caption + r"}",
+        r"\label{" + label + r"}",
+        r"\makebox[\textwidth][c]{%",
+        r"\resizebox{" + TABLE_RESIZE_WIDTH + r"}{!}{%",
+        render_outcome_tabular(spec),
+        r"}%",
+        r"}",
+        r"\end{table}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def radius_heading(radius_m: int) -> str:
+    return f"{radius_m} meter radius arena"
 
 
 def table_filename(spec: TableSpec) -> str:
@@ -466,31 +537,310 @@ def table_filename(spec: TableSpec) -> str:
     )
 
 
+def grouped_table_path(spec: TableSpec) -> Path:
+    return Path(spec.display_run_dir) / (
+        f"r{spec.radius_m}m__{spec.dynamics}__"
+        + ("kf_on" if spec.use_kf else "kf_off")
+        + ".tex"
+    )
+
+
+def display_path(repo_root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def strip_kf_on_suffix(name: str) -> str:
+    if name.endswith(KF_ON_SUFFIX):
+        return name[: -len(KF_ON_SUFFIX)]
+    return name
+
+
+def base_run_dir_for(run_dir: Path) -> Path:
+    return run_dir.with_name(strip_kf_on_suffix(run_dir.name))
+
+
+def kf_on_run_dir_for(base_run_dir: Path) -> Path:
+    return base_run_dir.with_name(base_run_dir.name + KF_ON_SUFFIX)
+
+
+def parse_training_params(run_dir: Path) -> Dict[str, str]:
+    name = run_dir.name
+    match = re.search(
+        r"Training_Policy_(?P<umax>[0-9.]+)u_(?P<vmax>[0-9.]+)vmax_(?P<ic_vmax>[0-9.]+)_icVmax",
+        name,
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return {"umax": "N/A", "vmax": "N/A", "ic_vmax": "N/A"}
+    return match.groupdict()
+
+
+def render_kf_table_block(label: str, spec: TableSpec) -> str:
+    lines = [
+        r"\textbf{" + latex_escape(label) + r"}\\[0.25em]",
+        r"{\setlength{\tabcolsep}{" + TABLE_COLSEP + r"}",
+        r"\makebox[\textwidth][c]{%",
+        r"\resizebox{" + TABLE_RESIZE_WIDTH + r"}{!}{%",
+        render_outcome_tabular(spec),
+        r"}%",
+        r"}",
+        r"}",
+    ]
+    return "\n".join(lines)
+
+
+def render_paired_kf_table(
+    display_run_dir: str,
+    radius_m: int,
+    dynamics: str,
+    dynamics_label: str,
+    kf_off_spec: TableSpec,
+    kf_on_spec: TableSpec,
+) -> str:
+    caption = (
+        f"Monte Carlo outcomes for {dynamics_label} in the "
+        + radius_heading(radius_m)
+        + r". KF off and KF on are shown in separate rows. "
+        + r"Cells are count; \% [95\% Wilson CI]."
+    )
+    label = "tab:mc-" + label_slug(
+        f"{display_run_dir}-{radius_m}m-{dynamics}-kf-off-vs-on"
+    )
+    lines = [
+        rf"\begin{{table}}[{TABLE_PLACEMENT}]",
+        r"\centering",
+        TABLE_FONT_SIZE,
+        r"\caption{" + caption + r"}",
+        r"\label{" + label + r"}",
+        render_kf_table_block("KF off", kf_off_spec),
+        r"\vspace{0.85em}",
+        "",
+        render_kf_table_block("KF on", kf_on_spec),
+        r"\end{table}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def copy_training_curve(run_dir: Path, merged_dir: Path, filename: str) -> Optional[Path]:
+    src = run_dir / "Plots" / "comparisons" / TRAINING_CURVE_FILENAME
+    if not src.is_file():
+        return None
+    dst = merged_dir / filename
+    shutil.copy2(src, dst)
+    return dst
+
+
+def latex_graphics_path(repo_root: Path, path: Path) -> str:
+    try:
+        return path.relative_to(repo_root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def render_training_curve_panel(label: str, image_path: Optional[Path], repo_root: Path) -> str:
+    lines = [
+        r"\begin{minipage}[t]{0.48\textwidth}",
+        r"\centering",
+        r"\textbf{" + latex_escape(label) + r"}\\[0.25em]",
+    ]
+    if image_path is None:
+        lines.append(
+            r"\fbox{\parbox[c][1.55in][c]{0.92\linewidth}{\centering N/A}}"
+        )
+    else:
+        graphics_path = latex_graphics_path(repo_root, image_path)
+        lines.append(
+            r"\includegraphics[width=\linewidth]{\detokenize{"
+            + graphics_path
+            + r"}}"
+        )
+    lines.append(r"\end{minipage}")
+    return "\n".join(lines)
+
+
+def render_training_curves_figure(
+    repo_root: Path,
+    merged_dir: Path,
+    display_run_dir: str,
+    base_run_dir: Path,
+    kf_on_run_dir: Path,
+    policy_caption: str,
+) -> str:
+    kf_off_curve = copy_training_curve(
+        base_run_dir,
+        merged_dir,
+        "combined_training_curve_kf_off.png",
+    )
+    kf_on_curve = copy_training_curve(
+        kf_on_run_dir,
+        merged_dir,
+        "combined_training_curve_kf_on.png",
+    )
+    label = "fig:mc-" + label_slug(display_run_dir) + "-training-curves-kf"
+    lines = [
+        rf"\begin{{figure}}[{TABLE_PLACEMENT}]",
+        r"\centering",
+        render_training_curve_panel("KF off", kf_off_curve, repo_root),
+        r"\hfill",
+        render_training_curve_panel("KF on", kf_on_curve, repo_root),
+        r"\caption{Combined training return curves for "
+        + policy_caption
+        + r".}",
+        r"\label{" + label + r"}",
+        r"\end{figure}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_merged_thesis_tables(
+    all_specs: List[TableSpec],
+    present_specs: List[TableSpec],
+    out_dir: Path,
+) -> None:
+    if not present_specs:
+        return
+
+    repo_root = all_specs[0].repo_root if all_specs else present_specs[0].repo_root
+    merged_root = out_dir / "Merged_Thesis"
+    if merged_root.exists():
+        shutil.rmtree(merged_root)
+    merged_root.mkdir(parents=True, exist_ok=True)
+
+    present_base_specs: List[TableSpec] = []
+    seen_base_run_dirs = set()
+    for spec in present_specs:
+        base_run_dir = base_run_dir_for(spec.run_dir)
+        if base_run_dir in seen_base_run_dirs:
+            continue
+        seen_base_run_dirs.add(base_run_dir)
+        present_base_specs.append(spec)
+
+    specs_by_source = {
+        (spec.run_dir, spec.radius_m, spec.dynamics, spec.use_kf): spec
+        for spec in all_specs
+    }
+    for run_spec in present_base_specs:
+        base_run_dir = base_run_dir_for(run_spec.run_dir)
+        kf_on_run_dir = kf_on_run_dir_for(base_run_dir)
+        display_run_dir = display_path(repo_root, base_run_dir)
+        policy_caption = training_identifier(parse_training_params(base_run_dir))
+        merged_dir = merged_root / Path(display_run_dir)
+        merged_dir.mkdir(parents=True, exist_ok=True)
+
+        parts = [
+            "% Auto-generated by generate_mc_latex_tables.py.",
+            "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, and \\usepackage{float}.",
+            "% Thesis selection: training curves, HCW 20/100 m KF off/on, Elliptic LTV 20/100 m KF off/on.",
+            "% KF-off tables are read from the base run folder; KF-on tables are read from the matching _KF_ON folder.",
+            "",
+            r"\section{Training case: " + policy_caption + r"}",
+            "",
+            render_training_curves_figure(
+                repo_root,
+                merged_dir,
+                display_run_dir,
+                base_run_dir,
+                kf_on_run_dir,
+                policy_caption,
+            ),
+        ]
+
+        for dynamics_label, dynamics, radii_m in THESIS_SELECTIONS:
+            parts.extend(["", r"\subsection{" + dynamics_label + r"}", ""])
+            for radius_m in radii_m:
+                kf_off_spec = specs_by_source.get(
+                    (base_run_dir, radius_m, dynamics, False)
+                )
+                if kf_off_spec is None:
+                    kf_off_spec = TableSpec(
+                        repo_root=repo_root,
+                        run_dir=base_run_dir,
+                        radius_m=radius_m,
+                        dynamics=dynamics,
+                        dynamics_label=dynamics_label,
+                        use_kf=False,
+                        kf_label="KF off",
+                    )
+
+                kf_on_spec = specs_by_source.get(
+                    (kf_on_run_dir, radius_m, dynamics, True)
+                )
+                if kf_on_spec is None:
+                    kf_on_spec = TableSpec(
+                        repo_root=repo_root,
+                        run_dir=kf_on_run_dir,
+                        radius_m=radius_m,
+                        dynamics=dynamics,
+                        dynamics_label=dynamics_label,
+                        use_kf=True,
+                        kf_label="KF on",
+                    )
+
+                parts.extend(
+                    [
+                        r"\subsubsection{" + radius_heading(radius_m) + r"}",
+                        "",
+                        render_paired_kf_table(
+                            display_run_dir,
+                            radius_m,
+                            dynamics,
+                            dynamics_label,
+                            kf_off_spec,
+                            kf_on_spec,
+                        ),
+                    ]
+                )
+
+        (merged_dir / MERGED_THESIS_FILENAME).write_text("\n".join(parts), encoding="utf-8")
+
+
 def write_table_set(
     specs: List[TableSpec],
     out_dir: Path,
     aggregate_name: str,
     subdir_name: str,
+    group_by_run_dir: bool = False,
 ) -> None:
     table_dir = out_dir / subdir_name
+    if table_dir.exists():
+        shutil.rmtree(table_dir)
     table_dir.mkdir(parents=True, exist_ok=True)
-    for stale_path in table_dir.glob("*.tex"):
-        stale_path.unlink()
 
     aggregate_parts = [
         "% Auto-generated by generate_mc_latex_tables.py.",
-        "% Requires: \\usepackage{booktabs} and \\usepackage{graphicx}.",
+        "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, and \\usepackage{float}.",
         "% Phase columns are policy matchups.",
+        "% Outcome rows are grouped into defender wins, attacker wins, and ties.",
         "% Cell format: count; percent\\% \\raisebox{0.25ex}{\\tiny [lo\\%, hi\\%]}.",
         "% Bottom rows: total n and pooled rollout total ms/step [95% normal CI].",
-        "% Tables use \\resizebox{\\textwidth}{!}{...} to avoid page overflow.",
+        f"% Tables use [{{{TABLE_PLACEMENT}}}] placement to force them at the insertion point.",
+        "% Tables are centered in a \\makebox and resized to \\textwidth+0.5in.",
+        "% This allows roughly 0.25in overhang into each margin for larger text.",
+        f"% Column padding uses \\tabcolsep={TABLE_COLSEP} to reduce scaling shrinkage.",
         "",
     ]
 
+    current_run_dir: Optional[str] = None
     for spec in specs:
         rendered = render_table(spec)
-        filename = table_filename(spec)
-        (table_dir / filename).write_text(rendered + "\n", encoding="utf-8")
+        rel_path = grouped_table_path(spec) if group_by_run_dir else Path(table_filename(spec))
+        target_path = table_dir / rel_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(rendered + "\n", encoding="utf-8")
+        if group_by_run_dir and spec.display_run_dir != current_run_dir:
+            current_run_dir = spec.display_run_dir
+            aggregate_parts.extend(
+                [
+                    "",
+                    "% " + current_run_dir,
+                    "",
+                ]
+            )
         aggregate_parts.append(rendered)
 
     (out_dir / aggregate_name).write_text("\n".join(aggregate_parts), encoding="utf-8")
@@ -508,7 +858,8 @@ def write_index(specs: List[TableSpec], out_dir: Path) -> None:
                 "kf",
                 "present_phase_count",
                 "missing_phases",
-                "table_filename",
+                "present_table_path",
+                "complete_grid_table_filename",
             ]
         )
         for spec in specs:
@@ -527,6 +878,7 @@ def write_index(specs: List[TableSpec], out_dir: Path) -> None:
                     "on" if spec.use_kf else "off",
                     present,
                     ";".join(missing),
+                    grouped_table_path(spec).as_posix() if present > 0 else "",
                     table_filename(spec),
                 ]
             )
@@ -566,7 +918,9 @@ def main() -> None:
         out_dir,
         aggregate_name="mc_outcome_tables_present.tex",
         subdir_name="tables_present",
+        group_by_run_dir=True,
     )
+    write_merged_thesis_tables(all_specs, present_specs, out_dir)
     if not args.skip_complete_grid:
         write_table_set(
             all_specs,
@@ -579,6 +933,7 @@ def main() -> None:
     print(f"Scanned {len(run_dirs)} run directories")
     print(f"Present-data tables: {len(present_specs)}")
     print(f"Wrote: {out_dir / 'mc_outcome_tables_present.tex'}")
+    print(f"Wrote: {out_dir / 'Merged_Thesis'}")
     if not args.skip_complete_grid:
         print(f"Wrote: {out_dir / 'mc_outcome_tables_complete_grid.tex'}")
     print(f"Wrote: {out_dir / 'mc_outcome_table_index.csv'}")

@@ -1,4 +1,6 @@
 """
+core/safety_filter.py
+
 Velocity-cap safety filters that project nominal accelerations into safe box and CBF constraints.
 """
 

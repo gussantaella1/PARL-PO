@@ -1,4 +1,6 @@
 """
+tests/test_velocity_cap.py
+
 Regression tests for velocity-cap enforcement and rollout velocity reporting.
 """
 

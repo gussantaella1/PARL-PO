@@ -1,4 +1,6 @@
 """
+core/intercept_heuristic.py
+
 Intercept-prior helpers that point policies toward coasting attacker intercept locations.
 """
 

@@ -1,4 +1,6 @@
 """
+game_viz.py
+
 Visualization helpers for single-attacker 3D rollouts, animations, and diagnostic plots.
 """
 

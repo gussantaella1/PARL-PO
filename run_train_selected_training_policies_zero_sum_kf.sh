@@ -15,6 +15,8 @@ CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 TARGET_SUFFIX="${TARGET_SUFFIX:-_KF_ON}"
 DRY_RUN=0
 
+# Environment variables control the interpreter, GPU binding, and suffix. That
+# keeps the editable part of this script focused on the selected run list below.
 # Uncomment the parent run directories you want to replay as KF runs.
 # These may be top-level runs or nested paths such as Legacy_Runs/... .
 SELECTED_RUN_DIRS=(
@@ -55,6 +57,8 @@ EXTRA_OVERRIDES=(
 )
 
 if [[ "${1:-}" == "--dry-run" ]]; then
+  # Dry-run is the safety catch: it prints the reconstructed commands without
+  # launching long training jobs or creating new output folders.
   DRY_RUN=1
   shift
 fi
@@ -103,6 +107,7 @@ echo "[run_train_selected_training_policies_zero_sum_kf] Using CUDA_VISIBLE_DEVI
 
 skipped=0
 for raw_run_dir in "${SELECTED_RUN_DIRS[@]}"; do
+  # Trim a trailing slash so suffix checks and target names stay consistent.
   run_dir="${raw_run_dir%/}"
 
   if [[ ! -d "${run_dir}" ]]; then
@@ -133,6 +138,8 @@ for raw_run_dir in "${SELECTED_RUN_DIRS[@]}"; do
   fi
 
   mapfile -d '' -t cmd < <(
+    # The inline Python reconstructs the rl_loop.py invocation from the saved
+    # manifest. It emits NUL-delimited argv items so bash preserves spaces safely.
     "${PYTHON_BIN}" - "${manifest_path}" "${target_dir}" "${PYTHON_BIN}" <<'PY'
 import json
 import sys
@@ -158,6 +165,7 @@ cmd = [
 
 
 def add(flag, value):
+    # Missing manifest fields stay missing; the training defaults can fill them.
     if value is None:
         return
     cmd.extend([flag, str(value)])
@@ -198,6 +206,7 @@ cmd.extend([
     target_dir.name,
 ])
 
+# NUL delimiters let mapfile rebuild argv without shell re-splitting.
 for item in cmd:
     sys.stdout.buffer.write(item.encode("utf-8"))
     sys.stdout.buffer.write(b"\0")
@@ -205,6 +214,8 @@ PY
   )
 
   if (( ${#EXTRA_OVERRIDES[@]} > 0 )); then
+    # EXTRA_OVERRIDES comes last on purpose. It is the quick override layer for
+    # one-off reruns without editing config_rl.py or the saved manifest.
     cmd+=("${EXTRA_OVERRIDES[@]}")
   fi
 

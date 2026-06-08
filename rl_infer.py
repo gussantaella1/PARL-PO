@@ -1,4 +1,6 @@
 """
+rl_infer.py
+
 Checkpoint loading and batched action inference for trained teacher and student policies.
 """
 

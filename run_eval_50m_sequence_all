@@ -11,6 +11,8 @@ cd "$(dirname "$0")"
 source ./run_eval_sequence_lib.sh
 
 DEFAULT_RUN_SPECS=(
+  # Default queue for this sweep. Passing args to the script replaces this list,
+  # which is safer than editing the body for one-off runs.
   # Missing 50m HCW:
   "Failed_Runs/Training_Policy_0.5u_1.5vmax_1.5_icVmax:hcw"
   "Failed_Runs/Training_Policy_0.5u_1vmax_1.0_icVmax:hcw"
@@ -35,6 +37,8 @@ fi
 DYNAMICS_OVERRIDE="$(canonicalize_dyn_name "${DYNAMICS_OVERRIDE:-}")"
 OUT_DIR_SUFFIX="${OUT_DIR_SUFFIX:-}"
 
+# These are the evaluation knobs that should stay identical across every matchup
+# in this distance suite. Per-run dynamics is added later after precedence logic.
 COMMON_ARGS=(
   --auto_shell_grid
   --grid_mode cartesian
@@ -57,6 +61,8 @@ COMMON_ARGS_DYNAMICS="$(detect_common_args_dynamics COMMON_ARGS)"
 strip_dynamics_args COMMON_ARGS COMMON_ARGS_BASE
 
 build_common_args_for_dynamics() {
+  # Rebuild COMMON_ARGS for each run so the same script can mix HCW and
+  # elliptic_ltv jobs without duplicating the whole launcher.
   local effective_dynamics="$1"
   local -n out_args_ref="$2"
 
@@ -67,6 +73,7 @@ build_common_args_for_dynamics() {
 }
 
 run_policy_case() {
+  # Policy-vs-policy case: both checkpoints are loaded from the same run folder.
   local run_dir="$1"
   local case_name="$2"
   local def_ckpt="$3"
@@ -87,6 +94,8 @@ run_policy_case() {
 }
 
 run_rule_case() {
+  # Rule-opponent case: useful for sanity checks, left callable even when the
+  # default queue focuses on learned attacker checkpoints.
   local run_dir="$1"
   local case_name="$2"
   local def_ckpt="$3"
@@ -111,6 +120,8 @@ if [[ -n "${DYNAMICS_OVERRIDE}" ]]; then
 fi
 
 for run_spec in "${RUN_SPECS[@]}"; do
+  # Resolve folder, dynamics, and output suffix once, then run the standard
+  # matchup set under that exact context.
   parse_run_spec "${run_spec}" run_dir run_dyn
   effective_dynamics="$(resolve_effective_dynamics "${run_dyn}" "${DYNAMICS_OVERRIDE}" "${COMMON_ARGS_DYNAMICS}")"
 

@@ -1,4 +1,6 @@
 """
+core/train_eval.py
+
 Training, evaluation, checkpointing, opponent mixing, and distillation orchestration for staged PPO runs.
 """
 

@@ -1,4 +1,6 @@
 """
+dyn_models.py
+
 Orbital dynamics, coordinate-frame, and discretization helpers for HCW, elliptic LTV, and two-body models.
 """
 

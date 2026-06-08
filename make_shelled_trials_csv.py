@@ -130,7 +130,9 @@ def main():
     pts_per_shell = int(args.pts_per_shell)
     vel_scale = float(args.vel_scale)
 
-    shells = np.linspace(r_max / num_shells, r_max, num_shells)  # avoid exactly 0 by default
+    # Start at r_max / num_shells instead of zero; the center case is special enough
+    # that it stays behind --include_center.
+    shells = np.linspace(r_max / num_shells, r_max, num_shells)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -147,6 +149,8 @@ def main():
     def add_row(p_def, v_def, p_att, v_att):
         """Handle add row for this workflow."""
         nonlocal trial_idx
+        # Keep row construction in one place so the CSV schema, trial ids, and
+        # per-trial seed offsets cannot drift between the center row and shell rows.
         rows.append({
             "trial": trial_idx,
             "seed": int(args.seed) + trial_idx,
@@ -172,6 +176,8 @@ def main():
         # Defender positions on this shell
         P_def = center[None, :] + r * dirs
 
+        # Pairing controls how hard the same-radius geometry is: antipodal maximizes
+        # separation, while offset preserves shell coverage without identical directions.
         if args.pairing == "antipodal":
             P_att = center[None, :] + r * (-dirs)
         else:
@@ -185,7 +191,7 @@ def main():
             min_sep = float(args.min_sep)
             for i in range(pts_per_shell):
                 if np.linalg.norm(P_att[i] - P_def[i]) < min_sep:
-                    # try additional rolls until separation satisfied or give up
+                    # Try nearby index offsets first before falling back to antipodal.
                     ok = False
                     for extra in range(1, min(pts_per_shell, 50)):
                         cand = np.roll(P_def, shift=int(k + extra), axis=0)[i]
@@ -208,6 +214,8 @@ def main():
         for i in range(pts_per_shell):
             add_row(P_def[i], V_def[i], P_att[i], V_att[i])
 
+    # Write after generation succeeds, which avoids leaving behind a partial CSV if
+    # a pairing or config issue raises midway through.
     with out_path.open("w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()

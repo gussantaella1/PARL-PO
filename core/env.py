@@ -1,4 +1,6 @@
 """
+core/env.py
+
 Single-environment and vectorized pursuit-evasion environments used by training, evaluation, and rollout scripts.
 """
 

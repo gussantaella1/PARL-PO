@@ -1,4 +1,6 @@
 """
+dispersion.py
+
 Initial-condition and parameter-dispersion helpers for Monte Carlo rollouts.
 """
 
@@ -22,6 +24,7 @@ def sample_uniform_ball(rng: np.random.Generator, center: np.ndarray, radius: fl
     v = rng.normal(size=D)
     v = v / (np.linalg.norm(v) + 1e-12)
     u = rng.random()
+    # The 1/D exponent makes samples uniform by volume, not uniform by radius.
     rad = radius * (u ** (1.0 / D))
     return center + rad * v
 
@@ -53,6 +56,8 @@ def apply_param_dispersion(cfg: Dict[str, Any], rng: np.random.Generator) -> Non
 
         base = float(cfg[key])
 
+        # Parameter dispersion mutates the episode-local copy only; the base config
+        # remains clean for the next Monte Carlo episode.
         if dist == "normal":
             cfg[key] = float(base + rng.normal() * sigma)
         elif dist == "lognormal":
@@ -98,7 +103,8 @@ def build_episode_cfg_and_x0(cfg0: Dict[str, Any], episode_idx: int, trials_row:
     mode = ic.get("mode", "fixed")
 
     if trials_row is not None:
-        # CSV-based
+        # CSV rows are treated as authoritative initial conditions; only the optional
+        # jitter below is applied after loading them.
         p_def = np.array([trials_row["def_x"], trials_row["def_y"], trials_row["def_z"]], dtype=float)
         v_def = np.array([trials_row.get("def_vx", 0.0), trials_row.get("def_vy", 0.0), trials_row.get("def_vz", 0.0)], dtype=float)
         p_att = np.array([trials_row["att1_x"], trials_row["att1_y"], trials_row["att1_z"]], dtype=float)
@@ -116,6 +122,8 @@ def build_episode_cfg_and_x0(cfg0: Dict[str, Any], episode_idx: int, trials_row:
         xs = [np.concatenate([p_def, v_def])]
 
         for _ in range(num_attackers):
+            # Retry attacker positions to avoid starting inside the requested
+            # minimum separation from the defender.
             for _try in range(200):
                 p_att = sample_uniform_ball(rng, center, sample_r)
                 if min_sep <= 0 or np.linalg.norm(p_att - p_def) >= min_sep:
@@ -129,7 +137,8 @@ def build_episode_cfg_and_x0(cfg0: Dict[str, Any], episode_idx: int, trials_row:
         # fixed
         x0 = np.asarray(cfg["x0"], dtype=float)
 
-    # Jitter (always optional)
+    # Jitter is intentionally last so it perturbs both fixed and sampled cases in
+    # the same way.
     jit = disp.get("x0_jitter", {}) or {}
     x0 = apply_x0_jitter(
         x0,

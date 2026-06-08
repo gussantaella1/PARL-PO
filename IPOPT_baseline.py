@@ -1,4 +1,6 @@
 """
+IPOPT_baseline.py
+
 IPOPT-style baseline rollout helpers for comparing learned policies against a constrained one-step optimizer.
 """
 

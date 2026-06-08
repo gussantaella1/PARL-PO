@@ -1,4 +1,6 @@
 """
+docs/generate_policy_io_diagram.py
+
 Diagram generator for the policy input-output documentation in docs/.
 """
 
@@ -10,6 +12,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 
 
+# Keep the generated image next to this script so README/docs links stay stable.
 ROOT = Path(__file__).resolve().parent
 OUT_PATH = ROOT / "policy_io_diagram.png"
 
@@ -62,6 +65,8 @@ def add_label(ax, x, y, text, fontsize=14, color="#243042", weight="bold", ha="l
 
 def main():
     """Parse command-line arguments and run this script."""
+    # The diagram is intentionally hand-laid out in normalized axes coordinates.
+    # That makes it easy to tweak one box without pulling in a graph-layout dependency.
     fig, ax = plt.subplots(figsize=(18, 10), dpi=200)
     fig.patch.set_facecolor("#f7f3ea")
     ax.set_facecolor("#f7f3ea")
@@ -277,6 +282,8 @@ def main():
         va="center",
     )
 
+    # Static PNG output is enough here because the diagram is documentation, not
+    # part of the runtime pipeline.
     plt.savefig(OUT_PATH, dpi=220, bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     print(OUT_PATH)

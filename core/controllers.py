@@ -1,4 +1,6 @@
 """
+core/controllers.py
+
 Rule-based attacker controllers used for warm starts, baselines, and non-learning opponents.
 """
 

@@ -1,4 +1,6 @@
 """
+analyze_obs_importance.py
+
 Observation-importance analysis for trained PPO policies using gradients and feature ablations.
 """
 
@@ -122,6 +124,8 @@ def _observation_groups(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     out: List[Dict[str, Any]] = []
     for name, label, sl, dims in groups:
+        # Keep names, human labels, and raw observation indices together so JSON
+        # output is easy to line back up with the policy input vector.
         out.append(
             {
                 "name": name,
@@ -170,11 +174,15 @@ def _target_outputs(
         raise RuntimeError(f"No loaded policy found for role '{policy_role}'.")
 
     if not is_student:
+        # Teacher policies expose the usual actor/value heads, so we can attribute
+        # both action sensitivity and value sensitivity from the same observation batch.
         dist = model.dist(obs_batch, who=who)
         action = torch.tanh(dist.mean) * wrapper.umax
         value = model.value(obs_batch)
         return action, value
 
+    # Student policies operate on estimator-shaped inputs rather than the full
+    # training observation, so this mirrors the inference wrapper's student adapter.
     D = wrapper.D
     rel = obs_batch[:, 2 * D : 3 * D]
     v1 = obs_batch[:, 3 * D : 4 * D]
@@ -232,6 +240,8 @@ def _collect_observations(
         while (not done) and (steps < max_steps):
             obs_def, obs_att = env.get_obs_pair()
             target_obs = obs_def if policy_role == "def" else obs_att
+            # Store the observation before stepping so attribution explains what
+            # the target policy actually saw when choosing its action.
             observations.append(np.asarray(target_obs, dtype=np.float32).copy())
 
             if policy_role == "def":
@@ -328,6 +338,8 @@ def _compute_ablation_scores(
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """Compute ablation scores from the provided rollout or config data."""
     device = wrapper.device
+    # Ablation replaces each feature group with its empirical mean; this keeps the
+    # perturbed observation on the same scale instead of zeroing physically shifted data.
     baseline = obs_np.mean(axis=0, keepdims=True).astype(np.float32)
     obs_t = torch.as_tensor(obs_np, dtype=torch.float32, device=device)
     baseline_t = torch.as_tensor(baseline, dtype=torch.float32, device=device)
@@ -346,6 +358,8 @@ def _compute_ablation_scores(
 
         for group in groups:
             idx = group["indices"]
+            # Only one named group is removed at a time, which makes the reported
+            # delta a local "what did this group contribute?" score.
             batch_abl = batch.clone()
             batch_abl[:, idx] = baseline_t[:, idx]
             action_abl, value_abl = _target_outputs(wrapper, policy_role, batch_abl)
@@ -402,6 +416,7 @@ def _summarize_groups(
             row["value_ablation_delta"] = float(value_ablate[group["name"]])
         summary.append(row)
 
+    # Rank by action ablation because it is the most directly behavioral signal.
     summary.sort(key=lambda item: item["action_ablation_delta"], reverse=True)
     return summary
 
@@ -499,11 +514,16 @@ def main() -> None:
     cfg = copy.deepcopy(cfg)
     cfg["rl_eval_deterministic"] = bool(args.deterministic)
     cfg["device"] = args.device
+    # Rebuild dynamics from the manifest config instead of trusting whatever module
+    # defaults are currently active in the working tree.
     _build_dyn_for_cfg(cfg)
     _set_global_seed(int(args.seed))
 
     opponent_mode = args.opponent_mode
     if opponent_mode is None:
+        # Pick a safe default opponent: defender attribution can use the training
+        # rule controller, while attacker attribution needs either a loaded defender
+        # or a stationary/zero-action opponent.
         if args.policy_role == "def":
             opponent_mode = "loaded" if args.opponent_ckpt_path else "rule"
         else:

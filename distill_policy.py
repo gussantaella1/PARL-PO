@@ -1,4 +1,6 @@
 """
+distill_policy.py
+
 Command-line entry point for building a distillation config and launching teacher-student training.
 """
 
@@ -18,6 +20,9 @@ from core.distill import distill_from_teacher
 # Edit These Knobs
 # =========================================================
 
+# This script is intentionally config-by-dict rather than argparse-heavy because
+# distillation runs tend to be hand-tuned. Keep paths and one-off overrides here,
+# then let build_distill_cfg merge them into config_for_train().
 DISTILL_RUN: Dict[str, Any] = {
     # Required paths
     "teacher_ckpt": "Training_Policy/def1_teacher.pt",
@@ -69,6 +74,8 @@ DISTILL_RUN: Dict[str, Any] = {
 def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
     """Internal helper for deep update."""
     for key, value in src.items():
+        # Nested override blocks should patch the existing config instead of
+        # replacing whole dictionaries like cfg["ukf"] or cfg["safety_filter"].
         if isinstance(value, dict) and isinstance(dst.get(key), dict):
             _deep_update(dst[key], value)
         else:
@@ -78,6 +85,8 @@ def _deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
     """Build distill cfg for the current workflow."""
+    # Start from the same training config as PPO so observation layout, dynamics,
+    # rewards, and policy dimensions stay compatible with the teacher checkpoint.
     cfg = config_for_train(
         attacker_mode=run_cfg["attacker_mode"],
         train_role=run_cfg["train_role"],
@@ -95,6 +104,8 @@ def build_distill_cfg(run_cfg: Dict[str, Any]) -> Dict[str, Any]:
     _deep_update(cfg, dict(run_cfg.get("cfg_overrides", {})))
     if run_cfg.get("distill_collection_mode") is not None:
         cfg["distill_collection_mode"] = run_cfg["distill_collection_mode"]
+    # Rebuild dynamics after overrides, because horizon/dynamics knobs can change
+    # the matrices that the student and rollout collection need.
     build_dyn(cfg)
     return cfg
 

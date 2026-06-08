@@ -1,4 +1,6 @@
 """
+tests/test_arena_radius_knob.py
+
 Regression tests for arena-radius scheduling and shell-bound curriculum behavior.
 """
 

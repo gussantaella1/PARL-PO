@@ -1,4 +1,6 @@
 """
+game_runner.py
+
 Rollout runner that executes trained RL policies under HCW, elliptic LTV, or nonlinear two-body dynamics.
 """
 

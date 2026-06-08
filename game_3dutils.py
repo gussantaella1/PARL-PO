@@ -1,4 +1,6 @@
 """
+game_3dutils.py
+
 3D geometry and compatibility helpers for camera/FOV checks and legacy Kalman-filter calls.
 """
 

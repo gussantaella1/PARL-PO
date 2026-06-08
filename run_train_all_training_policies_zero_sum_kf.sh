@@ -15,6 +15,8 @@ CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 TARGET_SUFFIX="${TARGET_SUFFIX:-_KF_ON}"
 DRY_RUN=0
 
+# The only accepted CLI flag is --dry-run. Everything else is controlled through
+# environment variables so this script stays easy to repeat from shell history.
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=1
   shift
@@ -54,6 +56,8 @@ run_step() {
 }
 
 mapfile -t RUN_DIRS < <(
+  # Only top-level policy folders are replayed here. Nested/legacy runs belong in
+  # the selected-run launcher where the list is intentionally hand-curated.
   find . -maxdepth 1 -mindepth 1 -type d -name 'Training_Policy*' -printf '%f\n' | sort
 )
 
@@ -62,6 +66,8 @@ echo "[run_train_all_training_policies_zero_sum_kf] Using CUDA_VISIBLE_DEVICES=$
 
 skipped=0
 for run_dir in "${RUN_DIRS[@]}"; do
+  # Never overwrite a completed or partially completed KF rerun. If the target
+  # folder exists, leave it for manual inspection.
   if [[ "${run_dir}" == *"${TARGET_SUFFIX}" ]]; then
     echo "[run_train_all_training_policies_zero_sum_kf] Skipping ${run_dir}: already matches target suffix"
     skipped=$((skipped + 1))
@@ -84,6 +90,8 @@ for run_dir in "${RUN_DIRS[@]}"; do
   fi
 
   mapfile -d '' -t cmd < <(
+    # The inline Python reconstructs the rl_loop.py invocation from the saved
+    # manifest. It emits NUL-delimited argv items so bash preserves spaces safely.
     "${PYTHON_BIN}" - "${manifest_path}" "${target_dir}" "${PYTHON_BIN}" <<'PY'
 import json
 import sys
@@ -116,6 +124,7 @@ cmd = [
 
 
 def add(flag, value):
+    # Missing manifest fields stay missing; the training defaults can fill them.
     if value is None:
         return
     cmd.extend([flag, str(value)])
@@ -144,6 +153,7 @@ if disable_tb:
 else:
     add("--tb_logdir", cli_args.get("tb_logdir"))
 
+# NUL delimiters let mapfile rebuild argv without shell re-splitting.
 for item in cmd:
     sys.stdout.buffer.write(item.encode("utf-8"))
     sys.stdout.buffer.write(b"\0")

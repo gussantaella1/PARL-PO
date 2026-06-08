@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+regenerate_comparison_plots.py
+
 Rebuild staged training comparison plots from an existing run directory.
 
 This is a plots-only helper: it reads saved ``train_metrics_*.npz`` files and
@@ -13,6 +15,8 @@ from pathlib import Path
 from core.plotting import plot_compare_phases
 
 
+# These are the canonical staged metrics emitted by rl_loop.py. Missing files are
+# skipped so this can still regenerate plots for partial or interrupted runs.
 PHASE_SPECS = [
     ("def0_teacher", "train_metrics_def0_teacher.npz", "R_def_mean", "def"),
     ("att1_teacher", "train_metrics_att1_teacher.npz", "R_att_mean", "att"),
@@ -32,6 +36,7 @@ def _existing_phase_metrics(run_dir: Path):
         metric_path = run_dir / filename
         if not metric_path.is_file():
             continue
+        # core.plotting expects the stable tuple shape: (legend label, npz path, metric key).
         item = (label, str(metric_path), metric_key)
         combined.append(item)
         if role == "def":
@@ -88,6 +93,8 @@ def main():
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
 
+    # Match the directory layout produced during training so regenerated images can
+    # be dropped into an existing run without moving files around.
     comparisons_dir = run_dir / "Plots" / "comparisons"
     defender, attacker, combined = _existing_phase_metrics(run_dir)
 
@@ -143,10 +150,8 @@ if __name__ == "__main__":
     main()
 
 
-"""
-python regenerate_comparison_plots.py --run_dir Training_Policy
-"""
-
-"""
-Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt
-"""
+# Example:
+#   python regenerate_comparison_plots.py --run_dir Training_Policy
+#
+# Historical run this helper was originally used against:
+#   Training_Policy_Large_Arena_Staged_Static_Reward_Third_Attempt

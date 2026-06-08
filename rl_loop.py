@@ -79,6 +79,8 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
     """Build runtime overrides for the current workflow."""
     overrides = {}
 
+    # Keep CLI overrides sparse: only values the user actually passed are placed
+    # into this dict, so config_for_train() remains the source of defaults.
     if args.device is not None:
         overrides["device"] = args.device
     if args.seed is not None:
@@ -89,6 +91,8 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
         vmax = float(args.vmax)
         if vmax <= 0.0:
             raise ValueError(f"--vmax must be > 0, got {vmax!r}.")
+        # vmax lives in both legacy top-level config and the current safety
+        # filter block. Set both so old and new consumers agree.
         overrides["vmax"] = vmax
         overrides.setdefault("safety_filter", {})
         overrides["safety_filter"]["vmax"] = vmax
@@ -107,6 +111,8 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
         overrides["estimator_kind"] = args.estimator_kind
     if args.reward_type is not None:
         overrides["reward_type"] = args.reward_type
+        # The KF reward and estimator state move together. Reject mixed CLI
+        # choices early instead of letting a later phase fail in the environment.
         if args.reward_type == "zero_sum_kf":
             if overrides.get("use_kf") is False:
                 raise ValueError("--reward_type zero_sum_kf requires --use_kf true.")
@@ -141,6 +147,8 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
 
     tb_prefix = args.tb_run_prefix
     if tb_prefix is None:
+        # Default TensorBoard runs to the output folder name so multiple sweeps
+        # are easy to distinguish even when launched from scripts.
         tb_prefix = os.path.basename(os.path.abspath(out_dir)) or "training_run"
     overrides["tb_run_prefix"] = tb_prefix
 
@@ -227,6 +235,8 @@ if __name__ == "__main__":
     args = _parse_args()
     selected_phases = _parse_phase_list(args.phases)
 
+    # Import the heavier training/plotting stack only after args parse. That keeps
+    # --help fast and avoids importing CUDA/Torch modules unless we actually run.
     from core.plotting import (
         load_npz_metrics,
         plot_compare_phases,
@@ -246,6 +256,9 @@ if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     runtime_overrides = _build_runtime_overrides(args, OUT_DIR)
 
+    # Name every phase checkpoint up front. Later phases can then require the
+    # exact predecessor they depend on, whether it was trained in this invocation
+    # or already existed in OUT_DIR.
     def0_teacher_ckpt = os.path.join(OUT_DIR, "def0_teacher.pt")
     att1_teacher_ckpt = os.path.join(OUT_DIR, "att1_teacher.pt")
     def1_teacher_ckpt = os.path.join(OUT_DIR, "def1_teacher.pt")
@@ -276,6 +289,8 @@ if __name__ == "__main__":
     runlog.set_config("cli_args", vars(args))
     runlog.set_config("runtime_overrides", runtime_overrides)
 
+    # Log one resolved training config before phase-specific overrides mutate it.
+    # This is the run-level "what did I ask for?" record in run_manifest.json.
     cfg_training_log = config_for_train(
         attacker_mode="train",
         train_role="rl",
@@ -297,6 +312,8 @@ if __name__ == "__main__":
 
         phase0_extra = _merge_dicts(runtime_overrides, {
             # "gamma": 0.995,
+            # Give phase 0 a slightly forgiving defender capture buffer while it
+            # learns against the rule attacker.
             "hit_buffer_def": 0.25,
         })
         phase0_cfg = _build_phase_cfg("rule", "def", phase0_extra)

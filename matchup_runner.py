@@ -1,4 +1,6 @@
 """
+matchup_runner.py
+
 Rollout runner for policy-versus-baseline matchups across paper, game-theory, IPOPT, and rule opponents.
 """
 
@@ -218,6 +220,8 @@ def _finite_diff_grad(fun, x: np.ndarray, eps: float) -> np.ndarray:
 
 def _as_action_list(actions: Any, D: int, n_expected: int) -> List[np.ndarray]:
     """Internal helper for as action list."""
+    # Baseline solvers disagree on whether a single action is a vector or a list.
+    # Normalize here so downstream 1vN adapters can work with one representation.
     if isinstance(actions, (list, tuple)):
         out = [np.asarray(a, dtype=float).reshape(-1) for a in actions]
     else:
@@ -241,6 +245,7 @@ def _flatten_action_list(actions: List[np.ndarray]) -> np.ndarray:
     """Flatten per-agent action arrays into one optimization vector."""
     if not actions:
         return np.zeros((0,), dtype=np.float32)
+    # Box optimizers operate on one vector, while rollout code wants per-agent arrays.
     return np.concatenate([np.asarray(a, dtype=np.float32).reshape(-1) for a in actions], axis=0)
 
 
@@ -752,6 +757,8 @@ def _baseline_should_resolve(
     turn_len: int,
 ) -> bool:
     """Internal helper for baseline should resolve."""
+    # Some baselines are expensive, so turn_len lets them hold the previous action
+    # between solver calls while the simulation still steps every dt.
     if k == 0:
         return True
     if opponent_baseline == "rule":
@@ -1479,6 +1486,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
         print(f"[warn] {estimator_kind.upper()} in this runner is HCW-only; disabling estimator for non-HCW dynamics.")
         use_kf = False
 
+    # Estimator state is optional and strictly an observation source; the plant
+    # still advances with the true simulated states below.
     est_hist = None
     x2_est = x2.copy()
     x1_est = x1.copy()
@@ -1715,6 +1724,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
 
     t_roll0 = time.perf_counter()
     for k in range(steps):
+        # Each side can observe either truth or the latest estimator state, depending
+        # on the KF settings chosen for this rollout.
         x2_for_def_obs = x2_est if (use_kf and ukf12 is not None) else x2
         x1_for_att_obs = x1_est if (use_kf and ukf21 is not None) else x1
         obs_def = build_train_obs(x1, x2_for_def_obs, m_def, m_att)
@@ -1741,6 +1752,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
             )
 
         if _baseline_should_resolve(opponent_baseline, cfg, k, turn_len):
+            # The baseline always responds to the current policy action, so the
+            # matchup is policy-vs-best-response rather than two independent rollouts.
             u_baseline_cmd, dbg = _solve_baseline_best_response(
                 cfg=cfg,
                 opponent_baseline=opponent_baseline,
@@ -1832,6 +1845,8 @@ def run_rhc_with_policy_vs_baseline_collect_frames_3d(
                 return p
 
             if ukf12 is not None:
+                # Prediction can consume true, noisy, or no opponent control depending
+                # on ukf.action_access; measurement is az/el only.
                 u12_pred, u12_cov = _kf_predict_control(
                     ukf_action_access,
                     _u3(u2_real),

@@ -1,4 +1,6 @@
 """
+core/freeze_utils.py
+
 Small checks for freezing PyTorch modules and catching accidental changes to frozen policies.
 """
 
@@ -71,4 +73,3 @@ def assert_deterministic_action(ppo, obs_batch: torch.Tensor, who: str, tol: flo
     if d > tol:
         raise RuntimeError(f"[DETERMINISM CHECK FAILED] {who} deterministic act differs: max|Δa|={d:.3e}")
     return d
-

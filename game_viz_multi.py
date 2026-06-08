@@ -1,4 +1,6 @@
 """
+game_viz_multi.py
+
 Visualization helpers for multi-agent 3D rollouts, animations, and diagnostic plots.
 """
 

@@ -1,4 +1,6 @@
 """
+core/distill.py
+
 Teacher-student distillation utilities for converting privileged teacher policies into deployable partial-observation students.
 """
 

@@ -1,4 +1,6 @@
 """
+core/models.py
+
 Actor-critic policy networks and optional differentiable priors used by PPO and inference.
 """
 

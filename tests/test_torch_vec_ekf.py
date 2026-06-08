@@ -1,4 +1,6 @@
 """
+tests/test_torch_vec_ekf.py
+
 Regression tests that compare vectorized EKF behavior against scalar environments.
 """
 

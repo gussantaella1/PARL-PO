@@ -1,4 +1,6 @@
 """
+nash_ipopt_solver.py
+
 Standalone one-step IPOPT/CasADi Nash solver retained for experiments and not used by the main training loop.
 """
 

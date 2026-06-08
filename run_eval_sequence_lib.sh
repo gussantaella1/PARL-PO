@@ -10,6 +10,8 @@
 #   Training_Policy_2.0u_1vmax_1.0_icVmax|elliptic_ltv
 
 trim_whitespace() {
+  # Bash array parsing leaves whitespace exactly as typed, so normalize specs
+  # before comparing names or building output folder suffixes.
   local value="${1:-}"
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
@@ -17,6 +19,8 @@ trim_whitespace() {
 }
 
 canonicalize_dyn_name() {
+  # Keep all launchers using the same spellings. This makes folder suffixes and
+  # evaluate_policy.py overrides predictable even when I type a variant by hand.
   local dyn
   dyn="$(trim_whitespace "${1:-}")"
 
@@ -37,6 +41,7 @@ canonicalize_dyn_name() {
 }
 
 format_dynamics_label() {
+  # Log HCW explicitly as the default so queue output is easy to read later.
   local dyn
   dyn="$(canonicalize_dyn_name "${1:-}")"
   if [[ -n "${dyn}" ]]; then
@@ -47,6 +52,8 @@ format_dynamics_label() {
 }
 
 parse_run_spec() {
+  # Split a run spec into "folder" and optional "dynamics" without forcing every
+  # caller to remember the delimiter details.
   local spec="$1"
   local -n out_run_dir_ref="$2"
   local -n out_dyn_ref="$3"
@@ -71,6 +78,8 @@ parse_run_spec() {
 }
 
 detect_common_args_dynamics() {
+  # If COMMON_ARGS already contains --dynamics, remember it before stripping the
+  # flag out. Per-run dynamics and DYNAMICS_OVERRIDE can still take precedence.
   local -n args_ref="$1"
   local detected=""
   local arg=""
@@ -94,6 +103,8 @@ detect_common_args_dynamics() {
 }
 
 strip_dynamics_args() {
+  # Dynamics is injected per run after precedence is resolved, so remove any
+  # common dynamics flag before appending the effective value.
   local -n src_ref="$1"
   local -n dst_ref="$2"
   local arg=""
@@ -116,6 +127,7 @@ strip_dynamics_args() {
 }
 
 resolve_effective_dynamics() {
+  # Precedence is: explicit environment override, per-run spec, then COMMON_ARGS.
   local run_dyn override_dyn common_dyn
   run_dyn="$(canonicalize_dyn_name "${1:-}")"
   override_dyn="$(canonicalize_dyn_name "${2:-}")"
@@ -131,6 +143,8 @@ resolve_effective_dynamics() {
 }
 
 auto_suffix_for_dynamics() {
+  # HCW is the no-suffix baseline; non-HCW evals get a suffix so outputs do not
+  # silently overwrite the default folders.
   local dyn
   dyn="$(canonicalize_dyn_name "${1:-}")"
   if [[ -z "${dyn}" || "${dyn}" == "hcw" ]]; then
@@ -141,6 +155,8 @@ auto_suffix_for_dynamics() {
 }
 
 warn_if_non_hcw_kf_request() {
+  # The estimator path is intentionally HCW-only in this rollout stack. Keep this
+  # warning centralized so all eval launchers explain the same caveat.
   local dyn
   local use_kf="${2:-false}"
   local script_name="${3:-run_eval_sequence}"

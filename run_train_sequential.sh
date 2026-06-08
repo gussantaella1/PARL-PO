@@ -30,6 +30,8 @@ run_step() {
   return 0
 }
 
+# Each active block below is a complete rl_loop.py run. Comment/uncomment whole
+# blocks when you want a small manual training batch with explicit CLI knobs.
 run_step "Training_Policy_0.5u_1vmax_1.0_icVmax" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
     --out_dir Training_Policy_0.5u_1vmax_1.0_icVmax \
@@ -55,6 +57,8 @@ run_step "Training_Policy_0.5u_1.5vmax_1.5_icVmax" \
     --steps_per_env 1024
 
 
+# Parked experiments stay as full blocks so they can be revived without guessing
+# which CLI knobs originally belonged together.
 # run_step "Training_Policy_2.0u_1.5vmax_1.5_icVmax" \
 #   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
 #     --out_dir Training_Policy_2.0u_1.5vmax_1.5_icVmax \

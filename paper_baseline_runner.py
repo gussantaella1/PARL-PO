@@ -1,4 +1,6 @@
 """
+paper_baseline_runner.py
+
 Paper-derived baseline policies, payoff solvers, and rollout wrappers used for comparison studies.
 """
 

@@ -1,4 +1,6 @@
 """
+GameTheory_baseline.py
+
 Game-theory baseline rollout helpers for comparing learned policies against gradient-based one-step best responses.
 """
 

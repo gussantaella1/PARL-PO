@@ -1,4 +1,6 @@
 """
+tests/test_intercept_heuristic.py
+
 Regression tests for intercept-prior geometry and blend scheduling.
 """
 

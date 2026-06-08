@@ -1,4 +1,6 @@
 """
+tensorboard_plotters.py
+
 TensorBoard scalar readers and plotting helpers for comparing training curves.
 """
 
@@ -13,6 +15,8 @@ def find_event_dirs(root):
     Return directories that contain at least one events.out.tfevents* file.
     Searches recursively.
     """
+    # TensorBoard usually nests event files under run/seed folders, so the recursive
+    # search lets one experiment directory become the only required input.
     event_files = glob.glob(os.path.join(root, "**", "events.out.tfevents.*"), recursive=True)
     dirs = sorted(set(os.path.dirname(p) for p in event_files))
     return dirs
@@ -64,6 +68,7 @@ def composite_curve(run_dirs, tag, grid_size=300, smooth_alpha=None):
         if s is None:
             continue
         if smooth_alpha is not None:
+            # Smooth before interpolation so each run keeps its own time history.
             v = ema(v, smooth_alpha)
         series.append((s, v))
 
@@ -97,7 +102,8 @@ def composite_curve(run_dirs, tag, grid_size=300, smooth_alpha=None):
         Y.append(y_interp)
         used += 1
 
-    Y = np.stack(Y, axis=0)  # (n_runs, grid_size)
+    # Shape is (n_runs, grid_size); NaNs mark regions where a run did not contribute.
+    Y = np.stack(Y, axis=0)
     mean = np.nanmean(Y, axis=0)
     std  = np.nanstd(Y, axis=0)
 
@@ -129,7 +135,8 @@ def plot_composite(
     plt.plot(x, mean, label=f"mean (n={used})")
 
     if ci95:
-        # 95% CI ≈ 1.96 * std / sqrt(n_at_x)
+        # 95% CI is computed per x-position because union-mode grids can have
+        # different numbers of runs contributing at different steps.
         n_eff = np.maximum(counts, 1)
         ci = 1.96 * (std / np.sqrt(n_eff))
         plt.fill_between(x, mean - ci, mean + ci, alpha=0.2, label="95% CI")

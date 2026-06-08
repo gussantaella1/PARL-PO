@@ -1,4 +1,6 @@
 """
+core/buffers.py
+
 Rollout storage and generalized advantage estimation used by the PPO training loop.
 """
 
@@ -72,4 +74,3 @@ def compute_gae_from_buffer(buf: RolloutBuffer, gamma: float, lam: float):
     R = ret.reshape(T*N)
     A = (A - A.mean()) / (A.std() + 1e-8)
     return A, R
-

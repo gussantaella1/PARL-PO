@@ -1,4 +1,6 @@
 """
+core/plotting.py
+
 Training and initial-condition plotting utilities for policy runs and comparisons.
 """
 
