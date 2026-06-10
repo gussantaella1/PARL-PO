@@ -7,10 +7,10 @@ MC_eval_{20,50,100}m[/_elliptic_ltv]/<matchup>/results.json file, and emits
 booktabs-ready tables. Each table compares the staged policy matchups with one
 compact cell per phase:
 
-    count; percent% \\raisebox{0.25ex}{\\tiny [lo%, hi%]}
+    count; $percent \\pm se\\%$
 
 The bottom rows add the total trial count and mean rollout compute time per
-simulated step in milliseconds, with a 95% normal error bound.
+simulated step in milliseconds, with standard error.
 
 Missing result files are rendered as N/A. By default, only top-level
 Training_Policy* folders are included; pass --include-failed-runs to also scan
@@ -73,10 +73,16 @@ OUTCOME_GROUPS = (
 )
 
 BOLD_OUTCOMES = {"defender_capture", "attacker_hit_oi"}
-TABLE_FONT_SIZE = r"\footnotesize"
+TABLE_FONT_SIZE = r"\scriptsize"
 TABLE_PLACEMENT = "H"
 TABLE_RESIZE_WIDTH = r"\dimexpr\textwidth+0.5in\relax"
+TABLE_ARRAYSTRETCH = "1.02"
+THESIS_TABLE_RESIZE_WIDTH = r"\dimexpr\textwidth+0.75in\relax"
+THESIS_TABLE_ARRAYSTRETCH = "1.04"
+THESIS_KF_BLOCK_VSPACE = "0.75em"
 TABLE_COLSEP = "1pt"
+OUTCOME_GROUP_ADDLINESPACE = "0.18em"
+DELTA_V_UNIT = r"$\mathrm{m}/\mathrm{s}$"
 MERGED_THESIS_FILENAME = "merged_thesis_tables.tex"
 TRAINING_CURVE_FILENAME = "compare__R_mean__def0_vs_att1_vs_def1_vs_att2_vs_def2.png"
 KF_ON_SUFFIX = "_KF_ON"
@@ -143,14 +149,21 @@ def label_slug(text: str) -> str:
     return slug or "table"
 
 
-def wilson_ci(successes: int, n: int, z: float = 1.959963984540054) -> Tuple[float, float]:
+def binary_stderr_from_count(count: int, n: int) -> float:
     if n <= 0:
-        return (math.nan, math.nan)
-    phat = successes / n
-    denom = 1.0 + z * z / n
-    center = (phat + z * z / (2.0 * n)) / denom
-    half = z * math.sqrt((phat * (1.0 - phat) + z * z / (4.0 * n)) / n) / denom
-    return (max(0.0, center - half), min(1.0, center + half))
+        return math.nan
+    p = max(0.0, min(1.0, float(count) / float(n)))
+    return math.sqrt(max(0.0, p * (1.0 - p) / float(n)))
+
+
+def proportion_stderr_from_stats(stats: Dict[str, Any], count: int, n: int) -> float:
+    try:
+        stderr = float(stats.get("stderr"))
+    except (TypeError, ValueError):
+        stderr = math.nan
+    if math.isfinite(stderr):
+        return max(0.0, stderr)
+    return binary_stderr_from_count(count, n)
 
 
 def discover_run_dirs(repo_root: Path, include_failed_runs: bool) -> List[Path]:
@@ -271,19 +284,15 @@ def outcome_cell(data: Optional[Dict[str, Any]], outcome: str) -> str:
         return "N/A"
 
     rate = stats.get("rate", count_i / n_i)
-    ci = stats.get("ci_wilson", {}) or {}
-    lo = ci.get("lo")
-    hi = ci.get("hi")
-    if lo is None or hi is None:
-        lo, hi = wilson_ci(count_i, n_i)
+    stderr = proportion_stderr_from_stats(stats, count_i, n_i)
 
     return (
         f"{count_i}; "
-        f"{100.0 * float(rate):.1f}\\% "
-        r"\raisebox{0.25ex}{\tiny ["
-        f"{100.0 * float(lo):.1f}\\%, "
-        f"{100.0 * float(hi):.1f}\\%]"
-        r"}"
+        r"$"
+        f"{100.0 * float(rate):.1f}"
+        r" \pm "
+        f"{100.0 * float(stderr):.1f}\\%"
+        r"$"
     )
 
 
@@ -327,10 +336,13 @@ def step_time_cell(data: Optional[Dict[str, Any]]) -> str:
     except (TypeError, ValueError):
         stderr_ms = 0.0
 
-    half_width = 1.959963984540054 * stderr_ms
-    lo = max(0.0, mean_ms - half_width)
-    hi = mean_ms + half_width
-    return f"{mean_ms:.2f} ms [{lo:.2f} ms, {hi:.2f} ms]"
+    return (
+        r"$"
+        f"{mean_ms:.2f}"
+        r" \pm "
+        f"{stderr_ms:.2f}"
+        r"$ ms"
+    )
 
 
 def step_time_summary(data: Optional[Dict[str, Any]]) -> Optional[Tuple[int, float, float]]:
@@ -387,16 +399,60 @@ def combined_step_time_cell(phase_results: Dict[str, Optional[Dict[str, Any]]]) 
         stderr = 0.0
 
     mean_ms = 1000.0 * mean
-    half_width = 1.959963984540054 * 1000.0 * stderr
-    lo = max(0.0, mean_ms - half_width)
-    hi = mean_ms + half_width
-    return f"{mean_ms:.2f} ms [{lo:.2f} ms, {hi:.2f} ms]"
+    stderr_ms = 1000.0 * stderr
+    return (
+        r"$"
+        f"{mean_ms:.2f}"
+        r" \pm "
+        f"{stderr_ms:.2f}"
+        r"$ ms"
+    )
+
+
+def quartile_metric_cell(data: Optional[Dict[str, Any]], metric_key: str, unit: str) -> str:
+    if data is None:
+        return "N/A"
+
+    summary = (
+        data.get("metrics_trial", {})
+        .get(metric_key, {})
+    )
+    if not isinstance(summary, dict):
+        return "N/A"
+
+    try:
+        q25 = float(summary["q25"])
+        q50 = float(summary["q50"])
+        q75 = float(summary["q75"])
+    except (KeyError, TypeError, ValueError):
+        return "N/A"
+
+    return (
+        r"$"
+        f"{q50:.2f}"
+        r"\,["
+        f"{q25:.2f}, {q75:.2f}"
+        r"]$ "
+        + unit
+    )
+
+
+def delta_v_row(
+    phase_results: Dict[str, Optional[Dict[str, Any]]],
+    metric_key: str,
+    label: str,
+) -> str:
+    cells = [
+        quartile_metric_cell(phase_results[matchup], metric_key, DELTA_V_UNIT)
+        for _, matchup, _ in PHASES
+    ]
+    return label + " & " + " & ".join(cells) + r" \\"
 
 
 def bold_cell(cell: str) -> str:
     if cell == "N/A":
         return cell
-    return r"\textbf{" + cell + "}"
+    return r"{\bfseries\boldmath " + cell + "}"
 
 
 def total_count_row(phase_results: Dict[str, Optional[Dict[str, Any]]]) -> str:
@@ -457,7 +513,7 @@ def render_outcome_tabular(spec: TableSpec) -> str:
     for group_label, outcomes in OUTCOME_GROUPS:
         lines.extend(
             [
-                r"\addlinespace[0.25em]",
+                rf"\addlinespace[{OUTCOME_GROUP_ADDLINESPACE}]",
                 r"\multicolumn{5}{@{}l@{}}{\underline{\textit{"
                 + latex_escape(group_label)
                 + r":}}} \\",
@@ -476,6 +532,10 @@ def render_outcome_tabular(spec: TableSpec) -> str:
 
     lines.extend(
         [
+            r"\midrule",
+            r"\multicolumn{5}{@{}l@{}}{\underline{\textit{Delta-v statistics:}}} \\",
+            delta_v_row(phase_results, "delta_v_def_total", r"Def. total $\Delta v$"),
+            delta_v_row(phase_results, "delta_v_att_total", r"Att. total $\Delta v$"),
             r"\midrule",
             total_count_row(phase_results),
             r"Step time & \multicolumn{4}{l@{}}{"
@@ -499,7 +559,9 @@ def render_table(spec: TableSpec, policy_caption: Optional[str] = None) -> str:
         + policy_desc
         + ", "
         + f"{spec.radius_m} m, {spec.dynamics_label}, {spec.kf_label}. "
-        + r"Cells are count; \% [95\% Wilson CI]."
+        + r"Outcome cells report count; \% $\pm$ SE. "
+        + r"Delta-v rows report median [Q1, Q3]. "
+        + r"Step time reports mean $\pm$ SE."
     )
     label = "tab:mc-" + label_slug(
         f"{spec.display_run_dir}-{spec.radius_m}m-{spec.dynamics}-"
@@ -511,6 +573,7 @@ def render_table(spec: TableSpec, policy_caption: Optional[str] = None) -> str:
         r"\centering",
         TABLE_FONT_SIZE,
         rf"\setlength{{\tabcolsep}}{{{TABLE_COLSEP}}}",
+        rf"\renewcommand{{\arraystretch}}{{{TABLE_ARRAYSTRETCH}}}",
         r"\caption{" + caption + r"}",
         r"\label{" + label + r"}",
         r"\makebox[\textwidth][c]{%",
@@ -582,8 +645,9 @@ def render_kf_table_block(label: str, spec: TableSpec) -> str:
     lines = [
         r"\textbf{" + latex_escape(label) + r"}\\[0.25em]",
         r"{\setlength{\tabcolsep}{" + TABLE_COLSEP + r"}",
+        rf"\renewcommand{{\arraystretch}}{{{THESIS_TABLE_ARRAYSTRETCH}}}",
         r"\makebox[\textwidth][c]{%",
-        r"\resizebox{" + TABLE_RESIZE_WIDTH + r"}{!}{%",
+        r"\resizebox{" + THESIS_TABLE_RESIZE_WIDTH + r"}{!}{%",
         render_outcome_tabular(spec),
         r"}%",
         r"}",
@@ -599,12 +663,17 @@ def render_paired_kf_table(
     dynamics_label: str,
     kf_off_spec: TableSpec,
     kf_on_spec: TableSpec,
+    policy_caption: str,
 ) -> str:
     caption = (
         f"Monte Carlo outcomes for {dynamics_label} in the "
         + radius_heading(radius_m)
-        + r". KF off and KF on are shown in separate rows. "
-        + r"Cells are count; \% [95\% Wilson CI]."
+        + ", "
+        + policy_caption
+        + r". KF off and KF on are shown in each table. "
+        + r"Outcome cells report counts; \% $\pm$ SE. "
+        + r"Delta-v rows report median [Q1, Q3]. "
+        + r"Step time reports mean $\pm$ SE."
     )
     label = "tab:mc-" + label_slug(
         f"{display_run_dir}-{radius_m}m-{dynamics}-kf-off-vs-on"
@@ -616,7 +685,7 @@ def render_paired_kf_table(
         r"\caption{" + caption + r"}",
         r"\label{" + label + r"}",
         render_kf_table_block("KF off", kf_off_spec),
-        r"\vspace{0.85em}",
+        rf"\vspace{{{THESIS_KF_BLOCK_VSPACE}}}",
         "",
         render_kf_table_block("KF on", kf_on_spec),
         r"\end{table}",
@@ -792,6 +861,7 @@ def write_merged_thesis_tables(
                             dynamics_label,
                             kf_off_spec,
                             kf_on_spec,
+                            policy_caption,
                         ),
                     ]
                 )
@@ -816,9 +886,11 @@ def write_table_set(
         "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, and \\usepackage{float}.",
         "% Phase columns are policy matchups.",
         "% Outcome rows are grouped into defender wins, attacker wins, and ties.",
-        "% Cell format: count; percent\\% \\raisebox{0.25ex}{\\tiny [lo\\%, hi\\%]}.",
-        "% Bottom rows: total n and pooled rollout total ms/step [95% normal CI].",
+        "% Outcome cells: count; $percent \\pm SE\\%$.",
+        "% Delta-v rows: median [Q1, Q3].",
+        "% Step time row: pooled mean ms/step \\pm SE.",
         f"% Tables use [{{{TABLE_PLACEMENT}}}] placement to force them at the insertion point.",
+        f"% Table row spacing uses \\arraystretch={TABLE_ARRAYSTRETCH}.",
         "% Tables are centered in a \\makebox and resized to \\textwidth+0.5in.",
         "% This allows roughly 0.25in overhang into each margin for larger text.",
         f"% Column padding uses \\tabcolsep={TABLE_COLSEP} to reduce scaling shrinkage.",

@@ -118,6 +118,10 @@ python evaluate_policy.py \
 For the standard scripted sweeps:
 
 ```bash
+./run_eval_sequence_all 20m
+./run_eval_sequence_all 50m
+./run_eval_sequence_all 100m
+./run_eval_sequence_all 100m_advantage
 ./run_eval_20m_sequence_all
 ./run_eval_50m_sequence_all
 ./run_eval_100m_sequence_all
@@ -128,7 +132,7 @@ For the standard scripted sweeps:
 You can pass explicit run specs to the eval launchers:
 
 ```bash
-./run_eval_50m_sequence_all "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
+./run_eval_sequence_all 50m "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
 ```
 
 Each run spec accepts `run_dir:dynamics` or `run_dir|dynamics`. If dynamics is

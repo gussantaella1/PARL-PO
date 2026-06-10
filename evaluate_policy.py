@@ -9,7 +9,7 @@ through matchup_runner.py, which keeps the paper/game-theory/IPOPT/rule opponent
 logic out of the main RL rollout path.
 
 Outputs (all written under --out_dir):
-  - results.json : aggregate stats + Wilson CI on pass rate
+  - results.json : aggregate stats + standard deviation and Wilson CI on pass rate
   - trials.csv   : per-trial metrics + seed + initial conditions (+ grid indices if cartesian)
   - starts_xy.png, starts_xz.png : start position coverage (def + attacker(s))
 
@@ -496,6 +496,8 @@ def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[s
             "failures": 0,
             "rate": nan,
             "mean": nan,
+            "std": nan,
+            "std_sample": nan,
             "stderr": nan,
             "ci_wilson": {"alpha": float(alpha), "lo": nan, "hi": nan},
         }
@@ -503,6 +505,8 @@ def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[s
     k = int(np.sum(x))
     p = float(k / n)
     lo, hi = wilson_ci(k, n, alpha=float(alpha))
+    std = float(np.sqrt(p * (1.0 - p)))
+    std_sample = float(np.sqrt(p * (1.0 - p) * n / (n - 1))) if n > 1 else float("nan")
     stderr = float(np.sqrt(p * (1.0 - p) / n))
     return {
         "n": n,
@@ -510,6 +514,8 @@ def _binary_summary_from_values(vals: np.ndarray, alpha: float = 0.05) -> Dict[s
         "failures": n - k,
         "rate": p,
         "mean": p,
+        "std": std,
+        "std_sample": std_sample,
         "stderr": stderr,
         "ci_wilson": {"alpha": float(alpha), "lo": float(lo), "hi": float(hi)},
     }

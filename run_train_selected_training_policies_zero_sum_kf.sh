@@ -23,16 +23,10 @@ SELECTED_RUN_DIRS=(
 
   # "Training_Policy_0.5u_1.5vmax_0.25_icVmax"
   # "Training_Policy_0.5u_1.5vmax_1.0_icVmax"
-  "Training_Policy_0.1u_1vmax_0.05_icVmax"
+  # "Training_Policy_0.1u_1vmax_0.05_icVmax"
 
+  "Training_Policy_0.5u_1vmax_0.25_icVmax"
 
-
-  #Failed
-  # "Failed_Runs/Training_Policy_0.5u_1vmax_1.0_icVmax"
-  # "Failed_Runs/Training_Policy_0.5u_1.5vmax_1.5_icVmax"
-
-
-#Ignored
 
 )
 

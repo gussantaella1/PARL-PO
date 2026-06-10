@@ -25,28 +25,49 @@ Outputs:
 - `mc_outcome_table_index.csv`: coverage index showing which phase/matchup
   cells were missing and where present-table files were written.
 
+Generated table captions define the displayed statistics: outcome cells report
+count; percentage `\pm` standard error, delta-v rows report median `[Q1, Q3]`,
+and step time reports pooled mean `\pm` standard error.
+
 Each outcome cell is kept on one compact line:
 
 ```text
-count; percent% \raisebox{0.25ex}{\tiny [lo%, hi%]}
+count; $percent \pm se\%$
 ```
+
+The `\pm` value is the standard error of the binary outcome proportion,
+reported in percentage points and derived from the outcome count and total
+trial count.
 
 Outcome rows are grouped into defender wins, attacker wins, and ties. Ties
 currently contain only timeout / no capture.
+
+Each result table also includes a delta-v statistics mini-section before the
+bottom summary rows. The defender and attacker rows report median
+trajectory-total delta-v with interquartile range:
+
+```text
+median [Q1, Q3] m/s
+```
 
 The bottom rows report total trial count and mean rollout total time per
 simulated step in milliseconds, pooled across the four phase/matchup columns:
 
 ```text
-mean ms [95% normal CI]
+$mean \pm standard error$ ms
 ```
 
-Tables are centered in `\makebox[\textwidth][c]{...}` and wrapped in
+Tables use `\scriptsize` text with tightened row spacing, centered in
+`\makebox[\textwidth][c]{...}` and wrapped in
 `\resizebox{\dimexpr\textwidth+0.5in\relax}{!}{...}`. This lets each table
 borrow roughly 0.25 inches from the left and right margins so the scaled text
 is larger while still staying centered. Column padding is tightened with
 `\setlength{\tabcolsep}{1pt}` to recover more of the larger text size without
 increasing the margin overhang.
+
+The stacked thesis result blocks use a slightly wider resize target
+(`\textwidth+0.75in`) with tightened row spacing so the full-width KF-off and
+KF-on tables stay compact.
 
 The generated LaTeX assumes `booktabs`, `graphicx`, and `float`:
 

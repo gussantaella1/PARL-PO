@@ -32,29 +32,44 @@ run_step() {
 
 # Each active block below is a complete rl_loop.py run. Comment/uncomment whole
 # blocks when you want a small manual training batch with explicit CLI knobs.
-run_step "Training_Policy_0.5u_1vmax_1.0_icVmax" \
+run_step "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1vmax_1.0_icVmax \
+    --out_dir Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation \
     --device cuda \
     --vec_backend torch \
-    --vmax 1.0 \
+    --vmax 1.5 \
     --umax 0.5 \
     --k_pos 0.05 \
     --k_dock 0.0125 \
     --train_ic_vmax 1.0 \
     --steps_per_env 1024
 
-run_step "Training_Policy_0.5u_1.5vmax_1.5_icVmax" \
-  env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1.5vmax_1.5_icVmax \
-    --device cuda \
-    --vec_backend torch \
-    --train_ic_vmax 1.50 \
-    --vmax 1.5 \
-    --umax 0.5 \
-    --k_pos 0.05 \
-    --k_dock 0.0125 \
-    --steps_per_env 1024
+
+
+# run_step "Training_Policy_0.5u_1vmax_0.25_icVmax" \
+#   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
+#     --out_dir Training_Policy_0.5u_1vmax_0.25_icVmax \
+#     --device cuda \
+#     --vec_backend torch \
+#     --train_ic_vmax 0.25 \
+#     --vmax 1.0 \
+#     --umax 0.5 \
+#     --k_pos 0.05 \
+#     --k_dock 0.0125 \
+#     --steps_per_env 1024
+
+
+# run_step "Training_Policy_0.5u_1vmax_0.5_icVmax" \
+#   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
+#     --out_dir Training_Policy_0.5u_1vmax_0.5_icVmax \
+#     --device cuda \
+#     --vec_backend torch \
+#     --train_ic_vmax 0.5 \
+#     --vmax 1.0 \
+#     --umax 0.5 \
+#     --k_pos 0.05 \
+#     --k_dock 0.0125 \
+#     --steps_per_env 1024
 
 
 # Parked experiments stay as full blocks so they can be revived without guessing
