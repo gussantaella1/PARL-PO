@@ -317,6 +317,9 @@ TRAIN: Dict[str, Any] = {
     "vec_backend": "torch",  # "sync" | "subproc" | "torch"
     "vec_workers": None,     # only used when vec_backend == "subproc"
     "mp_start_method": None, # auto-selects a multiprocessing start method
+    # Keep the torch backend on the legacy per-env reset path by default.
+    # Enable this only when intentionally testing the newer fast-reset sampler.
+    "torch_fast_reset": False,
 
     #Higher accelerations setting (2.0 m/s^2)
     # "umax": 2.0,

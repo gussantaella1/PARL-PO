@@ -102,6 +102,8 @@ def _build_runtime_overrides(args, out_dir: str) -> dict:
         overrides["k_dock"] = args.k_dock
     if args.train_ic_vmax is not None:
         overrides["train_ic_vmax"] = args.train_ic_vmax
+    if args.torch_fast_reset is not None:
+        overrides["torch_fast_reset"] = bool(args.torch_fast_reset)
     if args.use_kf is not None:
         overrides["use_kf"] = bool(args.use_kf)
     if args.estimator_kind is not None:
@@ -169,6 +171,14 @@ def _parse_args():
     ap.add_argument("--k_pos", type=float, default=None, help="Override cfg['k_pos'].")
     ap.add_argument("--k_dock", type=float, default=None, help="Override cfg['k_dock'].")
     ap.add_argument("--train_ic_vmax", type=float, default=None, help="Override cfg['train_ic_vmax'].")
+    ap.add_argument(
+        "--torch_fast_reset",
+        nargs="?",
+        const=True,
+        default=None,
+        type=_parse_bool,
+        help="Enable or disable the TorchVecEnv fast-reset sampler. Default behavior comes from cfg['torch_fast_reset'].",
+    )
     ap.add_argument(
         "--use_kf",
         nargs="?",
