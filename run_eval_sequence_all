@@ -26,18 +26,14 @@ SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
 # every suite against this one folder list unless the user passes explicit run
 # specs on the command line.
 DEFAULT_RUN_SPECS=(
-  # HCW:
-
-  "Training_Policy_2.0u_1.5vmax_1.5_icVmax:hcw"
-
-  # elliptic_ltv:
+  # Base-directory non-KF policy folders. The RERUN folder is intentionally
+  # included even while its checkpoint set is still being populated.
+  "Training_Policy_0.1u_1vmax_0.05_icVmax:hcw"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax:hcw"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN:hcw"
   "Training_Policy_0.1u_1vmax_0.05_icVmax:elliptic_ltv"
-  "Training_Policy_0.5u_1.5vmax_1.0_icVmax:elliptic_ltv"
-  "Training_Policy_0.5u_1.5vmax_0.25_icVmax:elliptic_ltv"
-  "Failed_Runs/Training_Policy_0.5u_1.5vmax_1.5_icVmax:elliptic_ltv"
-  "Failed_Runs/Training_Policy_0.5u_1vmax_1.0_icVmax:elliptic_ltv"
-  "Training_Policy_2.0u_1.5vmax_1.5_icVmax:elliptic_ltv"
   "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN:elliptic_ltv"
 )
 
 print_usage() {

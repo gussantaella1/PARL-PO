@@ -1,16 +1,16 @@
 {
-  "created_utc": "2026-06-10T19:58:38.357792+00:00",
-  "out_dir": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation",
+  "created_utc": "2026-06-16T18:42:27.117630+00:00",
+  "out_dir": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN",
   "env": {
     "python": "3.11.14 (main, Oct 21 2025, 18:31:21) [GCC 11.2.0]",
     "platform": "Linux-6.8.0-117-generic-x86_64-with-glibc2.35"
   },
   "configs": {
     "cli_args": {
-      "out_dir": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation",
+      "out_dir": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN",
       "phases": "0,1,2,3,4",
       "device": "cuda",
-      "seed": null,
+      "seed": 42,
       "umax": 0.5,
       "vmax": 1.5,
       "k_pos": 0.05,
@@ -36,6 +36,7 @@
     },
     "runtime_overrides": {
       "device": "cuda",
+      "seed": 42,
       "umax": 0.5,
       "vmax": 1.5,
       "safety_filter": {
@@ -46,7 +47,7 @@
       "train_ic_vmax": 1.0,
       "steps_per_env": 1024,
       "vec_backend": "torch",
-      "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation"
+      "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN"
     },
     "training config used": {
       "umax": 0.5,
@@ -348,7 +349,7 @@
       "use_tensorboard": true,
       "tb_logdir": "runs",
       "tb_run_name": "ppo_diffgame_def",
-      "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation",
+      "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_RERUN",
       "episodes_per_iter": 8,
       "max_steps": 300,
       "lookahead_H": 15,
@@ -363,45 +364,5 @@
       "vmax": 1.5
     }
   },
-  "stages": [
-    {
-      "name": "PHASE0_train_def0",
-      "start_utc": "2026-06-10T19:58:38.360195+00:00",
-      "meta": {
-        "phase_name": "def0",
-        "attacker_mode": "rule",
-        "extra_train_cfg": {
-          "device": "cuda",
-          "umax": 0.5,
-          "vmax": 1.5,
-          "safety_filter": {
-            "vmax": 1.5
-          },
-          "k_pos": 0.05,
-          "k_dock": 0.0125,
-          "train_ic_vmax": 1.0,
-          "steps_per_env": 1024,
-          "vec_backend": "torch",
-          "tb_run_prefix": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation",
-          "hit_buffer_def": 0.25
-        }
-      },
-      "outputs": {
-        "train_role": "def",
-        "teacher_ckpt": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation/def0_teacher.pt",
-        "teacher_best_metric_name": "R_def_mean",
-        "teacher_best_metric": 122.77381680163796,
-        "teacher_best_update": 780,
-        "teacher_best_ckpt_path": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation/def0_teacher__best.pt",
-        "teacher_last_ckpt_path": "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation/def0_teacher.pt",
-        "student_ckpt": null,
-        "distill_enabled": false,
-        "distill_method": "modern",
-        "distill_duration_s": null
-      },
-      "status": "ok",
-      "end_utc": "2026-06-10T21:22:54.051330+00:00",
-      "duration_s": 5055.691134175984
-    }
-  ]
+  "stages": []
 }

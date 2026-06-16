@@ -50,7 +50,6 @@ from matchup_runner import (
     run_rhc_with_policy_vs_baseline_collect_frames_3d,
 )
 from core.utils import resolve_start_radius_bounds, set_seed
-from dispersion import build_episode_cfg_and_x0
 
 
 # ------------------------- local defaults -------------------------
@@ -108,6 +107,8 @@ EVALUATE_POLICY_DEFAULTS: Dict[str, Any] = {
     "arena_radius": None,
     "x0_pos_jitter": None,
     "x0_vel_jitter": None,
+    "dispersions_module": "dispersions",
+    "disable_dispersions": False,
     "dynamics": None,
     "dt": None,
     "collision_radius_m": None,
@@ -668,6 +669,343 @@ def _load_base_cfg(
     return cfg, f"run_manifest:{manifest_path}", manifest_path
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert common NumPy values into JSON-serializable Python values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _load_dispersions_config(module_name: Optional[str], disabled: bool) -> Tuple[Dict[str, Any], str]:
+    """Load Monte Carlo dispersion settings from a Python module."""
+    if disabled:
+        return {"enabled": False}, "disabled"
+
+    if module_name is None or str(module_name).strip() == "":
+        return {"enabled": False}, "none"
+
+    name = str(module_name).strip()
+    mod = importlib.import_module(name)
+    if hasattr(mod, "config_for_eval"):
+        cfg = mod.config_for_eval()
+    elif hasattr(mod, "DISPERSIONS"):
+        cfg = getattr(mod, "DISPERSIONS")
+    else:
+        raise RuntimeError(
+            f"Dispersions module '{name}' must define config_for_eval() or DISPERSIONS."
+        )
+    if cfg is None:
+        cfg = {}
+    if not isinstance(cfg, dict):
+        raise RuntimeError(f"Dispersions module '{name}' returned {type(cfg).__name__}; expected dict.")
+    return copy.deepcopy(cfg), f"module:{name}"
+
+
+def _resolve_dispersion_value(value: Any, cfg: Optional[Dict[str, Any]], label: str) -> Any:
+    """Resolve constants or config-derived values inside dispersion specs."""
+    if not isinstance(value, dict) or "from_config" not in value:
+        return value
+    if cfg is None:
+        raise ValueError(f"{label} references config, but no config was provided.")
+
+    key = str(value.get("from_config", "")).strip()
+    if key == "vmax":
+        resolved = _resolve_rollout_vmax(cfg)
+        if resolved is None:
+            raise ValueError(f"{label} requested vmax, but cfg does not define vmax or safety_filter.vmax.")
+    else:
+        resolved: Any = cfg
+        for part in key.split("."):
+            if not isinstance(resolved, dict) or part not in resolved:
+                if "default" in value:
+                    resolved = value["default"]
+                    break
+                raise ValueError(f"{label} requested cfg path {key!r}, but {part!r} is missing.")
+            resolved = resolved[part]
+
+    scale = value.get("scale", 1.0)
+    offset = value.get("offset", 0.0)
+    return np.asarray(resolved, dtype=float) * float(scale) + float(offset)
+
+
+def _axis_vector(
+    value: Any,
+    D: int,
+    label: str,
+    *,
+    default: float = 0.0,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """Convert a scalar or axis list into a D-vector."""
+    value = _resolve_dispersion_value(value, cfg, label)
+    if value is None:
+        return np.full(D, float(default), dtype=float)
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 0:
+        return np.full(D, float(arr), dtype=float)
+    arr = arr.reshape(-1)
+    if arr.size == D:
+        return arr.astype(float)
+    if arr.size == 3 and D <= 3:
+        return arr[:D].astype(float)
+    raise ValueError(f"{label} must be a scalar or length-{D} vector, got shape {arr.shape}.")
+
+
+def _gaussian_delta(
+    spec: Any,
+    rng: np.random.Generator,
+    D: int,
+    label: str,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> np.ndarray:
+    """Draw an additive Gaussian delta from a mean/std spec."""
+    if spec is None:
+        return np.zeros(D, dtype=float)
+    if not isinstance(spec, dict):
+        spec = {"mean": 0.0, "std": spec}
+    if not bool(spec.get("enabled", True)):
+        return np.zeros(D, dtype=float)
+    mean = _axis_vector(spec.get("mean", 0.0), D, f"{label}.mean", cfg=cfg)
+    std = np.maximum(_axis_vector(spec.get("std", 0.0), D, f"{label}.std", cfg=cfg), 0.0)
+    return mean + rng.normal(size=D) * std
+
+
+def _apply_initial_state_dispersions(
+    cfg: Dict[str, Any],
+    x0: np.ndarray,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Apply Gaussian position/velocity uncertainty around a nominal x0."""
+    disp = cfg.get("dispersion", {}) or {}
+    if not bool(disp.get("enabled", True)):
+        return np.asarray(x0, dtype=float).copy()
+
+    state = disp.get("initial_state", {}) or {}
+    if not bool(state.get("enabled", True)):
+        return np.asarray(x0, dtype=float).copy()
+
+    D = int(cfg.get("D", np.asarray(x0).shape[1] // 2))
+    out = np.asarray(x0, dtype=float).copy()
+    role_names = ["def"] + [f"att{idx}" for idx in range(1, max(1, out.shape[0] - 1) + 1)]
+
+    for kind, col0 in (("position", 0), ("velocity", D)):
+        group = state.get(kind, {}) or {}
+        if not bool(group.get("enabled", True)):
+            continue
+        default_spec = group.get("default", None)
+        for row_idx in range(out.shape[0]):
+            role = role_names[row_idx] if row_idx < len(role_names) else f"agent{row_idx}"
+            aliases = [role]
+            if role.startswith("att"):
+                aliases.append("att")
+            aliases.append("all")
+
+            delta = _gaussian_delta(default_spec, rng, D, f"initial_state.{kind}.default", cfg=cfg)
+            for alias in aliases:
+                if alias in group:
+                    delta += _gaussian_delta(group.get(alias), rng, D, f"initial_state.{kind}.{alias}", cfg=cfg)
+            out[row_idx, col0:col0 + D] += delta
+
+    return out
+
+
+def _draw_gaussian_value(
+    current: Any,
+    spec: Any,
+    rng: np.random.Generator,
+    label: str,
+    *,
+    cfg: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Draw a scalar/vector config value from a Gaussian parameter spec."""
+    if not isinstance(spec, dict):
+        spec = {"mean": None, "std": spec}
+    if not bool(spec.get("enabled", True)):
+        return current
+
+    mean_raw = spec.get("mean", None)
+    if mean_raw is None:
+        if current is None:
+            return current
+        mean = np.asarray(current, dtype=float)
+    else:
+        mean_raw = _resolve_dispersion_value(mean_raw, cfg, f"{label}.mean")
+        mean = np.asarray(mean_raw, dtype=float)
+
+    std = np.asarray(_resolve_dispersion_value(spec.get("std", 0.0), cfg, f"{label}.std"), dtype=float)
+    if mean.ndim == 0:
+        draw = float(mean) + float(std) * float(rng.normal())
+    else:
+        mean_arr = mean.astype(float)
+        if std.ndim == 0:
+            std_arr = np.full_like(mean_arr, float(std), dtype=float)
+        else:
+            std_arr = np.asarray(std, dtype=float)
+            if std_arr.shape != mean_arr.shape:
+                raise ValueError(
+                    f"{label}.std shape {std_arr.shape} does not match mean shape {mean_arr.shape}."
+                )
+        draw = mean_arr + np.maximum(std_arr, 0.0) * rng.normal(size=mean_arr.shape)
+
+    if "min" in spec:
+        draw = np.maximum(draw, float(spec["min"]))
+    if "max" in spec:
+        draw = np.minimum(draw, float(spec["max"]))
+
+    if isinstance(draw, np.ndarray):
+        return draw.astype(float).tolist()
+    return float(draw)
+
+
+def _apply_parameter_dispersions(cfg: Dict[str, Any], rng: np.random.Generator) -> None:
+    """Apply top-level per-trial config parameter dispersions in-place."""
+    disp = cfg.get("dispersion", {}) or {}
+    params = disp.get("parameters", None)
+    if params is None:
+        params = disp.get("params", {}) or {}
+    if not isinstance(params, dict) or not bool(params.get("enabled", False)):
+        return
+
+    for key, spec in params.items():
+        if key == "enabled" or not isinstance(spec, dict):
+            continue
+        if key not in cfg and spec.get("mean", None) is None:
+            continue
+        cfg[key] = _draw_gaussian_value(cfg.get(key), spec, rng, f"parameters.{key}", cfg=cfg)
+
+
+def _apply_kf_dispersions(cfg: Dict[str, Any], rng: np.random.Generator) -> None:
+    """Apply per-trial KF/EKF/UKF trait dispersions in-place."""
+    disp = cfg.get("dispersion", {}) or {}
+    kf = disp.get("kf", {}) or {}
+    if not bool(kf.get("enabled", False)):
+        return
+    if bool(kf.get("only_when_use_kf", True)) and not bool(cfg.get("use_kf", False)):
+        return
+
+    params = kf.get("parameters", {}) or {}
+    if not isinstance(params, dict):
+        return
+
+    ukf_cfg = cfg.setdefault("ukf", {})
+    for key, spec in params.items():
+        if not isinstance(spec, dict):
+            continue
+        if key not in ukf_cfg and spec.get("mean", None) is None:
+            continue
+        ukf_cfg[key] = _draw_gaussian_value(ukf_cfg.get(key), spec, rng, f"kf.parameters.{key}", cfg=cfg)
+
+
+def _episode_seed_from_dispersion(
+    cfg: Dict[str, Any],
+    episode_idx: int,
+    eval_seed_base: int,
+) -> int:
+    """Resolve the seed used for this episode's dispersion draws and rollout."""
+    disp = cfg.get("dispersion", {}) or {}
+    seed_cfg = disp.get("seed", {}) or {}
+    seed_base = seed_cfg.get("episode_seed_base", None)
+    if seed_base is None:
+        seed_base = int(eval_seed_base)
+    return int(seed_base) + int(episode_idx)
+
+
+def _prepare_episode_cfg(
+    cfg0: Dict[str, Any],
+    episode_idx: int,
+    eval_seed_base: int,
+) -> Tuple[Dict[str, Any], int, np.random.Generator]:
+    """Build the per-trial config copy and RNG used for Gaussian dispersions."""
+    cfg = copy.deepcopy(cfg0)
+    ep_seed = _episode_seed_from_dispersion(cfg, episode_idx, eval_seed_base)
+    rng = np.random.default_rng(ep_seed)
+    _apply_parameter_dispersions(cfg, rng)
+    _apply_kf_dispersions(cfg, rng)
+    return cfg, int(ep_seed), rng
+
+
+def _set_initial_state_std(disp: Dict[str, Any], kind: str, value: float) -> None:
+    """Set all-role initial-state Gaussian std from a CLI compatibility flag."""
+    state = disp.setdefault("initial_state", {})
+    state.setdefault("enabled", True)
+    group = state.setdefault(kind, {})
+    group.setdefault("enabled", True)
+    spec = group.setdefault("default", {})
+    spec["std"] = float(value)
+
+
+def _dispersion_spec_has_draws(spec: Any) -> bool:
+    """Return True if a Gaussian spec can change a value across trials."""
+    if not isinstance(spec, dict) or not bool(spec.get("enabled", True)):
+        return False
+    if np.any(np.asarray(spec.get("std", 0.0), dtype=float) > 0.0):
+        return True
+    return spec.get("mean", None) is not None
+
+
+def _dispersion_has_config_draws(cfg: Dict[str, Any]) -> bool:
+    """Return True when dispersions alter config/KF traits, not just x0."""
+    disp = cfg.get("dispersion", {}) or {}
+    if not bool(disp.get("enabled", True)):
+        return False
+
+    params = disp.get("parameters", None)
+    if params is None:
+        params = disp.get("params", {}) or {}
+    if isinstance(params, dict) and bool(params.get("enabled", False)):
+        for key, spec in params.items():
+            if key != "enabled" and _dispersion_spec_has_draws(spec):
+                return True
+
+    kf = disp.get("kf", {}) or {}
+    if isinstance(kf, dict) and bool(kf.get("enabled", False)) and bool(cfg.get("use_kf", False)):
+        for spec in (kf.get("parameters", {}) or {}).values():
+            if _dispersion_spec_has_draws(spec):
+                return True
+
+    return False
+
+
+def _top_level_parameter_dispersions_active(cfg: Dict[str, Any]) -> bool:
+    """Return True when enabled top-level parameter dispersions can change cfg."""
+    disp = cfg.get("dispersion", {}) or {}
+    if not bool(disp.get("enabled", True)):
+        return False
+    params = disp.get("parameters", None)
+    if params is None:
+        params = disp.get("params", {}) or {}
+    if not isinstance(params, dict) or not bool(params.get("enabled", False)):
+        return False
+    for key, spec in params.items():
+        if key != "enabled" and _dispersion_spec_has_draws(spec):
+            return True
+    return False
+
+
+def _initial_velocity_dispersion_active(cfg: Dict[str, Any]) -> bool:
+    """Return True when initial velocity Gaussian dispersions can alter x0."""
+    disp = cfg.get("dispersion", {}) or {}
+    if not bool(disp.get("enabled", True)):
+        return False
+    state = disp.get("initial_state", {}) or {}
+    if not bool(state.get("enabled", True)):
+        return False
+    vel = state.get("velocity", {}) or {}
+    if not bool(vel.get("enabled", True)):
+        return False
+    for key, spec in vel.items():
+        if key != "enabled" and _dispersion_spec_has_draws(spec):
+            return True
+    return False
+
+
 def _get_center_and_radius(cfg: Dict[str, Any], D: int) -> Tuple[np.ndarray, float]:
     """Internal helper for get center and radius."""
     ar = cfg.get("arena", {}) or {}
@@ -715,18 +1053,6 @@ def _resolve_shell_plan_radius(
             f"{label} must resolve to a finite positive radius, got {raw_val!r}."
         )
     return float(radius)
-
-
-def _apply_x0_jitter(cfg: Dict[str, Any], x0: np.ndarray, rng: np.random.Generator) -> np.ndarray:
-    """Apply x0 jitter to the current config, state, or rollout data."""
-    jit = cfg.get("x0_jitter", {}) or {}
-    pos_j = float(jit.get("pos", 0.0))
-    vel_j = float(jit.get("vel", 0.0))
-    D = int(cfg.get("D", x0.shape[1] // 2))
-    out = x0.copy().astype(float)
-    out[:, :D] += rng.normal(size=out[:, :D].shape) * pos_j
-    out[:, D:2*D] += rng.normal(size=out[:, D:2*D].shape) * vel_j
-    return out
 
 
 def _resolve_rollout_vmax(cfg: Dict[str, Any]) -> Optional[float]:
@@ -796,8 +1122,7 @@ def _supports_batched_cuda_eval(cfg: Dict[str, Any], opponent_source: str) -> bo
         and str(cfg.get("estimator_kind", "ukf")).strip().lower() != "ekf"
     ):
         return False
-    disp_params = ((cfg.get("dispersion", {}) or {}).get("params", {}) or {})
-    if bool(disp_params.get("enabled", False)):
+    if _dispersion_has_config_draws(cfg):
         return False
     return True
 
@@ -2652,6 +2977,16 @@ def main():
              "initial velocity dispersion. --velocity_dispersion_std is the preferred name; "
              "--x0_vel_jitter remains supported.",
     )
+    ap.add_argument(
+        "--dispersions_module",
+        default="dispersions",
+        help="Python module defining Monte Carlo Gaussian dispersions via DISPERSIONS or config_for_eval().",
+    )
+    ap.add_argument(
+        "--disable_dispersions",
+        action="store_true",
+        help="Disable dispersions.py for this run. CLI x0 jitter flags still map into dispersions unless omitted.",
+    )
 
     ap.add_argument("--alpha", type=float, default=0.05, help="CI alpha (0.05 => 95% CI).")
 
@@ -2727,6 +3062,11 @@ def main():
     cli_present = _cli_option_strings(sys.argv)
     cfg0, base_cfg_source, manifest_path = _load_base_cfg(args, mod)
     applied_defaults = _apply_parser_defaults_from_cfg(args, ap, EVALUATE_POLICY_DEFAULTS, sys.argv)
+    dispersion_cfg, dispersion_source = _load_dispersions_config(
+        args.dispersions_module,
+        bool(args.disable_dispersions),
+    )
+    cfg0["dispersion"] = dispersion_cfg
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2738,6 +3078,7 @@ def main():
     if applied_defaults:
         log(f"[eval] applied evaluate_policy defaults for: {', '.join(sorted(applied_defaults))}")
     log(f"[eval] base cfg loaded from {base_cfg_source}.")
+    log(f"[eval] dispersions loaded from {dispersion_source}.")
     if manifest_path is not None:
         log(f"[eval] run manifest={manifest_path}")
 
@@ -2801,11 +3142,13 @@ def main():
         cfg0["arena"]["r"] = float(args.arena_radius)
 
     if args.x0_pos_jitter is not None or args.x0_vel_jitter is not None:
-        cfg0.setdefault("x0_jitter", {})
+        cfg0.setdefault("dispersion", {})
+        cfg0["dispersion"]["enabled"] = True
         if args.x0_pos_jitter is not None:
-            cfg0["x0_jitter"]["pos"] = float(args.x0_pos_jitter)
+            _set_initial_state_std(cfg0["dispersion"], "position", float(args.x0_pos_jitter))
         if args.x0_vel_jitter is not None:
-            cfg0["x0_jitter"]["vel"] = float(args.x0_vel_jitter)
+            _set_initial_state_std(cfg0["dispersion"], "velocity", float(args.x0_vel_jitter))
+        cfg0["x0_jitter"] = {"pos": 0.0, "vel": 0.0}
 
     if args.steps is not None:
         cfg0["T"] = int(args.steps)
@@ -2837,7 +3180,8 @@ def main():
         f"kf_action_meas_std={(cfg0.get('ukf', {}) or {}).get('action_meas_std')} "
         f"velocity_ctrl={(cfg0.get('safety_filter', {}) or {}).get('enabled')} "
         f"vmax={_resolve_rollout_vmax(cfg0)} "
-        f"umax={cfg0.get('umax')} arena_r={(cfg0.get('arena', {}) or {}).get('r')}"
+        f"umax={cfg0.get('umax')} arena_r={(cfg0.get('arena', {}) or {}).get('r')} "
+        f"dispersions_enabled={bool((cfg0.get('dispersion', {}) or {}).get('enabled', True))}"
     )
 
     # ---------------------------
@@ -2847,6 +3191,9 @@ def main():
     t_dyn0 = time.time()
     mod.build_dyn(cfg0)
     log(f"[eval] build_dyn done in {time.time() - t_dyn0:.3f}s.")
+    rebuild_dyn_per_trial = _top_level_parameter_dispersions_active(cfg0)
+    if rebuild_dyn_per_trial:
+        log("[eval] top-level parameter dispersions active; rebuilding dynamics for each trial cfg.")
 
     # ---------------------------
     # Prepare trial lists (paired/cartesian/auto/random/default)
@@ -3105,7 +3452,8 @@ def main():
 
         row: Dict[str, Any] = {
             "trial": i_trial,
-            "seed": int(item["seed"]),
+            "seed": int(item["ep_seed"]),
+            "eval_seed": int(item["seed"]),
             "grid_mode": args.grid_mode if not args.auto_shell_grid else f"{args.grid_mode}+auto_shell",
             "pass_trial": pass_trial,
             "num_attackers": 1,
@@ -3127,6 +3475,26 @@ def main():
         if (args.grid_mode == "cartesian") and (def_rows is not None) and (att_rows is not None):
             row["def_idx"] = cart_di
             row["att_idx"] = cart_ai
+
+        row["cfg_umax"] = cfg_run.get("umax")
+        row["cfg_dt"] = cfg_run.get("dt")
+        if bool(cfg_run.get("use_kf", False)):
+            ukf_run = cfg_run.get("ukf", {}) or {}
+            for key in (
+                "sigma_az",
+                "sigma_el",
+                "pos_std0",
+                "vel_std0",
+                "init_pos_std",
+                "init_vel_std",
+                "init_mean_pos_std",
+                "init_mean_vel_std",
+                "action_meas_std",
+                "accel_std0",
+                "init_mean_accel_std",
+            ):
+                if key in ukf_run:
+                    row[f"kf_cfg_{key}"] = ukf_run.get(key)
 
         row.update(_aggregate_trial_metrics([trial_metrics]))
         for k_, v_ in trial_metrics.items():
@@ -3208,19 +3576,18 @@ def main():
         t_trial0 = time.time()
         seed = int(args.seed + i)
 
-        set_seed(seed)
-        rng = np.random.default_rng(seed)
-
-        cfg_trial, _x0_unused, ep_seed = build_episode_cfg_and_x0(
+        cfg_trial, ep_seed, rng = _prepare_episode_cfg(
             cfg0,
             episode_idx=i,
-            trials_row=None,
+            eval_seed_base=int(args.seed),
         )
 
         if args.dynamics is not None:
             cfg_trial["dynamics"] = str(args.dynamics)
         if args.dt is not None:
             cfg_trial["dt"] = float(args.dt)
+        if rebuild_dyn_per_trial:
+            mod.build_dyn(cfg_trial)
 
         set_seed(int(ep_seed))
 
@@ -3274,11 +3641,11 @@ def main():
                 f"Expected x0 shape ({expected_rows}, >= {2 * D}) for num_attackers={num_attackers}, got {tuple(x0.shape)}"
             )
 
-        x0 = _apply_x0_jitter(cfg_trial, x0, rng)
-        active_vel_jitter = float((cfg_trial.get("x0_jitter", {}) or {}).get("vel", 0.0))
+        x0 = _apply_initial_state_dispersions(cfg_trial, x0, rng)
+        active_vel_dispersion = _initial_velocity_dispersion_active(cfg_trial)
         active_rollout_vmax = _resolve_rollout_vmax(cfg_trial)
         if active_rollout_vmax is not None and (
-            args.sample_ic or args.auto_shell_grid or active_vel_jitter > 0.0
+            args.sample_ic or args.auto_shell_grid or active_vel_dispersion
         ):
             x0 = _project_x0_velocities_to_vmax(x0, D, float(active_rollout_vmax))
 
@@ -3290,6 +3657,8 @@ def main():
         cfg_run = copy.deepcopy(cfg_trial)
         cfg_run["x0"] = np.asarray(x0, dtype=float).tolist()
         cfg_run["seed"] = int(ep_seed)
+        cfg_run["x0_jitter"] = {"pos": 0.0, "vel": 0.0}
+        cfg_run["train_ic_mode"] = "fixed"
         _apply_ckpt_overrides(cfg_run, args.def_ckpt_path, args.att_ckpt_path)
 
         steps_run = int(args.steps) if args.steps is not None else int(cfg_run.get("T", cfg0.get("T", 0)) or 0)
@@ -3461,6 +3830,8 @@ def main():
         "steps": cfg0.get("T"),
         "def_ckpt_path": cfg0.get("def_ckpt_path"),
         "att_ckpt_path": cfg0.get("att_ckpt_path"),
+        "dispersions_source": dispersion_source,
+        "dispersions_enabled": bool((cfg0.get("dispersion", {}) or {}).get("enabled", True)),
     }
 
     results = {
@@ -3483,6 +3854,8 @@ def main():
         "base_cfg_source": base_cfg_source,
         "run_manifest": str(manifest_path) if manifest_path is not None else None,
         "rollout_cfg": rollout_cfg_summary,
+        "dispersions_source": dispersion_source,
+        "dispersions": _json_safe(cfg0.get("dispersion", {})),
         "grid_mode": args.grid_mode,
         "auto_shell_grid": bool(args.auto_shell_grid),
         "shell_fracs": args.shell_fracs if args.auto_shell_grid else None,

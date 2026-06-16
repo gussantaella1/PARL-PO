@@ -11,29 +11,14 @@ cd "$(dirname "$0")"
 source ./run_eval_sequence_lib.sh
 
 DEFAULT_RUN_SPECS=(
-  # Default queue for this sweep. Passing args to the script replaces this list,
-  # which is safer than editing the body for one-off runs.
-  # Missing KF-enabled HCW runs across 20m/50m/100m:
-  # "Training_Policy_0.5u_1.5vmax_0.25_icVmax_KF_ON:hcw"
-  # "Training_Policy_0.5u_1.5vmax_1.0_icVmax_KF_ON:hcw"
-  # "Training_Policy_0.5u_1vmax_1.0_icVmax_KF_ON:hcw"
-
-  #Good ones
-
-  # "Training_Policy_2.0u_1.5vmax_1.5_icVmax_KF_ON:hcw"
-  # "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:hcw"
-
-  # Elliptic examples are left commented because the current rollout stack
-  # disables the estimator for non-HCW dynamics.
-  # "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:elliptic_ltv"
-  # "Training_Policy_0.5u_1.5vmax_1.0_icVmax_KF_ON:elliptic_ltv"
-  # "Training_Policy_2.0u_1.5vmax_1.5_icVmax_KF_ON:elliptic_ltv"
-  # "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:elliptic_ltv"
-
-  #Missing ones
+  # Base-directory KF policy folders with complete def0/def1/def2 and att1/att2
+  # checkpoint sets. Each folder is evaluated in HCW and elliptic LTV.
   "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:hcw"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:hcw"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_KF_ON:hcw"
   "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:elliptic_ltv"
-
+  "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:elliptic_ltv"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch_KF_ON:elliptic_ltv"
 )
 
 if (($# > 0)); then
