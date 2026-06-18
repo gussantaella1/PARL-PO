@@ -32,19 +32,19 @@ run_step() {
 
 # Each active block below is a complete rl_loop.py run. Comment/uncomment whole
 # blocks when you want a small manual training batch with explicit CLI knobs.
-run_step "Training_Policy_0.5u_1.0vmax_0.5_icVmax" \
+run_step "Training_Policy_0.5u_1.5vmax_1.0_icVmax" \
   env CUDA_VISIBLE_DEVICES=0 python rl_loop.py \
-    --out_dir Training_Policy_0.5u_1.0vmax_0.5_icVmax \
+    --out_dir Training_Policy_0.5u_1.5vmax_1.0_icVmax \
     --device cuda \
     --vec_backend torch \
     --torch_fast_reset false \
-    --vmax 1.0 \
+    --use_kf false \
+    --vmax 1.5 \
     --umax 0.5 \
     --k_pos 0.05 \
     --k_dock 0.0125 \
-    --train_ic_vmax 0.5 \
+    --train_ic_vmax 1.0 \
     --steps_per_env 1024
-
 
 
 # run_step "Training_Policy_0.5u_1vmax_0.25_icVmax" \

@@ -21,19 +21,13 @@ source ./run_eval_sequence_lib.sh
 
 SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
 
-# Default queue definitions live near the top so they are easy to edit, matching
-# the layout of run_eval_kf_sequence_all. By default this shared launcher runs
-# every suite against this one folder list unless the user passes explicit run
-# specs on the command line.
-DEFAULT_RUN_SPECS=(
-  # Base-directory non-KF policy folders with complete def0/def1/def2 and
-  # att1/att2 checkpoint sets. Each folder is evaluated in HCW and elliptic LTV.
-  "Training_Policy_0.1u_1vmax_0.05_icVmax:hcw"
-  "Training_Policy_2.0u_1vmax_1.0_icVmax:hcw"
-  "Training_Policy_0.5u_1.5vmax_1.0_icVmax:hcw"
-  "Training_Policy_0.1u_1vmax_0.05_icVmax:elliptic_ltv"
-  "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
-  "Training_Policy_0.5u_1.5vmax_1.0_icVmax:elliptic_ltv"
+DEFAULT_DYNAMICS=(hcw elliptic_ltv)
+REQUIRED_POLICY_CKPTS=(
+  def0_teacher.pt
+  att1_teacher.pt
+  def1_teacher.pt
+  att2_teacher.pt
+  def2_teacher.pt
 )
 
 print_usage() {
@@ -83,9 +77,45 @@ canonicalize_suite_name() {
 }
 
 populate_default_run_specs() {
-  local -n out_specs_ref="$2"
+  local -n out_specs_ref="$1"
+  local run_dir=""
+  local dyn=""
+  local missing_ckpt=""
+  local has_missing=false
 
-  out_specs_ref=("${DEFAULT_RUN_SPECS[@]}")
+  out_specs_ref=()
+  for run_dir in Training_Policy*/; do
+    [[ -d "${run_dir}" ]] || continue
+    run_dir="${run_dir%/}"
+
+    # This is the non-KF launcher. Keep the base-directory sweep scoped to
+    # regular top-level policy folders, and avoid known suspect runs.
+    if [[ "${run_dir}" == *"_KF_ON"* || "${run_dir}" == *"VERY_SUS"* ]]; then
+      continue
+    fi
+
+    has_missing=false
+    for missing_ckpt in "${REQUIRED_POLICY_CKPTS[@]}"; do
+      if [[ ! -f "${run_dir}/${missing_ckpt}" ]]; then
+        has_missing=true
+        break
+      fi
+    done
+    if [[ "${has_missing}" == "true" ]]; then
+      echo "[${SCRIPT_NAME}] Skipping default run ${run_dir}; missing required policy checkpoints." >&2
+      continue
+    fi
+
+    for dyn in "${DEFAULT_DYNAMICS[@]}"; do
+      out_specs_ref+=("${run_dir}:${dyn}")
+    done
+  done
+}
+
+populate_default_queue() {
+  local -n out_queue_ref="$1"
+
+  out_queue_ref=()
 }
 
 suite_out_root_base() {
@@ -108,6 +138,22 @@ suite_out_root_base() {
   esac
 }
 
+case_completed_today() {
+  local out_dir="$1"
+  local today="${TODAY:-$(date +%F)}"
+
+  if [[ "${FORCE_RERUN:-false}" == "true" || "${FORCE_RERUN:-0}" == "1" ]]; then
+    return 1
+  fi
+  if [[ "${SKIP_COMPLETED_TODAY:-true}" == "false" || "${SKIP_COMPLETED_TODAY:-1}" == "0" ]]; then
+    return 1
+  fi
+  [[ -f "${out_dir}/results.json" && -f "${out_dir}/trials.csv" ]] || return 1
+  [[ "$(date -r "${out_dir}/results.json" +%F)" == "${today}" ]] || return 1
+  [[ "$(date -r "${out_dir}/trials.csv" +%F)" == "${today}" ]] || return 1
+  return 0
+}
+
 build_common_args_for_suite() {
   local suite="$1"
   local effective_dynamics="$2"
@@ -118,7 +164,6 @@ build_common_args_for_suite() {
     --grid_mode cartesian
     --index 15000
     --shell_fracs 0.2,0.4,0.6,0.8
-    --velocity_dispersion_std 0.5
     --steps 6000
     --points_per_shell 40
     --velocity_controller_enabled true
@@ -165,6 +210,12 @@ run_policy_case() {
   local out_root="$6"
   local effective_dynamics="$7"
   local common_args=()
+  local out_dir="${run_dir}/${out_root}/${case_name}"
+
+  if case_completed_today "${out_dir}"; then
+    echo "[${SCRIPT_NAME}] Skipping suite=${suite} ${run_dir} :: ${case_name}; already completed today."
+    return 0
+  fi
 
   build_common_args_for_suite "${suite}" "${effective_dynamics}" common_args
 
@@ -173,7 +224,7 @@ run_policy_case() {
     --run_dir "${run_dir}" \
     --def_ckpt_path "${run_dir}/${def_ckpt}" \
     --att_ckpt_path "${run_dir}/${att_ckpt}" \
-    --out_dir "${run_dir}/${out_root}/${case_name}" \
+    --out_dir "${out_dir}" \
     "${common_args[@]}"
 }
 
@@ -185,6 +236,12 @@ run_rule_case() {
   local out_root="$5"
   local effective_dynamics="$6"
   local common_args=()
+  local out_dir="${run_dir}/${out_root}/${case_name}"
+
+  if case_completed_today "${out_dir}"; then
+    echo "[${SCRIPT_NAME}] Skipping suite=${suite} ${run_dir} :: ${case_name}; already completed today."
+    return 0
+  fi
 
   build_common_args_for_suite "${suite}" "${effective_dynamics}" common_args
 
@@ -194,7 +251,7 @@ run_rule_case() {
     --def_ckpt_path "${run_dir}/${def_ckpt}" \
     --policy_role def \
     --opponent_source rule \
-    --out_dir "${run_dir}/${out_root}/${case_name}" \
+    --out_dir "${out_dir}" \
     "${common_args[@]}"
 }
 
@@ -251,9 +308,12 @@ OUT_DIR_SUFFIX="${OUT_DIR_SUFFIX:-}"
 
 SUITES=()
 USER_RUN_SPECS=()
+DEFAULT_QUEUE_ITEMS=()
+GENERATED_DEFAULT_RUN_SPECS=()
 
 if (($# == 0)); then
   SUITES=(20m 50m 100m 100m_advantage)
+  populate_default_queue DEFAULT_QUEUE_ITEMS
 else
   SUITE_SELECTOR="$(canonicalize_suite_name "$1")"
   if [[ -n "${SUITE_SELECTOR}" ]]; then
@@ -270,14 +330,25 @@ else
   fi
 fi
 
-for suite in "${SUITES[@]}"; do
-  RUN_SPECS=()
-  if ((${#USER_RUN_SPECS[@]} > 0)); then
-    RUN_SPECS=("${USER_RUN_SPECS[@]}")
-  else
-    populate_default_run_specs RUN_SPECS
+if ((${#DEFAULT_QUEUE_ITEMS[@]} > 0)); then
+  for queue_item in "${DEFAULT_QUEUE_ITEMS[@]}"; do
+    suite="${queue_item%%|*}"
+    run_spec="${queue_item#*|}"
+    run_suite "${suite}" "${run_spec}"
+  done
+else
+  if ((${#USER_RUN_SPECS[@]} == 0)); then
+    populate_default_run_specs GENERATED_DEFAULT_RUN_SPECS
   fi
-  run_suite "${suite}" "${RUN_SPECS[@]}"
-done
+  for suite in "${SUITES[@]}"; do
+    RUN_SPECS=()
+    if ((${#USER_RUN_SPECS[@]} > 0)); then
+      RUN_SPECS=("${USER_RUN_SPECS[@]}")
+    else
+      RUN_SPECS=("${GENERATED_DEFAULT_RUN_SPECS[@]}")
+    fi
+    run_suite "${suite}" "${RUN_SPECS[@]}"
+  done
+fi
 
 echo "[${SCRIPT_NAME}] Done"

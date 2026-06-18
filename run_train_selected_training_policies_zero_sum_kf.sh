@@ -25,8 +25,7 @@ SELECTED_RUN_DIRS=(
   # "Training_Policy_0.5u_1.5vmax_1.0_icVmax"
   # "Training_Policy_0.1u_1vmax_0.05_icVmax"
 
-  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_Validation_Pre_Torch"
-  "Training_Policy_2.0u_1vmax_1.0_icVmax"
+  "Training_Policy_0.5u_1.0vmax_0.5_icVmax"
 
 
 )

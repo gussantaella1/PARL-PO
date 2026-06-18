@@ -757,7 +757,7 @@ def _axis_vector(
     raise ValueError(f"{label} must be a scalar or length-{D} vector, got shape {arr.shape}.")
 
 
-def _gaussian_delta(
+def _initial_state_delta(
     spec: Any,
     rng: np.random.Generator,
     D: int,
@@ -765,7 +765,7 @@ def _gaussian_delta(
     *,
     cfg: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
-    """Draw an additive Gaussian delta from a mean/std spec."""
+    """Draw an additive initial-state delta from a Gaussian or uniform spec."""
     if spec is None:
         return np.zeros(D, dtype=float)
     if not isinstance(spec, dict):
@@ -773,6 +773,13 @@ def _gaussian_delta(
     if not bool(spec.get("enabled", True)):
         return np.zeros(D, dtype=float)
     mean = _axis_vector(spec.get("mean", 0.0), D, f"{label}.mean", cfg=cfg)
+    dist = str(spec.get("dist", spec.get("distribution", "gaussian"))).strip().lower()
+    if dist in ("uniform", "box"):
+        half_width_raw = spec.get("half_width", spec.get("width", spec.get("std", 0.0)))
+        half_width = np.maximum(_axis_vector(half_width_raw, D, f"{label}.half_width", cfg=cfg), 0.0)
+        return mean + rng.uniform(low=-half_width, high=half_width, size=D)
+    if dist not in ("gaussian", "normal"):
+        raise ValueError(f"{label}.dist must be 'gaussian' or 'uniform', got {dist!r}.")
     std = np.maximum(_axis_vector(spec.get("std", 0.0), D, f"{label}.std", cfg=cfg), 0.0)
     return mean + rng.normal(size=D) * std
 
@@ -782,7 +789,7 @@ def _apply_initial_state_dispersions(
     x0: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Apply Gaussian position/velocity uncertainty around a nominal x0."""
+    """Apply configured position/velocity uncertainty around a nominal x0."""
     disp = cfg.get("dispersion", {}) or {}
     if not bool(disp.get("enabled", True)):
         return np.asarray(x0, dtype=float).copy()
@@ -807,10 +814,10 @@ def _apply_initial_state_dispersions(
                 aliases.append("att")
             aliases.append("all")
 
-            delta = _gaussian_delta(default_spec, rng, D, f"initial_state.{kind}.default", cfg=cfg)
+            delta = _initial_state_delta(default_spec, rng, D, f"initial_state.{kind}.default", cfg=cfg)
             for alias in aliases:
                 if alias in group:
-                    delta += _gaussian_delta(group.get(alias), rng, D, f"initial_state.{kind}.{alias}", cfg=cfg)
+                    delta += _initial_state_delta(group.get(alias), rng, D, f"initial_state.{kind}.{alias}", cfg=cfg)
             out[row_idx, col0:col0 + D] += delta
 
     return out
@@ -932,19 +939,26 @@ def _prepare_episode_cfg(
 
 
 def _set_initial_state_std(disp: Dict[str, Any], kind: str, value: float) -> None:
-    """Set all-role initial-state Gaussian std from a CLI compatibility flag."""
+    """Set all-role initial-state spread from a CLI compatibility flag."""
     state = disp.setdefault("initial_state", {})
     state.setdefault("enabled", True)
     group = state.setdefault(kind, {})
     group.setdefault("enabled", True)
     spec = group.setdefault("default", {})
-    spec["std"] = float(value)
+    dist = str(spec.get("dist", spec.get("distribution", "gaussian"))).strip().lower()
+    if dist in ("uniform", "box"):
+        spec["half_width"] = float(value)
+    else:
+        spec["std"] = float(value)
 
 
 def _dispersion_spec_has_draws(spec: Any) -> bool:
-    """Return True if a Gaussian spec can change a value across trials."""
+    """Return True if a dispersion spec can change a value across trials."""
     if not isinstance(spec, dict) or not bool(spec.get("enabled", True)):
         return False
+    half_width = spec.get("half_width", spec.get("width", 0.0))
+    if np.any(np.asarray(half_width, dtype=float) > 0.0):
+        return True
     if np.any(np.asarray(spec.get("std", 0.0), dtype=float) > 0.0):
         return True
     return spec.get("mean", None) is not None
@@ -2973,8 +2987,9 @@ def main():
         dest="x0_vel_jitter",
         type=float,
         default=None,
-        help="Override x0_jitter['vel'] as the per-axis Gaussian standard deviation used for "
-             "initial velocity dispersion. --velocity_dispersion_std is the preferred name; "
+        help="Override x0_jitter['vel'] as the per-axis initial velocity spread. For a "
+             "uniform initial-state dispersion this is the half-width; for a Gaussian "
+             "dispersion this is the standard deviation. --velocity_dispersion_std is the preferred name; "
              "--x0_vel_jitter remains supported.",
     )
     ap.add_argument(
@@ -3140,6 +3155,12 @@ def main():
         cfg0.setdefault("arena", {})
         cfg0["arena"]["type"] = "sphere"
         cfg0["arena"]["r"] = float(args.arena_radius)
+        # Eval suites pass an explicit arena radius for the MC shell geometry.
+        # Training manifests may still carry an arena-radius curriculum knob;
+        # if left enabled, Env.reset() can shrink the active termination arena
+        # back to the training schedule (for example 20 m) while the shell grid
+        # samples 50/100 m starts. Force the rollout arena to the CLI radius.
+        cfg0["arena_radius_knob"] = {"enabled": False}
 
     if args.x0_pos_jitter is not None or args.x0_vel_jitter is not None:
         cfg0.setdefault("dispersion", {})
@@ -3832,6 +3853,8 @@ def main():
         "att_ckpt_path": cfg0.get("att_ckpt_path"),
         "dispersions_source": dispersion_source,
         "dispersions_enabled": bool((cfg0.get("dispersion", {}) or {}).get("enabled", True)),
+        "batched_cuda_eval": bool(use_batched_cuda_eval),
+        "eval_batch_size": int(eval_batch_size),
     }
 
     results = {

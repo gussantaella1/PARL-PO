@@ -2171,7 +2171,7 @@ class TorchVecEnv:
         self._ic_history_att_count = 0
         self.torch_fast_reset = bool(self.cfg.get("torch_fast_reset", False))
         self._fast_reset_enabled = bool(
-            self.torch_fast_reset
+            (self.torch_fast_reset or (self.use_kf and self._batched_ekf_enabled))
             and cfg_list is None
             and self.num_attackers == 1
             and ((not self.use_kf) or self._batched_ekf_enabled)
@@ -2564,12 +2564,175 @@ class TorchVecEnv:
     def _fast_reset_slots(self, indices: torch.Tensor, *, resample_opp: bool) -> None:
         """Internal helper for fast reset slots."""
         idx_t = torch.as_tensor(indices, dtype=torch.int64, device=self.device).reshape(-1)
-        # Correctness first: preserve the fast-reset call sites, but use the
-        # exact legacy per-env reset implementation for each selected slot.
-        # This keeps behavior aligned with Env.reset() while we retain a single
-        # reset API for the torch vectorized backend.
-        for idx in idx_t.detach().cpu().tolist():
-            self._reset_env_slot(int(idx), resample_opp=resample_opp)
+        if not (self.use_kf and self._batched_ekf_enabled):
+            # KF-off training stays on the scalar reset behavior restored for
+            # the old non-KF runs; the batched reset below is only the legacy
+            # EKF/KF-on training path.
+            for idx in idx_t.detach().cpu().tolist():
+                self._reset_env_slot(int(idx), resample_opp=resample_opp)
+            return
+
+        count = int(idx_t.numel())
+        if count == 0:
+            return
+
+        radii = self._sample_arena_radius_batch(count)
+        reward_norm_radius = (
+            torch.full_like(radii, self.reward_normalize_radius_m)
+            if self.reward_normalize_radius_m is not None
+            else radii
+        )
+        if self.normalize_reward:
+            reward_dist_scale = reward_norm_radius
+            reward_geom_scale = torch.pow(reward_norm_radius, self.normalize_reward_geometry_power)
+            term_dist_scale = radii
+            soft_wall_term = torch.full_like(radii, self.soft_wall)
+            oi_radius_term = self.oi_radius / radii.clamp_min(1e-9)
+            arena_term_limit = torch.full_like(radii, self.margin)
+        else:
+            ones = torch.ones_like(radii)
+            reward_dist_scale = ones
+            reward_geom_scale = ones
+            term_dist_scale = ones
+            soft_wall_term = self.soft_wall * radii
+            oi_radius_term = torch.full_like(radii, self.oi_radius)
+            arena_term_limit = self.margin * radii
+
+        mode = self.train_ic_mode
+        D = self.D
+        v_max = self.train_ic_vmax
+        min_sep = self.train_min_sep
+        p1 = None
+        p2 = None
+
+        if mode == "fixed":
+            x0 = self._x0_base_t.unsqueeze(0).expand(count, -1, -1).clone()
+            if self._x0_jitter_pos > 0.0:
+                pos_jitter = (2.0 * torch.rand((count, 2, D), dtype=self.dtype, device=self.device) - 1.0) * self._x0_jitter_pos
+                x0[:, :, 0:D] += pos_jitter
+            if self._x0_jitter_vel > 0.0:
+                vel_jitter = (2.0 * torch.rand((count, 2, D), dtype=self.dtype, device=self.device) - 1.0) * self._x0_jitter_vel
+                x0[:, :, D : 2 * D] += vel_jitter
+            p1 = x0[:, 0, 0:D]
+            v1 = x0[:, 0, D : 2 * D]
+            p2 = x0[:, 1, 0:D]
+            v2 = x0[:, 1, D : 2 * D]
+        elif mode == "random_shell":
+            r_def_min, r_def_max = self._resolve_shell_bounds_batch(radii, who="def")
+            r_att_min, r_att_max = self._resolve_shell_bounds_batch(radii, who="att")
+            if torch.any(r_def_min > r_def_max):
+                raise ValueError("Invalid defender shell bounds for random_shell.")
+            if torch.any(r_att_min > r_att_max):
+                raise ValueError("Invalid attacker shell bounds for random_shell.")
+            p1 = self._sample_shell_positions(r_def_min, r_def_max)
+            p2 = self._sample_shell_positions(r_att_min, r_att_max)
+            if min_sep > 0.0:
+                invalid = torch.linalg.vector_norm(p2 - p1, dim=-1) < min_sep
+                tries = 0
+                while torch.any(invalid):
+                    tries += 1
+                    if tries > 256:
+                        raise RuntimeError("random_shell fast reset could not satisfy min_sep after many retries.")
+                    p2[invalid] = self._sample_shell_positions(r_att_min[invalid], r_att_max[invalid])
+                    invalid = torch.linalg.vector_norm(p2 - p1, dim=-1) < min_sep
+            v1 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+            v2 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+        elif mode == "random_shell_advantage":
+            radial_margin = self._percent_advantage_defender * np.pi * 2.0 * self.oi_radius
+            if radial_margin < 0.0:
+                raise ValueError(f"percent_advantage_defender must be >= 0, got {radial_margin}")
+            r_def_min, r_def_max = self._resolve_shell_bounds_batch(radii, who="def")
+            r_att_min, r_att_max = self._resolve_shell_bounds_batch(radii, who="att")
+            r_att_min = torch.maximum(r_att_min, torch.full_like(r_att_min, radial_margin))
+            max_feasible_def_radius = r_att_max - radial_margin
+            r_def_max = torch.minimum(r_def_max, max_feasible_def_radius)
+            if torch.any(r_def_min > r_def_max):
+                raise ValueError("Invalid defender shell bounds for random_shell_advantage.")
+            if torch.any(r_att_min > r_att_max):
+                raise ValueError("Invalid attacker shell bounds for random_shell_advantage.")
+            if torch.any(r_def_min > max_feasible_def_radius):
+                raise ValueError("Infeasible radial shells for random_shell_advantage.")
+
+            p1 = torch.empty((count, D), dtype=self.dtype, device=self.device)
+            p2 = torch.empty((count, D), dtype=self.dtype, device=self.device)
+            remaining = torch.arange(count, device=self.device, dtype=torch.int64)
+            tries = 0
+            while remaining.numel() > 0:
+                tries += 1
+                if tries > 512:
+                    raise RuntimeError(
+                        "random_shell_advantage fast reset could not sample a feasible initial condition."
+                    )
+                p2_try = self._sample_shell_positions(r_att_min[remaining], r_att_max[remaining])
+                r_att = torch.linalg.vector_norm(p2_try - self.center_t.unsqueeze(0), dim=-1)
+                r_def_max_eff = torch.minimum(r_def_max[remaining], r_att - radial_margin)
+                feasible = r_def_max_eff >= r_def_min[remaining]
+
+                next_remaining_parts = []
+                if torch.any(~feasible):
+                    next_remaining_parts.append(remaining[~feasible])
+                if torch.any(feasible):
+                    feasible_idx = remaining[feasible]
+                    p2_feasible = p2_try[feasible]
+                    p1_try = self._sample_shell_positions(r_def_min[feasible_idx], r_def_max_eff[feasible])
+                    sep_ok = torch.linalg.vector_norm(p1_try - p2_feasible, dim=-1) >= min_sep
+                    if torch.any(sep_ok):
+                        ok_idx = feasible_idx[sep_ok]
+                        p1[ok_idx] = p1_try[sep_ok]
+                        p2[ok_idx] = p2_feasible[sep_ok]
+                    if torch.any(~sep_ok):
+                        next_remaining_parts.append(feasible_idx[~sep_ok])
+                if next_remaining_parts:
+                    remaining = torch.cat(next_remaining_parts)
+                else:
+                    remaining = torch.empty((0,), dtype=torch.int64, device=self.device)
+
+            v1 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+            v2 = (2.0 * torch.rand((count, D), dtype=self.dtype, device=self.device) - 1.0) * v_max
+        else:
+            raise ValueError(f"Unknown train_ic_mode='{mode}'")
+
+        self.state_t[idx_t] = torch.cat([p1, v1, p2, v2], dim=-1)
+        self._t_steps[idx_t] = 0
+        self.radius_t[idx_t] = radii
+        self.reward_dist_scale_t[idx_t] = reward_dist_scale
+        self.reward_geom_scale_t[idx_t] = reward_geom_scale
+        self.term_dist_scale_t[idx_t] = term_dist_scale
+        self.soft_wall_term_t[idx_t] = soft_wall_term
+        self.oi_radius_term_t[idx_t] = oi_radius_term
+        self.arena_term_limit_t[idx_t] = arena_term_limit
+        if resample_opp:
+            self._opp_mode_codes[idx_t] = self._sample_opp_mode_codes(count)
+        self._weak_scale_t[idx_t] = float(self.envs[0].weak_scale)
+        self._weak_noise_std_t[idx_t] = float(self.envs[0].weak_noise_std)
+
+        if self.use_fuel:
+            self.m_def_t[idx_t] = self.m0_def
+            self.m_att_t[idx_t] = self.m0_att
+
+        p1_ekf = p1.to(dtype=self._ekf_dtype)
+        v1_ekf = v1.to(dtype=self._ekf_dtype)
+        p2_ekf = p2.to(dtype=self._ekf_dtype)
+        v2_ekf = v2.to(dtype=self._ekf_dtype)
+        if self._ukf_init_mean_pos_std > 0.0:
+            p2_ekf = p2_ekf + self._ukf_init_mean_pos_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+            p1_ekf = p1_ekf + self._ukf_init_mean_pos_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+        if self._ukf_init_mean_vel_std > 0.0:
+            v2_ekf = v2_ekf + self._ukf_init_mean_vel_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+            v1_ekf = v1_ekf + self._ukf_init_mean_vel_std * torch.randn((count, D), dtype=self._ekf_dtype, device=self.device)
+        if self._ekf_state_dim == 9:
+            accel_scale = self._ukf_init_mean_accel_std
+            att_accel = accel_scale * torch.randn((count, 3), dtype=self._ekf_dtype, device=self.device)
+            def_accel = accel_scale * torch.randn((count, 3), dtype=self._ekf_dtype, device=self.device)
+            self._def_ekf_x_t[idx_t] = torch.cat([p2_ekf, v2_ekf, att_accel], dim=-1)
+            self._att_ekf_x_t[idx_t] = torch.cat([p1_ekf, v1_ekf, def_accel], dim=-1)
+        else:
+            self._def_ekf_x_t[idx_t] = torch.cat([p2_ekf, v2_ekf], dim=-1)
+            self._att_ekf_x_t[idx_t] = torch.cat([p1_ekf, v1_ekf], dim=-1)
+        self._def_ekf_P_t[idx_t] = self._ekf_P0_t.unsqueeze(0).expand(count, -1, -1)
+        self._att_ekf_P_t[idx_t] = self._ekf_P0_t.unsqueeze(0).expand(count, -1, -1)
+
+        self._record_ic_batch(p1, p2)
 
     def _reset_env_slot(self, idx: int, *, resample_opp: bool) -> None:
         """Internal helper for reset env slot."""

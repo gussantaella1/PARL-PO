@@ -5,21 +5,26 @@ Editable Monte Carlo dispersion settings for evaluate_policy.py.
 
 The evaluation harness first builds a nominal trial from the selected workflow
 (auto shell grid, CSV rows, random shell sampling, or cfg["x0"]). It then applies
-the Gaussian dispersions below to that nominal trial.
+the dispersions below to that nominal trial.
 
-Gaussian specs use:
-  mean: additive mean offset for state dispersions, or absolute mean value for
-        KF/config parameters. Use None for parameter means to keep the current
-        config value.
+Initial-state specs use:
+  dist: "uniform" for bounded old-style x0_jitter draws, or "gaussian" for
+        bell-curve draws.
+  mean: additive mean offset for state dispersions.
+  half_width: uniform draw half-width, used as mean + U(-half_width, +half_width).
+  std: Gaussian standard deviation when dist is "gaussian".
+
+KF/config parameter specs are Gaussian and use:
+  mean: absolute mean value. Use None to keep the current config value.
   std:  Gaussian standard deviation.
 
 Scalars apply to every axis. Length-3 lists apply to x/y/z or vx/vy/vz.
 Config-derived values can be written as {"from_config": "path.to.key", "scale": 1.0}.
 
 The non-KF defaults below match the old shell-grid Monte Carlo setup without
-double-applying jitter: position dispersion uses the old base-run value of 0.5 m,
-then evaluate_policy.py clears cfg["x0_jitter"] before rollout so the
-environment does not jitter the already-dispersed x0 again.
+double-applying jitter: position and velocity dispersion use the old bounded
+x0_jitter style, then evaluate_policy.py clears cfg["x0_jitter"] before rollout
+so the environment does not jitter the already-dispersed x0 again.
 """
 
 from __future__ import annotations
@@ -39,31 +44,31 @@ DISPERSIONS: Dict[str, Any] = {
         "episode_seed_base": None,
     },
 
-    # Additive Gaussian uncertainty around the nominal initial condition.
+    # Additive uncertainty around the nominal initial condition.
     # For auto_shell_grid this means "relative to the generated shell point."
     "initial_state": {
         "enabled": True,
         "position": {
             "enabled": True,
             # Additive position error in meters, applied after the nominal shell
-            # or CSV point is selected. This mirrors the old base-run x0_jitter
-            # position path: x += N(0, 0.5) per axis.
-            "default": {"mean": 0.0, "std": 0.5},
+            # or CSV point is selected. This mirrors the old x0_jitter path:
+            # x += U(-0.5, +0.5) per axis.
+            "default": {"dist": "uniform", "mean": 0.0, "half_width": 0.5},
             # Role-specific entries are additional deltas on top of default.
             # Keep these at zero unless defender/attacker starts should differ.
-            "def": {"mean": [0.0, 0.0, 0.0], "std": [0.0, 0.0, 0.0]},
-            "att": {"mean": [0.0, 0.0, 0.0], "std": [0.0, 0.0, 0.0]},
+            "def": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
+            "att": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
         },
         "velocity": {
             "enabled": True,
             # Additive velocity draw in m/s after the nominal shell/CSV velocity
-            # is selected. The mean adapts to each loaded run config's
-            # safety_filter.vmax/cfg["vmax"]; evaluate_policy.py projects the
+            # is selected. This mirrors the old eval-time x0_vel_jitter 0.5:
+            # v += U(-0.5, +0.5) per axis. evaluate_policy.py then projects the
             # final velocity vector back to ||v|| <= vmax before rollout.
-            "default": {"mean": {"from_config": "vmax", "scale": 0.5}, "std": 0.2},
+            "default": {"dist": "uniform", "mean": 0.0, "half_width": 0.5},
             # Role-specific entries are additional deltas on top of default.
-            "def": {"mean": [0.0, 0.0, 0.0], "std": [0.0, 0.0, 0.0]},
-            "att": {"mean": [0.0, 0.0, 0.0], "std": [0.0, 0.0, 0.0]},
+            "def": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
+            "att": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
         },
     },
 
