@@ -9,8 +9,8 @@ compact cell per phase:
 
     count; $percent \\pm se\\%$
 
-The bottom rows add the total trial count and mean rollout compute time per
-simulated step in milliseconds, with standard error.
+The bottom rows add the total trial count and rollout compute time per
+simulated step in milliseconds as median [Q1, Q3].
 
 Missing result files are rendered as N/A. By default, only top-level
 Training_Policy* folders are included; pass --include-failed-runs to also scan
@@ -76,14 +76,23 @@ BOLD_OUTCOMES = {"defender_capture", "attacker_hit_oi"}
 TABLE_FONT_SIZE = r"\scriptsize"
 TABLE_PLACEMENT = "H"
 TABLE_RESIZE_WIDTH = r"\dimexpr\textwidth+0.5in\relax"
-TABLE_ARRAYSTRETCH = "1.02"
+TABLE_ARRAYSTRETCH = "0.94"
 THESIS_TABLE_RESIZE_WIDTH = r"\dimexpr\textwidth+0.75in\relax"
-THESIS_TABLE_ARRAYSTRETCH = "1.04"
-THESIS_KF_BLOCK_VSPACE = "0.75em"
+THESIS_TABLE_ARRAYSTRETCH = "0.94"
+THESIS_KF_BLOCK_VSPACE = "0.35em"
+TABLE_NEEDSPACE = r"0.82\textheight"
+THESIS_TABLE_NEEDSPACE = r"0.92\textheight"
+TRAINING_CURVE_NEEDSPACE = r"0.45\textheight"
 TABLE_COLSEP = "1pt"
 OUTCOME_GROUP_ADDLINESPACE = "0.18em"
 DELTA_V_UNIT = r"$\mathrm{m}/\mathrm{s}$"
+NA_CELL = r"\makebox[8em][c]{\tiny N/A}"
+TABLE_STATS_NOTE = (
+    r" Cells: count; \% $\pm$ SE. "
+    r"$\Delta v$ and time: median [Q1, Q3]."
+)
 MERGED_THESIS_FILENAME = "merged_thesis_tables.tex"
+MERGED_THESIS_INPUTS_FILENAME = "merged_thesis_inputs.tex"
 TRAINING_CURVE_FILENAME = "compare__R_mean__def0_vs_att1_vs_def1_vs_att2_vs_def2.png"
 KF_ON_SUFFIX = "_KF_ON"
 THESIS_SELECTIONS = (
@@ -259,7 +268,7 @@ def load_result(spec: TableSpec, matchup: str) -> Optional[Dict[str, Any]]:
 
 def outcome_cell(data: Optional[Dict[str, Any]], outcome: str) -> str:
     if data is None:
-        return "N/A"
+        return NA_CELL
 
     breakdown = data.get("outcome_breakdown", {}) or {}
     counts = breakdown.get("counts", {}) or {}
@@ -267,21 +276,21 @@ def outcome_cell(data: Optional[Dict[str, Any]], outcome: str) -> str:
 
     count = counts.get(outcome)
     if count is None:
-        return "N/A"
+        return NA_CELL
 
     try:
         count_i = int(count)
     except (TypeError, ValueError):
-        return "N/A"
+        return NA_CELL
 
     stats = stats_by_outcome.get(outcome, {}) or {}
     n = stats.get("n", data.get("num_trials"))
     try:
         n_i = int(n)
     except (TypeError, ValueError):
-        return "N/A"
+        return NA_CELL
     if n_i <= 0:
-        return "N/A"
+        return NA_CELL
 
     rate = stats.get("rate", count_i / n_i)
     stderr = proportion_stderr_from_stats(stats, count_i, n_i)
@@ -298,7 +307,7 @@ def outcome_cell(data: Optional[Dict[str, Any]], outcome: str) -> str:
 
 def total_count_cell(data: Optional[Dict[str, Any]]) -> str:
     if data is None:
-        return "N/A"
+        return NA_CELL
     n = data.get("num_trials")
     if n is None:
         stats_by_outcome = (
@@ -312,37 +321,28 @@ def total_count_cell(data: Optional[Dict[str, Any]]) -> str:
     try:
         return str(int(n))
     except (TypeError, ValueError):
-        return "N/A"
+        return NA_CELL
 
 
 def step_time_cell(data: Optional[Dict[str, Any]]) -> str:
     if data is None:
-        return "N/A"
+        return NA_CELL
 
     summary = (
         data.get("metrics_trial", {})
         .get("rollout_total_sec_per_step", {})
     )
     if not isinstance(summary, dict):
-        return "N/A"
+        return NA_CELL
 
     try:
-        mean_ms = 1000.0 * float(summary["mean"])
+        q25_ms = 1000.0 * float(summary["q25"])
+        q50_ms = 1000.0 * float(summary["q50"])
+        q75_ms = 1000.0 * float(summary["q75"])
     except (KeyError, TypeError, ValueError):
-        return "N/A"
+        return NA_CELL
 
-    try:
-        stderr_ms = 1000.0 * float(summary.get("stderr", 0.0))
-    except (TypeError, ValueError):
-        stderr_ms = 0.0
-
-    return (
-        r"$"
-        f"{mean_ms:.2f}"
-        r" \pm "
-        f"{stderr_ms:.2f}"
-        r"$ ms"
-    )
+    return step_time_iqr_cell(q25_ms, q50_ms, q75_ms)
 
 
 def step_time_summary(data: Optional[Dict[str, Any]]) -> Optional[Tuple[int, float, float]]:
@@ -376,18 +376,55 @@ def step_time_summary(data: Optional[Dict[str, Any]]) -> Optional[Tuple[int, flo
     return n, mean, std
 
 
+def step_time_iqr_summary(data: Optional[Dict[str, Any]]) -> Optional[Tuple[float, float, float]]:
+    if data is None:
+        return None
+    summary = (
+        data.get("metrics_trial", {})
+        .get("rollout_total_sec_per_step", {})
+    )
+    if not isinstance(summary, dict):
+        return None
+    try:
+        return (
+            1000.0 * float(summary["q25"]),
+            1000.0 * float(summary["q50"]),
+            1000.0 * float(summary["q75"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def step_time_iqr_cell(q25_ms: float, q50_ms: float, q75_ms: float) -> str:
+    return (
+        r"$"
+        f"{q50_ms:.4f}"
+        r"\,["
+        f"{q25_ms:.4f}, {q75_ms:.4f}"
+        r"]$ ms"
+    )
+
+
 def combined_step_time_cell(phase_results: Dict[str, Optional[Dict[str, Any]]]) -> str:
-    summaries = [
-        step_time_summary(phase_results[matchup])
+    iqr_summaries = [
+        step_time_iqr_summary(phase_results[matchup])
         for _, matchup, _ in PHASES
     ]
+    iqr_summaries = [item for item in iqr_summaries if item is not None]
+    if iqr_summaries:
+        q25_ms = sum(item[0] for item in iqr_summaries) / len(iqr_summaries)
+        q50_ms = sum(item[1] for item in iqr_summaries) / len(iqr_summaries)
+        q75_ms = sum(item[2] for item in iqr_summaries) / len(iqr_summaries)
+        return step_time_iqr_cell(q25_ms, q50_ms, q75_ms)
+
+    summaries = [step_time_summary(phase_results[matchup]) for _, matchup, _ in PHASES]
     summaries = [item for item in summaries if item is not None]
     if not summaries:
-        return "N/A"
+        return NA_CELL
 
     total_n = sum(n for n, _, _ in summaries)
     if total_n <= 0:
-        return "N/A"
+        return NA_CELL
     mean = sum(n * m for n, m, _ in summaries) / total_n
 
     if total_n > 1:
@@ -398,34 +435,26 @@ def combined_step_time_cell(phase_results: Dict[str, Optional[Dict[str, Any]]]) 
     else:
         stderr = 0.0
 
-    mean_ms = 1000.0 * mean
-    stderr_ms = 1000.0 * stderr
-    return (
-        r"$"
-        f"{mean_ms:.2f}"
-        r" \pm "
-        f"{stderr_ms:.2f}"
-        r"$ ms"
-    )
+    return step_time_iqr_cell(1000.0 * mean, 1000.0 * mean, 1000.0 * mean)
 
 
 def quartile_metric_cell(data: Optional[Dict[str, Any]], metric_key: str, unit: str) -> str:
     if data is None:
-        return "N/A"
+        return NA_CELL
 
     summary = (
         data.get("metrics_trial", {})
         .get(metric_key, {})
     )
     if not isinstance(summary, dict):
-        return "N/A"
+        return NA_CELL
 
     try:
         q25 = float(summary["q25"])
         q50 = float(summary["q50"])
         q75 = float(summary["q75"])
     except (KeyError, TypeError, ValueError):
-        return "N/A"
+        return NA_CELL
 
     return (
         r"$"
@@ -450,9 +479,13 @@ def delta_v_row(
 
 
 def bold_cell(cell: str) -> str:
-    if cell == "N/A":
+    if cell == NA_CELL:
         return cell
     return r"{\bfseries\boldmath " + cell + "}"
+
+
+def is_na_cell(cell: str) -> bool:
+    return cell == NA_CELL
 
 
 def total_count_row(phase_results: Dict[str, Optional[Dict[str, Any]]]) -> str:
@@ -460,11 +493,11 @@ def total_count_row(phase_results: Dict[str, Optional[Dict[str, Any]]]) -> str:
         total_count_cell(phase_results[matchup])
         for _, matchup, _ in PHASES
     ]
-    present = [cell for cell in cells if cell != "N/A"]
+    present = [cell for cell in cells if not is_na_cell(cell)]
     if not present:
-        return r"Total $n$ & \multicolumn{4}{l@{}}{N/A} \\"
-    if len(set(present)) == 1 and all(cell in {"N/A", present[0]} for cell in cells):
-        if all(cell != "N/A" for cell in cells):
+        return r"Total $n$ & \multicolumn{4}{l@{}}{" + NA_CELL + r"} \\"
+    if len(set(present)) == 1 and all(is_na_cell(cell) or cell == present[0] for cell in cells):
+        if all(not is_na_cell(cell) for cell in cells):
             return r"Total $n$ & \multicolumn{4}{l@{}}{" + present[0] + r"} \\"
     return r"Total $n$ & \multicolumn{4}{l@{}}{" + ", ".join(cells) + r"} \\"
 
@@ -558,10 +591,8 @@ def render_table(spec: TableSpec, policy_caption: Optional[str] = None) -> str:
         "Monte Carlo outcomes for "
         + policy_desc
         + ", "
-        + f"{spec.radius_m} m, {spec.dynamics_label}, {spec.kf_label}. "
-        + r"Outcome cells report count; \% $\pm$ SE. "
-        + r"Delta-v rows report median [Q1, Q3]. "
-        + r"Step time reports mean $\pm$ SE."
+        + f"{spec.radius_m} m, {spec.dynamics_label}, {spec.kf_label}."
+        + TABLE_STATS_NOTE
     )
     label = "tab:mc-" + label_slug(
         f"{spec.display_run_dir}-{spec.radius_m}m-{spec.dynamics}-"
@@ -569,6 +600,7 @@ def render_table(spec: TableSpec, policy_caption: Optional[str] = None) -> str:
     )
 
     lines = [
+        rf"\Needspace{{{TABLE_NEEDSPACE}}}",
         rf"\begin{{table}}[{TABLE_PLACEMENT}]",
         r"\centering",
         TABLE_FONT_SIZE,
@@ -666,19 +698,18 @@ def render_paired_kf_table(
     policy_caption: str,
 ) -> str:
     caption = (
-        f"Monte Carlo outcomes for {dynamics_label} in the "
+        f"Monte Carlo outcomes: {dynamics_label}, "
         + radius_heading(radius_m)
         + ", "
         + policy_caption
-        + r". KF off and KF on are shown in each table. "
-        + r"Outcome cells report counts; \% $\pm$ SE. "
-        + r"Delta-v rows report median [Q1, Q3]. "
-        + r"Step time reports mean $\pm$ SE."
+        + r"."
+        + TABLE_STATS_NOTE
     )
     label = "tab:mc-" + label_slug(
         f"{display_run_dir}-{radius_m}m-{dynamics}-kf-off-vs-on"
     )
     lines = [
+        rf"\Needspace{{{THESIS_TABLE_NEEDSPACE}}}",
         rf"\begin{{table}}[{TABLE_PLACEMENT}]",
         r"\centering",
         TABLE_FONT_SIZE,
@@ -689,6 +720,7 @@ def render_paired_kf_table(
         "",
         render_kf_table_block("KF on", kf_on_spec),
         r"\end{table}",
+        r"\clearpage",
         "",
     ]
     return "\n".join(lines)
@@ -751,6 +783,7 @@ def render_training_curves_figure(
     )
     label = "fig:mc-" + label_slug(display_run_dir) + "-training-curves-kf"
     lines = [
+        rf"\Needspace{{{TRAINING_CURVE_NEEDSPACE}}}",
         rf"\begin{{figure}}[{TABLE_PLACEMENT}]",
         r"\centering",
         render_training_curve_panel("KF off", kf_off_curve, repo_root),
@@ -793,6 +826,7 @@ def write_merged_thesis_tables(
         (spec.run_dir, spec.radius_m, spec.dynamics, spec.use_kf): spec
         for spec in all_specs
     }
+    input_paths: List[Path] = []
     for run_spec in present_base_specs:
         base_run_dir = base_run_dir_for(run_spec.run_dir)
         kf_on_run_dir = kf_on_run_dir_for(base_run_dir)
@@ -803,7 +837,7 @@ def write_merged_thesis_tables(
 
         parts = [
             "% Auto-generated by generate_mc_latex_tables.py.",
-            "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, and \\usepackage{float}.",
+            "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, \\usepackage{float}, and \\usepackage{needspace}.",
             "% Thesis selection: training curves, HCW 20/100 m KF off/on, Elliptic LTV 20/100 m KF off/on.",
             "% KF-off tables are read from the base run folder; KF-on tables are read from the matching _KF_ON folder.",
             "",
@@ -866,7 +900,24 @@ def write_merged_thesis_tables(
                     ]
                 )
 
-        (merged_dir / MERGED_THESIS_FILENAME).write_text("\n".join(parts), encoding="utf-8")
+        merged_file = merged_dir / MERGED_THESIS_FILENAME
+        merged_file.write_text("\n".join(parts), encoding="utf-8")
+        input_paths.append(merged_file)
+
+    input_lines = [
+        "% Auto-generated by generate_mc_latex_tables.py.",
+        "% Include this file from a repo-root LaTeX document with:",
+        "% \\input{LaTeX_Tables/Merged_Thesis/merged_thesis_inputs.tex}",
+        "% Comment out individual \\input lines below while iterating.",
+        "",
+    ]
+    for path in input_paths:
+        input_lines.append(r"\input{" + latex_graphics_path(repo_root, path) + r"}")
+    input_lines.append("")
+    (merged_root / MERGED_THESIS_INPUTS_FILENAME).write_text(
+        "\n".join(input_lines),
+        encoding="utf-8",
+    )
 
 
 def write_table_set(
@@ -883,13 +934,13 @@ def write_table_set(
 
     aggregate_parts = [
         "% Auto-generated by generate_mc_latex_tables.py.",
-        "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, and \\usepackage{float}.",
+        "% Requires: \\usepackage{booktabs}, \\usepackage{graphicx}, \\usepackage{float}, and \\usepackage{needspace}.",
         "% Phase columns are policy matchups.",
         "% Outcome rows are grouped into defender wins, attacker wins, and ties.",
         "% Outcome cells: count; $percent \\pm SE\\%$.",
         "% Delta-v rows: median [Q1, Q3].",
-        "% Step time row: pooled mean ms/step \\pm SE.",
-        f"% Tables use [{{{TABLE_PLACEMENT}}}] placement to force them at the insertion point.",
+        "% Step time row: median [Q1, Q3] ms/step.",
+        f"% Tables use [{TABLE_PLACEMENT}] placement with \\Needspace guards to keep declaration-order placement predictable.",
         f"% Table row spacing uses \\arraystretch={TABLE_ARRAYSTRETCH}.",
         "% Tables are centered in a \\makebox and resized to \\textwidth+0.5in.",
         "% This allows roughly 0.25in overhang into each margin for larger text.",

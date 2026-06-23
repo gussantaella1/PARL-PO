@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+#
+# Run only the thesis-priority KF Monte Carlo suites: 20 m and 100 m.
+#
+# By default this writes to tagged folders, e.g. MC_eval_20m_kf_batched, so the
+# fixed-KF batched results do not get mixed with older scalar KF-dispersion
+# results. Set OUT_DIR_TAG="" to write to the standard MC_eval_20m/100m folders
+# and skip cases that already have results.json + trials.csv.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+source ./run_eval_sequence_lib.sh
+
+SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
+EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-512}"
+DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions_kf_batched}"
+OUT_DIR_TAG="${OUT_DIR_TAG-_kf_batched}"
+
+DEFAULT_RUN_SPECS=(
+  "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:hcw"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:hcw"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_KF_ON:hcw"
+  "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:elliptic_ltv"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax_KF_ON:elliptic_ltv"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax_KF_ON:elliptic_ltv"
+)
+
+MATCHUPS=(
+  "def0_vs_att1:def0_teacher.pt:att1_teacher.pt"
+  "def1_vs_att1:def1_teacher.pt:att1_teacher.pt"
+  "def1_vs_att2:def1_teacher.pt:att2_teacher.pt"
+  "def2_vs_att2:def2_teacher.pt:att2_teacher.pt"
+)
+
+case_completed() {
+  local out_dir="$1"
+
+  if [[ "${FORCE_RERUN:-false}" == "true" || "${FORCE_RERUN:-0}" == "1" ]]; then
+    return 1
+  fi
+  [[ -s "${out_dir}/results.json" && -s "${out_dir}/trials.csv" ]]
+}
+
+suite_out_root() {
+  local suite="$1"
+  local effective_dynamics="$2"
+  local base=""
+  local dyn_suffix=""
+
+  case "${suite}" in
+    20m) base="MC_eval_20m" ;;
+    100m) base="MC_eval_100m" ;;
+    *)
+      echo "[${SCRIPT_NAME}] Unknown suite: ${suite}" >&2
+      return 1
+      ;;
+  esac
+
+  dyn_suffix="$(auto_suffix_for_dynamics "${effective_dynamics}")"
+  printf '%s%s%s\n' "${base}" "${OUT_DIR_TAG}" "${dyn_suffix}"
+}
+
+build_common_args() {
+  local suite="$1"
+  local effective_dynamics="$2"
+  local -n out_args_ref="$3"
+
+  out_args_ref=(
+    --auto_shell_grid
+    --grid_mode cartesian
+    --index 15000
+    --shell_fracs 0.2,0.4,0.6,0.8
+    --steps 6000
+    --points_per_shell 40
+    --velocity_controller_enabled true
+    --advantage_scale 1.0
+    --save_rollout_error_cases
+    --device cuda
+    --use_kf true
+    --dispersions_module "${DISPERSIONS_MODULE}"
+    --eval_batch_size "${EVAL_BATCH_SIZE}"
+  )
+
+  case "${suite}" in
+    20m) out_args_ref+=(--arena_radius 20.0) ;;
+    100m) out_args_ref+=(--arena_radius 100.0) ;;
+  esac
+
+  if [[ -n "${effective_dynamics}" ]]; then
+    out_args_ref+=(--dynamics "${effective_dynamics}")
+  fi
+}
+
+run_case() {
+  local suite="$1"
+  local run_dir="$2"
+  local effective_dynamics="$3"
+  local matchup="$4"
+  local case_name def_ckpt att_ckpt out_root out_dir
+  local common_args=()
+
+  IFS=: read -r case_name def_ckpt att_ckpt <<< "${matchup}"
+  out_root="$(suite_out_root "${suite}" "${effective_dynamics}")"
+  out_dir="${run_dir}/${out_root}/${case_name}"
+
+  if case_completed "${out_dir}"; then
+    echo "[${SCRIPT_NAME}] Skipping ${suite} ${run_dir} :: ${case_name}; existing results found."
+    return 0
+  fi
+
+  build_common_args "${suite}" "${effective_dynamics}" common_args
+
+  echo "[${SCRIPT_NAME}] Starting ${suite} ${run_dir} :: ${case_name} dynamics=$(format_dynamics_label "${effective_dynamics}") out_root=${out_root}"
+  python evaluate_policy.py \
+    --run_dir "${run_dir}" \
+    --def_ckpt_path "${run_dir}/${def_ckpt}" \
+    --att_ckpt_path "${run_dir}/${att_ckpt}" \
+    --out_dir "${out_dir}" \
+    "${common_args[@]}"
+}
+
+DYNAMICS_OVERRIDE="$(canonicalize_dyn_name "${DYNAMICS_OVERRIDE:-}")"
+
+if (($# > 0)); then
+  RUN_SPECS=("$@")
+else
+  RUN_SPECS=("${DEFAULT_RUN_SPECS[@]}")
+fi
+
+echo "[${SCRIPT_NAME}] OUT_DIR_TAG=${OUT_DIR_TAG:-<standard folders>}"
+echo "[${SCRIPT_NAME}] DISPERSIONS_MODULE=${DISPERSIONS_MODULE}"
+echo "[${SCRIPT_NAME}] EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE}"
+
+for run_spec in "${RUN_SPECS[@]}"; do
+  parse_run_spec "${run_spec}" run_dir run_dyn
+  effective_dynamics="$(resolve_effective_dynamics "${run_dyn}" "${DYNAMICS_OVERRIDE}" "")"
+
+  for suite in 20m 100m; do
+    echo "[${SCRIPT_NAME}] Queueing suite=${suite} ${run_dir} dynamics=$(format_dynamics_label "${effective_dynamics}")"
+    for matchup in "${MATCHUPS[@]}"; do
+      run_case "${suite}" "${run_dir}" "${effective_dynamics}" "${matchup}"
+    done
+  done
+done
+
+echo "[${SCRIPT_NAME}] Done"

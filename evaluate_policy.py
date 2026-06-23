@@ -969,7 +969,9 @@ def _dispersion_spec_has_draws(spec: Any) -> bool:
         return True
     if _spread_is_nonzero(spec.get("std", 0.0)):
         return True
-    return spec.get("mean", None) is not None
+    # A fixed mean override changes the shared evaluation config, but it does
+    # not create per-trial draws. Keep that batch-friendly.
+    return False
 
 
 def _dispersion_has_config_draws(cfg: Dict[str, Any]) -> bool:

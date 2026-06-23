@@ -48,9 +48,9 @@ DISPERSIONS: Dict[str, Any] = {
     # For auto_shell_grid this means "relative to the generated shell point."
     "initial_state": {
         "enabled": True,
-        # random_shell_advantage bounded each component by train_ic_vmax but did
-        # not project the resulting vector norm to the rollout speed limit.
-        "project_velocity_to_vmax": False,
+        # Sample components from the training range, then enforce the rollout
+        # controller's vector-speed limit on the prepared initial state.
+        "project_velocity_to_vmax": True,
         "position": {
             # random_shell_advantage sampled positions directly from its shells;
             # it did not add another position jitter afterward. Keep the selected
@@ -98,7 +98,7 @@ DISPERSIONS: Dict[str, Any] = {
             "sigma_az": {"mean": np.deg2rad(0.5), "std": 0.0, "min": 0.0},
             "sigma_el": {"mean": np.deg2rad(0.5), "std": 0.0, "min": 0.0},
             # Initial covariance diagonal scales for target position/velocity.
-            "pos_std0": {"mean": 4.0, "std": 0.0, "min": 0.0},
+            "pos_std0": {"mean": 2.0, "std": 0.0, "min": 0.0},
             "vel_std0": {"mean": 0.01, "std": 0.0, "min": 0.0},
             # Initial estimator mean perturbation scales.
             "init_pos_std": {"mean": 4.0, "std": 0.0, "min": 0.0},

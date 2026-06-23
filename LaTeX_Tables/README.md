@@ -21,13 +21,19 @@ Outputs:
   The visible headings and captions use parameter-based identifiers instead of
   literal folder names, with training cases as `\section{...}`, dynamics as
   `\subsection{...}`, and arena radii as `\subsubsection{...}`.
+- `Merged_Thesis/merged_thesis_inputs.tex`: a small include manifest with one
+  `\input{...}` line per merged training-case file. From a repo-root document
+  such as `testing.tex`, include all merged tables with:
+  `\input{LaTeX_Tables/Merged_Thesis/merged_thesis_inputs.tex}`. For faster
+  iteration, comment out individual `\input` lines in that manifest or call one
+  training-case file directly.
 - `tables_complete_grid/`: one `.tex` file per complete-grid table.
 - `mc_outcome_table_index.csv`: coverage index showing which phase/matchup
   cells were missing and where present-table files were written.
 
 Generated table captions define the displayed statistics: outcome cells report
 count; percentage `\pm` standard error, delta-v rows report median `[Q1, Q3]`,
-and step time reports pooled mean `\pm` standard error.
+and step time reports median `[Q1, Q3]`.
 
 Each outcome cell is kept on one compact line:
 
@@ -50,11 +56,12 @@ trajectory-total delta-v with interquartile range:
 median [Q1, Q3] m/s
 ```
 
-The bottom rows report total trial count and mean rollout total time per
-simulated step in milliseconds, pooled across the four phase/matchup columns:
+The bottom rows report total trial count and rollout total time per simulated
+step in milliseconds as median with interquartile range. Combined four-phase
+tables average the per-phase quartiles:
 
 ```text
-$mean \pm standard error$ ms
+median [Q1, Q3] ms
 ```
 
 Tables use `\scriptsize` text with tightened row spacing, centered in
@@ -69,12 +76,13 @@ The stacked thesis result blocks use a slightly wider resize target
 (`\textwidth+0.75in`) with tightened row spacing so the full-width KF-off and
 KF-on tables stay compact.
 
-The generated LaTeX assumes `booktabs`, `graphicx`, and `float`:
+The generated LaTeX assumes `booktabs`, `graphicx`, `float`, and `needspace`:
 
 ```latex
 \usepackage{booktabs}
 \usepackage{graphicx}
 \usepackage{float}
+\usepackage{needspace}
 ```
 
 To include failed runs too:
