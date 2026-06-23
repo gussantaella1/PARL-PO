@@ -956,10 +956,18 @@ def _dispersion_spec_has_draws(spec: Any) -> bool:
     """Return True if a dispersion spec can change a value across trials."""
     if not isinstance(spec, dict) or not bool(spec.get("enabled", True)):
         return False
+
+    def _spread_is_nonzero(value: Any) -> bool:
+        # Config-derived spreads are resolved later against each trial cfg. They
+        # are potentially nonzero, so detection must not cast the reference dict.
+        if isinstance(value, dict) and "from_config" in value:
+            return True
+        return bool(np.any(np.asarray(value, dtype=float) > 0.0))
+
     half_width = spec.get("half_width", spec.get("width", 0.0))
-    if np.any(np.asarray(half_width, dtype=float) > 0.0):
+    if _spread_is_nonzero(half_width):
         return True
-    if np.any(np.asarray(spec.get("std", 0.0), dtype=float) > 0.0):
+    if _spread_is_nonzero(spec.get("std", 0.0)):
         return True
     return spec.get("mean", None) is not None
 
@@ -3665,7 +3673,13 @@ def main():
         x0 = _apply_initial_state_dispersions(cfg_trial, x0, rng)
         active_vel_dispersion = _initial_velocity_dispersion_active(cfg_trial)
         active_rollout_vmax = _resolve_rollout_vmax(cfg_trial)
-        if active_rollout_vmax is not None and (
+        initial_state_dispersion = (
+            (cfg_trial.get("dispersion", {}) or {}).get("initial_state", {}) or {}
+        )
+        project_velocity_to_vmax = bool(
+            initial_state_dispersion.get("project_velocity_to_vmax", True)
+        )
+        if active_rollout_vmax is not None and project_velocity_to_vmax and (
             args.sample_ic or args.auto_shell_grid or active_vel_dispersion
         ):
             x0 = _project_x0_velocities_to_vmax(x0, D, float(active_rollout_vmax))

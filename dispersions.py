@@ -21,10 +21,10 @@ KF/config parameter specs are Gaussian and use:
 Scalars apply to every axis. Length-3 lists apply to x/y/z or vx/vy/vz.
 Config-derived values can be written as {"from_config": "path.to.key", "scale": 1.0}.
 
-The non-KF defaults below match the old shell-grid Monte Carlo setup without
-double-applying jitter: position and velocity dispersion use the old bounded
-x0_jitter style, then evaluate_policy.py clears cfg["x0_jitter"] before rollout
-so the environment does not jitter the already-dispersed x0 again.
+The non-KF defaults preserve each selected shell-grid position while matching
+random_shell_advantage velocity sampling from the loaded run configuration.
+evaluate_policy.py then clears cfg["x0_jitter"] before rollout so the environment
+does not alter the prepared state again.
 """
 
 from __future__ import annotations
@@ -48,12 +48,15 @@ DISPERSIONS: Dict[str, Any] = {
     # For auto_shell_grid this means "relative to the generated shell point."
     "initial_state": {
         "enabled": True,
+        # random_shell_advantage bounded each component by train_ic_vmax but did
+        # not project the resulting vector norm to the rollout speed limit.
+        "project_velocity_to_vmax": False,
         "position": {
-            "enabled": True,
-            # Additive position error in meters, applied after the nominal shell
-            # or CSV point is selected. This mirrors the old x0_jitter path:
-            # x += U(-0.5, +0.5) per axis.
-            "default": {"dist": "uniform", "mean": 0.0, "half_width": 0.5},
+            # random_shell_advantage sampled positions directly from its shells;
+            # it did not add another position jitter afterward. Keep the selected
+            # Monte Carlo shell point unchanged.
+            "enabled": False,
+            "default": {"dist": "uniform", "mean": 0.0, "half_width": 0.0},
             # Role-specific entries are additional deltas on top of default.
             # Keep these at zero unless defender/attacker starts should differ.
             "def": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
@@ -61,11 +64,13 @@ DISPERSIONS: Dict[str, Any] = {
         },
         "velocity": {
             "enabled": True,
-            # Additive velocity draw in m/s after the nominal shell/CSV velocity
-            # is selected. This mirrors the old eval-time x0_vel_jitter 0.5:
-            # v += U(-0.5, +0.5) per axis. evaluate_policy.py then projects the
-            # final velocity vector back to ||v|| <= vmax before rollout.
-            "default": {"dist": "uniform", "mean": 0.0, "half_width": 0.5},
+            # Match random_shell_advantage: each velocity component is sampled
+            # uniformly from [-train_ic_vmax, +train_ic_vmax].
+            "default": {
+                "dist": "uniform",
+                "mean": 0.0,
+                "half_width": {"from_config": "train_ic_vmax"},
+            },
             # Role-specific entries are additional deltas on top of default.
             "def": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},
             "att": {"dist": "uniform", "mean": [0.0, 0.0, 0.0], "half_width": [0.0, 0.0, 0.0]},

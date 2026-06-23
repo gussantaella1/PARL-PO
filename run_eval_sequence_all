@@ -21,13 +21,31 @@ source ./run_eval_sequence_lib.sh
 
 SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
 
-DEFAULT_DYNAMICS=(hcw elliptic_ltv)
-REQUIRED_POLICY_CKPTS=(
-  def0_teacher.pt
-  att1_teacher.pt
-  def1_teacher.pt
-  att2_teacher.pt
-  def2_teacher.pt
+# Default queue definitions live near the top so they are easy to edit. The
+# no-argument queue is scoped to selected non-KF MC suites.
+DEFAULT_RUN_SPECS=(
+  # Base-directory non-KF policy folders with complete def0/def1/def2 and
+  # att1/att2 checkpoint sets.
+  "Training_Policy_0.1u_1vmax_0.05_icVmax:hcw"
+  "Training_Policy_0.1u_1vmax_0.05_icVmax:elliptic_ltv"
+
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax:hcw"
+  "Training_Policy_0.5u_1.5vmax_1.0_icVmax:elliptic_ltv"
+
+  "Training_Policy_2.0u_1vmax_1.0_icVmax:hcw"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
+)
+
+DEFAULT_QUEUE=(
+#   # 0.1u: only the 100 m advantage suites remained stale.
+#   "100m_advantage|Training_Policy_0.1u_1vmax_0.05_icVmax:hcw"
+#   "100m_advantage|Training_Policy_0.1u_1vmax_0.05_icVmax:elliptic_ltv"
+
+#   # 2.0u: the 100 m elliptic LTV suite was partial, and both 100 m advantage
+#   # suites remained stale.
+#   "100m|Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
+#   "100m_advantage|Training_Policy_2.0u_1vmax_1.0_icVmax:hcw"
+#   "100m_advantage|Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
 )
 
 print_usage() {
@@ -78,44 +96,14 @@ canonicalize_suite_name() {
 
 populate_default_run_specs() {
   local -n out_specs_ref="$1"
-  local run_dir=""
-  local dyn=""
-  local missing_ckpt=""
-  local has_missing=false
 
-  out_specs_ref=()
-  for run_dir in Training_Policy*/; do
-    [[ -d "${run_dir}" ]] || continue
-    run_dir="${run_dir%/}"
-
-    # This is the non-KF launcher. Keep the base-directory sweep scoped to
-    # regular top-level policy folders, and avoid known suspect runs.
-    if [[ "${run_dir}" == *"_KF_ON"* || "${run_dir}" == *"VERY_SUS"* ]]; then
-      continue
-    fi
-
-    has_missing=false
-    for missing_ckpt in "${REQUIRED_POLICY_CKPTS[@]}"; do
-      if [[ ! -f "${run_dir}/${missing_ckpt}" ]]; then
-        has_missing=true
-        break
-      fi
-    done
-    if [[ "${has_missing}" == "true" ]]; then
-      echo "[${SCRIPT_NAME}] Skipping default run ${run_dir}; missing required policy checkpoints." >&2
-      continue
-    fi
-
-    for dyn in "${DEFAULT_DYNAMICS[@]}"; do
-      out_specs_ref+=("${run_dir}:${dyn}")
-    done
-  done
+  out_specs_ref=("${DEFAULT_RUN_SPECS[@]}")
 }
 
 populate_default_queue() {
   local -n out_queue_ref="$1"
 
-  out_queue_ref=()
+  out_queue_ref=("${DEFAULT_QUEUE[@]}")
 }
 
 suite_out_root_base() {
@@ -309,7 +297,6 @@ OUT_DIR_SUFFIX="${OUT_DIR_SUFFIX:-}"
 SUITES=()
 USER_RUN_SPECS=()
 DEFAULT_QUEUE_ITEMS=()
-GENERATED_DEFAULT_RUN_SPECS=()
 
 if (($# == 0)); then
   SUITES=(20m 50m 100m 100m_advantage)
@@ -337,15 +324,12 @@ if ((${#DEFAULT_QUEUE_ITEMS[@]} > 0)); then
     run_suite "${suite}" "${run_spec}"
   done
 else
-  if ((${#USER_RUN_SPECS[@]} == 0)); then
-    populate_default_run_specs GENERATED_DEFAULT_RUN_SPECS
-  fi
   for suite in "${SUITES[@]}"; do
     RUN_SPECS=()
     if ((${#USER_RUN_SPECS[@]} > 0)); then
       RUN_SPECS=("${USER_RUN_SPECS[@]}")
     else
-      RUN_SPECS=("${GENERATED_DEFAULT_RUN_SPECS[@]}")
+      populate_default_run_specs RUN_SPECS
     fi
     run_suite "${suite}" "${RUN_SPECS[@]}"
   done
