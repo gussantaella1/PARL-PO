@@ -15,15 +15,24 @@ from typing import Dict, Iterable, List, Tuple
 POLICIES = (
     (
         "Training_Policy_0.1u_1vmax_0.05_icVmax",
-        "$u_{max}=0.1$\n$v_{max}=1$, $v_{IC}=0.05$",
+        r"$\mathbf{u}_{max}=\mathbf{0.1}\ \mathbf{m/s^2}$"
+        "\n"
+        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$, "
+        r"$\mathbf{v}_{IC}=\mathbf{0.05}\ \mathbf{m/s}$",
     ),
     (
         "Training_Policy_0.5u_1.5vmax_1.0_icVmax",
-        "$u_{max}=0.5$\n$v_{max}=1.5$, $v_{IC}=1.0$",
+        r"$\mathbf{u}_{max}=\mathbf{0.5}\ \mathbf{m/s^2}$"
+        "\n"
+        r"$\mathbf{v}_{max}=\mathbf{1.5}\ \mathbf{m/s}$, "
+        r"$\mathbf{v}_{IC}=\mathbf{1.0}\ \mathbf{m/s}$",
     ),
     (
         "Training_Policy_2.0u_1vmax_1.0_icVmax",
-        "$u_{max}=2.0$\n$v_{max}=1$, $v_{IC}=1.0$",
+        r"$\mathbf{u}_{max}=\mathbf{2.0}\ \mathbf{m/s^2}$"
+        "\n"
+        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$, "
+        r"$\mathbf{v}_{IC}=\mathbf{1.0}\ \mathbf{m/s}$",
     ),
 )
 
@@ -35,10 +44,10 @@ TEST_CASES = (
 )
 
 MATCHUPS = (
-    ("def0_vs_att1", "$\\pi_{def,0}$ vs $\\pi_{att,1}$"),
-    ("def1_vs_att1", "$\\pi_{def,1}$ vs $\\pi_{att,1}$"),
-    ("def1_vs_att2", "$\\pi_{def,1}$ vs $\\pi_{att,2}$"),
-    ("def2_vs_att2", "$\\pi_{def,2}$ vs $\\pi_{att,2}$"),
+    ("def0_vs_att1", r"$\mathbf{\pi}_{def,0}$ vs $\mathbf{\pi}_{att,1}$"),
+    ("def1_vs_att1", r"$\mathbf{\pi}_{def,1}$ vs $\mathbf{\pi}_{att,1}$"),
+    ("def1_vs_att2", r"$\mathbf{\pi}_{def,1}$ vs $\mathbf{\pi}_{att,2}$"),
+    ("def2_vs_att2", r"$\mathbf{\pi}_{def,2}$ vs $\mathbf{\pi}_{att,2}$"),
 )
 
 GROUPS = (
@@ -176,6 +185,8 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
         ax.set_title(case_label, fontsize=12, pad=8)
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in POLICIES], fontsize=8)
+        for tick in ax.get_xticklabels():
+            tick.set_fontweight("bold")
         ax.set_ylim(0, 105)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
@@ -187,7 +198,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
     fig.suptitle(
-        f"Monte Carlo net outcome distributions across four learning phases ({state_label})",
+        f"Monte Carlo aggregate outcome distributions across four learning phases ({state_label})",
         fontsize=15,
     )
     fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.95))
@@ -264,6 +275,8 @@ def plot_policy_phase_histogram(
         ax.set_title(case_label, fontsize=12, pad=8)
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=8)
+        for tick in ax.get_xticklabels():
+            tick.set_fontweight("bold")
         ax.set_ylim(0, 105)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
@@ -275,7 +288,7 @@ def plot_policy_phase_histogram(
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
     fig.suptitle(
-        f"Monte Carlo outcome distributions across learning phases ({state_label})\n{policy_label}",
+        f"Monte Carlo outcome distributions across each learning phase\n({state_label}) {policy_label}",
         fontsize=14,
     )
     fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.92))
