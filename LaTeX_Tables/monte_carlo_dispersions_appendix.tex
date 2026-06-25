@@ -1,0 +1,55 @@
+% Auto-generated thesis appendix table for Monte Carlo dispersion settings.
+% Source: dispersions.py
+% Requires: \usepackage{booktabs}, \usepackage{float}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Monte Carlo evaluation dispersions used for the thesis rollouts. Initial positions are the selected shell-grid starts. Initial velocity components are sampled independently and then the prepared velocity vector is projected to the rollout speed limit when needed.}
+\label{tab:mc-dispersions-initial-state}
+\begin{tabular}{@{}p{0.24\textwidth}p{0.18\textwidth}p{0.30\textwidth}p{0.18\textwidth}@{}}
+\toprule
+\textbf{Quantity} & \textbf{Distribution} & \textbf{Value} & \textbf{Applies to} \\
+\midrule
+Initial position selection & Shell-grid sampling & Defender and attacker positions are selected from the valid shell-grid start pairs for each arena. The defender-advantage constraint is enforced through the valid shell-pair set; no additive position jitter is applied after selection. & Defender and attacker \\
+Initial velocity component perturbation & Uniform & $U[-v_{\max}^{\mathrm{IC}},\,v_{\max}^{\mathrm{IC}}]~\mathrm{m/s}$ & Defender and attacker, each axis \\
+Velocity projection & Deterministic clipping & $\|\mathbf{v}_0\| \leq v_{\max}$ & Defender and attacker \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Policy-specific initial-velocity dispersion and KF measured-control dispersion values. The angular line-of-sight sensor noise is fixed across all training cases; only the measured-control noise scales with each policy's control authority. The measured-control dispersion is active only for KF-on evaluations and is drawn from a Gaussian distribution with nonnegative clipping.}
+\label{tab:mc-dispersions-policy-specific}
+\begin{tabular}{@{}p{0.25\textwidth}p{0.13\textwidth}p{0.13\textwidth}p{0.15\textwidth}p{0.25\textwidth}@{}}
+\toprule
+\textbf{Training case} & \textbf{$u_{\max}$} & \textbf{$v_{\max}$} & \textbf{$v_{\max}^{\mathrm{IC}}$} & \textbf{KF measured-control std. draw} \\
+\midrule
+$u_{\max}=0.1$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=0.05$ & $0.1~\mathrm{m/s^2}$ & $1~\mathrm{m/s}$ & $0.05~\mathrm{m/s}$ & $\mathcal{N}(0.025,\,0.0025^2)$ $\mathrm{m/s^2}$ \\
+$u_{\max}=0.5$; $v_{\max}=1.5$; $v_{\max}^{\mathrm{IC}}=1.0$ & $0.5~\mathrm{m/s^2}$ & $1.5~\mathrm{m/s}$ & $1.0~\mathrm{m/s}$ & $\mathcal{N}(0.125,\,0.0125^2)$ $\mathrm{m/s^2}$ \\
+$u_{\max}=2.0$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=1.0$ & $2.0~\mathrm{m/s^2}$ & $1~\mathrm{m/s}$ & $1.0~\mathrm{m/s}$ & $\mathcal{N}(0.500,\,0.0500^2)$ $\mathrm{m/s^2}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{KF-on sensor and estimator settings used during the Monte Carlo rollouts. The angular sensor noise is fixed for every training case. Values are fixed across trials except for the measured-control standard deviation reported in Table~\ref{tab:mc-dispersions-policy-specific}. These settings are applied only when the rollout uses the Kalman-filter estimator.}
+\label{tab:mc-dispersions-kf}
+\begin{tabular}{@{}p{0.36\textwidth}p{0.16\textwidth}p{0.14\textwidth}p{0.24\textwidth}@{}}
+\toprule
+\textbf{KF quantity} & \textbf{Distribution} & \textbf{Value} & \textbf{Units / notes} \\
+\midrule
+Azimuth measurement noise, $\sigma_{\mathrm{az}}$ & Fixed & $0.5^\circ$ & $8.73\times10^{-3}~\mathrm{rad}$ \\
+Elevation measurement noise, $\sigma_{\mathrm{el}}$ & Fixed & $0.5^\circ$ & $8.73\times10^{-3}~\mathrm{rad}$ \\
+Measured-control noise, \texttt{action\_meas\_std} & Gaussian & See Table~\ref{tab:mc-dispersions-policy-specific} & Scales as $0.25u_{\max}$ with $10\%$ relative std. \\
+Initial covariance position std., \texttt{pos\_std0} & Fixed & $2.0$ & $\mathrm{m}$ \\
+Initial covariance velocity std., \texttt{vel\_std0} & Fixed & $0.01$ & $\mathrm{m/s}$ \\
+Initial estimator mean position perturbation std., \texttt{init\_mean\_pos\_std} & Fixed & $0.0$ & $\mathrm{m}$ \\
+Initial estimator mean velocity perturbation std., \texttt{init\_mean\_vel\_std} & Fixed & $0.0$ & $\mathrm{m/s}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
