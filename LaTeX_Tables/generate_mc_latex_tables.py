@@ -187,9 +187,12 @@ def discover_run_dirs(repo_root: Path, include_failed_runs: bool) -> List[Path]:
 def requested_specs(repo_root: Path, run_dirs: Iterable[Path]) -> List[TableSpec]:
     specs: List[TableSpec] = []
     for run_dir in run_dirs:
+        expected_use_kf = run_dir.name.endswith(KF_ON_SUFFIX)
         for radius_m in RADII_M:
             for dynamics, dynamics_label in DYNAMICS:
                 for use_kf, kf_label in KF_STATES:
+                    if use_kf != expected_use_kf:
+                        continue
                     specs.append(
                         TableSpec(
                             repo_root=repo_root,
