@@ -666,6 +666,45 @@ def build_dyn(cfg: Dict[str, Any]):
     cfg["dyn"].setdefault("model", None)
     cfg["dyn"].setdefault("type", None)
 
+    def _seq_len_ok(name: str) -> bool:
+        arr = cfg["dyn"].get(name, None)
+        if arr is None:
+            return False
+        try:
+            return int(arr.shape[0]) >= N
+        except Exception:
+            return False
+
+    # Reuse precomputed dynamics when a caller passes a cfg that was already
+    # built. This matters for scalar Elliptic LTV Monte Carlos, where rebuilding
+    # Ad_seq/Bd_seq inside every policy wrapper dominates runtime.
+    if dyn_name == "hcw":
+        if (
+            cfg["dyn"].get("type") == "lti"
+            and cfg["dyn"].get("model") == "hcw"
+            and cfg["dyn"].get("Ad", None) is not None
+            and cfg["dyn"].get("Bd", None) is not None
+        ):
+            return
+    elif dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
+        if (
+            cfg["dyn"].get("type") == "ltv"
+            and cfg["dyn"].get("model") == "two_body_rtn_ltv"
+            and cfg["dyn"].get("chief_cache", None) is not None
+            and _seq_len_ok("Ad_seq")
+            and _seq_len_ok("Bd_seq")
+        ):
+            cfg["dyn"]["Ad"] = cfg["dyn"]["Ad_seq"][0]
+            cfg["dyn"]["Bd"] = cfg["dyn"]["Bd_seq"][0]
+            return
+    elif dyn_name == "two_body":
+        if (
+            cfg["dyn"].get("type") == "nonlinear"
+            and cfg["dyn"].get("model") == "two_body_rtn"
+            and cfg["dyn"].get("chief_cache", None) is not None
+        ):
+            return
+
     # ---------------------------
     # 1) HCW (LTI)
     # ---------------------------

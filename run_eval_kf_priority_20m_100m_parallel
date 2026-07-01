@@ -13,6 +13,7 @@ PARALLEL_JOBS="${PARALLEL_JOBS:-2}"
 DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions}"
 OUT_DIR_TAG="${OUT_DIR_TAG-}"
 LOG_ROOT="${LOG_ROOT:-logs/kf_priority_parallel_$(date +%Y%m%d_%H%M%S)}"
+CONFIG_MODULE="${CONFIG_MODULE:-config_rl}"
 
 DEFAULT_RUN_SPECS=(
   "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:hcw"
@@ -74,6 +75,7 @@ build_common_args() {
     --advantage_scale 1.0
     --save_rollout_error_cases
     --device cuda
+    --config_module "${CONFIG_MODULE}"
     --use_kf true
     --dispersions_module "${DISPERSIONS_MODULE}"
   )
@@ -146,6 +148,7 @@ fi
 echo "[${SCRIPT_NAME}] PARALLEL_JOBS=${PARALLEL_JOBS}"
 echo "[${SCRIPT_NAME}] OUT_DIR_TAG=${OUT_DIR_TAG:-<standard folders>}"
 echo "[${SCRIPT_NAME}] DISPERSIONS_MODULE=${DISPERSIONS_MODULE}"
+echo "[${SCRIPT_NAME}] CONFIG_MODULE=${CONFIG_MODULE}"
 echo "[${SCRIPT_NAME}] LOG_ROOT=${LOG_ROOT}"
 
 for run_spec in "${RUN_SPECS[@]}"; do

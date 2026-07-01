@@ -77,6 +77,12 @@ class Distribution:
             return 0.0
         return 100.0 * float(self.counts.get(label, 0)) / float(self.total)
 
+    def percent_se(self, label: str) -> float:
+        if self.total <= 0:
+            return 0.0
+        p = float(self.counts.get(label, 0)) / float(self.total)
+        return 100.0 * (p * (1.0 - p) / float(self.total)) ** 0.5
+
 
 def load_counts(path: Path) -> Dict[str, int]:
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -139,20 +145,28 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
 
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
+            errors = [dist.percent_se(group_label) for dist in distributions]
             bars = ax.bar(
                 x + offsets[idx],
                 values,
+                yerr=errors,
                 width=bar_width,
                 color=COLORS[group_label],
                 label=group_label,
+                error_kw={
+                    "ecolor": "#252525",
+                    "elinewidth": 0.8,
+                    "capsize": 2.5,
+                    "capthick": 0.8,
+                },
             )
-            for bar, value, dist in zip(bars, values, distributions):
+            for bar, value, error, dist in zip(bars, values, errors, distributions):
                 if dist.total <= 0:
                     continue
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
-                    value + 1.0,
-                    f"{value:.1f}%",
+                    value + error + 1.0,
+                    f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
                     fontsize=7,
@@ -187,7 +201,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
         ax.set_xticklabels([label for _, label in POLICIES], fontsize=8)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylim(0, 105)
+        ax.set_ylim(0, 108)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
@@ -239,20 +253,28 @@ def plot_policy_phase_histogram(
 
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
+            errors = [dist.percent_se(group_label) for dist in distributions]
             bars = ax.bar(
                 x + offsets[idx],
                 values,
+                yerr=errors,
                 width=bar_width,
                 color=COLORS[group_label],
                 label=group_label,
+                error_kw={
+                    "ecolor": "#252525",
+                    "elinewidth": 0.8,
+                    "capsize": 2.5,
+                    "capthick": 0.8,
+                },
             )
-            for bar, value, dist in zip(bars, values, distributions):
+            for bar, value, error, dist in zip(bars, values, errors, distributions):
                 if dist.total <= 0:
                     continue
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
-                    value + 1.0,
-                    f"{value:.1f}%",
+                    value + error + 1.0,
+                    f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
                     fontsize=7,
@@ -277,7 +299,7 @@ def plot_policy_phase_histogram(
         ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=8)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylim(0, 105)
+        ax.set_ylim(0, 108)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
