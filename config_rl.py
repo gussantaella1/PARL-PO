@@ -82,8 +82,8 @@ COMMON: Dict[str, Any] = {
     # NEW (chief orbit for elliptical/two-body)
     "chief_orbit": {
         "mu": 3.986004418e14,
-        "a":  6_371_000.0 + 400_000.0,  # semi-major axis (m)
-        "e":  0.1,                      # eccentricity
+        "a":  6_371_000.0 + 1_000_000.0,  # semi-major axis (m)
+        "e":  0.1,                        # eccentricity
         "i":  0.0,                      # rad
         "raan": 0.0,                    # rad
         "argp": 0.0,                    # rad
@@ -732,7 +732,11 @@ def build_dyn(cfg: Dict[str, Any]):
     # 3) Elliptical “non-LTI” (LTV) via per-step linearization of two-body RTN
     # ---------------------------
     elif dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
-        orb = cfg.get("chief_orbit", {})
+        # Evaluation run manifests can carry older chief-orbit settings from
+        # training. Keep the nominal Elliptic LTV comparison tied to the current
+        # main config so reruns use the corrected physical orbit.
+        orb = _dcopy(COMMON["chief_orbit"])
+        cfg["chief_orbit"] = orb
         cache = chief_orbit_cache_rtn(orb, dt=dt, N=N)
         Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(cache, dt=dt, eps=1e-5)
         cfg["dyn"]["chief_cache"] = cache
