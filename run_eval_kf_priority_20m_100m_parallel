@@ -151,6 +151,8 @@ echo "[${SCRIPT_NAME}] DISPERSIONS_MODULE=${DISPERSIONS_MODULE}"
 echo "[${SCRIPT_NAME}] CONFIG_MODULE=${CONFIG_MODULE}"
 echo "[${SCRIPT_NAME}] LOG_ROOT=${LOG_ROOT}"
 
+prewarm_elliptic_ltv_cache_if_needed "${SCRIPT_NAME}" "${DYNAMICS_OVERRIDE}" "" "${CONFIG_MODULE}" "6000" "${RUN_SPECS[@]}"
+
 for run_spec in "${RUN_SPECS[@]}"; do
   parse_run_spec "${run_spec}" run_dir run_dyn
   effective_dynamics="$(resolve_effective_dynamics "${run_dyn}" "${DYNAMICS_OVERRIDE}" "")"

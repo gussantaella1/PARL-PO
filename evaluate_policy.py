@@ -938,6 +938,36 @@ def _prepare_episode_cfg(
     return cfg, int(ep_seed), rng
 
 
+def _is_elliptic_ltv_dynamics(cfg: Dict[str, Any]) -> bool:
+    dyn_name = str(cfg.get("dynamics", "hcw")).strip().lower()
+    return dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel")
+
+
+def _elliptic_ltv_randomize_nu0_active(cfg: Dict[str, Any]) -> bool:
+    if not _is_elliptic_ltv_dynamics(cfg):
+        return False
+    ell_cfg = cfg.get("elliptic_ltv", {}) or {}
+    return bool(ell_cfg.get("randomize_nu0", False))
+
+
+def _clear_built_dynamics(cfg: Dict[str, Any]) -> None:
+    dyn = cfg.setdefault("dyn", {})
+    for key in ("Ad", "Bd", "Ad_seq", "Bd_seq", "chief_cache", "model", "type"):
+        dyn[key] = None
+
+
+def _apply_elliptic_ltv_nu0_randomization(
+    cfg: Dict[str, Any],
+    rng: np.random.Generator,
+) -> Optional[float]:
+    if not _elliptic_ltv_randomize_nu0_active(cfg):
+        return None
+    nu0 = float(rng.uniform(0.0, 2.0 * math.pi))
+    cfg.setdefault("chief_orbit", {})
+    cfg["chief_orbit"]["nu0"] = nu0
+    return nu0
+
+
 def _set_initial_state_std(disp: Dict[str, Any], kind: str, value: float) -> None:
     """Set all-role initial-state spread from a CLI compatibility flag."""
     state = disp.setdefault("initial_state", {})
@@ -1145,6 +1175,8 @@ def _supports_batched_cuda_eval(cfg: Dict[str, Any], opponent_source: str) -> bo
         and bool(cfg.get("use_kf", False))
         and str(cfg.get("estimator_kind", "ukf")).strip().lower() != "ekf"
     ):
+        return False
+    if _elliptic_ltv_randomize_nu0_active(cfg) and bool(cfg.get("use_kf", False)):
         return False
     if _dispersion_has_config_draws(cfg):
         return False
@@ -1878,6 +1910,118 @@ def _save_outcome_histogram(
         "proportions": {k: counts[k] / float(n) for k in labels},
         "proportion_stats": stats,
     }
+
+
+def _save_outcome_vs_nu0_plot(
+    out_dir: Path,
+    trial_rows: List[Dict[str, Any]],
+    bins: int = 18,
+) -> Optional[str]:
+    """Save binned net outcome rates versus Elliptic LTV starting true anomaly."""
+    vals: List[Tuple[float, str]] = []
+    for row in trial_rows:
+        if "elliptic_ltv_nu0_deg" not in row:
+            continue
+        try:
+            deg = float(row["elliptic_ltv_nu0_deg"]) % 360.0
+        except Exception:
+            continue
+        vals.append((deg, str(row.get("outcome_label", _classify_trial_outcome(row)))))
+    if not vals:
+        return None
+
+    import matplotlib.pyplot as plt
+
+    bins = max(4, int(bins))
+    edges = np.linspace(0.0, 360.0, bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    width = float(edges[1] - edges[0])
+
+    labels = ["Defender wins", "Attacker wins", "Ties"]
+    colors = {
+        "Defender wins": "#2f7d59",
+        "Attacker wins": "#b8463a",
+        "Ties": "#6f6f77",
+    }
+    counts = {label: np.zeros(bins, dtype=float) for label in labels}
+    totals = np.zeros(bins, dtype=float)
+
+    def group_for_outcome(outcome: str) -> str:
+        if outcome in ("defender_capture", "attacker_crashed_wall"):
+            return "Defender wins"
+        if outcome in ("attacker_hit_oi", "defender_hit_oi", "defender_crashed_wall"):
+            return "Attacker wins"
+        return "Ties"
+
+    for deg, outcome in vals:
+        idx = int(np.searchsorted(edges, deg, side="right") - 1)
+        idx = min(max(idx, 0), bins - 1)
+        totals[idx] += 1.0
+        counts[group_for_outcome(outcome)][idx] += 1.0
+
+    shares = {
+        label: np.divide(counts[label], totals, out=np.full_like(totals, np.nan), where=totals > 0)
+        for label in labels
+    }
+    stderr = {
+        label: np.sqrt(
+            np.divide(
+                shares[label] * (1.0 - shares[label]),
+                totals,
+                out=np.full_like(totals, np.nan),
+                where=totals > 0,
+            )
+        )
+        for label in labels
+    }
+
+    fig, ax = plt.subplots(figsize=(11.0, 5.8))
+    for label in labels:
+        ax.errorbar(
+            centers,
+            100.0 * shares[label],
+            yerr=100.0 * stderr[label],
+            color=colors[label],
+            marker="o",
+            linewidth=1.8,
+            markersize=4.0,
+            capsize=2.5,
+            label=label,
+        )
+
+    ax2 = ax.twinx()
+    ax2.bar(
+        centers,
+        totals,
+        width=0.82 * width,
+        color="#d7d7d7",
+        edgecolor="none",
+        alpha=0.35,
+        label="Trials per bin",
+    )
+    ax2.set_ylabel("Trials per bin")
+    ax2.set_ylim(0.0, max(1.0, float(np.nanmax(totals)) * 1.25))
+
+    ax.set_xlim(0.0, 360.0)
+    ax.set_ylim(0.0, 105.0)
+    ax.set_xticks(np.arange(0.0, 361.0, 45.0))
+    ax.set_xlabel("Initial chief true anomaly, $\\nu_0$ (deg)")
+    ax.set_ylabel("Outcome share (%)")
+    ax.set_title("Monte Carlo Outcome Rates Versus Initial Elliptic LTV Orbital Phase")
+    ax.grid(True, axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax2.spines["top"].set_visible(False)
+
+    handles, handle_labels = ax.get_legend_handles_labels()
+    handles2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(handles + handles2, handle_labels + labels2, loc="upper center", ncol=4, frameon=False)
+
+    fig.tight_layout()
+    path = out_dir / "outcome_vs_nu0.png"
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+    return path.name
 
 
 def _downsample_xyz_path(xyz: np.ndarray, max_points: int = 256) -> np.ndarray:
@@ -3223,8 +3367,31 @@ def main():
     mod.build_dyn(cfg0)
     log(f"[eval] build_dyn done in {time.time() - t_dyn0:.3f}s.")
     rebuild_dyn_per_trial = _top_level_parameter_dispersions_active(cfg0)
-    if rebuild_dyn_per_trial:
-        log("[eval] top-level parameter dispersions active; rebuilding dynamics for each trial cfg.")
+    randomize_elliptic_ltv_nu0 = _elliptic_ltv_randomize_nu0_active(cfg0)
+    if randomize_elliptic_ltv_nu0:
+        rebuild_dyn_per_trial = True
+        full_cache_ready = (
+            (cfg0.get("dyn", {}) or {}).get("full_orbit_Ad_seq", None) is not None
+            and (cfg0.get("dyn", {}) or {}).get("full_orbit_Bd_seq", None) is not None
+            and (cfg0.get("dyn", {}) or {}).get("full_orbit_chief_cache", None) is not None
+        )
+        if full_cache_ready:
+            period_steps = int((cfg0.get("dyn", {}) or {}).get("full_orbit_period_steps", 0) or 0)
+            log(
+                "[eval] Elliptic LTV nu0 randomization enabled: drawing nu0 ~ Uniform(0, 2*pi) "
+                f"per trial and slicing a precomputed full-orbit cache ({period_steps} period steps)."
+            )
+        else:
+            raise RuntimeError(
+                "Elliptic LTV nu0 randomization is enabled, but no full-orbit cache was built. "
+                "Keep elliptic_ltv.use_full_orbit_cache enabled and prewarm the cache before evaluation."
+            )
+    if rebuild_dyn_per_trial and randomize_elliptic_ltv_nu0 and (
+        (cfg0.get("dyn", {}) or {}).get("full_orbit_Ad_seq", None) is not None
+    ):
+        log("[eval] refreshing per-trial Elliptic LTV dynamics by full-orbit cache slicing.")
+    elif rebuild_dyn_per_trial:
+        log("[eval] rebuilding dynamics for each trial cfg.")
 
     # ---------------------------
     # Prepare trial lists (paired/cartesian/auto/random/default)
@@ -3442,6 +3609,8 @@ def main():
         cfg_run = item["cfg_run"]
         cart_di = item["def_idx"]
         cart_ai = item["att_idx"]
+        elliptic_ltv_nu0 = item.get("elliptic_ltv_nu0", None)
+        elliptic_ltv_phase_idx = item.get("elliptic_ltv_phase_idx", None)
 
         trial_errors = 0
         trial_metrics: Dict[str, Any]
@@ -3509,6 +3678,11 @@ def main():
 
         row["cfg_umax"] = cfg_run.get("umax")
         row["cfg_dt"] = cfg_run.get("dt")
+        if elliptic_ltv_nu0 is not None:
+            row["elliptic_ltv_nu0_rad"] = float(elliptic_ltv_nu0)
+            row["elliptic_ltv_nu0_deg"] = float(math.degrees(float(elliptic_ltv_nu0)) % 360.0)
+            if elliptic_ltv_phase_idx is not None:
+                row["elliptic_ltv_phase_idx"] = int(elliptic_ltv_phase_idx)
         if bool(cfg_run.get("use_kf", False)):
             ukf_run = cfg_run.get("ukf", {}) or {}
             for key in (
@@ -3617,6 +3791,31 @@ def main():
             cfg_trial["dynamics"] = str(args.dynamics)
         if args.dt is not None:
             cfg_trial["dt"] = float(args.dt)
+        trial_elliptic_ltv_nu0 = _apply_elliptic_ltv_nu0_randomization(cfg_trial, rng)
+        trial_elliptic_ltv_phase_idx = None
+        if trial_elliptic_ltv_nu0 is not None:
+            dyn_trial = cfg_trial.get("dyn", {}) or {}
+            if not hasattr(mod, "set_elliptic_ltv_phase"):
+                raise RuntimeError(
+                    "Elliptic LTV nu0 randomization requires the config module to define "
+                    "set_elliptic_ltv_phase()."
+                )
+            if (
+                dyn_trial.get("full_orbit_Ad_seq", None) is None
+                or dyn_trial.get("full_orbit_Bd_seq", None) is None
+                or dyn_trial.get("full_orbit_chief_cache", None) is None
+            ):
+                raise RuntimeError(
+                    "Elliptic LTV nu0 randomization requires a precomputed full-orbit cache. "
+                    "Run prewarm_elliptic_ltv_cache.py or keep launcher prewarming enabled."
+                )
+            trial_elliptic_ltv_phase_idx = int(
+                mod.set_elliptic_ltv_phase(
+                    cfg_trial,
+                    float(trial_elliptic_ltv_nu0),
+                    steps=int(args.steps) if args.steps is not None else int(cfg_trial.get("T", cfg0.get("T", 0)) or 0),
+                )
+            )
         if rebuild_dyn_per_trial:
             mod.build_dyn(cfg_trial)
 
@@ -3702,6 +3901,9 @@ def main():
         if steps_run <= 0:
             raise RuntimeError(f"Invalid steps_run={steps_run}. Provide --steps or ensure cfg['T'] is set.")
         cfg_run["T"] = steps_run
+        if trial_elliptic_ltv_nu0 is not None:
+            cfg_run.setdefault("chief_orbit", {})
+            cfg_run["chief_orbit"]["nu0"] = float(trial_elliptic_ltv_nu0)
 
         if pending_items and int(pending_items[0]["steps_run"]) != steps_run:
             _flush_pending_items()
@@ -3716,6 +3918,8 @@ def main():
                 "def_idx": cart_di,
                 "att_idx": cart_ai,
                 "ep_seed": int(ep_seed),
+                "elliptic_ltv_nu0": trial_elliptic_ltv_nu0,
+                "elliptic_ltv_phase_idx": trial_elliptic_ltv_phase_idx,
                 "t_trial0": t_trial0,
             }
         )
@@ -3863,6 +4067,9 @@ def main():
         "def_shell_radius": float(def_shell_plan_radius) if def_shell_plan_radius is not None else None,
         "att_shell_radius": float(att_shell_plan_radius) if att_shell_plan_radius is not None else None,
         "dynamics": cfg0.get("dynamics"),
+        "chief_orbit": _json_safe(cfg0.get("chief_orbit", {})),
+        "elliptic_ltv": _json_safe(cfg0.get("elliptic_ltv", {})),
+        "elliptic_ltv_randomize_nu0": bool(randomize_elliptic_ltv_nu0),
         "dt": cfg0.get("dt"),
         "steps": cfg0.get("T"),
         "def_ckpt_path": cfg0.get("def_ckpt_path"),
@@ -4051,6 +4258,9 @@ def main():
     event_hist_path = _save_time_to_event_histograms(out_dir, trial_rows, float(cfg0.get("dt", float("nan"))))
     if event_hist_path is not None:
         extra_plot_files.append(event_hist_path)
+    outcome_vs_nu0_path = _save_outcome_vs_nu0_plot(out_dir, trial_rows)
+    if outcome_vs_nu0_path is not None:
+        extra_plot_files.append(outcome_vs_nu0_path)
     extra_plot_files.extend(_save_trajectory_overlay_plots(out_dir, cfg0, trajectory_records))
 
     kf_plot_paths: List[str] = []

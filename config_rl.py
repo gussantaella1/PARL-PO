@@ -1,7 +1,10 @@
 # config_rl.py
 from __future__ import annotations
 from typing import Dict, Any
+import hashlib
+import math
 import numpy as np
+from pathlib import Path
 from copy import deepcopy
 
 # ---------- helpers ----------
@@ -82,12 +85,18 @@ COMMON: Dict[str, Any] = {
     # NEW (chief orbit for elliptical/two-body)
     "chief_orbit": {
         "mu": 3.986004418e14,
-        "a":  6_371_000.0 + 1_000_000.0,  # semi-major axis (m)
-        "e":  0.1,                        # eccentricity
+        "a":  6_371_000.0 + 1_275_000.0,  # semi-major axis (m); 550 x 2000 km altitudes
+        "e":  1_450_000.0 / 15_292_000.0, # eccentricity for 550 km perigee, 2000 km apogee
         "i":  0.0,                      # rad
         "raan": 0.0,                    # rad
         "argp": 0.0,                    # rad
         "nu0":  0.0,                    # rad (true anomaly at t=0)
+    },
+    "elliptic_ltv": {
+        "randomize_nu0": True,           # if True, draw nu0 ~ Uniform(0, 2*pi) per eval trial
+        "use_full_orbit_cache": True,    # precompute one orbit and slice per randomized nu0
+        "disk_cache_enabled": True,      # share the full-orbit cache across eval processes
+        "disk_cache_dir": ".dyn_cache",
     },
 
     # Dyn container (extended)
@@ -645,6 +654,151 @@ def config_for_eval(**overrides) -> Dict[str, Any]:
     cfg = _apply_role_specific_curriculum_overrides(cfg)
     return cfg
 
+
+def _slice_chief_cache(cache: Dict[str, Any], start_idx: int, steps: int) -> Dict[str, Any]:
+    """Return a contiguous chief-cache slice for a rollout starting at start_idx."""
+    out = {
+        "mu": cache["mu"],
+        "dt": cache["dt"],
+        "N": int(steps),
+    }
+    lo = int(start_idx)
+    hi = lo + int(steps) + 1
+    for key in ("rC", "vC", "C_RTN2I", "C_I2RTN", "w_rtn"):
+        out[key] = cache[key][lo:hi].copy()
+    return out
+
+
+def _mean_anomaly_from_true_anomaly(nu: float, e: float) -> float:
+    """Convert true anomaly to mean anomaly in [0, 2*pi)."""
+    E = 2.0 * math.atan2(
+        math.sqrt(1.0 - e) * math.sin(float(nu) / 2.0),
+        math.sqrt(1.0 + e) * math.cos(float(nu) / 2.0),
+    )
+    M = E - float(e) * math.sin(E)
+    return float(M % (2.0 * math.pi))
+
+
+def _elliptic_ltv_full_cache_path(
+    ell_cfg: Dict[str, Any],
+    orb: Dict[str, Any],
+    dt: float,
+    rollout_steps: int,
+    full_steps: int,
+    period_steps: int,
+    eps: float,
+) -> Path:
+    cache_dir = Path(str(ell_cfg.get("disk_cache_dir", ".dyn_cache")))
+    key_parts = [
+        f"mu={float(orb['mu']):.17g}",
+        f"a={float(orb['a']):.17g}",
+        f"e={float(orb['e']):.17g}",
+        f"i={float(orb.get('i', 0.0)):.17g}",
+        f"raan={float(orb.get('raan', 0.0)):.17g}",
+        f"argp={float(orb.get('argp', 0.0)):.17g}",
+        f"dt={float(dt):.17g}",
+        f"rollout_steps={int(rollout_steps)}",
+        f"full_steps={int(full_steps)}",
+        f"period_steps={int(period_steps)}",
+        f"eps={float(eps):.17g}",
+    ]
+    digest = hashlib.sha256("|".join(key_parts).encode("utf-8")).hexdigest()[:20]
+    return cache_dir / f"elliptic_ltv_full_orbit_{digest}.npz"
+
+
+def _load_elliptic_ltv_full_cache(path: Path) -> Dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    data = np.load(path, allow_pickle=False)
+    chief_cache = {
+        "mu": float(data["mu"]),
+        "dt": float(data["dt"]),
+        "N": int(data["full_steps"]),
+        "rC": data["rC"],
+        "vC": data["vC"],
+        "C_RTN2I": data["C_RTN2I"],
+        "C_I2RTN": data["C_I2RTN"],
+        "w_rtn": data["w_rtn"],
+    }
+    return {
+        "chief_cache": chief_cache,
+        "Ad_seq": data["Ad_seq"],
+        "Bd_seq": data["Bd_seq"],
+        "period_steps": int(data["period_steps"]),
+        "period_sec": float(data["period_sec"]),
+    }
+
+
+def _save_elliptic_ltv_full_cache(
+    path: Path,
+    cache: Dict[str, Any],
+    Ad_seq: np.ndarray,
+    Bd_seq: np.ndarray,
+    period_steps: int,
+    period_sec: float,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp_path, "wb") as f:
+        np.savez(
+            f,
+            mu=float(cache["mu"]),
+            dt=float(cache["dt"]),
+            full_steps=int(cache["N"]),
+            period_steps=int(period_steps),
+            period_sec=float(period_sec),
+            rC=cache["rC"],
+            vC=cache["vC"],
+            C_RTN2I=cache["C_RTN2I"],
+            C_I2RTN=cache["C_I2RTN"],
+            w_rtn=cache["w_rtn"],
+            Ad_seq=Ad_seq,
+            Bd_seq=Bd_seq,
+        )
+    tmp_path.replace(path)
+
+
+def set_elliptic_ltv_phase(cfg: Dict[str, Any], nu0: float, steps: int | None = None) -> int:
+    """Slice a precomputed full-orbit Elliptic LTV cache for a trial nu0.
+
+    The input nu0 is a true anomaly. The cache is uniformly sampled in time, so
+    this maps true anomaly to mean anomaly and then to the nearest cache index.
+    """
+    dyn = cfg.setdefault("dyn", {})
+    Ad_full = dyn.get("full_orbit_Ad_seq", None)
+    Bd_full = dyn.get("full_orbit_Bd_seq", None)
+    chief_full = dyn.get("full_orbit_chief_cache", None)
+    period_steps = int(dyn.get("full_orbit_period_steps", 0) or 0)
+    if Ad_full is None or Bd_full is None or chief_full is None or period_steps <= 0:
+        raise RuntimeError("Elliptic LTV full-orbit cache is not available for phase slicing.")
+
+    steps = int(steps if steps is not None else cfg.get("T", 0))
+    if steps <= 0:
+        raise RuntimeError(f"Invalid Elliptic LTV phase-slice steps={steps}.")
+
+    e = float((cfg.get("chief_orbit", {}) or COMMON["chief_orbit"]).get("e", COMMON["chief_orbit"]["e"]))
+    M0 = _mean_anomaly_from_true_anomaly(float(nu0), e)
+    start_idx = int(round((M0 / (2.0 * math.pi)) * float(period_steps))) % period_steps
+    hi = start_idx + steps
+    if hi > int(Ad_full.shape[0]):
+        raise RuntimeError(
+            f"Full-orbit Elliptic LTV cache too short for start_idx={start_idx}, steps={steps}, "
+            f"Ad_len={Ad_full.shape[0]}."
+        )
+
+    cfg.setdefault("chief_orbit", {})
+    cfg["chief_orbit"]["nu0"] = float(nu0)
+    dyn["Ad_seq"] = Ad_full[start_idx:hi].copy()
+    dyn["Bd_seq"] = Bd_full[start_idx:hi].copy()
+    dyn["chief_cache"] = _slice_chief_cache(chief_full, start_idx, steps)
+    dyn["Ad"] = dyn["Ad_seq"][0]
+    dyn["Bd"] = dyn["Bd_seq"][0]
+    dyn["type"] = "ltv"
+    dyn["model"] = "two_body_rtn_ltv"
+    dyn["phase_start_idx"] = int(start_idx)
+    dyn["phase_nu0"] = float(nu0)
+    return int(start_idx)
+
 # ---------- Dynamics builder ----------
 def build_dyn(cfg: Dict[str, Any]):
     import numpy as np
@@ -734,18 +888,69 @@ def build_dyn(cfg: Dict[str, Any]):
     elif dyn_name in ("elliptic_ltv", "elliptical_ltv", "th", "tschauner_hempel"):
         # Evaluation run manifests can carry older chief-orbit settings from
         # training. Keep the nominal Elliptic LTV comparison tied to the current
-        # main config so reruns use the corrected physical orbit.
+        # main config so reruns use the corrected physical orbit. When orbital
+        # phase randomization is enabled, preserve the trial-level nu0 draw.
+        ell_cfg = cfg.setdefault("elliptic_ltv", _dcopy(COMMON.get("elliptic_ltv", {})))
         orb = _dcopy(COMMON["chief_orbit"])
+        randomize_nu0 = bool(ell_cfg.get("randomize_nu0", False))
+        use_full_orbit_cache = bool(ell_cfg.get("use_full_orbit_cache", True))
+        if bool(ell_cfg.get("randomize_nu0", False)):
+            orb["nu0"] = float((cfg.get("chief_orbit", {}) or {}).get("nu0", orb.get("nu0", 0.0)))
         cfg["chief_orbit"] = orb
-        cache = chief_orbit_cache_rtn(orb, dt=dt, N=N)
-        Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(cache, dt=dt, eps=1e-5)
-        cfg["dyn"]["chief_cache"] = cache
-        cfg["dyn"]["Ad_seq"] = Ad_seq.astype(np.float32)  # (N,6,6)
-        cfg["dyn"]["Bd_seq"] = Bd_seq.astype(np.float32)  # (N,6,3)
-        cfg["dyn"]["Ad"] = cfg["dyn"]["Ad_seq"][0]
-        cfg["dyn"]["Bd"] = cfg["dyn"]["Bd_seq"][0]
-        cfg["dyn"]["type"] = "ltv"
-        cfg["dyn"]["model"] = "two_body_rtn_ltv"
+        if randomize_nu0 and use_full_orbit_cache:
+            mu = float(orb["mu"])
+            a = float(orb["a"])
+            eps = 1e-5
+            period_sec = 2.0 * math.pi * math.sqrt(a**3 / mu)
+            period_steps = int(math.ceil(period_sec / dt))
+            full_steps = int(period_steps + N + 1)
+            cache_data = None
+            cache_path = None
+            if bool(ell_cfg.get("disk_cache_enabled", True)):
+                cache_path = _elliptic_ltv_full_cache_path(
+                    ell_cfg,
+                    orb,
+                    dt=dt,
+                    rollout_steps=N,
+                    full_steps=full_steps,
+                    period_steps=period_steps,
+                    eps=eps,
+                )
+                cache_data = _load_elliptic_ltv_full_cache(cache_path)
+            if cache_data is None:
+                cache_orb = _dcopy(orb)
+                cache_orb["nu0"] = 0.0
+                cache = chief_orbit_cache_rtn(cache_orb, dt=dt, N=full_steps)
+                Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(cache, dt=dt, eps=eps)
+                Ad_seq = Ad_seq.astype(np.float32)
+                Bd_seq = Bd_seq.astype(np.float32)
+                if cache_path is not None:
+                    _save_elliptic_ltv_full_cache(cache_path, cache, Ad_seq, Bd_seq, period_steps, period_sec)
+            else:
+                cache = cache_data["chief_cache"]
+                Ad_seq = cache_data["Ad_seq"]
+                Bd_seq = cache_data["Bd_seq"]
+                period_steps = int(cache_data["period_steps"])
+                period_sec = float(cache_data["period_sec"])
+            cfg["dyn"]["full_orbit_chief_cache"] = cache
+            cfg["dyn"]["full_orbit_Ad_seq"] = Ad_seq
+            cfg["dyn"]["full_orbit_Bd_seq"] = Bd_seq
+            cfg["dyn"]["full_orbit_period_steps"] = int(period_steps)
+            cfg["dyn"]["full_orbit_period_sec"] = float(period_sec)
+            if cache_path is not None:
+                cfg["dyn"]["full_orbit_cache_path"] = str(cache_path)
+                cfg["dyn"]["full_orbit_cache_loaded"] = bool(cache_data is not None)
+            set_elliptic_ltv_phase(cfg, float(orb.get("nu0", 0.0)), steps=N)
+        else:
+            cache = chief_orbit_cache_rtn(orb, dt=dt, N=N)
+            Ad_seq, Bd_seq = linearize_two_body_rtn_discrete(cache, dt=dt, eps=1e-5)
+            cfg["dyn"]["chief_cache"] = cache
+            cfg["dyn"]["Ad_seq"] = Ad_seq.astype(np.float32)  # (N,6,6)
+            cfg["dyn"]["Bd_seq"] = Bd_seq.astype(np.float32)  # (N,6,3)
+            cfg["dyn"]["Ad"] = cfg["dyn"]["Ad_seq"][0]
+            cfg["dyn"]["Bd"] = cfg["dyn"]["Bd_seq"][0]
+            cfg["dyn"]["type"] = "ltv"
+            cfg["dyn"]["model"] = "two_body_rtn_ltv"
 
     else:
         raise ValueError(f"Unknown dynamics='{cfg['dynamics']}'")

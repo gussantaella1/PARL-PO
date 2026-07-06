@@ -141,6 +141,8 @@ if [[ -n "${DYNAMICS_OVERRIDE}" ]]; then
   echo "[run_eval_kf_sequence_all] DYNAMICS_OVERRIDE=${DYNAMICS_OVERRIDE} will override any per-policy dynamics specs"
 fi
 
+prewarm_elliptic_ltv_cache_if_needed "run_eval_kf_sequence_all" "${DYNAMICS_OVERRIDE}" "${COMMON_ARGS_DYNAMICS}" "config_rl" "6000" "${RUN_SPECS[@]}"
+
 for run_spec in "${RUN_SPECS[@]}"; do
   # Resolve dynamics once per policy folder, then reuse that value across all
   # distance suites so output names line up cleanly.

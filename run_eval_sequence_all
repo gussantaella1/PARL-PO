@@ -259,6 +259,8 @@ run_suite() {
     echo "[${SCRIPT_NAME}] suite=${suite} DYNAMICS_OVERRIDE=${DYNAMICS_OVERRIDE} will override any per-policy dynamics specs"
   fi
 
+  prewarm_elliptic_ltv_cache_if_needed "${SCRIPT_NAME}" "${DYNAMICS_OVERRIDE}" "${common_args_dynamics}" "config_rl" "6000" "${run_specs[@]}"
+
   for run_spec in "${run_specs[@]}"; do
     local run_dir=""
     local run_dyn=""

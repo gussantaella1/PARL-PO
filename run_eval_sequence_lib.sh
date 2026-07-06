@@ -166,3 +166,67 @@ warn_if_non_hcw_kf_request() {
     echo "[${script_name}] Warning: use_kf=true requested with dynamics=${dyn}, but the current rollout stack disables the estimator for non-HCW dynamics." >&2
   fi
 }
+
+run_specs_include_elliptic_ltv() {
+  local override_dyn common_dyn run_dir run_dyn spec effective_dynamics
+  override_dyn="$(canonicalize_dyn_name "${1:-}")"
+  common_dyn="$(canonicalize_dyn_name "${2:-}")"
+  shift 2 || true
+
+  for spec in "$@"; do
+    parse_run_spec "${spec}" run_dir run_dyn
+    effective_dynamics="$(resolve_effective_dynamics "${run_dyn}" "${override_dyn}" "${common_dyn}")"
+    if [[ "${effective_dynamics}" == "elliptic_ltv" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+prewarm_elliptic_ltv_cache_if_needed() {
+  local script_name="$1"
+  local override_dyn="$2"
+  local common_dyn="$3"
+  local config_module="${4:-config_rl}"
+  local steps="${5:-6000}"
+  shift 5 || true
+
+  if [[ "${PREWARM_ELLIPTIC_LTV_CACHE:-true}" == "false" || "${PREWARM_ELLIPTIC_LTV_CACHE:-1}" == "0" ]]; then
+    return 0
+  fi
+  if ! run_specs_include_elliptic_ltv "${override_dyn}" "${common_dyn}" "$@"; then
+    return 0
+  fi
+
+  echo "[${script_name}] Prewarming Elliptic LTV full-orbit cache..."
+  python prewarm_elliptic_ltv_cache.py --config_module "${config_module}" --steps "${steps}"
+}
+
+prewarm_elliptic_ltv_cache() {
+  local config_module="${1:-config_rl}"
+  local steps="${2:-6000}"
+  local dt="${3:-0.1}"
+  local script_name="${4:-run_eval_sequence}"
+
+  echo "[${script_name}] Prewarming Elliptic LTV full-orbit dynamics cache via ${config_module} (steps=${steps}, dt=${dt})..."
+  CONFIG_MODULE_PREWARM="${config_module}" \
+  STEPS_PREWARM="${steps}" \
+  DT_PREWARM="${dt}" \
+  python -c 'import importlib, os, time
+mod = importlib.import_module(os.environ["CONFIG_MODULE_PREWARM"])
+cfg = mod.config_for_eval()
+cfg["dynamics"] = "elliptic_ltv"
+cfg["T"] = int(os.environ["STEPS_PREWARM"])
+cfg["dt"] = float(os.environ["DT_PREWARM"])
+t0 = time.time()
+mod.build_dyn(cfg)
+dyn = cfg.get("dyn", {}) or {}
+print(
+    "[prewarm] done in {:.3f}s loaded={} path={} period_steps={}".format(
+        time.time() - t0,
+        dyn.get("full_orbit_cache_loaded"),
+        dyn.get("full_orbit_cache_path"),
+        dyn.get("full_orbit_period_steps"),
+    )
+)'
+}

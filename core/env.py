@@ -2198,9 +2198,24 @@ class TorchVecEnv:
         self._dyn_type = str(dyn_cfg.get("type", "lti") or "lti").strip().lower()
         self._Ad_seq_t = None
         self._Bd_seq_t = None
+        self._env_index_t = torch.arange(self.num_envs, dtype=torch.long, device=self.device)
         if self._dyn_type == "ltv":
-            Ad_seq = dyn_cfg.get("Ad_seq", None)
-            Bd_seq = dyn_cfg.get("Bd_seq", None)
+            if cfg_list is not None:
+                Ad_seq_rows = []
+                Bd_seq_rows = []
+                for cfg_i in cfg_list:
+                    dyn_i = cfg_i.get("dyn", {}) or {}
+                    Ad_seq_i = dyn_i.get("Ad_seq", None)
+                    Bd_seq_i = dyn_i.get("Bd_seq", None)
+                    if Ad_seq_i is None or Bd_seq_i is None:
+                        raise ValueError("TorchVecEnv requires cfg['dyn']['Ad_seq'] and ['Bd_seq'] for each LTV config.")
+                    Ad_seq_rows.append(np.asarray(Ad_seq_i, dtype=np.float32))
+                    Bd_seq_rows.append(np.asarray(Bd_seq_i, dtype=np.float32))
+                Ad_seq = np.stack(Ad_seq_rows, axis=0)
+                Bd_seq = np.stack(Bd_seq_rows, axis=0)
+            else:
+                Ad_seq = dyn_cfg.get("Ad_seq", None)
+                Bd_seq = dyn_cfg.get("Bd_seq", None)
             if Ad_seq is None or Bd_seq is None:
                 raise ValueError("TorchVecEnv requires cfg['dyn']['Ad_seq'] and ['Bd_seq'] for LTV dynamics.")
             self._Ad_seq_t = torch.as_tensor(Ad_seq, dtype=self.dtype, device=self.device)
@@ -2809,6 +2824,10 @@ class TorchVecEnv:
         if self._dyn_type == "ltv":
             if self._Ad_seq_t is None or self._Bd_seq_t is None:
                 raise RuntimeError("LTV dynamics selected, but Ad/Bd sequences are unavailable.")
+            if self._Ad_seq_t.ndim == 4:
+                max_idx = int(self._Ad_seq_t.shape[1] - 1)
+                idx = torch.clamp(self._t_steps, min=0, max=max_idx)
+                return self._Ad_seq_t[self._env_index_t, idx], self._Bd_seq_t[self._env_index_t, idx]
             max_idx = int(self._Ad_seq_t.shape[0] - 1)
             idx = torch.clamp(self._t_steps, min=0, max=max_idx)
             return self._Ad_seq_t[idx], self._Bd_seq_t[idx]
