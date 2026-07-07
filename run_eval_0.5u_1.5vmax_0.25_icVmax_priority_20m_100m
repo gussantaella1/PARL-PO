@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+#
+# Rerun the thesis-priority Monte Carlo suites for the existing
+# 0.5u / 1.5vmax / 0.25_icVmax policies.
+#
+# This covers:
+#   - KF off: HCW and Elliptic LTV, 20 m and 100 m
+#   - KF on:  HCW and Elliptic LTV, 20 m and 100 m
+#
+# By default this overwrites the standard MC_eval_20m/100m folders for these
+# 0.25_icVmax runs only. It does not touch the 1.0_icVmax thesis folders.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+FORCE_RERUN="${FORCE_RERUN:-true}"
+OUT_DIR_TAG="${OUT_DIR_TAG-}"
+DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions}"
+CONFIG_MODULE="${CONFIG_MODULE:-config_rl}"
+
+BASE_RUN="Training_Policy_0.5u_1.5vmax_0.25_icVmax"
+KF_RUN="${BASE_RUN}_KF_ON"
+
+run_step() {
+  local name="$1"
+  shift
+
+  echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] Starting ${name}"
+  "$@"
+  echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] Completed ${name}"
+}
+
+echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] FORCE_RERUN=${FORCE_RERUN}"
+echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] OUT_DIR_TAG=${OUT_DIR_TAG:-<standard folders>}"
+echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] DISPERSIONS_MODULE=${DISPERSIONS_MODULE}"
+echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] CONFIG_MODULE=${CONFIG_MODULE}"
+
+run_step "KF off 20m" \
+  env FORCE_RERUN="${FORCE_RERUN}" CONFIG_MODULE="${CONFIG_MODULE}" ./run_eval_sequence_all \
+    20m \
+    "${BASE_RUN}:hcw" \
+    "${BASE_RUN}:elliptic_ltv"
+
+run_step "KF off 100m" \
+  env FORCE_RERUN="${FORCE_RERUN}" CONFIG_MODULE="${CONFIG_MODULE}" ./run_eval_sequence_all \
+    100m \
+    "${BASE_RUN}:hcw" \
+    "${BASE_RUN}:elliptic_ltv"
+
+run_step "KF on 20m/100m" \
+  env FORCE_RERUN="${FORCE_RERUN}" OUT_DIR_TAG="${OUT_DIR_TAG}" DISPERSIONS_MODULE="${DISPERSIONS_MODULE}" CONFIG_MODULE="${CONFIG_MODULE}" ./run_eval_kf_priority_20m_100m \
+    "${KF_RUN}:hcw" \
+    "${KF_RUN}:elliptic_ltv"
+
+echo "[run_eval_0.5u_1.5vmax_0.25_icVmax_priority_20m_100m] Done"
