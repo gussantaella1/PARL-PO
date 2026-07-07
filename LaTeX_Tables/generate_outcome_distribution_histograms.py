@@ -39,10 +39,10 @@ POLICIES = (
 )
 
 TEST_CASES = (
-    ("HCW 20 m", "MC_eval_20m"),
-    ("HCW 100 m", "MC_eval_100m"),
-    ("Elliptic LTV 20 m", "MC_eval_20m_elliptic_ltv"),
-    ("Elliptic LTV 100 m", "MC_eval_100m_elliptic_ltv"),
+    ("HCW - 20 m radius", "MC_eval_20m"),
+    ("HCW - 100 m radius", "MC_eval_100m"),
+    ("Elliptic LTV - 20 m radius", "MC_eval_20m_elliptic_ltv"),
+    ("Elliptic LTV - 100 m radius", "MC_eval_100m_elliptic_ltv"),
 )
 
 MATCHUPS = (
@@ -249,6 +249,10 @@ def add_step_time_table(ax, stats: MetricStats) -> None:
         cell.set_facecolor("#fbfbfb")
 
 
+def set_case_title(ax, case_label: str) -> None:
+    ax.set_title(case_label, fontsize=11.5, fontweight="bold", y=1.13, pad=0)
+
+
 def add_phase_delta_v_table(ax, stats_by_phase: List[MetricStats]) -> None:
     cells = [[format_phase_delta_v_cell(stats) for stats in stats_by_phase]]
     table = ax.table(
@@ -371,7 +375,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     color="#555555",
                 )
 
-        ax.set_title(case_label, fontsize=12, pad=8)
+        set_case_title(ax, case_label)
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in POLICIES], fontsize=8)
         for tick in ax.get_xticklabels():
@@ -385,12 +389,27 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
     axes[0].set_ylabel("Outcome share (%)")
     axes[2].set_ylabel("Outcome share (%)")
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
+    fig.legend(
+        handles,
+        labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.012),
+        ncol=3,
+        frameon=False,
+    )
     fig.suptitle(
         f"Monte Carlo aggregate outcome distributions across four learning phases ({state_label})",
         fontsize=15,
+        y=0.985,
     )
-    fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.95))
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.99,
+        top=0.86,
+        bottom=0.12,
+        hspace=0.47,
+        wspace=0.08,
+    )
     fig.savefig(output_path, dpi=220)
     plt.close(fig)
     return output_path
@@ -478,7 +497,7 @@ def plot_policy_phase_histogram(
                     rotation=90,
                 )
 
-        ax.set_title(case_label, fontsize=12, pad=8)
+        set_case_title(ax, case_label)
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=8)
         for tick in ax.get_xticklabels():
@@ -504,7 +523,7 @@ def plot_policy_phase_histogram(
         left=0.06,
         right=0.99,
         top=0.84,
-        bottom=0.12,
+        bottom=0.14,
         hspace=0.60,
         wspace=0.08,
     )
