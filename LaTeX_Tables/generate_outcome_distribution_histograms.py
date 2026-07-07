@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import math
 import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 
 POLICIES = (
@@ -84,10 +86,184 @@ class Distribution:
         return 100.0 * (p * (1.0 - p) / float(self.total)) ** 0.5
 
 
+@dataclass(frozen=True)
+class MetricStats:
+    def_dv: Tuple[float, float, float]
+    att_dv: Tuple[float, float, float]
+    step_ms: Tuple[float, float, float]
+    n: int
+
+    @property
+    def present(self) -> bool:
+        return self.n > 0
+
+
 def load_counts(path: Path) -> Dict[str, int]:
     data = json.loads(path.read_text(encoding="utf-8"))
     raw = ((data.get("outcome_breakdown") or {}).get("counts") or {})
     return {str(k): int(v) for k, v in raw.items()}
+
+
+def _finite_float(value: object) -> Optional[float]:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _quartiles(values: List[float]) -> Tuple[float, float, float]:
+    import numpy as np
+
+    if not values:
+        return (float("nan"), float("nan"), float("nan"))
+    arr = np.asarray(values, dtype=float)
+    q25, q50, q75 = np.nanpercentile(arr, [25.0, 50.0, 75.0])
+    return float(q50), float(q25), float(q75)
+
+
+def load_metric_samples(path: Path) -> Tuple[List[float], List[float], List[float]]:
+    def_dv: List[float] = []
+    att_dv: List[float] = []
+    step_ms: List[float] = []
+    trials_path = path.parent / "trials.csv"
+    if not trials_path.is_file():
+        return def_dv, att_dv, step_ms
+
+    with trials_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            val = _finite_float(row.get("trial_delta_v_def_total"))
+            if val is not None:
+                def_dv.append(val)
+            val = _finite_float(row.get("trial_delta_v_att_total"))
+            if val is not None:
+                att_dv.append(val)
+            val = _finite_float(row.get("trial_rollout_total_sec_per_step"))
+            if val is not None:
+                step_ms.append(1000.0 * val)
+    return def_dv, att_dv, step_ms
+
+
+def aggregate_metric_stats(run_dir: Path, eval_dir: str, matchups: Iterable[str]) -> MetricStats:
+    def_dv: List[float] = []
+    att_dv: List[float] = []
+    step_ms: List[float] = []
+    for matchup in matchups:
+        path = run_dir / eval_dir / matchup / "results.json"
+        if not path.is_file():
+            continue
+        d_vals, a_vals, s_vals = load_metric_samples(path)
+        def_dv.extend(d_vals)
+        att_dv.extend(a_vals)
+        step_ms.extend(s_vals)
+    return MetricStats(
+        def_dv=_quartiles(def_dv),
+        att_dv=_quartiles(att_dv),
+        step_ms=_quartiles(step_ms),
+        n=min(len(def_dv), len(att_dv), len(step_ms)),
+    )
+
+
+def format_metric_stats(stats: MetricStats) -> str:
+    if not stats.present:
+        return ""
+
+    def _fmt_triplet(vals: Tuple[float, float, float], decimals: int) -> str:
+        med, q1, q3 = vals
+        return f"{med:.{decimals}f} [{q1:.{decimals}f}, {q3:.{decimals}f}]"
+
+    return (
+        r"$\Delta v_D$ "
+        + _fmt_triplet(stats.def_dv, 2)
+        + " m/s\n"
+        + r"$\Delta v_A$ "
+        + _fmt_triplet(stats.att_dv, 2)
+        + " m/s\n"
+        + "Step "
+        + _fmt_triplet(stats.step_ms, 4)
+        + " ms"
+    )
+
+
+def format_step_stats(stats: MetricStats) -> str:
+    if not stats.present:
+        return ""
+    med, q1, q3 = stats.step_ms
+    return rf"$\mathbf{{Step\ time:}}$ {med:.4f} [{q1:.4f}, {q3:.4f}] ms"
+
+
+def format_phase_delta_v_cell(stats: MetricStats) -> str:
+    if not stats.present:
+        return ""
+    d_med, d_q1, d_q3 = stats.def_dv
+    a_med, a_q1, a_q3 = stats.att_dv
+    return (
+        rf"$\mathbf{{Def.\ \Delta v:}}$ {d_med:.2f} [{d_q1:.2f}, {d_q3:.2f}] m/s"
+        "\n"
+        rf"$\mathbf{{Att.\ \Delta v:}}$ {a_med:.2f} [{a_q1:.2f}, {a_q3:.2f}] m/s"
+    )
+
+
+def annotate_metric_stats(ax, stats: MetricStats) -> None:
+    text = format_metric_stats(stats)
+    if not text:
+        return
+    ax.text(
+        0.985,
+        0.965,
+        text,
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=7,
+        linespacing=1.15,
+        bbox={
+            "boxstyle": "round,pad=0.25",
+            "facecolor": "white",
+            "edgecolor": "#b8b8b8",
+            "linewidth": 0.6,
+            "alpha": 0.88,
+        },
+    )
+
+
+def add_step_time_table(ax, stats: MetricStats) -> None:
+    text = format_step_stats(stats)
+    if not text:
+        return
+    table = ax.table(
+        cellText=[[text]],
+        cellLoc="center",
+        loc="bottom",
+        bbox=[0.0, -0.325, 1.0, 0.055],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(6.0)
+    for cell in table.get_celld().values():
+        cell.PAD = 0.01
+        cell.set_edgecolor("#d0d0d0")
+        cell.set_linewidth(0.5)
+        cell.set_facecolor("#fbfbfb")
+
+
+def add_phase_delta_v_table(ax, stats_by_phase: List[MetricStats]) -> None:
+    cells = [[format_phase_delta_v_cell(stats) for stats in stats_by_phase]]
+    table = ax.table(
+        cellText=cells,
+        cellLoc="center",
+        loc="bottom",
+        bbox=[0.0, -0.255, 1.0, 0.135],
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(5.4)
+    for cell in table.get_celld().values():
+        cell.PAD = 0.015
+        cell.set_edgecolor("#d0d0d0")
+        cell.set_linewidth(0.5)
+        cell.set_facecolor("#fbfbfb")
 
 
 def aggregate_distribution(run_dir: Path, eval_dir: str) -> Distribution:
@@ -139,9 +315,8 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
     for ax, (case_label, eval_dir) in zip(axes, TEST_CASES):
         distributions: List[Distribution] = []
         for policy_dir, _ in POLICIES:
-            distributions.append(
-                aggregate_distribution(repo_root / f"{policy_dir}{suffix}", eval_dir)
-            )
+            run_dir = repo_root / f"{policy_dir}{suffix}"
+            distributions.append(aggregate_distribution(run_dir, eval_dir))
 
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
@@ -165,7 +340,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     continue
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
-                    value + error + 1.0,
+                    min(value + error + 1.0, 98.5),
                     f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
@@ -201,7 +376,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
         ax.set_xticklabels([label for _, label in POLICIES], fontsize=8)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylim(0, 108)
+        ax.set_ylim(0, 100)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
@@ -250,6 +425,15 @@ def plot_policy_phase_histogram(
             matchup_distribution(run_dir, eval_dir, matchup)
             for matchup, _ in MATCHUPS
         ]
+        case_stats = aggregate_metric_stats(
+            run_dir,
+            eval_dir,
+            (matchup for matchup, _ in MATCHUPS),
+        )
+        phase_stats = [
+            aggregate_metric_stats(run_dir, eval_dir, (matchup,))
+            for matchup, _ in MATCHUPS
+        ]
 
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
@@ -273,7 +457,7 @@ def plot_policy_phase_histogram(
                     continue
                 ax.text(
                     bar.get_x() + bar.get_width() / 2.0,
-                    value + error + 1.0,
+                    min(value + error + 1.0, 98.5),
                     f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
@@ -299,11 +483,13 @@ def plot_policy_phase_histogram(
         ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=8)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylim(0, 108)
+        ax.set_ylim(0, 100)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
+        add_phase_delta_v_table(ax, phase_stats)
+        add_step_time_table(ax, case_stats)
 
     axes[0].set_ylabel("Outcome share (%)")
     axes[2].set_ylabel("Outcome share (%)")
@@ -312,9 +498,17 @@ def plot_policy_phase_histogram(
     fig.suptitle(
         f"Monte Carlo outcome distributions across each learning phase\n({state_label}) {policy_label}",
         fontsize=14,
+        y=0.98,
     )
-    fig.tight_layout(rect=(0.0, 0.07, 1.0, 0.92))
-    fig.savefig(output_path, dpi=220)
+    fig.subplots_adjust(
+        left=0.06,
+        right=0.99,
+        top=0.84,
+        bottom=0.12,
+        hspace=0.60,
+        wspace=0.08,
+    )
+    fig.savefig(output_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
     return output_path
 
