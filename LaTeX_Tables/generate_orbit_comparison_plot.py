@@ -18,6 +18,7 @@ from config_rl import COMMON
 
 
 EARTH_RADIUS_M = 6_371_000.0
+EARTH_IMAGE_PATH = REPO_ROOT / "LaTeX_Tables" / "assets" / "artemis_ii_hello_world_earth.jpg"
 
 
 def main() -> None:
@@ -58,52 +59,85 @@ def main() -> None:
     t_ell = 2.0 * math.pi * math.sqrt(a**3 / mu)
 
     km = 1.0 / 1000.0
-    fig, ax = plt.subplots(figsize=(8.2, 7.2))
+    fig, ax = plt.subplots(figsize=(10.2, 7.2))
+
+    earth_radius_km = EARTH_RADIUS_M * km
+    if EARTH_IMAGE_PATH.exists():
+        earth_img = plt.imread(EARTH_IMAGE_PATH)
+        # Centered crop around the visible Earth disk. The crop is intentionally
+        # a bit smaller than the photographic limb diameter so the image
+        # overfills the plotted Earth circle and the clip path removes the edge.
+        earth_center_x = 1800
+        earth_center_y = 1110
+        earth_crop_half_width = 940
+        earth_img = earth_img[
+            earth_center_y - earth_crop_half_width : earth_center_y + earth_crop_half_width,
+            earth_center_x - earth_crop_half_width : earth_center_x + earth_crop_half_width,
+        ]
+        earth_artist = ax.imshow(
+            earth_img,
+            extent=(-earth_radius_km, earth_radius_km, -earth_radius_km, earth_radius_km),
+            zorder=1,
+        )
+        earth_clip = plt.Circle((0.0, 0.0), earth_radius_km, transform=ax.transData)
+        earth_artist.set_clip_path(earth_clip)
 
     earth = plt.Circle(
         (0.0, 0.0),
-        EARTH_RADIUS_M * km,
-        facecolor="#d9eef8",
-        edgecolor="#4f7f98",
+        earth_radius_km,
+        facecolor="none" if EARTH_IMAGE_PATH.exists() else "#78b7d8",
+        edgecolor="#386f8c",
         linewidth=1.1,
-        zorder=1,
+        zorder=3,
     )
     ax.add_patch(earth)
 
-    ax.plot(x_hcw * km, y_hcw * km, color="#2f6fbb", linewidth=2.0, label="HCW circular chief orbit")
-    ax.plot(x_ell * km, y_ell * km, color="#b8463a", linewidth=2.0, label="Elliptic LTV chief orbit")
+    ax.plot(
+        x_hcw * km,
+        y_hcw * km,
+        color="#2f6fbb",
+        linewidth=2.0,
+        label="HCW circular chief orbit (training and evaluation)",
+    )
+    ax.plot(
+        x_ell * km,
+        y_ell * km,
+        color="#b8463a",
+        linewidth=2.0,
+        label="Elliptic LTV chief orbit (evaluation only)",
+    )
 
     ax.scatter([rp * km], [0.0], color="#b8463a", s=36, zorder=4)
     ax.scatter([-ra * km], [0.0], color="#b8463a", s=36, zorder=4)
     ax.scatter([r_hcw * km], [0.0], color="#2f6fbb", s=36, zorder=4)
 
     ax.annotate(
-        f"Elliptic perigee\n{h_perigee * km:.1f} km alt.",
+        f"Elliptic perigee:\n{h_perigee * km:.1f} km alt.",
         xy=(rp * km, 0.0),
-        xytext=(rp * km + 330.0, 550.0),
+        xytext=(rp * km + 850.0, 1050.0),
         arrowprops={"arrowstyle": "->", "linewidth": 0.9, "color": "#555555"},
         fontsize=9,
         ha="left",
     )
     ax.annotate(
-        f"Elliptic apogee\n{h_apogee * km:.1f} km alt.",
+        f"Elliptic\napogee:\n{h_apogee * km:.1f} km\nalt.",
         xy=(-ra * km, 0.0),
-        xytext=(-ra * km - 1750.0, -720.0),
+        xytext=(-ra * km - 1350.0, -950.0),
         arrowprops={"arrowstyle": "->", "linewidth": 0.9, "color": "#555555"},
         fontsize=9,
-        ha="left",
+        ha="center",
     )
     ax.annotate(
-        f"HCW circular\n{h_hcw * km:.1f} km alt.",
+        f"HCW circular:\n{h_hcw * km:.1f} km alt.",
         xy=(r_hcw * km, 0.0),
-        xytext=(r_hcw * km + 290.0, -720.0),
+        xytext=(r_hcw * km + 1100.0, -980.0),
         arrowprops={"arrowstyle": "->", "linewidth": 0.9, "color": "#555555"},
         fontsize=9,
         ha="left",
     )
 
     info = (
-        "Parameters used in config_rl.py\n"
+        "Parameters used:\n"
         f"HCW: r0 = {r_hcw * km:.0f} km, T = {t_hcw / 60.0:.2f} min\n"
         f"Elliptic LTV: a = {a * km:.0f} km, e = {e:.4f}, T = {t_ell / 60.0:.2f} min"
     )
@@ -119,12 +153,12 @@ def main() -> None:
     )
 
     lim = max(ra, r_hcw) * km * 1.17
-    ax.set_xlim(-lim, lim)
+    ax.set_xlim(-lim * 1.12, lim * 1.35)
     ax.set_ylim(-lim, lim)
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Inertial x (km)")
     ax.set_ylabel("Inertial y (km)")
-    ax.set_title("Chief Orbit Geometry Used for HCW and Elliptic LTV Evaluations", pad=12)
+    ax.set_title("Chief Orbit Geometry Used for HCW and Elliptic LTV Dynamics", pad=12)
     ax.grid(True, color="#dddddd", linewidth=0.8)
     ax.legend(loc="upper right", frameon=False)
     ax.set_axisbelow(True)
