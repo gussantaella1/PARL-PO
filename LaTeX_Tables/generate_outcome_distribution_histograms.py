@@ -201,9 +201,9 @@ def format_phase_delta_v_cell(stats: MetricStats) -> str:
     d_med, d_q1, d_q3 = stats.def_dv
     a_med, a_q1, a_q3 = stats.att_dv
     return (
-        rf"$\mathbf{{Def.\ \Delta v:}}$ {d_med:.2f} [{d_q1:.2f}, {d_q3:.2f}] m/s"
+        rf"$\mathbf{{D\ \Delta v:}}$ {d_med:.2f} [{d_q1:.2f}, {d_q3:.2f}] m/s"
         "\n"
-        rf"$\mathbf{{Att.\ \Delta v:}}$ {a_med:.2f} [{a_q1:.2f}, {a_q3:.2f}] m/s"
+        rf"$\mathbf{{A\ \Delta v:}}$ {a_med:.2f} [{a_q1:.2f}, {a_q3:.2f}] m/s"
     )
 
 
@@ -218,7 +218,7 @@ def annotate_metric_stats(ax, stats: MetricStats) -> None:
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=7,
+        fontsize=9,
         linespacing=1.15,
         bbox={
             "boxstyle": "round,pad=0.25",
@@ -238,10 +238,10 @@ def add_step_time_table(ax, stats: MetricStats) -> None:
         cellText=[[text]],
         cellLoc="center",
         loc="bottom",
-        bbox=[0.0, -0.325, 1.0, 0.055],
+        bbox=[0.0, -0.365, 1.0, 0.075],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(6.0)
+    table.set_fontsize(8.2)
     for cell in table.get_celld().values():
         cell.PAD = 0.01
         cell.set_edgecolor("#d0d0d0")
@@ -250,7 +250,19 @@ def add_step_time_table(ax, stats: MetricStats) -> None:
 
 
 def set_case_title(ax, case_label: str) -> None:
-    ax.set_title(case_label, fontsize=11.5, fontweight="bold", y=1.13, pad=0)
+    ax.set_title(case_label, fontsize=13.2, fontweight="bold", y=1.13, pad=0)
+
+
+def add_group_separators(ax, x_positions: Iterable[float]) -> None:
+    x_vals = list(x_positions)
+    for left, right in zip(x_vals, x_vals[1:]):
+        ax.axvline(
+            0.5 * (left + right),
+            color="#404040",
+            linewidth=0.8,
+            linestyle="--",
+            zorder=0,
+        )
 
 
 def add_phase_delta_v_table(ax, stats_by_phase: List[MetricStats]) -> None:
@@ -259,10 +271,10 @@ def add_phase_delta_v_table(ax, stats_by_phase: List[MetricStats]) -> None:
         cellText=cells,
         cellLoc="center",
         loc="bottom",
-        bbox=[0.0, -0.255, 1.0, 0.135],
+        bbox=[0.0, -0.285, 1.0, 0.170],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(5.4)
+    table.set_fontsize(7.3)
     for cell in table.get_celld().values():
         cell.PAD = 0.015
         cell.set_edgecolor("#d0d0d0")
@@ -310,17 +322,19 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
     state_label = "KF on" if use_kf else "KF off"
     output_path = out_dir / f"outcome_distribution_{'kf_on' if use_kf else 'kf_off'}.png"
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.0, 7.8), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13.0, 8.4), sharey=True)
     axes = axes.ravel()
-    bar_width = 0.22
+    bar_width = 0.475
     offsets = np.array([-bar_width, 0.0, bar_width])
-    x = np.arange(len(POLICIES))
+    x = np.arange(len(POLICIES)) * 2.15
 
     for ax, (case_label, eval_dir) in zip(axes, TEST_CASES):
         distributions: List[Distribution] = []
         for policy_dir, _ in POLICIES:
             run_dir = repo_root / f"{policy_dir}{suffix}"
             distributions.append(aggregate_distribution(run_dir, eval_dir))
+
+        add_group_separators(ax, x)
 
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
@@ -332,6 +346,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                 width=bar_width,
                 color=COLORS[group_label],
                 label=group_label,
+                zorder=2,
                 error_kw={
                     "ecolor": "#252525",
                     "elinewidth": 0.8,
@@ -348,7 +363,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
-                    fontsize=7,
+                    fontsize=9.4,
                     rotation=0,
                 )
 
@@ -360,7 +375,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     "missing",
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=10,
                     color="#555555",
                     rotation=90,
                 )
@@ -371,23 +386,24 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     f"{dist.present_matchups}/{len(MATCHUPS)}",
                     ha="center",
                     va="bottom",
-                    fontsize=8,
+                    fontsize=9.5,
                     color="#555555",
                 )
 
         set_case_title(ax, case_label)
         ax.set_xticks(x)
-        ax.set_xticklabels([label for _, label in POLICIES], fontsize=8)
+        ax.set_xticklabels([label for _, label in POLICIES], fontsize=9.3)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
         ax.set_ylim(0, 100)
+        ax.tick_params(axis="y", labelleft=True)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
-    axes[0].set_ylabel("Outcome share (%)")
-    axes[2].set_ylabel("Outcome share (%)")
+    axes[0].set_ylabel("Outcome share (%)", fontsize=11)
+    axes[2].set_ylabel("Outcome share (%)", fontsize=11)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(
         handles,
@@ -399,7 +415,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
     )
     fig.suptitle(
         f"Monte Carlo aggregate outcome distributions across four learning phases ({state_label})",
-        fontsize=15,
+        fontsize=16.2,
         y=0.985,
     )
     fig.subplots_adjust(
@@ -433,11 +449,11 @@ def plot_policy_phase_histogram(
     output_path = policy_out_dir / f"outcome_distribution_by_phase_{state_slug}.png"
     run_dir = repo_root / f"{policy_dir}{suffix}"
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.0, 7.8), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13.6, 7.8), sharey=True)
     axes = axes.ravel()
-    bar_width = 0.22
+    bar_width = 0.82
     offsets = np.array([-bar_width, 0.0, bar_width])
-    x = np.arange(len(MATCHUPS))
+    x = np.arange(len(MATCHUPS)) * 2.75
 
     for ax, (case_label, eval_dir) in zip(axes, TEST_CASES):
         distributions = [
@@ -454,6 +470,8 @@ def plot_policy_phase_histogram(
             for matchup, _ in MATCHUPS
         ]
 
+        add_group_separators(ax, x)
+
         for idx, (group_label, _) in enumerate(GROUPS):
             values = [dist.percent(group_label) for dist in distributions]
             errors = [dist.percent_se(group_label) for dist in distributions]
@@ -464,6 +482,7 @@ def plot_policy_phase_histogram(
                 width=bar_width,
                 color=COLORS[group_label],
                 label=group_label,
+                zorder=2,
                 error_kw={
                     "ecolor": "#252525",
                     "elinewidth": 0.8,
@@ -480,7 +499,7 @@ def plot_policy_phase_histogram(
                     f"{value:.1f}%\n±{error:.1f}%",
                     ha="center",
                     va="bottom",
-                    fontsize=7,
+                    fontsize=9.4,
                     rotation=0,
                 )
 
@@ -492,17 +511,18 @@ def plot_policy_phase_histogram(
                     "missing",
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=10,
                     color="#555555",
                     rotation=90,
                 )
 
         set_case_title(ax, case_label)
         ax.set_xticks(x)
-        ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=8)
+        ax.set_xticklabels([label for _, label in MATCHUPS], fontsize=9.3)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
         ax.set_ylim(0, 100)
+        ax.tick_params(axis="y", labelleft=True)
         ax.grid(axis="y", color="#d9d9d9", linewidth=0.8, alpha=0.8)
         ax.set_axisbelow(True)
         ax.spines["top"].set_visible(False)
@@ -510,21 +530,21 @@ def plot_policy_phase_histogram(
         add_phase_delta_v_table(ax, phase_stats)
         add_step_time_table(ax, case_stats)
 
-    axes[0].set_ylabel("Outcome share (%)")
-    axes[2].set_ylabel("Outcome share (%)")
+    axes[0].set_ylabel("Outcome share (%)", fontsize=11)
+    axes[2].set_ylabel("Outcome share (%)", fontsize=11)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=3, frameon=False)
     fig.suptitle(
         f"Monte Carlo outcome distributions across each learning phase\n({state_label}) {policy_label}",
-        fontsize=14,
+        fontsize=15.4,
         y=0.98,
     )
     fig.subplots_adjust(
-        left=0.06,
-        right=0.99,
+        left=0.045,
+        right=0.995,
         top=0.84,
-        bottom=0.14,
-        hspace=0.60,
+        bottom=0.16,
+        hspace=0.68,
         wspace=0.08,
     )
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
