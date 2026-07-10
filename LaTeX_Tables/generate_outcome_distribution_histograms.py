@@ -19,21 +19,24 @@ POLICIES = (
         "Training_Policy_0.1u_1vmax_0.05_icVmax",
         r"$\mathbf{u}_{max}=\mathbf{0.1}\ \mathbf{m/s^2}$"
         "\n"
-        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$, "
+        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$"
+        "\n"
         r"$\mathbf{v}_{IC}=\mathbf{0.05}\ \mathbf{m/s}$",
     ),
     (
-        "Training_Policy_0.5u_1.5vmax_1.0_icVmax",
+        "Training_Policy_0.5u_1.5vmax_0.25_icVmax",
         r"$\mathbf{u}_{max}=\mathbf{0.5}\ \mathbf{m/s^2}$"
         "\n"
-        r"$\mathbf{v}_{max}=\mathbf{1.5}\ \mathbf{m/s}$, "
-        r"$\mathbf{v}_{IC}=\mathbf{1.0}\ \mathbf{m/s}$",
+        r"$\mathbf{v}_{max}=\mathbf{1.5}\ \mathbf{m/s}$"
+        "\n"
+        r"$\mathbf{v}_{IC}=\mathbf{0.25}\ \mathbf{m/s}$",
     ),
     (
         "Training_Policy_2.0u_1vmax_1.0_icVmax",
         r"$\mathbf{u}_{max}=\mathbf{2.0}\ \mathbf{m/s^2}$"
         "\n"
-        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$, "
+        r"$\mathbf{v}_{max}=\mathbf{1}\ \mathbf{m/s}$"
+        "\n"
         r"$\mathbf{v}_{IC}=\mathbf{1.0}\ \mathbf{m/s}$",
     ),
 )
@@ -192,7 +195,14 @@ def format_step_stats(stats: MetricStats) -> str:
     if not stats.present:
         return ""
     med, q1, q3 = stats.step_ms
-    return rf"$\mathbf{{Step\ time:}}$ {med:.4f} [{q1:.4f}, {q3:.4f}] ms"
+    return rf"$\mathbf{{Step\ time\!:}}$ {med:.4f} [{q1:.4f}, {q3:.4f}] ms"
+
+
+def format_total_n(stats: MetricStats) -> str:
+    if not stats.present:
+        return ""
+    per_matchup_n = stats.n // len(MATCHUPS) if len(MATCHUPS) > 0 else stats.n
+    return rf"$\mathbf{{Total\ n\ (per\ matchup)\!:}}$ {per_matchup_n}"
 
 
 def format_phase_delta_v_cell(stats: MetricStats) -> str:
@@ -205,6 +215,14 @@ def format_phase_delta_v_cell(stats: MetricStats) -> str:
         "\n"
         rf"$\mathbf{{A\ \Delta v:}}$ {a_med:.2f} [{a_q1:.2f}, {a_q3:.2f}] m/s"
     )
+
+
+def format_phase_delta_v_values(stats: MetricStats, agent: str) -> str:
+    if not stats.present:
+        return ""
+    values = stats.def_dv if agent == "def" else stats.att_dv
+    med, q1, q3 = values
+    return f"{med:.2f} [{q1:.2f}, {q3:.2f}] m/s"
 
 
 def annotate_metric_stats(ax, stats: MetricStats) -> None:
@@ -231,17 +249,19 @@ def annotate_metric_stats(ax, stats: MetricStats) -> None:
 
 
 def add_step_time_table(ax, stats: MetricStats) -> None:
-    text = format_step_stats(stats)
-    if not text:
+    step_text = format_step_stats(stats)
+    total_text = format_total_n(stats)
+    if not step_text:
         return
     table = ax.table(
-        cellText=[[text]],
+        cellText=[[step_text, total_text]],
         cellLoc="center",
         loc="bottom",
-        bbox=[0.0, -0.365, 1.0, 0.075],
+        bbox=[0.0, -0.465, 1.0, 0.095],
+        colWidths=[0.5, 0.5],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8.2)
+    table.set_fontsize(8.8)
     for cell in table.get_celld().values():
         cell.PAD = 0.01
         cell.set_edgecolor("#d0d0d0")
@@ -250,7 +270,7 @@ def add_step_time_table(ax, stats: MetricStats) -> None:
 
 
 def set_case_title(ax, case_label: str) -> None:
-    ax.set_title(case_label, fontsize=13.2, fontweight="bold", y=1.13, pad=0)
+    ax.set_title(case_label, fontsize=13.2, fontweight="bold", y=1.18, pad=0)
 
 
 def add_group_separators(ax, x_positions: Iterable[float]) -> None:
@@ -266,15 +286,21 @@ def add_group_separators(ax, x_positions: Iterable[float]) -> None:
 
 
 def add_phase_delta_v_table(ax, stats_by_phase: List[MetricStats]) -> None:
-    cells = [[format_phase_delta_v_cell(stats) for stats in stats_by_phase]]
+    cells = [
+        [r"$\mathbf{D\ \Delta v\!:}$"]
+        + [format_phase_delta_v_values(stats, "def") for stats in stats_by_phase],
+        [r"$\mathbf{A\ \Delta v\!:}$"]
+        + [format_phase_delta_v_values(stats, "att") for stats in stats_by_phase],
+    ]
     table = ax.table(
         cellText=cells,
         cellLoc="center",
         loc="bottom",
-        bbox=[0.0, -0.285, 1.0, 0.170],
+        bbox=[-0.065, -0.365, 1.065, 0.205],
+        colWidths=[0.065, 0.25, 0.25, 0.25, 0.25],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(7.3)
+    table.set_fontsize(8.8)
     for cell in table.get_celld().values():
         cell.PAD = 0.015
         cell.set_edgecolor("#d0d0d0")
@@ -449,7 +475,7 @@ def plot_policy_phase_histogram(
     output_path = policy_out_dir / f"outcome_distribution_by_phase_{state_slug}.png"
     run_dir = repo_root / f"{policy_dir}{suffix}"
 
-    fig, axes = plt.subplots(2, 2, figsize=(13.6, 7.8), sharey=True)
+    fig, axes = plt.subplots(2, 2, figsize=(13.6, 9.2), sharey=True)
     axes = axes.ravel()
     bar_width = 0.82
     offsets = np.array([-bar_width, 0.0, bar_width])
@@ -542,9 +568,9 @@ def plot_policy_phase_histogram(
     fig.subplots_adjust(
         left=0.045,
         right=0.995,
-        top=0.84,
-        bottom=0.16,
-        hspace=0.68,
+        top=0.82,
+        bottom=0.19,
+        hspace=0.90,
         wspace=0.08,
     )
     fig.savefig(output_path, dpi=220, bbox_inches="tight")
