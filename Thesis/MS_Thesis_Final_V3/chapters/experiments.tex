@@ -1,0 +1,97 @@
+\chapter{Training Experiments}
+
+
+We trained the policies on NVIDIA GeForce GPUs available in our lab while randomizing the agents' starting states in position and velocity. The initial policies were trained with a relatively myopic discount factor ($\gamma = 0.991$) and a capture radius of $0.75~\mathrm{m}$. The hyperparameters used throughout these experiments are listed in Appendix~\ref{appendix:hyperparameters}. We tested a number of different hyperparameter settings before converging on these values, so the final choices used in this work are empirical.
+
+
+We chose to focus on three test cases for this thesis. Across them, we varied only the actuation limit $u_{\max}$, the maximum velocity $v_{\max}$, and the maximum initial velocity in each episode $v_{\max}^{\mathrm{IC}}$, while keeping the remaining training hyperparameters the same across the three runs. We evaluated each case with the Kalman filter disabled for the fully observable setting and with the Kalman filter enabled for the partially observable setting via behavior cloning. In the KF-on runs, the prior adversary action was modeled with a measured-control noise standard deviation of $0.025~\mathrm{m/s^2}$.
+
+The three test cases that we'll focus on in the remainder of this work are:
+
+
+\begin{itemize}
+    \item Training case 1: $u_{\max} = 0.1~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.05~\mathrm{m/s}$
+    \item Training case 2: $u_{\max} = 0.5~\mathrm{m/s^2}$, $v_{\max} = 1.5~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.25~\mathrm{m/s}$
+    \item Training case 3: $u_{\max} = 2.0~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 1.0~\mathrm{m/s}$
+\end{itemize}
+
+These values are meant to test the PARL+BC-produced policies and their corresponding Monte Carlo evaluations at different actuation limits and max velocity saturation limits.
+
+
+\section{Training Curves}
+\label{sec:Net_Training_Curves}
+\label{sec:training-curves}
+
+\section{Training case 1: $u_{\max} = 0.1~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.05~\mathrm{m/s}$}
+\label{sec:training-case-1}
+
+\Needspace{0.45\textheight}
+\begin{figure}[H]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF off}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_0.1u_1vmax_0.05_icVmax/combined_training_curve_kf_off.png}}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF on}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_0.1u_1vmax_0.05_icVmax/combined_training_curve_kf_on.png}}
+\end{minipage}
+\caption{Combined training return curves for $u_{\max} = 0.1~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.05~\mathrm{m/s}$, across 5 interchanging training phases.}
+\label{fig:mc-training-policy-0-1u-1vmax-0-05-icvmax-training-curves-kf}
+\end{figure}
+
+
+\section{Training case 2: $u_{\max} = 0.5~\mathrm{m/s^2}$, $v_{\max} = 1.5~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.25~\mathrm{m/s}$}
+\label{sec:training-case-2}
+
+\Needspace{0.45\textheight}
+\begin{figure}[H]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF off}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_0.5u_1.5vmax_0.25_icVmax/combined_training_curve_kf_off.png}}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF on}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_0.5u_1.5vmax_0.25_icVmax/combined_training_curve_kf_on.png}}
+\end{minipage}
+\caption{Combined training return curves for $u_{\max} = 0.5~\mathrm{m/s^2}$, $v_{\max} = 1.5~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.25~\mathrm{m/s}$, across 5 interchanging training phases.}
+\label{fig:mc-training-policy-0-5u-1-5vmax-1-0-icvmax-training-curves-kf}
+\end{figure}
+
+
+\section{Training Case 3: $u_{\max} = 2.0~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 1.0~\mathrm{m/s}$}
+\label{sec:training-case-3}
+
+\Needspace{0.45\textheight}
+\begin{figure}[H]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF off}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_2.0u_1vmax_1.0_icVmax/combined_training_curve_kf_off.png}}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\textbf{KF on}\\[0.25em]
+\includegraphics[width=\linewidth]{\detokenize{Figures/Merged_Thesis/Training_Policy_2.0u_1vmax_1.0_icVmax/combined_training_curve_kf_on.png}}
+\end{minipage}
+\caption{Combined training return curves for $u_{\max} = 2.0~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 1.0~\mathrm{m/s}$, across 5 interchanging training phases.}
+\label{fig:mc-training-policy-2-0u-1vmax-1-0-icvmax-training-curves-kf}
+\end{figure}
+
+\subsection{Training Analysis}
+\label{subsec:training-analysis}
+
+By analyzing the curves in Figures~\ref{fig:mc-training-policy-0-1u-1vmax-0-05-icvmax-training-curves-kf}, \ref{fig:mc-training-policy-0-5u-1-5vmax-1-0-icvmax-training-curves-kf}, and \ref{fig:mc-training-policy-2-0u-1vmax-1-0-icvmax-training-curves-kf}, we see that the PARL+BC framework produces stable, convergent policies across multiple phases of training. The partially observable results also broadly follow the same qualitative pattern as the fully observable ones.
+
+By studying the mean reward levels at convergence, we see that the defender tends to obtain slightly stronger policies as the phases progress, while the attacker policies become somewhat weaker in response. This is consistent with the intended effect of the opponent-randomization strategy described earlier, namely to make the defender progressively stronger and more resilient across the course of training.
+
+ 
