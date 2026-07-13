@@ -1,0 +1,31 @@
+===== PAGE 75 =====
+
+observations outside of that volume. We believe that this is in big part thanks to the
+symmetry of the research problem proposed in this paper.
+Instead of overfitting to the smaller arena’s training data used during training,
+the trained policies interpolate agentic behavior learned in the smaller arena into the
+larger space, even though it’s never seen the observations corresponding to the larger
+space during training.
+By training in the smaller arena volume we manage to concentrate and condense
+all the agent’s learning transitions into a relatively cheaper training that can then
+work in those larger arenas provided the symmetry.
+This is not perfect of course, as we did clearly see performance degrade between
+the 20m and the 100m arena. Regardless, it’s an exciting result nonetheless.
+The velocity saturation controller properly bounds the agent’s behavior
+within a "safe" threshold without preventing learning
+The CFB-QP velocity saturation controller properly safeguards and bounds
+the agents’ actions to a defined limit. In fact, the learned policy clearly learns how to
+work within the bounds of the controller and somewhat coexist with it.
+The development of this finding came from initial testing of learned policies
+without the controller on larger arenas. We’d notice that agent policies would act
+greedily pick up a lot of speed, and lose control. This meant that the defender
+would end up letting the attacker through a lot. After doing a lot of analysis on this
+phenomenon, we concluded that the reward function, as presented in section??, does
+not really provide an incentive for the agent to safeguard its own actuation for the
+sake of keeping controllability within a certain threshold.
+Alternatively, one could have put in these incentives into the reward functions,
+but we thought that it would have made for a more difficult learning objective as it
+would convolute with the terms currently present the reward function. This, in turn,
+would have made us lose interpretability of the reward function, meaning the ability
+75
+

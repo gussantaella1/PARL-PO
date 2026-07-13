@@ -1,0 +1,29 @@
+===== PAGE 61 =====
+
+If any given simulation rollout. If the maximum time horizon is reached during a
+simulation, it is counted as a timeout and a de-facto tie between both agents. For
+the aggregate number of rollouts within a Monte Carlo set of runs, we report the
+number of times in which each outcome ocurred, their corresponidng percetnage, and
+the standard error.
+Control-effort:
+Each simulation also reports the total∆v budget used by each agent over any
+given simulation rollout. This is gives a measure of the control effort used by each
+policy during the simulation. The aggregated∆v values are then reported summarized
+using the median and inrerquartile range[Q1, Q3]across all trials within a given Monte
+Carlo set.
+Runtime metrics:
+We report the time it took for the policies compute the rollout per each time
+step in the simulation in milliseconds. The objective of this is to keep track of the real-
+time computational cost of running the policies in our hardware. The aggregated values
+within a given Monte Carlo set are summarized using the median and interquartile
+range[Q 1, Q3].
+Comparison axes.
+All of the metrics above are taken for each matchup of
+(πdef,0 vsπ att,1,π def,1 vsπ att,1,π def,1 vsπ att,2, andπ def,2 vsπ att,2)
+for each of the test cases in subsection 5.1. All of these metrics for each
+matchup are then run across (i) HCW versus elliptic LTV rollouts, (ii) full-state versus
+EKF-based observations via the behavior cloning framework, and (iii) different arena
+sizes (20m and 100m). These comparisons allow us to asses the policies’ performance
+across different dynamics models, robustness to partial observability and sensor noise,
+61
+

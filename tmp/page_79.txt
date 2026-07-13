@@ -1,0 +1,30 @@
+===== PAGE 79 =====
+
+Chapter 7: Conclusion
+Throughout this thesis we showed that the proposed PARL+BC method for
+RL-based adversarial planning can work within the constrains of a navigation and
+control architecture. With the appropriate hyperparameters, the method delivered
+convergent policies throughout via phased learning with opponent randomization
+across a number of testing scenarios.
+Our Monte Carlo evaluations of the resulting policies indicate that, in a Target-
+Attacker-Defender constrained zero sum game with 1 defender vs 1 attacker, we
+achieved highly performing defender policies that succeed in up to 79.9% in the fully
+observable policies and up to 74.7% in the partially observable policies (a 6.51% relative
+drop in performance relative to the fully observable policies) against a competitive RL
+attacker, the latter which the agents are forced to take bearings-only measurements
+to obtain their their opponents’ states. This was done across 4800-9600 Monte Carlo
+runs per arena.
+The compute time for these pre-trained policies during inference and rollout was
+were 0.145 ms median for full state policies and 3.91 ms per timestep on the EKF-based
+policies across all documented runs, providing fast compute speeds that showcase the
+potential computational advantages of such a method not only in adversarial space
+scenario but in other space autonomy regimes where fast compute times are required.
+These results helped us confirm our initial hypothesis to conclude that RL
+architectures can used in zero-sum adversarial scenarios, can learn coherent policies
+while subject to the constrains of classical navigation filtering and control int the
+loop, can remain robust under full and partial observability, interpolate outside of
+the training dataset given a symmetric problem, and provide convergent and highly
+performing behavior despite the stochasticity.
+Overall, this project showcases that, as long as they’re applied within contexts
+79
+

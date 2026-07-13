@@ -1,0 +1,27 @@
+===== PAGE 73 =====
+
+per timestep in the full state inference case and 3.91 ms per timestep on the EKF
+inference case.
+6.4 Analysis of results and anecdotes of development
+The results in section ?? show that the proposed PARL+BC method for
+adversarial reinforcement learning-based GNC is not only feasible but successful in
+constrained zero-sum strategy games with continuous control. We attribute this
+finding due to the following reasons:
+The well-defined, zero-sum objective definition via the reward function and
+the episodic termination conditions properly guide agents towards learning
+coherent policies
+The objectives that both spacecraft have to fulfill are well defined, if not over-
+defined, by the reward function plus the episodic terminal conditions. The zero-sum
+framing of this problem helps the agents have these defined objectives.
+In fact, early on in this research we focused on stand-off games instead of
+zero-sum games, where the defending agent would have to defend the asset from the
+attacker without docking onto the attacker, and both agents would be penalized if
+they docked/crashed into each other. This is inherently a non-zero sum game with
+shared equality constrains and an open loop, standoff objective.
+The result was fairly underwhelming after months of research, where we
+couldn’t develop successful defender policies. Our conclusion was that you should
+try to solve not solve open-loop and undefined learning objectives with reinforcement
+learning. Instead, open-loop Nash equilibrium solvers and other classical optimal
+control frameworks might best suit these sorts of research tasks.
+73
+

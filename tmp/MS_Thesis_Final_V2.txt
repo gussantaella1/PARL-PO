@@ -1,0 +1,3103 @@
+
+
+===== PAGE 1 =====
+
+Copyright
+by
+Gus Santaella
+2026
+1
+
+===== PAGE 2 =====
+
+The Thesis Committee for Gus Santaella
+certifies that this is the approved version of the following thesis:
+Learning Robust Strategies for an Orbital Target Defense
+Game: Phased Adversarial Reinforcement Learning under
+Estimation Uncertainty and Control Constraints
+SUPERVISING COMMITTEE:
+Maruthi Akella, Supervisor
+David Fridovich-Keil, Reader
+2
+
+===== PAGE 3 =====
+
+Learning Robust Strategies for an Orbital Target Defense
+Game: Phased Adversarial Reinforcement Learning under
+Estimation Uncertainty and Control Constraints
+by
+Gus Santaella
+Thesis
+Presented to the Faculty of the Graduate School of
+The University of Texas at Austin
+in Partial Fulfillment
+of the Requirements
+for the Degree of
+Master of Science in Engineering
+The University of Texas at Austin
+August 2026
+3
+
+===== PAGE 4 =====
+
+Dedication
+To all future Longhorn graduate students.
+4
+
+===== PAGE 5 =====
+
+Epigraph
+Merece lo que sueñas.
+—Octavio Paz
+5
+
+===== PAGE 6 =====
+
+Acknowledgments
+Thanks to the previous authors of this template, and to the Graduate School
+for providing it.
+6
+
+===== PAGE 7 =====
+
+Preface
+Readers, this document represents a great deal of time and effort. Enjoy.
+Cheers, Gus Santaella.
+7
+
+===== PAGE 8 =====
+
+Abstract
+Learning Robust Strategies for an Orbital Target Defense
+Game: Phased Adversarial Reinforcement Learning under
+Estimation Uncertainty and Control Constraints
+Gus Santaella, MSE
+The University of Texas at Austin, 2026
+SUPERVISOR: Maruthi Akella
+This thesis focuses on the use of reinforcement learning for adversarial planning
+within the framework of realistic guidance, navigation, and controls for orbital space-
+craft. Traditional approaches based on classical optimization methods can become
+brittle when faced against, intelligent and non-cooperative opponents which can have
+shifting strategies. Reinforcement learning algorithms can be useful tools to fill in this
+gap, so long as they’re used within the right use case and context that mitigates these
+algorithms’ lack of convergence guarantees, proneness to instability, non-stationarity,
+and limited utilization outside the training dataset.
+With this in mind, this thesis proposes the Phased Adversarial Reinforcement
+Learning plus Behavior Cloning (PARL+BC, for short) framework to train robust
+policies in a two-player, zero-sum Target-Attacker-Defender (TAD) orbital defense
+scenario. This framework is built based on the well-known Proximal Policy Optimiza-
+tion (PPO) online reinforcement learning algorithm. We train attackers by freezing
+existing opponent policies and using randomized mixtures of these, with the intent
+of mitigating non-stationarity during learning and avoiding the instabilities that are
+often seen on simultaneous play methods.
+8
+
+===== PAGE 9 =====
+
+These learned policies train within a closed loop aerospace guidance, navigation,
+and control architecture in the loop. The control piece comes in the form of a Control
+Barrier Function-Quadratic Program (CBF-QP) for velocity saturation within a pre-
+defined safety boundary. Moreover, the navigation piece, which is meant to showcase
+the feasibility of the framework under partial observability simulating real-life sensor
+limitations, is addressed by doing behavior cloning from observations obtained from
+an Extended Kalman Filter in-the-loop.
+We trained three different test cases that resulted in multiple attacker and
+defender policies across consecutive matchups, which showed stability during learning
+and convergent behavior.
+Furthermore, the policies are evaluated via Monte Carlo rollouts across full
+and partial observability, varying arena sizes, and the proper dispersions to randomize
+the starting states of each agent as well as their EKF parameters. While policies are
+trained under Hill-Clohessy-Wiltshire (HCW) linear time invariant relative orbital
+dynamics, we evaluated the policies in both HCW and elliptical Linear-Time-Varying
+(LTV) dynamics to see if the learned policies can transfer to time-varying dynamics
+that were not seen during training.
+The Monte Carlo results show that our proposed framework produces coherent
+and competitive defender and attacker policies for the proposed zero-sum game. Within
+a small, 20 m training arena, full-state policies reached up to a 79.9% defender win
+rate against a competitive, RL attacker with full state access to the opponent’s state
+and a 74.7% defender in the EKF-based policies with bearings-only measurements
+of the opponent’s state, a 6.51% relative drop in performance relative to the fully
+observable policies.
+When evaluating in a larger 100m radius arena, not used or seen by the policies
+during training, full-state results achieved up to a 66.2% defender win rate, a 16.5%
+relative drop in performance from the 20m training arena, whereas EKF-based policies
+struggled more with a 47.4% defender win rate, a 28.4% relative drop from the full
+9
+
+===== PAGE 10 =====
+
+state case.
+Evaluating all of the above across both HCW and elliptic LTV dynamics, even
+if the policies were never exposed to the latter during training, resulted in at most a
+1.07% relative change between results. Therefore, the policies that were trained under
+linear time-invariant dynamics effectively transferred to the linear-time-dynamics used
+during evaluation.
+Throughout the Monte Carlo runs, median policy inference time reached up to
+a 0.145 ms median per timestep on the full state policies and 3.91 ms per timestep on
+the EKF-based policies, the latter which includes the EKF compute time in the loop.
+All in all, the results obtained via our proposed PARL+BC method and
+its evaluation show that reinforcement learning can be integrated with classical
+navigation and control architectures in the loop in constrained adversarial orbital
+scenarios, resulting in robust and computationally efficient policies that work under
+partial observability and can extrapolate beyond the observations obtained through
+the training dataset.
+10
+
+===== PAGE 11 =====
+
+Table of Contents
+List of Tables . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 13
+List of Figures . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 15
+Chapter 1: Introduction . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 17
+Chapter 2: Literature review . . . . . . . . . . . . . . . . . . . . . . . . . . . 20
+Chapter 3: Environment and Spacecraft Dynamics . . . . . . . . . . . . . . . 25
+3.1 Dynamics models . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 27
+3.1.1 HCW (Hill–Clohessy–Wiltshire) orbital relative dynamics - Clo-
+hessy and Wiltshire (1960) and Hill (1878) . . . . . . . . . . . 27
+3.1.2 Elliptical LTV orbital relative dynamics - Tschauner and Hempel
+(1965) . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 28
+3.1.3 Orbits used in this work . . . . . . . . . . . . . . . . . . . . . . 31
+3.2 Estimation model - Bearing-Only Extended Kalman Filter (EKF) . . 33
+3.3 Controller model - CBF-QP velocity saturation controller . . . . . . . 35
+3.4 State, action, and observation. . . . . . . . . . . . . . . . . . . . . . . 38
+3.5 Reward shaping and termination conditions . . . . . . . . . . . . . . . 40
+3.5.1 Partial observability via behavior cloning . . . . . . . . . . . . 42
+Chapter 4: Learning Methods . . . . . . . . . . . . . . . . . . . . . . . . . . 43
+4.1 Single Phase PPO Algorithm . . . . . . . . . . . . . . . . . . . . . . . 43
+4.1.1 Policy development . . . . . . . . . . . . . . . . . . . . . . . . 46
+4.1.2 Advantage Estimation and PPO Objective . . . . . . . . . . . . 47
+4.2 Phased Stationary Training Schedule . . . . . . . . . . . . . . . . . . 47
+4.2.1 Rule-Based Attacker for phase 0 defender warm start . . . . . . 49
+4.3 Inference. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 50
+Chapter 5: Training Experiments . . . . . . . . . . . . . . . . . . . . . . . . 53
+5.1 Trainings Curves . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 54
+5.2 Training case 1:u max = 0.1 m/s2,v max = 1.0 m/s,v IC
+max = 0.05 m/s. . 54
+5.3 Training case 2:u max = 0.5 m/s2,v max = 1.5 m/s,v IC
+max = 0.25 m/s. . 54
+5.4 Training Case 3:u max = 2.0 m/s2,v max = 1.0 m/s,v IC
+max = 1.0 m/s. . 55
+5.4.1 Training Analysis . . . . . . . . . . . . . . . . . . . . . . . . . 55
+11
+
+===== PAGE 12 =====
+
+Chapter 6: Policy Monte Carlo Testing . . . . . . . . . . . . . . . . . . . . . 57
+6.1 Sample Rollout Explained in Images . . . . . . . . . . . . . . . . . . . 58
+6.1.1 Defender win . . . . . . . . . . . . . . . . . . . . . . . . . . . . 58
+6.1.2 Attacker win . . . . . . . . . . . . . . . . . . . . . . . . . . . . 59
+6.2 Metrics and Evaluation . . . . . . . . . . . . . . . . . . . . . . . . . . 60
+6.3 Monte Carlo Outcome Distribution Histograms . . . . . . . . . . . . . 63
+6.3.1 Training case:u max = 0.1 m/s2,v max = 1 m/s,v IC
+max = 0.05 m/s63
+6.3.2 Training case:u max = 0.5 m/s2,v max = 1.5 m/s,v IC
+max = 0.25 m/s65
+6.3.3 Training case:u max = 2.0 m/s2,v max = 1 m/s,v IC
+max = 1.0 m/s. 67
+6.3.4 Aggregate Outcome Distributions . . . . . . . . . . . . . . . . . 69
+6.4 Analysis of results and anecdotes of development . . . . . . . . . . . . 73
+6.5 Ideas for future development . . . . . . . . . . . . . . . . . . . . . . . 77
+Chapter 7: Conclusion . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 79
+Appendix A: Methodology Glossary . . . . . . . . . . . . . . . . . . . . . . . 81
+A.1 Methodology . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 81
+A.1.1 Symbols and Notation . . . . . . . . . . . . . . . . . . . . . . . 81
+A.1.2 Conventions . . . . . . . . . . . . . . . . . . . . . . . . . . . . 82
+A.1.3 Implementation terminology . . . . . . . . . . . . . . . . . . . 83
+Appendix B: Training Hyperparameters . . . . . . . . . . . . . . . . . . . . . 84
+Appendix C: Monte Carlo Dispersions . . . . . . . . . . . . . . . . . . . . . 86
+Appendix D: Monte Carlo Results in Tables . . . . . . . . . . . . . . . . . . 88
+D.1 Training case:u max = 0.1,v max = 1,v IC
+max = 0.05. . . . . . . . . . . . 89
+D.1.1 HCW . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 89
+D.1.2 Elliptic LTV . . . . . . . . . . . . . . . . . . . . . . . . . . . . 91
+D.2 Training case:u max = 0.5,v max = 1.5,v IC
+max = 0.25. . . . . . . . . . . 93
+D.2.1 HCW . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 93
+D.2.2 Elliptic LTV . . . . . . . . . . . . . . . . . . . . . . . . . . . . 95
+D.3 Training case:u max = 2.0,v max = 1,v IC
+max = 1.0. . . . . . . . . . . . . 97
+D.3.1 HCW . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 97
+D.3.2 Elliptic LTV . . . . . . . . . . . . . . . . . . . . . . . . . . . . 99
+D.4 Appendix section . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 101
+D.4.1 Appendix section . . . . . . . . . . . . . . . . . . . . . . . . . . 101
+Appendix E: Another Appendix . . . . . . . . . . . . . . . . . . . . . . . . . 102
+Glossary . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 103
+Works Cited . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 104
+Vita . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 107
+12
+
+===== PAGE 13 =====
+
+List of Tables
+3.1 Chief orbit parameters used for the HCW and elliptic LTV dynamics. 32
+B.1 Shared training hyperparameters used for the for all training policy
+cases. This table purposefully omits the training case-specific values
+umax,v max, andv IC
+max. . . . . . . . . . . . . . . . . . . . . . . . . . . . 84
+B.2 Training hyperparameters that changed between the three policy cases,
+excluding umax, vmax, and vIC
+max. These are appropriately adjusted
+actuation scale from each training case so that the rollout length and
+reward shaping stayed reasonable throughout. . . . . . . . . . . . . . 85
+C.1 Monte Carlo dispersion summary used for the presented evaluation
+results. The starting positions came from a shell-grid test, ensuring
+feasiblestartingpositionswithinthearenaboundariesgivenaseparation
+condition, while the starting velocities were randomly drawn from the
+training initial-velocity range on each case. . . . . . . . . . . . . . . . 86
+C.2 Case-specific values for the velocity dispersion and the KF measured
+noise on adversary’s control action. The measured-control noise changes
+with umax so that the relative control uncertainty stays comparable
+across test cases. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 86
+C.3 KF-on estimator settings used in the Monte Carlo rollouts. The angular
+bearing noise and initial covariance settings were kept fixed across all
+three training cases. . . . . . . . . . . . . . . . . . . . . . . . . . . . . 87
+D.1 Monte Carlo outcomes: HCW, 20 meter radius arena, umax = 0 .1,
+vmax = 1, vIC
+max = 0.05. Cells: count; % ± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 89
+D.2 Monte Carlo outcomes: HCW, 100 meter radius arena,umax = 0 .1,
+vmax = 1, vIC
+max = 0.05. Cells: count; % ± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 90
+D.3 Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 0.1,
+vmax = 1, vIC
+max = 0.05. Cells: count; % ± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 91
+D.4 Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax =
+0.1, vmax = 1, vIC
+max = 0.05. Cells: count; %± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 92
+D.5 Monte Carlo outcomes: HCW, 20 meter radius arena, umax = 0 .5,
+vmax = 1.5, vIC
+max = 0.25. Cells: count; %± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 93
+13
+
+===== PAGE 14 =====
+
+D.6 Monte Carlo outcomes: HCW, 100 meter radius arena,umax = 0 .5,
+vmax = 1.5, vIC
+max = 0.25. Cells: count; %± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 94
+D.7 Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 0.5,
+vmax = 1.5, vIC
+max = 0.25. Cells: count; %± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 95
+D.8 Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax =
+0.5, vmax = 1 .5, vIC
+max = 0 .25. Cells: count; % ± SE.∆ v and time:
+median [Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 96
+D.9 Monte Carlo outcomes: HCW, 20 meter radius arena, umax = 2 .0,
+vmax = 1, vIC
+max = 1.0. Cells: count; %± SE.∆ v and time: median [Q1,
+Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 97
+D.10 Monte Carlo outcomes: HCW, 100 meter radius arena,umax = 2 .0,
+vmax = 1, vIC
+max = 1.0. Cells: count; %± SE.∆ v and time: median [Q1,
+Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 98
+D.11 Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 2.0,
+vmax = 1, vIC
+max = 1.0. Cells: count; %± SE.∆ v and time: median [Q1,
+Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 99
+D.12 Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax =
+2.0, vmax = 1, vIC
+max = 1.0. Cells: count; %± SE.∆ v and time: median
+[Q1, Q3]. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 100
+14
+
+===== PAGE 15 =====
+
+List of Figures
+3.1 Sample of a policy rollout showing the agents carrying the proposed
+zero-sum game setup (left), as well as a simple graphic describing
+training scenarios for the defender (right). . . . . . . . . . . . . . . . 26
+3.2 Chief orbit geometry used for the HCW and elliptic LTV dynamics,
+showing the circular training/evaluation orbit and the elliptic evaluation-
+only orbit. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 32
+4.1 Diagram showing the PARL + BC algorithm’s learning loop within the
+GNC architecture constrained by the Extended Kalman Filter and the
+Classical CBF-QP controller . . . . . . . . . . . . . . . . . . . . . . . 43
+4.2 Diagram showing the inference desribed in algorithm 6 . . . . . . . . 52
+5.1 Combined training return curves forumax = 0.1 m/s2, vmax = 1.0 m/s,
+vIC
+max = 0.05 m/s, across 5 interchanging training phases. . . . . . . . . 54
+5.2 Combined training return curves forumax = 0.5 m/s2, vmax = 1.5 m/s,
+vIC
+max = 0.25 m/s, across 5 interchanging training phases. . . . . . . . . 55
+5.3 Combined training return curves forumax = 2.0 m/s2, vmax = 1.0 m/s,
+vIC
+max = 1.0 m/s, across 5 interchanging training phases. . . . . . . . . 55
+6.1 Sample starting positions used for a Monte Carlo evaluation in a 20m
+radius arena. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 57
+6.2 Representative rollout snapshots forπdef,1 vs πatt,1, resulting in a win
+for the defender. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 58
+6.3 Rollout diagnostics for the same engagement shown in Fig. 6.4. The
+subfigures in the panel report distance-to-center, relative separation,
+commanded thrust history, velocity history, and cumulative delta-V
+usage. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 59
+6.4 Representative rollout snapshots forπdef,0 vs πatt,1, resulting in a win
+for the defender. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 59
+6.5 Rollout diagnostics for the same engagement shown in Fig. 6.4. The
+panels report distance-to-center, relative separation, commanded thrust
+histories, velocity histories, and cumulative delta-V usage. . . . . . . 60
+6.6 Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.1, D.2, D.3, and D.4). . 63
+6.7 Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.1, D.2, D.3, and D.4). 64
+6.8 Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.5, D.6, D.7, and D.8). . 65
+15
+
+===== PAGE 16 =====
+
+6.9 Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.5, D.6, D.7, and D.8). 66
+6.10 Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.9, D.10, D.11, and D.12). 67
+6.11 Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.9, D.10, D.11, and
+D.12). . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . 68
+6.12 Monte Carlo aggregate outcome distributions across four learning phases
+for the full-state policies. . . . . . . . . . . . . . . . . . . . . . . . . . 69
+6.13 Monte Carlo aggregate outcome distributions across four learning phases
+for the EKF-enabled policies. . . . . . . . . . . . . . . . . . . . . . . 70
+16
+
+===== PAGE 17 =====
+
+Chapter 1: Introduction
+Adversarial planning against non-cooperative agents has become a relevant
+area of research in real-world autonomous systems and robotics problems. Traditional
+optimal control frameworks to solve these kinds of problems tend to assume certain
+information strategies which can become jeopardized against an agent that’s following
+a shifting, actively adversarial strategy coming from a versatile, intelligent opponent.
+In these cases, classical control architectures may prove to be brittle against
+these highly dynamic strategies. Inspired by this dilemma, we chose to develop
+a reinforcement-learning (RL) based approach for planning against these sorts of
+adversarial opponents. The benefit behind these RL-based architectures is that, when
+properly trained, these can produce a single, deterministic policy that can actively
+react and adapt to a wide arrange of scenarios it’s been trained against.
+One of the arguments behind why research and industry have not widely
+adopted RL algorithms within their autonomy/GNC work comes down to their lack
+of formal guarantees for stability and convergence. This lack of guarantees can be
+attributed to the fact that these RL-based algorithms try to optimize against highly
+non-convex objectives while using gradients from noisy trajectories, approximate their
+value functions learned during trainings, are prone to overfit to the data distribution
+that they’re trained on, and struggle to interpolate to data outside this distribution.
+In other words, these factors can lead to a noisy stochastic gradient ascent/descent
+process that finds locally optimal solutions instead of the globally optimal solution
+that may not be guaranteed to work in regimes outside the training dataset. In fact,
+the development of better RL algorithms that can account for these mishaps present
+in the current state-of-the-art RL is perhaps some of the most interesting research
+going on in the world of theoretical deep RL in this day and age.
+Regardless, algorithms such as Proximal Policy Optimization (PPO, Schulman
+17
+
+===== PAGE 18 =====
+
+et al. (2017)), an on-policy algorithm created by OpenAI, remains one of the most
+widely popular algorithm in RL research for engineering applications (François-Lavet
+et al. (2018)). In simple terms, PPO is based on the principles of stochastic gradient
+ascent on a clipped surrogate objective function to be optimized. The benefits of these
+PPO-based architectures are that they’re relatively simple to set up, they reuse each
+rollout batch on multiple gradient steps, are easy to parallelize, and, most importantly,
+provide much more stability than vanilla policy gradient methods. For controls based
+engineering applications, which is what we’ll be studying in this work in this work,
+perhaps the biggest benefit of PPO is that it can be used for control continuous and
+discrete action spaces.
+With all of the above in mind, we set off to study reinforcement learning (RL)
+framework to train, model, and rollout robust adversarial policies for orbital zero
+sum games in Low Earth Orbit (LEO). In order to better understand how these
+architectures could interact with classical autonomy methods, we were most interested
+in studying how this framework could learn while subject to a closed-loop aerospace
+guidance, navigation, and control architecture. For our own applications, we wanted
+to solve a few questions in this research:
+• Can an RL architecture use the PPO algorithm learn coherent policies for
+continuous control of orbital spacecraft in LEO in zero-sum adversarial scenarios?
+• Can an RL architecture learn coherent policies under while interacting subject
+to the constrains of a classical controller in the loop?
+• Can an RL architecture learn coherent policies if, instead of having access
+of the opponent’s full state, it had partial observability and had to rely on
+measurements in-the-loop?
+• Can an RL architecture interpolate outside of the training dataset even if it was
+never trained against some of that data?
+18
+
+===== PAGE 19 =====
+
+• Can an RL architecture do all the above at once, provide convergent and
+high-performing policies despite the stochasticity?
+With this in mind, we propose the Phased Adversarial Reinforcement Learning
+and Behavior Cloning (PARL+BC) method for training and rollout of RL-enabled
+Guidance Navigation and Control (GNC) aerospace applications. The method uses
+dense step per geometry-based rewards and phased opponent freezing to mitigate
+non-stationarity encountered in multi-agent training and aid towards learning stability.
+PARL+BC learns while subject to the constrains of a classical velocity-saturating
+CBF-QP controller and, optionally, partial observability of the opponent’s state via a
+bearings-only Extended Kalman Filter, which is achieved by using behavior cloning.
+Our Monte Carlo evaluation results using the resulting policies show that
+PARL+BC produces highly performing policies in a constrained, zero-sum orbital
+asset defense game with equal spacecraft characteristics. The defender policies manage
+an aggregate success rate of up to 79.9% across four learning phases in across different
+training scenarios of varying max actuation when having access to its opponents full
+state, where the opponent is also guided by an RL-trained policy. For the Ektended
+Kalman Filter-based policies, where neither agent has access to their opponents state
+and instead have to measure it via a bearings only EKF, the defender policies succeded
+in up to 74.7% of the cases, a 6.51% relative drop in performance relative to the fully
+observable policies. Furthermore, this was achieved while providing fast-rollout and
+compute inference times of 0.145 ms median per timestep on the full state policies
+and 3.91 ms per timestep on the EKF-based policies.
+Our findings open the way for the development of highly compute efficient
+RL-based method for autonomous systems research and application, and a discussion
+of potential directions for future work is provided.
+For guidance on the terminology used throughout this writing, please refer to
+appendix A which serves as a glossary of some of the key terms used throughout this
+research.
+19
+
+===== PAGE 20 =====
+
+Chapter 2: Literature review
+It is no question that these sorts of orbital games have become an ever more
+prevalent area of research in aerospace autonomy academia, with plenty of examples
+of related works in recent years mostly on the optimal control-based methods.
+In“Pursuit–Evasion Game for Satellites Based on Continuous Thrust Reachable
+Domain”, Gong et al. (2020), the authors developed a classical differential game of
+satellite pursuit-evasion under continuous thrust using a Clohessy–Wiltshire (CW)
+model. Moreover,“A Pursuit-Evasion Game in the Orbital Plane”, Selvakumar and
+Bakolas (2017), they develop a two player zero-sum differential game with input
+constraints, providing a semi-analytical capture-time solution to their problem using
+closed-form optimal controls. Then in“Multiple-to-One Orbital Pursuit: A Com-
+putational Game Strategy”, Liu et al. (2025), they propose a one-step look-ahead
+Nash equilibrium method for cooperative pursuit-evasion in cooperative spacecraft.
+And lastly, in"Low-Thrust Orbital Differential Games with Speed Constraint Enforce-
+ment Using Cost Weighting", Drucker and Shaferman (2026), they frame a low-thrust
+spacecraft pursuit-evasion problem as a linear-quadratic zero-sum game with terminal
+speed constraints, from which they obtain guidance laws via cost-weight selection
+demonstrating improved performance against actively evading targets.
+In addition to more classical approaches to these rigorous space-bound problems,
+there’s been a rise of journal published research trying to solve variations of these games
+but opting for online reinforcement learning (RL) approaches in recent years. Despite
+the long standing criticism for core reinforcement learning algorithms to not be able to
+provide theoretical convergence guarantees to learned policies, researchers have found
+problems in which they’ve come in useful and provided empirically convergent policies,
+strong performance relative to their assigned tasks, and excellent computational
+efficiency.
+20
+
+===== PAGE 21 =====
+
+In"Online Solution for Orbital Pursuit-Evasion Game via Heterogeneous
+Proximal Policy Optimization", Li and Wang (2025), they successfully developed
+a PPO framework for multi-agent orbital pursuit-evasion, outperforming shooting
+methods in their optimality index metrics in computational efficiency while providing
+robustness to suboptimal opponent strategies. Next, inA Non-Fixed-Duration Turn-
+Based Orbital Game Algorithm Based on History-Aware and Predictive Result Reward
+Proximal Policy Optimization, Cao et al. (2026), they proposed HPRR-PPO algorithm
+to do alternating learning for non-fixed-duration turn-based orbital game problems,
+showing effective interception against evaders with compute speed suitable for real time
+deployment claiming a compute runtime of 1 ms per made decision. Then in"Near-
+Optimal Interception Strategy for Orbital Pursuit-Evasion using Deep Reinforcement
+Learning", Zhang et al. (2022), they use deep reinforcement learning to achieve
+near-optimal guidance laws in one to one orbital pursuit-evasion games. Finally, in
+"PRD-MADDPG: An Efficient Learning-Based Algorithm for Orbital Pursuit-Evasion
+Game with Impulsive Maneuvers", Zhao et al. (2023) propose a MADDPG based
+method for impulsive orbital pursuit-evasion.
+The fact that all these papers above have been published in the past few years
+makes it clear that there is growing interest in developing reinforcement learning-based
+methods for planning in adversarial orbital dynamics. This is especially relevant
+given the generalized growing interest within the autonomy community to implement
+machine learning-based frameworks to complement or even replace classical control
+architectures.
+Furthermore, additionalworkhasbeenmadeintheareasofdeliveringestimation-
+aware RL frameworks. While physical AI is something roboticists and industry alike
+are pushing towards, one must remember that real-life robots won’t have full-state
+measurements of their environment as we can achieve in a simulation. Instead, they
+need to use sensors to characterize their surroundings and plan accordingly. Generally
+speaking, this is problematic on the decision-making side, as it can turn a clean Markov
+Decision Process (MDP) that you’d see in a full-state environment into a Partially
+21
+
+===== PAGE 22 =====
+
+Observable Markov Decision Process (POMDP), which is harder to characterize (Kael-
+bling et al. (1998)). In “DESPOT: Online POMDP Planning with Regularization”,
+Ye et al. (2017), the authors show that modern decision-making under partial observ-
+ability can be carried out by planning over an approximated belief tree, showing that
+near-optimal policies can be obtained in partial observability without solving for the
+full POMDP. In "Deep Variational Reinforcement Learning for POMDPs", Igl et al.
+(2018), the authors show that reinforcement learning under partial observability using
+latent-state inference to estimate, meaning that a belief representation is learned from
+incomplete observations, showing that this method outperforms baselines in partially
+observable tasks. In "Learning Deep Neural Network Policies with Continuous Memory
+States", Zhang et al. (2015), they do partially observable learning with continuous
+control, where they handle the problem by augmenting the policies with continuous
+memory states, where they end up finding that learned policies can memorize relevant
+information needed to act with incomplete observations.
+Moreover, some works have tried to fill in the gaps between learning frameworks
+and classical control frameworks by combining the most desirable parts of each into a
+single integrated architecture.
+In "Safe Model-based Reinforcement Learning with Stability Guarantees",
+Berkenkamp et al. (2017) , they show that learning can be constrained via classi-
+cal stability/safety filtering, using Lyapunov safety certificates instead of leaving
+the learning unconstrained. In "Learning-based Model Predictive Control for Safe
+Exploration and Reinforcement Learning", Koller et al. (2019) they bridge safe explo-
+rations and reinforcement learning through model predictive control, showing that
+uncertainty-aware trajectories and terminal safety constraints can be made safely
+while improving learning performance And most importantly for the sake of this work,
+in “Safe Reinforcement Learning Using Robust Control Barrier Functions” ,Emam
+et al. (2021), they show how a Control-Barrier-Function (CBF) safety layer can be
+used to modify the learned policy’s behavior by projecting the policy actions in a
+22
+
+===== PAGE 23 =====
+
+way that induces a safe learning transitions map, preserving the safety of the learned
+model while allowing a reward-based policy to be learned on the side.
+We notice a few gaps in the existing literature. Namely, we see that most
+current orbital RL work, including those works cited in this literature review, assume
+privileged, full-state information within their frameworks, and practically none of the
+presented works study learned policies with online estimation in the loop. Almost
+none of these papers study the interaction of RL policies when intertwined with safety
+filters and classical control in the loop.
+All the above justify the novelty of this work. Here, we are not inventing any
+novel fundamental RL algorithm or the sort, but rather the novelty we present in this
+work is the integration of these pieces into a coherent and stable PARL+BC framework.
+Here we’re using a combination of different reinforcement learning techniques that
+can lead to coherent, robust learning strategies in zero-sum orbital defense game
+settings: using PPO to find learned policies per the given set of hyperparameters
+complex reward shaping, doing so without help of an equilibrium/Nash prior solution,
+and testing how to implement this method under a partial observability setting via
+bearings-only Kalman Filter measurements. In this work, we contribute to the present
+literature the following ways:
+• Using a staged PPO training pipeline instead of residual networks to train the
+agents’ policies in a zero-sum, two player orbital game. Namely, the defender
+and attacker policies are trained using in alternating phases against frozen and
+randomized mixtures of opponent mixtures. The goal of this is to produce
+policies that become more specialized, yet more generalizable, to complete their
+given task within the game framework instead of overfitting to any one rival.
+• Extending upon the PPO defense framework from the previous bullet to partially
+observable measurements via behavior cloning. In other words, this work evalu-
+ates policies where an agent doesn’t have access to the states of their adversaries.
+23
+
+===== PAGE 24 =====
+
+Instead, these have to be measured via bearings-only Kalman-filter estimates,
+based on the work by Aidala (1979). This provides a controlled test on how
+learned orbital defense policies degrade under sensor and partial observability
+limitations that would be present in a real world implementation.
+• Studying the interaction between learned policies in full and partial observability
+within the context of a classical CBF-QP safety filter. This shows how a model-
+based classical controller modifies or constrains learning behavior during training
+and rollouts.
+So in summary, existing literature shows that orbital pursuit evasion remains a
+relevant GNC problem to research and that reinforcement learning is increasingly being
+used by various works to obtain guidance policies. Nevertheless, most of the existing
+learning-based work cited above assumes access to privileged state information and
+separates the learned guidance problem from a spacecraft’s estimation and safety-based
+controls architecture.
+The contributions made by this work are therefore not the invention of any
+fundamental RL, guidance, estimation, or control algorithms (e.g: PPO, Kalman
+filtering, or CBF-QP control, to give a few examples), but rather the integration of all
+these algorithms into a phased learning framework.
+Specifically, by developing the PARL+BC framework, we research how alternat-
+ing, PPO-trained attacker and defender policies perform given opponent randomization,
+bearings-only estimator measurements, and CBF-QP safety control filtering. This
+positions the work done on PARL+BC as an effective architecture and case study for
+work on learning-based orbital defense subject to realistic constraints one would see
+in a real world autonomous vehicle, spacecraft or otherwise.
+24
+
+===== PAGE 25 =====
+
+Chapter 3: Environment and Spacecraft Dynamics
+To test our hypothesis for the PARL+BC framework, we propose a constrained
+zero-sum game, initially based on linear-time-invariant 2nd-order HCW dynamics to
+model it like an interaction of two agents relative to a chief circular orbit in the Local-
+Vertical Local-Horizontal (LVLH) frame. We bound these agents into the boundary of
+an imaginary spherical in space arena centered at the chief of the orbit. In our initial
+setup, we have two agents and a static element in the environment:
+1. Asset/Object of Interest (OI):A static object in the LVLH frame that is
+the "chief" of the orbit.
+2. Player 1 (defender):Defends an asset of interest by preventing player 2 from
+intercepting the asset of interest by capturing. If it intercepting player 2 or
+forces it out of the arena, it wins.
+3. Player 2 (attacker):Attacks the central chief asset of interest by preventing
+player 1’s defense strategy. If it intercepts the asset of interest, forces the
+defender to crash into it, or forces the defender out of the arena, it wins.
+The result is an interesting variation of pursuit evasion scenario where the
+conditions above make it a zero sum, spatially constrained game that simplifies the
+learning for an online RL algorithm as is PPO. Figure 3.1 offers a visual depiction of
+the proposed game.
+The states are the positions and velocities of each agent and the actions are
+continuous control inputs in 3D space, where we assume both spacecraft to be fully
+actuated in three translational degrees of freedom. For the sake of simplicity, we
+ignore the attitude evolution in this work, and we assume that the Player 1 and Player
+2 are simply looking at each other at all times.
+25
+
+===== PAGE 26 =====
+
+The entire simulation environment was developed by the author of this thesis
+in Python, using full advantage of the PyTorch library to assist with the RL training.
+Figure 3.1: Sample of a policy rollout showing the agents carrying the proposed
+zero-sum game setup (left), as well as a simple graphic describing training scenarios
+for the defender (right).
+26
+
+===== PAGE 27 =====
+
+3.1 Dynamics models
+3.1.1 HCW (Hill–Clohessy–Wiltshire) orbital relative dynamics - Clohessy
+and Wiltshire (1960) and Hill (1878)
+We model the follower in the chief agent’s Local Vertical, Local Horizontal
+(LVLH) frame assuming a circular reference orbit of radiusr0 around a body with
+parameterµ. The mean motion is defined as:
+n=
+q
+µ/r3
+0
+Let( x, y, z)be defined as the relative positions of the agents and let the control
+thrust acceleration of the agents be defined as:⃗a = [ax, ay, az]⊤. For small separations
+between agents and assuming the chief follows a circular orbit, the linearized HCW
+equations are
+¨x= 2n˙y+ 3n2x+a x,
+¨y=−2n˙x+a y,
+¨z=−n2z+a z
+Stacking the position and velocity elements into a single vector as⃗s := [x y z˙x˙y˙z]⊤
+gives the linear time invariant (LTI) form:
+˙⃗s=F ⃗s+G ⃗a,
+F=
+
+
+03×3 I3
+3n2 0 0
+0 0 0
+0 0−n 2
+0 2n0
+−2n0 0
+0 0 0
+
+ , G=
+03×3
+I3
+
+With a sample time∆t, we do a zero order hold discretization as:
+Ad =e F∆t ,
+Bd =
+Z ∆t
+0
+eF τG dτ
+From which we obtain our final dynamics evolution as:
+27
+
+===== PAGE 28 =====
+
+⃗sk+1 =A d⃗sk +B d⃗uk, A d ∈R 6×6, B d ∈R 6×3
+Do note that HCW is globally Linear Time Invariant (LTI) here only under
+certain assumptions, which are sufficient given the scope of this research: that the
+chief agent is following a circular orbit, we’re treating with small relative distances
+relative to the celestial object being orbited∥(x, y, z)∥ ≪r0, and that the control
+accelerations exerted by the agents are small relative to the central gravitational field.
+3.1.2 Elliptical LTV orbital relative dynamics - Tschauner and Hempel
+(1965)
+We have an elliptical dynamics model in order to study how our trained models
+behave under linear time variant dynamics. This means that instead of the A and B
+matrices remaining statics as they do with the HCW dynamics model, these A and B
+matrices change and evolve over time. Note that this model was used exclusively for
+Monte Carlo rollouts in this work, not for any of the trained policies.
+For this model, we again represent each agent in the chief’s local frame.
+The main difference is that this time around we won’t assume that the orbit is
+perfectly circular as we did in the HCW dynamics model. Instead, the chief follows
+an unperturbed Keplerian elliptical orbit with gravitational parameterµ, semi-major
+axis a, eccentricity e, inclination i, right ascension of the ascending nodeΩ, argument
+of periapsisω, and initial true anomalyν0.
+The mean motion of the chief orbit is defined as:
+n=
+p
+µ/a3
+At a given timetk =k∆t, the chief mean anomaly propagates as:
+Mk =M 0 +nt k
+28
+
+===== PAGE 29 =====
+
+where M0 is obtained fromν0. The eccentric anomalyEk is calculated from Kepler’s
+equation:
+Ek −esinE k =M k
+and the corresponding true anomaly from the above is:
+νk = 2 tan−1
+ √1 +esin(E k/2)√1−ecos(E k/2)
+
+The chief inertial position and velocity are then computed from its corresponding
+orbital elements. By defining:
+p=a(1−e 2), r k = p
+1 +ecosν k
+the chief state then becomes:
+⃗rc,p =
+
+
+rk cosν k
+rk sinν k
+0
+
+ , ⃗vc,p =
+r µ
+p
+
+
+−sinν k
+e+ cosν k
+0
+
+
+Then by using using the rotation matrix:
+Q=R 3(Ω)R1(i)R3(ω)
+we obtain the inertial chief state:
+⃗rc,k =Q ⃗rc,p ⃗vc,k =Q ⃗vc,p
+At each time step, the chief’s Radial–Transverse–Normal (RTN) frame is
+defined as:
+ˆ⃗Rk = rc,k
+∥rc,k∥, ˆ⃗Nk = rc,k ×v c,k
+∥rc,k ×v c,k∥, ˆ⃗Tk = ˆ⃗Nk × ˆ⃗Rk
+Here, we let the concatenated matrix:
+CRT N→I,k =
+h ˆ⃗Rk
+ˆ⃗Tk
+ˆ⃗Nk
+i
+29
+
+===== PAGE 30 =====
+
+map RTN coordinates into inertial coordinates. The angular velocity of the
+RTN frame is then:
+⃗ωk =
+
+
+0
+0
+∥⃗rc,k × ⃗vc,k∥/∥⃗rc,k∥2
+
+
+Now, let the relative RTN position and velocity be
+⃗ρ=
+
+
+ρR
+ρT
+ρN
+
+ , ˙⃗ρ=
+
+
+˙ρR
+˙ρT
+˙ρN
+
+
+and then define the stacked state of the agent as:
+⃗s:=
+
+ρR ρT ρN ˙ρR ˙ρT ˙ρN
+⊤
+For a given control acceleration⃗uk = [uR, uT , uN ]⊤ expressed in RTN coordi-
+nates, the inertial state of the deputy at any given timetk is:
+⃗rd,k = ⃗rc,k +C RT N→I,k⃗ρk
+⃗vd,k = ⃗vc,k +C RT N→I,k( ˙⃗ρk + ⃗ωk × ⃗ρk)
+The deputy is then propagated over a single sample interval by using two-body inertial
+dynamics:
+˙⃗rd = ⃗vd, ˙⃗vd =−µ ⃗rd
+∥⃗rd∥3 +C RT N→I,k⃗uk,
+where the control acceleration held constant over the interval on a zero-order hold.
+Following the propagation totk+1, the inertial deputy state is then transformed
+back into the new chief’s RTN frame:
+⃗ρk+1 =C I→RT N,k+1(⃗rd,k+1 − ⃗rc,k+1),
+˙⃗ρk+1 =C I→RT N,k+1(⃗vd,k+1 − ⃗vc,k+1)− ⃗ωk+1 × ⃗ρk+1.
+This transformation defines a nonlinear discrete-time map:
+⃗sk+1 =f k(⃗sk, ⃗uk)
+30
+
+===== PAGE 31 =====
+
+For the rollout model of the policies into this elliptical model, we use a linear
+time-varying approximation of this map about the chief trajectory. In other words, an
+approximation about zero relative state and zero control:
+⃗sk = ⃗0, ⃗uk = ⃗0
+The discrete LTV matrices are then computed on each step as:
+Ak = ∂fk
+∂s
+
+s=0,u=0
+, B k = ∂fk
+∂u
+
+s=0,u=0
+.
+In this implementation, these Jacobians are obtained by using centered finite differences
+in the form:
+Ak[:, j]≈ fk(ϵej,0)−f k(−ϵej,0)
+2ϵ , j= 1, . . . ,6,
+Bk[:, j]≈ fk(0, ϵej)−f k(0,−ϵe j)
+2ϵ , j= 1, . . . ,3.
+And finally, the rollout dynamics are therefore:
+⃗sk+1 =A k⃗sk +B k⃗uk, A k ∈R 6×6, B k ∈R 6×3.
+which define the time evolution of the state in the same way we did with HCW,
+but using our new elliptical dynamics model.
+Unlike HCW dynamics, however, the model is clearly not globally Linear
+Time Invariant (LTI) since the chief’s orbital radius, true anomaly, and RTN frame
+angular rate vary along the elliptical orbit. This approximation is valid for small
+relative separation relative to the chief’s orbital radius, control accelerations that are
+smaller relative to the central gravitational field, and assuming that the Keplerian
+chief trajectory remains unperturbed.
+3.1.3 Orbits used in this work
+Throughout this thesis, whenever we refer to HCW and Elliptical LTV dynamcis
+we refer to just one chief orbit per dynamics model to exemplify each case within
+31
+
+===== PAGE 32 =====
+
+the context of the work. The commanded motion each agent undergoes then occurs
+relative to this chief orbit. The parameters of each of these orbits are:
+Table 3.1: Chief orbit parameters used for the HCW and elliptic LTV dynamics.
+Parameter HCW circular orbit Elliptic LTV orbit
+Use case Training and evaluation Evaluation only
+Radius / semi-major axisr 0 = 6771 kma= 7646 km
+Eccentricitye= 0e= 0.0948
+Perigee altitude400 km 550 km
+Apogee altitude400 km 2000 km
+Orbital period92.41 min 110.89 min
+And the following is a visualization for these:
+Figure 3.2: Chief orbit geometry used for the HCW and elliptic LTV dynamics,
+showing the circular training/evaluation orbit and the elliptic evaluation-only orbit.
+32
+
+===== PAGE 33 =====
+
+3.2 Estimation model - Bearing-Only Extended Kalman Filter
+(EKF)
+An bearings-only EKF model, based on the work in Aidala (1979) which is
+based on the foundational piece by Kalman (1960), was picked for our state estimation
+architecture. This bearings-only EKF basically takes azimuth-elevation measurements
+(essentially acting as a basic optical navigation suite). Ergo, the measurement model
+is non-linear, even if the dynamics model may be linearized as is the case with HCW.
+Algorithm 1 describes the step of the KF measurement and update process:
+33
+
+===== PAGE 34 =====
+
+Algorithm 1Agent-Centric Bearing-Only Kalman Filter Update
+1: Given:HCW dynamics( A, B), step size∆ t, measurement period m, process
+noiseQ, measurement noiseR
+2:Initialize the agent beliefs:
+3:Initialize defender belief over attacker( ˆ⃗xD→A
+0 , PD→A
+0 )and attacker belief over
+defender( ˆ⃗xA→D
+0 P A→D
+0 )
+4:Define the measurement model:
+5:For observeriand targetj, let:
+⃗di→j
+t = ⃗pj
+t −⃗pi
+t, ⃗bi→j
+t = Ri
+wb⃗di→j
+t
+∥⃗di→j
+t ∥2
+, h( ⃗pi
+t, Ri
+wb, ⃗pj
+t ) =
+" atan2(bi→j
+y,t , bi→j
+x,t )
+atan2
+ 
+bi→j
+z,t ,
+q
+(bi→j
+x,t )2 + (bi→j
+y,t )2
+#
+6:fort= 1, . . . , Tdo
+7:Propagate the true defender and attacker states:
+8:Apply controls ⃗uD
+t , ⃗uA
+t
+9:foreach observer-target pair(i, j)∈ {(D, A),(A, D)}do
+10:Select the filter control input:
+11: ˜⃗uj
+t ←action_access
+12:Predict the belief mean and covariance:
+13: ˆ⃗xi→j
+t|t−1 ←A ˆ⃗xi→j
+t−1|t−1 +B ˜⃗uj
+t ;P i→j
+t|t−1 ←AP i→j
+t−1|t−1A⊤ +Q+BΣ uB⊤
+14:iftmodm= 0then
+15:Form the noisy bearing measurement:
+16: ⃗zi→j
+t ←h( ⃗pi
+t, Ri
+wb, ⃗pj
+t ) = +νt,ν t ∼N(0, R)
+17:Apply the EKF correction:
+18:Linearizeh, compute innovation ⃗yi→j
+t = ⃗zi→j
+t − ˆ⃗zi→j
+t|t−1, update belief
+19:Log the innovation and covariance diagnostics:
+20:Log∥ ⃗yi→j
+t ∥2
+2 andtr(P i→j
+t,pos)
+21:end if
+22:ifbelief diverges or leaves the allowed radius boundthen
+23:Repair the divergent belief:
+24:Clip/reset belief and restore covariance toP 0
+25:end if
+26:end for
+27:Build the agent observations from truth and belief:
+28:Use true self-state and estimated opponent state
+29:Compute reward and termination from the true physical state:
+30:Evaluate reward and terminal conditions from the true propagated state
+31:end for
+32:Return the final beliefs and belief-space observations:
+33:( ˆ⃗xD→A
+T|T , PD→A
+T|T ),( ˆ⃗xA→D
+T|T , PA→D
+T|T ), and resulting belief-space agent observations
+34
+
+===== PAGE 35 =====
+
+Note that the EKF needs the opponent’s action˜uj
+t during training and rollout.
+If this is set to none, the state measurement quality degrades significantly, and early
+testing of action-less KF policies showed that it produced completely incoherent
+policies in partial observability. Therefore, one of the big assumptions we make in this
+research is that, any agent has somehow measured their adversaries action using some
+other means, recovering the noiseless ground state with no noise or the ground state
+within a Gaussian noise profile.
+While an Unscented Kalman Filter (UKF) would be more friendly to further
+sensor fusion within the proposed architecture, an EKF was picked given that early
+testing of our estimation-in-the-loop training signaled to extremely long training times
+(on the order of days of training time per phase) with a UKF in the loop, likely due
+to the high compute utilization of the unscented transform. Furthermore, EKFs are
+more common seen in real-life aerospace estimation architectures.
+3.3 Controller model - CBF-QP velocity saturation controller
+One of the later additions to this research was the implementation of a CBF-QP
+controller (Ames et al. (2017)) to saturate the velocities of the agents during training
+and rollout.
+There’s a couple reasons behind this addition. First of all, we discovered during
+earlier development of this research that, without the velocity saturation limit, the
+agents would become greedy and myopic with the access they had to their own control
+output commands. The result of this was that the agents, especially the defender,
+would pick up a lot of speed by using most of the control limit and then struggle to
+steer and control themselves during training and rollout.
+Therefore, we decided to implement velocity saturation for both agents into
+our system, both during training and evaluation. For practical purposes, this velocity
+saturation can be justified as a safety barrier, one that bounds the velocities of the
+agents to avoid unsafe speeds at which they could collide and cause significant damage
+35
+
+===== PAGE 36 =====
+
+to each other, which is not the intent of the proposed game.
+One route we considered to implement this was to include a velocity/control
+saturating element in the reward function described in section 3.5, which would have
+been possible but we would have lost interpretability of the reward function and the
+mean reward return during training by combining various elements with different units
+into one monolithic reward function. Generally speaking, as we mention throughout
+that section, we found our RL trainings to behave best the simpler and cleaner our
+reward shaping was.
+Therefore, to fill in this gap, we saw this as a great opportunity to show how
+a classical controller could fill in this gap and do this velocity saturation relative
+to a predefined max velocityvmax. We opted to use a CBF-QP, which filters the
+commanded action relative to whether it’s considered feasible within the set defined
+by the velocity constraint. If the state is safe and the QP is feasible, then the system
+keeps the overall spacecraft dynamics within that set. If it is unfeasible, however, the
+filter will only return the least-violating admissible action. This would correspond to
+situations where the commanded correction to remain within the bounds ofvmax is
+incompatible with the available control authority.
+The RL-trained policies are directly affected and have to adapt to this new
+filter as it becomes a part of the environment the Markov chain needs to adjust to.
+In other words, the policy has to learn from a pre-filtered environment whereunom
+is not really the applied action. Rather, the safety layer of the CBF-QP changes
+the overall transition map used throughout the learning. This, in turn, keeps the
+learning setup Markov, at least on the full-state case, as it keeps the applied control
+as a deterministic function of the current state and its commanded action.
+The massive benefit of this is that the CBF-QP safety filter does not introduce
+any hidden dynamics into the controls system or the training logic. Rather, it modifies
+the environment learning transition map from one that would learn under raw policy
+commands without it to one that learns under the CBF-QP-filtered commands. This, in
+36
+
+===== PAGE 37 =====
+
+turn, ends up providing a computationally efficient constraint on the agents’ velocities
+while allowing the training logic to remain as simple as possible by not having to
+focus on anything other than the relative distances between the agents and the asset
+exclusively.
+Overall, the CBF-QP was highly performing during training and rollout right
+from its implementation, successfully constraining the net agent speed while not
+noticeably interfering on the agent’s learning or compute speeds during training or
+evaluation. The process is described in detail in algorithm 2.
+37
+
+===== PAGE 38 =====
+
+Algorithm 2Velocity CBF-QP Saturation Filter
+1: Given:nominal action ⃗unom
+t , agent state(⃗pt, ⃗vt), box bounds−umax ≤ ⃗u≤u max,
+speed limitv max, CBF gainα, HCW mean motionn
+2:Compute the barrier value:
+3:h t ←v 2
+max − ∥⃗vt∥2
+2
+4:Compute the HCW drift in the velocity channel:
+5:
+⃗fv(⃗pt, ⃗vt)←
+
+
+3n2px,t + 2nvy,t
+−2nvx,t
+−n2pz,t
+
+
+6:Form the CBF half-space from ˙ht +αh t ≥0:
+7:
+⃗at ←2 ⃗vt, b t ←αh t −2 ⃗v⊤
+t ⃗fv(⃗pt, ⃗vt)
+8:Pose the box-constrained projection:
+9:
+⃗u⋆
+t ←arg min
+⃗u
+1
+2 ∥⃗u− ⃗unom
+t ∥2
+2 s.t. ⃗a⊤
+t ⃗u≤b t,−u max ≤ ⃗u≤u max
+10:Check whether the clipped nominal action is already feasible:
+11: Clip ⃗unom
+t to the box bounds; if the clipped action already satisfies⃗a⊤
+t ⃗u≤b t,
+return it
+12: Construct the box corner that minimizes the half-space left-hand side:
+13: Let ⃗umin have components( umin)k = −umax if( at)k ≥ 0and( umin)k = +umax
+otherwise
+14:Handle the infeasible case:
+15:If ⃗a⊤
+t ⃗umin > bt, return the least-violating box action⃗u⋆
+t ← ⃗umin
+16:Otherwise search the KKT multiplier:
+17:
+⃗u(λ)←clip
+ ⃗unom
+t −λ ⃗at,−u max, umax
+
+18:Bracket and bisectλ:
+19:Increaseλuntil ⃗a⊤
+t ⃗u(λ)≤b t, then bisect onλto the desired tolerance
+20:Return the projected feasible action:
+21: ⃗u⋆
+t ← ⃗u(λ)
+3.4 State, action, and observation.
+Consider two agents described at the beginning of this chapter, a defender
+which we refer to as player/agent #1 and an attacker which we refer to as player/agent
+38
+
+===== PAGE 39 =====
+
+#2. These agents evolve under discretized dynamics (e.g: HCW), relative to a chief
+orbit, with a discrete time sampling∆t. For each agent i∈ {1, 2}, their state is
+defined as:
+⃗xi =
+⃗pi
+⃗vi
+
+∈R 2D, ⃗x+
+i =A d⃗xi +B d⃗ui, ⃗ui ∈R D
+where pi, vi ∈R D are the agents position and velocity in the relative frame
+and ui is a commanded acceleration clipped to a system actuation bound∥ui∥∞ ≤
+umax. With this in mind, the concatenated state for the environment is defined as
+s=
+
+x⊤
+1 , x⊤
+2
+⊤
+∈R 4D.
+Each policy observes a fixed, task-shaped observation vector defined as:
+⃗o= [( ⃗p1 − ⃗c),( ⃗p2 − ⃗c),( ⃗p2 − ⃗p1), ⃗v1, ⃗v2] (3.1)
+Which for the partially observable settings become the following for the attacker:
+⃗o1,EKF = [(⃗p1 − ⃗c),( ˜⃗p2,1 − ⃗c),( ˜⃗p2,1 − ⃗p1), ⃗v1, ˜⃗v2,1] (3.2)
+And the following for the defender:
+⃗o2,EKF = [(˜⃗p1,2 − ⃗c),( ⃗p2 − ⃗c),( ⃗p2 − ˜⃗p1,2), ˜⃗v1,2, ⃗v2] (3.3)
+Where the quantities with tilde are those measured via the bearings-only EKF
+described in algorithm 1.
+For the fully observable setting, we model the proposed zero-sum game as a
+discrete-time Markov Decision Process (MDP, for short). Here, the state consists of
+the previously laid out spacecraft states, the action is the agents’ commanded control
+in 3D, and the transition map is provided and filtered by the spacecraft dynamics and
+the CBF-QP controller logic. The reward function and termination conditions are
+defined by the game’s objectives as described in section??. For the partially obsevable
+39
+
+===== PAGE 40 =====
+
+setting via behavior cloning, the full-state MDP is replaced by the bearings only EKF
+measurement-based approximation, where the agents act based on the measurements
+they can get of their opponent instead of having access to its full state.
+One future area for development on the partial observability setting would
+be the implementation of a self-estimation model from which each agent also has to
+estimate their own position in space (e.g: essentially using an IMU model), which
+would add another layer of realism to the research presented in this work. Given the
+already high degree of complexity of the current research, we decided to not pursue
+that direction in this work.
+3.5 Reward shaping and termination conditions
+We then gather the distances of each agent to the center and their relative
+distance and normalize relative to the radius of the arenaR and a constant colission
+radius rcollision. We use these to define define the unitless attacker-to-centerd1, defender-
+to-center d2, and docking distanceddock. Note that these normalizations are absolutely
+necessary, as they provide stability during training. Upon normalizing, these quantities
+become:
+d1 = ∥⃗p1 − ⃗c∥2
+R2 , d 2 = ∥⃗p2 − ⃗c∥2
+R2 , d dock = max(0,∥ ⃗p2 − ⃗p1∥ −rcollision)
+R
+Note that unitless quantityddock is not squared unlike unitless quantitiesd1
+and d2 on purpose, as during our game it is meant to be a correcting factor, andd1
+andd 2 are supposed to be the dominating terms.
+Using these, we finally define our reward function for each time step, which for
+the defender is simply defined as:
+r1 =k pos d2
+| {z }
+encourage attacker
+away from
+asset
+−k dock ddock| {z }
+penalize large
+defender–attacker
+separation
+(3.4)
+40
+
+===== PAGE 41 =====
+
+And with episodic terminal rewards defined as:
+•r 1 +=β intercept for intercepting/docking to the attacker.
+•r 1 +=β wall for forcing the attacker out of the arena.
+•r 1 -=β intercept for defender crashing onto the asset of interest.
+•r 1 -=β wall for defender leaving the arena.
+And in order to keep the game as a min-max zero sum, the attacker reward is
+simply:
+r2 =−r 1|{z}
+attacker reward function
+So laid out this turns out to be a reward function in the form:
+r2 =−k pos d2
+| {z }
+encourage attacker
+towards
+asset
++k dock ddock| {z }
+reward large
+defender–attacker
+separation
+(3.5)
+And with episodic terminal rewards defined as:
+•r 1 -=β intercept for intercepting/docking to the attacker.
+•r 1 -=β wall for forcing the attacker out of the arena.
+•r 1 +=β intercept for defender crashing onto the asset of interest.
+•r 1 +=β wall for defender leaving the arena.
+41
+
+===== PAGE 42 =====
+
+3.5.1 Partial observability via behavior cloning
+One must note that the partially observable policies corresponding to obser-
+vations 3.2 and 3.3 also have access this form of a full state reward during training.
+This is because on the partially observable policies we want to purposefully match
+the measured observations to the full state reward, a process called behavior cloning,
+based on the work by Ross et al. (2011).
+In this process, we essentially create a measurement-based "student" that must
+learn from these fully observable rewards, with the intent of matching the behavior of
+the full state rewards as best as possible despite the sensor noise.
+This process proves to be perhaps the simplest way to match sensor measure-
+ments to RL rewards, which is why it was chosen. There’s other potential methods for
+training partially observable policies, such as distillation-based methods (e.g: Bajcsy
+et al. (2024)). We looked into implementing these methods earlier on, but found them
+to be too computationally expensive, so we proceeded regular behavior cloning in this
+form.
+42
+
+===== PAGE 43 =====
+
+Chapter 4: Learning Methods
+Throughout this section, we’ll be doing an in-depth description of the full
+guidance, navigation, control, and learning architecture which was used during this
+work. While reading the following subsections, please refer back to figure 4.1, which
+offers a compact visualization of the whole training loop:
+Figure 4.1: Diagram showing the PARL + BC algorithm’s learning loop within the
+GNC architecture constrained by the Extended Kalman Filter and the Classical
+CBF-QP controller
+4.1 Single Phase PPO Algorithm
+We collect on-policy results via the PPO algorithm, based on the foundational
+work by Schulman et al. (2017) and adapted to our dynamics and environment
+models, where the batches are a fixed length fromN vectorized environments, each
+of length H, and hence yielding B = N Htransitions per update on each policy.
+43
+
+===== PAGE 44 =====
+
+Algorithm 3 describes the single phase PPO training with full-state observations,
+whereas algorithm 4 describes the modifications that are made to the latter when
+doing partial observability trainings with the bearings-only EKF measurements:
+44
+
+===== PAGE 45 =====
+
+Algorithm 3Single-Phase PPO Update with Full-State Observations
+Require: Learning role r∈ {def,att}, fixed opponent controllerΠ¯r, horizon H,
+vectorized environmentsN
+Require:Full-state observation mapsObs full
+r ,Obs full
+¯r , dynamicsD(·), rewardR(·)
+Ensure:Updated policy parametersθ r
+1:Initialize vectorized PPO training:
+2: Initialize VecEnv(N), configured dynamics, learning policy πθr, and value
+functionV θr
+3:foru= 1, . . . , Udo
+4:Prepare a new rollout batch:
+5:Optionally decay learning rate and anneal environment coefficients
+6:Initialize rollout bufferB r
+7:fort= 1, . . . , Hin parallel overn= 1, . . . , Ndo
+8:Build full-state observations:
+9: ⃗or,(n)
+t ←Obs full
+r (⃗x(n)
+t )
+10: ⃗o¯r,(n)
+t ←Obs full
+¯r (⃗x(n)
+t )
+11:Select learner and opponent actions:
+12: ⃗ar,(n)
+t ∼π θr(· |⃗or,(n)
+t )
+13: ⃗a¯r,(n)
+t ←Π ¯r(⃗o¯r,(n)
+t )▷rule-based or deterministic frozen RL policy
+14:Step the environment:
+15:( ⃗or,(n)
+t+1 , rr,(n)
+t , d(n)
+t )←Step( ⃗ar,(n)
+t , ⃗a¯r,(n)
+t )
+16:Conceptually, this step entails:
+17: ⃗x(n)
+t+1 ←D
+
+⃗x(n)
+t , ⃗ar,(n)
+t , ⃗a¯r,(n)
+t
+
+▷propagate the true spacecraft state
+18:r r,(n)
+t ←R
+
+⃗x(n)
+t+1, ⃗ar,(n)
+t , ⃗a¯r,(n)
+t
+
+▷ evaluate the role-specific reward from
+the realized transition
+19:d (n)
+t ←Done
+
+⃗x(n)
+t+1
+
+▷check terminal conditions such as docking,
+interception, or boundary violation
+20: ⃗or,(n)
+t+1 ←Obs full
+r (⃗x(n)
+t+1)▷form the next observation from the updated
+true state
+21:Store the rollout transition:
+22:Store
+ ⃗or,(n)
+t , ⃗ar,(n)
+t ,logπ θr, Vθr, rr,(n)
+t , d(n)
+t
+
+inB r ▷terminated
+environments are reset internally in the vectorized implementation
+23:end for
+24:Compute returns and advantages from rewards:
+25:BootstrapV θr(⃗or
+H+1)
+26: Compute done-masked returns and GAE advantages from the stored rewards
+27:Update the policy and value function with PPO:
+28:Normalize advantages and optimize the PPO clipped surrogate objective
+29:using policy loss, value loss, and entropy regularization forEepochs
+30:end for
+45
+
+===== PAGE 46 =====
+
+Algorithm 4KF-On Modifications to Algorithm 3
+Require:EstimatorEwith belief state ˆ⃗xt and measurement model⃗yt
+1: Run Algorithm 3 unchanged, except replace the observation/reward portion of
+each rollout step by the following:
+2:Maintain both truth and belief:
+3: The simulator propagates the true state⃗xt, while the policy receives observations
+derived from the estimator stateˆ⃗xt
+4:Build estimator-based observations:
+5: ⃗or
+t ←Obs KF
+r (⃗xt, ˆ⃗xt)
+6: ⃗o¯r
+t ←Obs KF
+¯r (⃗xt, ˆ⃗xt) ▷ Opponent-state entries are replaced by estimator beliefs
+when not directly observed
+7:Select actions exactly as in Algorithm 3
+8:Propagate truth, then update the estimator:
+9: ⃗xt+1 ←D( ⃗xt, ⃗ar
+t , ⃗a¯r
+t )
+10: ˆ⃗xt+1 ←E( ˆ⃗xt, ⃗ar
+t , ⃗a¯r
+t , ⃗yt+1)
+11:Compute reward from the true state:
+12:r r
+t ←R( ⃗xt+1, ⃗ar
+t , ⃗a¯r
+t )▷Current KF-on training still uses true-state reward
+geometry
+13: Store the estimator-based observation in the rollout buffer, then con-
+tinue with bootstrap, GAE, and PPO updates exactly as in Algorithm
+3
+4.1.1 Policy development
+Given an observation ⃗o (equations 3.1, 3.2, and 3.3), we obtain an action
+⃗µ(⃗o)for the queried role who∈ {def,att}. From there, the action is sampled from a
+factorized normal distribution and squashed to enforce the actuation bound:
+⃗uraw ∼N
+ ⃗µ(⃗o),diag
+ ⃗σ 2
+, ⃗a=u max tanh(⃗uraw).
+From there, the corrected log-probability for PPO is
+logπ( ⃗a| ⃗o) = logN
+ ⃗uraw; ⃗µ, ⃗σ 2
+−
+DX
+j=1
+log
+ 
+1−tanh 2(uraw,j )
+
+.
+The criticV θ(⃗o)then maps the full observation⃗oto a scalar value
+46
+
+===== PAGE 47 =====
+
+4.1.2 Advantage Estimation and PPO Objective
+We use generalized advantage estimation (GAE) in the following form:
+δt =r t +γ(1−d t)V( ⃗ot+1)−V( ⃗ot),
+At =
+∞X
+l=0
+(γλ)l
+ lY
+k=1
+(1−d t+k)
+!
+δt+l.
+with terminal flagsdt ∈ {0, 1}. Letting Rt = At + V (ot)for a minibatch B, the
+PPO maximizes the training objective:
+LPPO =E B
+h
+min
+ 
+rtAt,clip(r t,1−ϵ,1+ϵ)A t
+
+−c v
+ 
+V( ⃗ot)−R t
+2
+| {z }
+(with value clipping)
++c H H
+
+π(· |⃗ot)
+i
+,
+where rt = exp(logπ θ(⃗at | ⃗ot)−logπ old(⃗at | ⃗ot)), ϵ is the policy clip, and
+cv, cH > 0weight the value loss and entropy bonus, while applying global gradi-
+ent clipping and standard Adam optimizers.
+4.2 Phased Stationary Training Schedule
+The process described in algorithm 3 (and the KF specifics from algorithm 4)
+is then replicated in independent phases of training. Following a 0th phase where
+the defender is trained interchangeably against a rule-based attacker to warm-start
+the training, each attacker or defender policy is trained against a combination of the
+resulting trained defender or attacker policies from previous phases. This process is
+called domain randomization, where training the agents against different versions of
+their opponents allows for the progressive development of sequentially stronger and
+smarter defender and attacker policies. By training against multiple policies at once,
+we mitigate overfitting to any one policy, one of the core issues of RL algorithms as
+described in the introduction. Therefore, this allows for the creation of create smarter,
+more generalizable policies for the attacker and defender. Algorithm 5 describes the
+phased training schedule.
+47
+
+===== PAGE 48 =====
+
+Algorithm 5Phased Alternating Training Cycle with Opponent Randomization
+1:Phase 0: Train defender teacherπ def,0 against the rule-based attacker:
+2:Build cfg withattacker_mode=ruleandtrain_role=def
+3:Do not use a checkpoint-based opponent mixture in this phase
+4:Train the defender teacher and retain checkpointθ D0
+5: Phase 1: Train attacker teacherπatt,1 against a frozen defender mixture
+based onπ def,0:
+6:Build cfg withattacker_mode=rlandtrain_role=att
+7:Loadθ D0 and freeze defender parameters
+8:Define opponent variants from the same frozen defender checkpoint:
+full:(action_scale,noise_std) = (1.0,0.0)
+weak:(0.25,0.05)
+very-weak:(0.0,0.0)
+9:Set
+opp_mix← {(πfull
+def,0,0.5),(π weak
+def,0,0.3),(π very-weak
+def,0 ,0.2)}
+10:Resample the active opponent variant fromopp_mixat each episode
+11:Train the attacker teacher and retain checkpointθ A1
+12: Phase 2: Fine-tune defender teacher πdef,0 →π def,1 against a frozen
+attacker mixture based onπatt,1:
+13:Build cfg withattacker_mode=rlandtrain_role=def
+14:Loadθ D0 as the defender initialization
+15:Loadθ A1 and freeze attacker parameters
+16:Define opponent variants from the same frozen attacker checkpoint:
+full:(action_scale,noise_std) = (1.0,0.0)
+weak:(0.25,0.05)
+very-weak:(0.0,0.0)
+17:Set
+opp_mix← {(πfull
+att,1,0.5),(π weak
+att,1 ,0.3),(π very-weak
+att,1 ,0.2)}
+18:Resample the active opponent variant fromopp_mixat each episode
+19:Train the defender teacher and retain checkpointθ D1
+20:Continue the alternating procedure for subsequent phases:
+21: Repeat the same attacker-training and defender-training pattern with the most
+recent frozen opponent checkpoint(s) and the corresponding checkpoint-based
+opponent mixture until the final scheduled phase is reached (Phase 3 trainsπatt,2
+and Phase 4 trainsπdef,2, yielding five phases total including Phase 0)
+Most importantly though, by freezing the opposing policy on each training
+phase we ensure that the stationary of the Markov chain in the decision process during
+48
+
+===== PAGE 49 =====
+
+the learning. Other published methods on zero-sum games attempt to skip this phased
+approach in favor of a simultaneous self-play method, where both agents train their
+policies at once and they learn within the same phase using entropy regularization
+methods (such as that of Rudolph et al. (2025)), but these methods tend to be unstable
+in certain contexts. In fact, we unsuccessfully attempted to do a similar simultaneous
+self-play approach in this context in the earlier stages of this research, and unfavorable
+results were what led us to pursue this phased stationary method.
+Other approaches that we experimented with were the use of residual networks
+with Nash differentials or classical controller priors, which could be a potential future
+direction for this work. Nevertheless, we found but that skipping residual networks
+and letting giving full power to the PPO to carry on with the optimization ended up
+being much simpler to iterate on and interpret results for.
+4.2.1 Rule-Based Attacker for phase 0 defender warm start
+To warm start the training, the attacker control input in the initial warm up
+phase phase (phase 0) is not defined by a PPO policy, but rather by an arbitrary,
+saturated convex combination with predefined weights.
+First we obtain ucenter, a one-step ridge least-squares action that pulls p2
+towards c (the asset/object of interest). Considering the position projection (P =
+[I 0] ∈R D×2D ), the next step position error (E2 := P Adx2 −c, given x2 =
+p2
+v2
+
+),
+and the position influence matrix (F := P Bd ∈R D×D), we obtain the least squares
+solution for,ucenter takes the form:
+ucenter =−K E 2, K= (F ⊤F+λI) −1F ⊤
+,
+To this we addurepulse, a term that is meant to push the attacker away from
+the defender. a term that consideringr := p2 −p 1, rmin > 0, gain g >0, and a small
+49
+
+===== PAGE 50 =====
+
+term ε >0that prevents the expression from blowing up at 0 pushes away from the
+defender under,urepulse is defined to:
+urepulse = g
+ 
+max{r2
+min,∥r∥ 2}+ε
+3/2 r.
+In addition to the two terms described before, we add a small penalty for the
+attacker velocityv 2.
+Then we add these terms together, with proper weightswc, wr, and wd for
+each, into a final acceleration that is saturated relative to the max actuation limit:
+u2 = sat umax(wc ucenter +w r urepulse −w d v2) ,
+4.3 Inference.
+At inference during policy evaluation, we translate observations into actuator
+commands that can be used by the spacecraft relative to a bounded commanded
+acceleration. at eval time we use the same 5D observation vectors as described in 3.1,
+3.2, or 3.3 depending on the case.
+By default we run a deterministic evaluation,uraw
+t = µθ(ot), where actions come
+from a squashed-Gaussian actor to guarantee that∥a∥∞ ≤u max. . When we report
+stochastic results, we sample from the diagonal Gaussianucmd
+t = umax tanh(uraw
+t ), and
+then apply tanh squashing and clipping asucmd
+t = umax tanh(uraw
+t ), which enfoces a
+bounded policy output on the final commanded acceleration/action.
+This commanded acceleration then passes through the CBF-QP velocity filter.
+Consequently, the spacecraft state evolves under the realized acceleration rather than
+directly under the unsquashed or pre-filter policy output.
+Algorithm 6 describes the policy inference process while figure 4.2 visualizes
+the same process.
+50
+
+===== PAGE 51 =====
+
+Algorithm 6Policy Interface + Spacecraft Actuation: Policy Action→ Applied
+Acceleration
+Require:Current spacecraft state ⃗xt, policyπ θ, max accelumax, dynamicsD(·)
+Require:Evaluation mode: deterministic or stochastic
+Ensure:Applied control ⃗uapp
+t and next state⃗xt+1
+1:Build the current observation:
+2: ⃗ot ←
+
+(⃗p1 − ⃗c),( ⃗pobs
+2 − ⃗c),( ⃗pobs
+2 − ⃗p1), ⃗v1, ⃗vobs
+2
+
+▷ ⃗pobs
+2 , ⃗vobs
+2 are belief states if
+the estimator is enabled
+3:Select a policy action in raw (unsquashed) space:
+4:ifdeterministic evaluationthen
+5: ⃗uraw
+t ← ⃗µθ(⃗ot)
+6:else
+7: ⃗uraw
+t ∼N
+ ⃗µθ(⃗ot),diag
+ ⃗σ 2
+θ (⃗ot)
+
+8:end if
+9:Squash + scale (bounded command):
+10: ⃗ucmd
+t ←u max tanh(⃗uraw
+t )▷ ⃗ucmd
+t ∈[−u max, umax]D
+11:Apply the velocity saturation filter:
+12:ifvelocity filter enabledthen
+13: ˜⃗ut ←S
+ ⃗xt, ⃗ucmd
+t
+
+▷velocity-CBF filtered command
+14:else
+15: ˜⃗ut ← ⃗ucmd
+t
+16:end if
+17:Enforce actuator bounds:
+18: ⃗uapp
+t ←clip
+
+˜⃗ut,−u max,+u max
+
+19:Propagate spacecraft dynamics:
+20: ⃗xt+1 ←D( ⃗xt, ⃗uapp
+t )▷e.g. HCW: ⃗xt+1 =A d⃗xt +B d⃗uapp
+t
+21:return( ⃗uapp
+t , ⃗xt+1)
+51
+
+===== PAGE 52 =====
+
+Figure 4.2: Diagram showing the inference desribed in algorithm 6
+52
+
+===== PAGE 53 =====
+
+Chapter 5: Training Experiments
+We performed the training of our policies in our own NVIDIA GeForce GPUs
+available in our own lab, we then let the training run while randomizing the starting
+states (positions and velocities). Initial policies were trained with relatively myopic
+policies (gamma = 0.991) and a capture radius of 0.75 meters. The hyperparameters
+utilized throughout these experimetns are described in appendix B. Do note that
+tested on a number of different hyperparameters before converging on these, so their
+choice in this work is empirical.
+We chose to focus on three different test cases for this thesis, where we just
+varied the actuation limitumax, the max velocityvmax, and the max initial velocity in
+any given episodevIC
+max, leaving all other training hyperparameters equivalent between
+the trhee runs. We run these with a KF off for a full observability run, and with a
+KF on for a partially observable run via behavior cloning. The KF on results have a
+(NUMBER needed) noise on the prior adversary action.
+The three test cases that we’ll focus on in the remainder of this work are:
+•Training case 1:u max = 0.1 m/s2,v max = 1.0 m/s,v IC
+max = 0.05 m/s
+•Training case 2:u max = 0.5 m/s2,v max = 1.5 m/s,v IC
+max = 0.25 m/s
+•Training case 3:u max = 2.0 m/s2,v max = 1.0 m/s,v IC
+max = 1.0 m/s
+These values are meant to test the PARL+BC-produced policies and their
+corresponding Monte Carlo evaluations at different actuation limits and max velocity
+saturation limits.
+53
+
+===== PAGE 54 =====
+
+5.1 Trainings Curves
+5.2 Training case 1: umax = 0 .1 m/s2, vmax = 1 .0 m/s, vIC
+max =
+0.05 m/s
+KF off
+ KF on
+Figure 5.1: Combined training return curves forumax = 0.1 m/s2, vmax = 1.0 m/s,
+vIC
+max = 0.05 m/s, across 5 interchanging training phases.
+5.3 Training case 2: umax = 0 .5 m/s2, vmax = 1 .5 m/s, vIC
+max =
+0.25 m/s
+54
+
+===== PAGE 55 =====
+
+KF off
+ KF on
+Figure 5.2: Combined training return curves forumax = 0.5 m/s2, vmax = 1.5 m/s,
+vIC
+max = 0.25 m/s, across 5 interchanging training phases.
+5.4 Training Case 3: umax = 2 .0 m/s2, vmax = 1 .0 m/s, vIC
+max =
+1.0 m/s
+KF off
+ KF on
+Figure 5.3: Combined training return curves forumax = 2.0 m/s2, vmax = 1.0 m/s,
+vIC
+max = 1.0 m/s, across 5 interchanging training phases.
+5.4.1 Training Analysis
+Overall, just from analyzing each curve described in figures 5.1, 5.2, and 5.3
+we see that PARL+BC framework manages to produce strong, convergent policies
+55
+
+===== PAGE 56 =====
+
+across the multiple phases of training. Furthermore, the partially observable results
+follow loosely the same pattern as the fully observable ones.
+By studying the mean reward at which the polciies converge, we see that
+the defender manages to get slightly stronger policies than that of the attacker as
+the phases progress and, consequently, the attacker policies become slightly weaker.
+This is a good sign, as it signals that the defender is progressively stronger and more
+generalizable thanks to the opponent randomization strategy that was described before,
+allowing it to be resilient throughout the progression of the training.
+56
+
+===== PAGE 57 =====
+
+Chapter 6: Policy Monte Carlo Testing
+To run an experiment to test the validity of these policies, we use a Monte
+Carlo (MC) based method to evaluate the performance of the already trained policies.
+This way we can run a large amount of simulations on these policies while dispersing
+different initial states of the agents, namely their starting positions and velocities
+within the boundaries of the training arena. By rolling the simulations across a large
+number of iterations. and storing the outcome of each simulation index, we can obtain
+statistically significant results that can tell us about the performance of the policies
+to do their assigned tasks. Figure 6.1 shows a sample of the randomized starting for
+the defender and attacker that were used for a run inside of a 20m radius arena:
+(a) Starting positions in x-y
+ (b) Starting positions in x-z
+Figure 6.1: Sample starting positions used for a Monte Carlo evaluation in a 20m
+radius arena.
+Appendix C shows the dispersions used throughout these Monte Carlo evalua-
+tions.
+57
+
+===== PAGE 58 =====
+
+6.1 Sample Rollout Explained in Images
+The following is a sample policy rollout between two attacker and defender
+policies, meant to illustrate what actually happens when we simulate a single simulation
+rollout within the Monte Carlo framework. Throughout these sample cases, note how
+the velocity and control norms get saturated and never pass a pre-defined boundary.
+6.1.1 Defender win
+Start of simulation
+ Early pursuit
+ Terminal approach
+ End of simulation
+Figure 6.2: Representative rollout snapshots forπdef,1 vs πatt,1, resulting in a win for
+the defender.
+58
+
+===== PAGE 59 =====
+
+Figure 6.3: Rollout diagnostics for the same engagement shown in Fig. 6.4. The
+subfigures in the panel report distance-to-center, relative separation, commanded
+thrust history, velocity history, and cumulative delta-V usage.
+6.1.2 Attacker win
+Start of simulation
+ Early pursuit
+ Terminal approach
+ End of simulation
+Figure 6.4: Representative rollout snapshots forπdef,0 vs πatt,1, resulting in a win
+for the defender.
+59
+
+===== PAGE 60 =====
+
+Figure 6.5: Rollout diagnostics for the same engagement shown in Fig. 6.4. The panels
+report distance-to-center, relative separation, commanded thrust histories, velocity
+histories, and cumulative delta-V usage.
+6.2 Metrics and Evaluation
+We evaluate each training policy matchup
+(πdef,0 vsπ att,1,π def,1 vsπ att,1,π def,1 vsπ att,2, andπ def,2 vsπ att,2)
+by testing them over a fixed time horizonT through the monte calro testing.
+Each simulation starts from randomized and dispersed in initial conditions for both
+agents within fixed boundaries for the arena. In each simulation rollout, we report
+the following metrics:
+Simulation outcome:
+The main metric we’re interested in the simulation is the outcome of the game:
+whether the defender won, whether the attacker won, or if they tie within the limits
+fo the time horizon. As described in section??, we count a defender win when the
+defender captures the attacker or when the attacker leaves the arena. Moreover, we
+count an attacker win when the attacker reaches the object of interest (OI), when the
+defender crashes accidentally into the OI, and when the defender leaves the arena.
+60
+
+===== PAGE 61 =====
+
+If any given simulation rollout. If the maximum time horizon is reached during a
+simulation, it is counted as a timeout and a de-facto tie between both agents. For
+the aggregate number of rollouts within a Monte Carlo set of runs, we report the
+number of times in which each outcome ocurred, their corresponidng percetnage, and
+the standard error.
+Control-effort:
+Each simulation also reports the total∆v budget used by each agent over any
+given simulation rollout. This is gives a measure of the control effort used by each
+policy during the simulation. The aggregated∆v values are then reported summarized
+using the median and inrerquartile range[Q1, Q3]across all trials within a given Monte
+Carlo set.
+Runtime metrics:
+We report the time it took for the policies compute the rollout per each time
+step in the simulation in milliseconds. The objective of this is to keep track of the real-
+time computational cost of running the policies in our hardware. The aggregated values
+within a given Monte Carlo set are summarized using the median and interquartile
+range[Q 1, Q3].
+Comparison axes.
+All of the metrics above are taken for each matchup of
+(πdef,0 vsπ att,1,π def,1 vsπ att,1,π def,1 vsπ att,2, andπ def,2 vsπ att,2)
+for each of the test cases in subsection 5.1. All of these metrics for each
+matchup are then run across (i) HCW versus elliptic LTV rollouts, (ii) full-state versus
+EKF-based observations via the behavior cloning framework, and (iii) different arena
+sizes (20m and 100m). These comparisons allow us to asses the policies’ performance
+across different dynamics models, robustness to partial observability and sensor noise,
+61
+
+===== PAGE 62 =====
+
+and ability to generalize to different arenas outside of the training regime. All of the
+above, in hand, allow for the fair comparison for each policy to perform and generalize
+against their adversary.
+Do note that the reporting of πdef,0 vs the rule-based attacker is skipped
+throughout this work as it is just meant to be a warm up-phase
+62
+
+===== PAGE 63 =====
+
+6.3 Monte Carlo Outcome Distribution Histograms
+6.3.1 Training case:u max = 0.1 m/s 2,v max = 1 m/s,v IC
+max = 0.05 m/s
+6.3.1.1 KF Off
+Figure 6.6: Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.1, D.2, D.3, and D.4).
+63
+
+===== PAGE 64 =====
+
+6.3.1.2 KF On
+Figure 6.7: Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.1, D.2, D.3, and D.4).
+64
+
+===== PAGE 65 =====
+
+6.3.2 Training case:u max = 0.5 m/s 2,v max = 1.5 m/s,v IC
+max = 0.25 m/s
+6.3.2.1 KF Off
+Figure 6.8: Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.5, D.6, D.7, and D.8).
+65
+
+===== PAGE 66 =====
+
+6.3.2.2 KF On
+Figure 6.9: Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.5, D.6, D.7, and D.8).
+66
+
+===== PAGE 67 =====
+
+6.3.3 Training case:u max = 2.0 m/s 2,v max = 1 m/s,v IC
+max = 1.0 m/s
+6.3.3.1 KF Off
+Figure 6.10: Monte Carlo outcome distributions across each learning phase for the
+full-state policies (corresponding to Tables D.9, D.10, D.11, and D.12).
+67
+
+===== PAGE 68 =====
+
+6.3.3.2 KF On
+Figure 6.11: Monte Carlo outcome distributions across each learning phase for the
+EKF-enabled policies (corresponding to Tables D.9, D.10, D.11, and D.12).
+68
+
+===== PAGE 69 =====
+
+6.3.4 Aggregate Outcome Distributions
+6.3.4.1 KF Off
+Figure 6.12: Monte Carlo aggregate outcome distributions across four learning phases
+for the full-state policies.
+69
+
+===== PAGE 70 =====
+
+6.3.4.2 KF On
+Figure 6.13: Monte Carlo aggregate outcome distributions across four learning phases
+for the EKF-enabled policies.
+6.3.4.3 Description of Monte Carlo results
+We can note a few patterns throughout the results presented above. First of all,
+we can see that, in the 20m radius test case evaluations the defender policies becomes
+progressively stronger to the point where the across each phase, managing to counter
+newly trained defender policies throughout the course of the phases.
+Overall, the aggregate plots tell us a clear story. From the 20m HCW KF off
+case, we see that the defender manages to win over the attacker in between 56.3%-79.5
+70
+
+===== PAGE 71 =====
+
+% of the cases in the 20m radius arena that it was trained on, whereas the attacker
+wins in only 19.1%-40.7% of the test cases. Tie cases remain minimal at 1.4%-2.5%
+On the 100m radius arena, we note that the results are considerably different,
+with the defender winning between 41.0%-66.2% of the cases, and the attacker winning
+in 33.4%-58.5% of the cases. Tie cases remain minimal at 0.3%-0.5%, meaning that
+the policy matchups were able to reach a termination case in the vast majority of
+cases within the provided 10 minute time limit.
+Donotethatthedefenderwasnevertrainedon100marena-basedmeasurements,
+so the drop off is to be expected. If anything, it’s a good result as it signifies a minimal
+drop off in performance and tells us that the policies were able to interpolate to
+observations outside the training dataset given the symmetry of the research problem
+in hand.
+For the elliptic LTV results, we see a defender win rate of 56.4%- 79.9% and an
+attacker win rate of 18.7%-41.1%, and a tie rate of 1.4%-2.9% on the 20 m radius arena.
+On the 100m radius arena, the defender win rate is of 40.6%-66.1%, the attacker win
+rate is 33.5%-59.0%, and tie cases 0.3%-0.4%.
+We see that the change between the HCW and Elliptic LTV results is minimal
+although the policies were never trained on the Elliptic LTV orbit, let alone a linear
+time varying orbit altogether, signaling that the policies are able to adapt to the new
+orbit also given the symmetry of the problem.
+On the KF-based results, we see that the trained, behavior-cloned policies
+follow similar patterns albeit with significantly different results.
+HCW 20 m radius results give an defender win rate of 56.0% to 74.7%. Attacker
+win rate of 19.8%-41.4%, and a tie rate of 2.5%-5.5%. Elliptic LTV 20 m radius results
+give a defender win rate of 56.0%- 73.9%, attacker win rate of 20.2%- 41.3%, and tie
+rate of 2.6%-5.9%. This follows the similar pattern described before for the full-state
+policies.
+71
+
+===== PAGE 72 =====
+
+On the 100m radius arena though, things become quite different. For HCW 100
+m radius, the defender win rate is 41.9%- 47.1%, the attacker win rate is 50.3%-57.1%,
+and tie cases are 0.5% to 2.6%. This means that the attacker is overall better than
+the defender at this arena, aided by the prospect of being able to plan under partial
+observability across a larger volume. On the 100m radius elliptical LTV arena, the
+defender win rate is 41.7%-47.4%, attacker win rate is 49.9%-57.3%, and ties are
+0.6%-2.7%. All of these are consistent with the HCW results.
+Compute-wise, policies had a compute time of0.062–0.145 ms per timestep in
+the full-state case and3.72–3.91 ms per timestep in the KF-on case, the latter which
+the EKF update time inside the evaluation rollout loop, across all primary evaluation
+runs.
+Overall, we see pretty coherent and consistent results throughout these eval-
+uation cases that help us prove the competency of the trained policies and their
+competitiveness at the time of evaluation. We note that actuation and velocity limits
+do affect the overall outcomes, with the best defender results coming from the highest
+actuation settings.
+From the numbers presented of these results, we obtain our figure of merit
+for the abstract and conclusion: where full state policies reached up to 79.9% win
+rate for the defender, dropping down to up to just 74.7% in the EKF-based case
+(signaling a 6.5% relative drop from full observability to partial observability), within
+the bounds of the 20 meter arena it was trained on. On the larger 100 m radius arena,
+which the policies where never trained on, the full state policies reached up to 66.2%,
+while the EKF-based cases struggled at a much more even 47.4% win rate (signaling
+a 28.4% relative drop from going from full observability to partial observability).
+Throughout all of these cases, HCW results and elliptic LTV differed by at most
+a 1.07% relative change, showing that learned policies transferred from the linear
+time invariant dynamics used during training to linear time varying dynamics used
+during evaluation. These results happened with a compute time of up to 0.145 ms
+72
+
+===== PAGE 73 =====
+
+per timestep in the full state inference case and 3.91 ms per timestep on the EKF
+inference case.
+6.4 Analysis of results and anecdotes of development
+The results in section ?? show that the proposed PARL+BC method for
+adversarial reinforcement learning-based GNC is not only feasible but successful in
+constrained zero-sum strategy games with continuous control. We attribute this
+finding due to the following reasons:
+The well-defined, zero-sum objective definition via the reward function and
+the episodic termination conditions properly guide agents towards learning
+coherent policies
+The objectives that both spacecraft have to fulfill are well defined, if not over-
+defined, by the reward function plus the episodic terminal conditions. The zero-sum
+framing of this problem helps the agents have these defined objectives.
+In fact, early on in this research we focused on stand-off games instead of
+zero-sum games, where the defending agent would have to defend the asset from the
+attacker without docking onto the attacker, and both agents would be penalized if
+they docked/crashed into each other. This is inherently a non-zero sum game with
+shared equality constrains and an open loop, standoff objective.
+The result was fairly underwhelming after months of research, where we
+couldn’t develop successful defender policies. Our conclusion was that you should
+try to solve not solve open-loop and undefined learning objectives with reinforcement
+learning. Instead, open-loop Nash equilibrium solvers and other classical optimal
+control frameworks might best suit these sorts of research tasks.
+73
+
+===== PAGE 74 =====
+
+The constrained volume in space in which the agent is allowed to learn its
+policies allows for excellent learning transitions
+The learning problem is properly constrained to a volume in space. We don’t
+have the agents’ policies search for solutions across infinite or undefined volumes in
+space. Instead, by defining arena boundaries, we’re able to constrain the agent’s
+learning transitions within a finite area in space.
+By training within a confined volume in close-proximity pursuit evasion, the
+agents are forced to train from extremely dynamic behaviors. In the early development
+of this work, we tried to train policies exclusively using the larger arena (using a 100
+m radius arena during training rather than a 20m radius one) and we found that
+this wouldn’t work. Training from a 100m radius arena from the get go would be an
+extremely hard task for the agents, especially the defender, and would produce bad
+policies .
+We suspect that part of this comes from the fact that training from long-
+proximity for the problem presented in this work may have to do with the long
+transient periods in these arena’s where the agents are not really forced to interact
+with each other given much greater amounts of empty space in the arena. Part of
+this might be able to be somewhat solved by doing very fine tuning of the learning
+hyperparameters, be it from more environments, data, exploration, or some other
+means. This way agents could properly find solutions within the larger training
+environment that match one-to-one with those of the smaller training arena, but it
+probably entail much more time and resource intensive.
+The trained policies interpolate to larger arenas during evaluation, even if
+it was never trained on observations corresponding to larger arenas.
+Expanding on the point above, we show that learning in a small, constrained
+volume as your environment gives good results, albeit not perfect, in larger volumes
+using the same learning policies. This is a rather fascinating find, as we show that the
+learned policies don’t overfit to the volume and don’t know what to do when seeing
+74
+
+===== PAGE 75 =====
+
+observations outside of that volume. We believe that this is in big part thanks to the
+symmetry of the research problem proposed in this paper.
+Instead of overfitting to the smaller arena’s training data used during training,
+the trained policies interpolate agentic behavior learned in the smaller arena into the
+larger space, even though it’s never seen the observations corresponding to the larger
+space during training.
+By training in the smaller arena volume we manage to concentrate and condense
+all the agent’s learning transitions into a relatively cheaper training that can then
+work in those larger arenas provided the symmetry.
+This is not perfect of course, as we did clearly see performance degrade between
+the 20m and the 100m arena. Regardless, it’s an exciting result nonetheless.
+The velocity saturation controller properly bounds the agent’s behavior
+within a "safe" threshold without preventing learning
+The CFB-QP velocity saturation controller properly safeguards and bounds
+the agents’ actions to a defined limit. In fact, the learned policy clearly learns how to
+work within the bounds of the controller and somewhat coexist with it.
+The development of this finding came from initial testing of learned policies
+without the controller on larger arenas. We’d notice that agent policies would act
+greedily pick up a lot of speed, and lose control. This meant that the defender
+would end up letting the attacker through a lot. After doing a lot of analysis on this
+phenomenon, we concluded that the reward function, as presented in section??, does
+not really provide an incentive for the agent to safeguard its own actuation for the
+sake of keeping controllability within a certain threshold.
+Alternatively, one could have put in these incentives into the reward functions,
+but we thought that it would have made for a more difficult learning objective as it
+would convolute with the terms currently present the reward function. This, in turn,
+would have made us lose interpretability of the reward function, meaning the ability
+75
+
+===== PAGE 76 =====
+
+to know what term is causing trouble if learning is good or bad, during policy training
+or evaluation.
+Instead, we show that following a modular framework like the one we suggest
+keeps the guidance learning objectives simple and the velocity controller separate.
+This not only, helps remove system-level ambiguities during development, but it proves
+our point that classical controllers can coexist with learned modules.
+The policies trained in LTI dynamics translate to LTV dynamics with the
+provided velocity and acceleration bounds
+The results trained under an HCW linear-time-invariant dynamics model hold
+within the context of an elliptical linear-time-variant dynamics model with almost
+equal performance.
+We think that this is due to a couple of things: 1) the fact that the policies are
+trained on observations that don’t depend on the dynamics model itself, and rather
+just the states of each agent and their adversary, and 2) the HCW or Elliptical LTV
+dynamics objectively don’t provide that much environmental acceleration onto the
+agents relative to how much actuation limits we’re giving each agent.
+Ergo, the agents may be able to offset whatever environmental dynamics given
+the actuation limits that we’re giving them in this work. If this work were to be
+translated to real life ultra low thrust ion thrusters, like those that can be found in
+CubeSats and small satellites of the sort in LEO, this is one of the things I’d be most
+careful with.
+Trained policies hold under partial observability and sensor noise when
+trained via behavior cloning from the full states
+The behavior cloning piece shows that all of the conclusions above holds up
+under partial observability. By teaching student policies based on the observations
+measured by the bearings-only EKF, we have minimal performance loss from the fully
+76
+
+===== PAGE 77 =====
+
+observable results.
+Of course, to point it out once more, this is assuming that you can somehow
+measure the prior action of your adversary within a certain amount of noise through
+some other means. Or if using some other measurement strategy not dependent on
+bearings-only EKFs, for your adversarial state measurements to be highly accurate.
+Regardless, it is exciting to find that we can develop successful policies for
+noisy, partially observable adversarial RL with
+6.5 Ideas for future development
+For follow ups on the work presented on this thesis, however, I think that there
+are a number of areas that could be researched to expand on the scopes of what is
+presented here. Some ideas for this include.
+• 1) Modifying the reward functions to include rewards for causing poor measure-
+ments on opponents (i.e: By rewarding for the higher the ??? in the ??? matrix
+of the opponent would be per certain dynamics and the sort).
+• 2) Allowing the asset to be able to move along the dynamics model instead of
+having it be static at the chief of the orbit.
+• 3) Adding more elaborate, realistic control models to simulate the actuators on
+board the spacecraft with high fidelity.
+It must be noted that the work presented in this thesis is meant to be an
+extensive proof of concept of certain ideas that could make RL-based GNC interesting
+in theory and simulation. The zero-sum game presented in this work is just meant to
+allow us to be a showcase how these RL can be used, whereas there are many other
+potential uses for these technologies.
+The whole point of this thesis is how one can use RL derive deterministic
+policies for stochastic and unpredictable behaviors within an aerospace context. Even
+77
+
+===== PAGE 78 =====
+
+in planning without adversarial opponents, there’s other areas where RL=based
+planning would prove to be resourceful, such as:
+• 1) To assist in Earth or celestial-bound terrain relative navigation of aircraft
+and spacecraft across well-defined start and end points on uncertain terrain.
+• 2) To aid in planning on precision spacecraft landings in GPS-denied environ-
+ments upon loss of redundancy or function of core navigation sensors. (e.g:
+laser-based altimetry)
+• 3) Adding more elaborate, realistic control models to simulate the actuators on
+board the spacecraft with high fidelity.
+All in all, as long as the principles in section ??? are respected, regarding the
+concrete and realistic objectives that shall be given to RL agents for them to learn
+appropriate policies, the potential applications for RL to aid or replace classical GNC
+architectures are endless.
+78
+
+===== PAGE 79 =====
+
+Chapter 7: Conclusion
+Throughout this thesis we showed that the proposed PARL+BC method for
+RL-based adversarial planning can work within the constrains of a navigation and
+control architecture. With the appropriate hyperparameters, the method delivered
+convergent policies throughout via phased learning with opponent randomization
+across a number of testing scenarios.
+Our Monte Carlo evaluations of the resulting policies indicate that, in a Target-
+Attacker-Defender constrained zero sum game with 1 defender vs 1 attacker, we
+achieved highly performing defender policies that succeed in up to 79.9% in the fully
+observable policies and up to 74.7% in the partially observable policies (a 6.51% relative
+drop in performance relative to the fully observable policies) against a competitive RL
+attacker, the latter which the agents are forced to take bearings-only measurements
+to obtain their their opponents’ states. This was done across 4800-9600 Monte Carlo
+runs per arena.
+The compute time for these pre-trained policies during inference and rollout was
+were 0.145 ms median for full state policies and 3.91 ms per timestep on the EKF-based
+policies across all documented runs, providing fast compute speeds that showcase the
+potential computational advantages of such a method not only in adversarial space
+scenario but in other space autonomy regimes where fast compute times are required.
+These results helped us confirm our initial hypothesis to conclude that RL
+architectures can used in zero-sum adversarial scenarios, can learn coherent policies
+while subject to the constrains of classical navigation filtering and control int the
+loop, can remain robust under full and partial observability, interpolate outside of
+the training dataset given a symmetric problem, and provide convergent and highly
+performing behavior despite the stochasticity.
+Overall, this project showcases that, as long as they’re applied within contexts
+79
+
+===== PAGE 80 =====
+
+with well-defined objectives, pure deep reinforcement learning based methods have
+a feasible implementation in certain areas of aerospace decision making, without
+needing to resort or fallback to classical optimization methods in the process. The fact
+that we showed that these results hold under partial observability justify a potential
+hardware application for algorithms along this line of work beyond the theoretical
+experiment. This could open the door for further implementations of such aerospace
+decision-making algorithms in the future as well as their coupling with existing classical
+control architectures.
+80
+
+===== PAGE 81 =====
+
+Appendix A: Methodology Glossary
+A.1 Methodology
+A.1.1 Symbols and Notation
+i∈ {1,2}Agent index (1: defender,2: attacker).
+D∈ {2,3}Spatial dimension.
+∆tDiscrete simulation timestep.
+R >0, ⃗c∈R D Arena radius and center.
+⃗pi, ⃗vi ∈R D Position and velocity of agenti.
+⃗xi =
+"
+⃗pi
+⃗vi
+#
+∈R 2D Agent state (e.g: under HCW dynamics,
+⃗x+
+i =A d⃗xi +B d⃗ui).
+Ad, Bd Discrete-time state transition matrices.
+⃗ui ∈R D Commanded acceleration, with
+∥⃗ui∥∞ ≤u max.
+⃗s= [ ⃗x⊤
+1 , ⃗x⊤
+2 ]⊤ ∈R 4D Full environment state.
+⃗ofull ∈R 5D Full-state observation
+(⃗p1 − ⃗c),( ⃗p2 − ⃗c),( ⃗p2 − ⃗p1), ⃗v1, ⃗v2
+
+.
+ˆ⃗xj|i,Σ j|i Agenti’s EKF estimate of agentj’s state
+mean and covariance.
+⃗o(i)
+EKF ∈R 5D Agent-iobservation formed by replacing
+the opponent state in⃗ofull with EKF
+estimates.
+QEKF, REKF EKF process and measurement noise
+covariance matrices.
+d1 = ∥⃗p1−⃗c∥2
+R2 Normalized defender-to-asset distance.
+d2 = ∥⃗p2−⃗c∥2
+R2 Normalized attacker-to-asset distance.
+r2
+rel = ∥⃗p2−⃗p1∥2
+R2 Normalized squared defender-attacker
+separation.
+rcap >0Capture/intercept radius.
+ddock = max{0,∥⃗p2−⃗p1∥−rcap}
+R Normalized docking/separation term used
+in reward shaping.
+βcap, βwall Terminal reward magnitudes for capture
+and boundary events.
+81
+
+===== PAGE 82 =====
+
+kpos, kdock Step-reward weights.
+vmax Velocity bound enforced by the safety
+filter.
+αCBF Control barrier function gain.
+⃗unom, ⃗ucmd, ⃗uapp Nominal, squashed, and applied control
+inputs.
+Ppos = [I0]∈R D×2D Position projector;F=P posBd.
+K= (F ⊤F+λ ridgeI) −1F ⊤ Ridge gain used in the one-step center-pull
+prior.
+⃗ucenter =−K(P posAd⃗x2 − ⃗c)One-step center-pull term in the
+rule-based attacker.
+⃗urepulse = g( ⃗p2−⃗p1)
+(max{r2
+min,∥⃗p2−⃗p1∥2}+εrep)3/2 Smooth repulsion term in the rule-based
+attacker.
+wc, wr, wd Weights in the rule-based attacker.
+γ∈(0,1]Discount factor.
+λGAE ∈[0,1]Generalized advantage estimation trace
+parameter.
+ϵPPO PPO clipping half-width.
+cV , cH Value-loss and entropy regularization
+coefficients.
+⃗µθ(·), ⃗σθ(·)Mean and diagonal standard deviation of
+the Gaussian policy.
+Nenv, H, BNumber of environments, rollout horizon,
+and batch size, withB=N envH.
+U, EPPO updates per policy and epochs per
+update.
+θ, ψPolicy and value-function parameters.
+A.1.2 Conventions
+(·)+ Quantity at the next discrete time step.
+ˆ(·)Estimated quantity produced by the EKF.
+(·)j|i State or quantity of agentj as estimated by agent
+i.
+satumax(·)Componentwise saturation onto[−u max, umax].
+clip[a,b](·)Componentwise clipping onto the interval[a, b].
+∥ · ∥2,∥ · ∥∞ Euclidean and max norms, respectively.
+82
+
+===== PAGE 83 =====
+
+A.1.3 Implementation terminology
+• Actor:learned residual multi-layer-perceptron (MLP) on ϕ with prior blend
+βdef ∈ [0, 1], diagonal standard deviation ⃗σ = exp(log ⃗σ). The log-standard-
+deviation terms are learned together with the policy.
+• Squash:Mapping of a raw acceleration to a defined actuation limit,⃗ucmd =
+umax tanh(⃗uraw), with exact log-Jacobian correction. This lets the policy explore
+continuously while respecting the acceleration bound used by the actuators.
+• VecEnv:Single-process vectorization. Instead of running one rollout at a
+time, we runNenv rollouts in parallel. When one rollout terminates, it is reset
+immediately so that the batch keeps the same tensor shape during training.
+• Fixed-opponent phase:Training phase where one agent is learning while the
+opponent policy is kept fixed. This is used so that the learning problem is less
+unstable than if both agents were changing at the same time.
+• Estimator-enabled rollout:a rollout where the policy does not observe the
+opponent’s true state directly, but instead receives the opponent state estimated
+by the EKF. Rewards and terminal conditions are still computed from the true
+simulated state.
+• Teacher and student policies:the teacher is the policy trained with full-state
+information. The student is the estimator-backed policy that is trained to imitate
+the teacher when only partial observations are available.
+83
+
+===== PAGE 84 =====
+
+Appendix B: Training Hyperparameters
+Table B.1: Shared training hyperparameters used for the for all training policy cases.
+This table purposefully omits the training case-specific valuesumax,v max, andv IC
+max.
+T erm V alue Notes
+Training dynamics HCW Training dynamics for the
+base policies
+Spatial dimensionD= 3 Three-dimensional rela-
+tive motion
+Simulation time step∆t= 0.1 sDiscrete propagation step
+Episode horizonT= 600steps Maximum training rollout
+length
+Training phases0,1,2,3,4 Alternating defender and
+attacker phases
+Vectorized environmentsN env = 256 Rollouts advanced in par-
+allel
+PPO updates per phase1000 Used for each training
+phase
+PPO epochs per update3 Optimization epochs per
+rollout batch
+Minibatch size4096PPO minibatch size
+Discount factorγ= 0.991Return discount factor
+GAE parameterλ GAE = 0.95 Generalized advantage es-
+timation trace parameter
+PPO clipping parameterϵ PPO = 0.2Clipping half-width
+Policy learning rate3.0×10 −4 Initial actor learning rate
+Value learning rate1.0×10 −3 Initial critic learning rate
+Learning-rate schedule Linear to0 .1of initial
+value
+Applied during training
+Value loss coefficient0.5Critic loss weight
+Entropy coefficient0.01 Exploration regularization
+weight
+Maximum gradient norm1.0Gradient clipping value
+Reward type Zero-sum Attacker reward is the neg-
+ative defender reward
+Reward normalization radius20 m Fixed geometry normaliza-
+tion radius
+Reward geometry power2 Squared normalized dis-
+tance terms
+Continued on next page
+84
+
+===== PAGE 85 =====
+
+Table B.1: Shared training hyperparameters used for the three policy training cases
+(continued).
+T erm V alue Notes
+Target-hit reward/penalty10.0 Terminal event magnitude
+Capture reward/penalty10.0 Terminal event magnitude
+Wall reward/penalty2.5 Terminal event magnitude
+Fuel-depletion penalty5.0Terminal event penalty
+Collision radius0.75 m Defender-attacker capture
+radius
+Defender effort penalty0.01 Per-step control-effort
+penalty
+Attacker effort penalty0.01 Per-step control-effort
+penalty
+Initial-condition mode Random shell advan-
+tage
+Shell starts with the de-
+fender starting closer
+Minimum initial separation2.0 m Minimum defender-
+attacker starting separa-
+tion
+Defender advantage scale1.0 Defender-advantage set-
+ting used in training
+Defender start shell0to16 m For the20 mtraining
+arena
+Attacker start shell, defender phases6to19 m Used when training de-
+fender phases
+Attacker start shell, attacker phases0to19 m Used when training at-
+tacker phases
+Vectorized backend Torch GPU-backed vectorized
+rollout backend
+Training device CUDA Training was run on GPU
+Table B.2: Training hyperparameters that changed between the three policy cases,
+excluding umax, vmax, and vIC
+max. These are appropriately adjusted actuation scale from
+each training case so that the rollout length and reward shaping stayed reasonable
+throughout.
+T raining case Steps per env.k pos kdock
+umax = 0.1;v max = 1;v IC
+max = 0.05 2048 0.025 0.00625
+umax = 0 .5; vmax = 1 .5; vIC
+max =
+0.25
+1024 0.050 0.01250
+umax = 2.0;v max = 1;v IC
+max = 1.0 512 0.100 0.02500
+85
+
+===== PAGE 86 =====
+
+Appendix C: Monte Carlo Dispersions
+Table C.1: Monte Carlo dispersion summary used for the presented evaluation results.
+The starting positions came from a shell-grid test, ensuring feasible starting positions
+within the arena boundaries given a separation condition, while the starting velocities
+were randomly drawn from the training initial-velocity range on each case.
+T erm Distribution V alue Applies to
+Starting position selec-
+tion
+Shell-grid sam-
+pling
+Defender and attacker starts
+are selected from the valid
+shell-grid pairs for each arena.
+The defender-advantage condi-
+tion is already built into this
+valid-pair set.
+Defender and at-
+tacker
+Starting velocity draw Uniform Each velocity compo-
+nent is drawn from
+U[−v IC
+max, vIC
+max] m/s.
+Defender and at-
+tacker
+Velocity limit after sam-
+pling
+Projection The sampled velocity is pro-
+jected so that∥v0∥ ≤vmax.
+Defender and at-
+tacker
+Table C.2: Case-specific values for the velocity dispersion and the KF measured noise
+on adversary’s control action. The measured-control noise changes withumax so that
+the relative control uncertainty stays comparable across test cases.
+T raining caseu max vmax vIC
+max Measured-control
+noise in KF-on runs
+umax = 0 .1; vmax = 1;
+vIC
+max = 0.05
+0.1 m/s2 1 m/s 0.05 m/sN(0.025,0.0025 2) m/s2
+umax = 0 .5; vmax = 1 .5;
+vIC
+max = 0.25
+0.5 m/s2 1.5 m/s 0.25 m/sN(0.025,0.0025 2) m/s2
+umax = 2 .0; vmax = 1;
+vIC
+max = 1.0
+2.0 m/s2 1 m/s 1.0 m/sN(0.025,0.0025 2) m/s2
+86
+
+===== PAGE 87 =====
+
+Table C.3: KF-on estimator settings used in the Monte Carlo rollouts. The angular
+bearing noise and initial covariance settings were kept fixed across all three training
+cases.
+KF-on term Distribution V alue Notes
+Azimuth bearing noise,σaz Fixed0.5 ◦ 8.73×10 −3 rad
+Elevation bearing noise,σel Fixed0.5 ◦ 8.73×10 −3 rad
+Measured-control noise,
+action_meas_std
+Gaussian See Table C.2 Mean is0 .25umax and
+std. is10%of that
+mean.
+Initial covariance position std.,
+pos_std0
+Fixed2.0 m
+Initial covariance velocity std.,
+vel_std0
+Fixed0.01 m/s
+Initial estimator mean position per-
+turbation std.,init_mean_pos_std
+Fixed0.0 m
+Initial estimator mean velocity per-
+turbation std.,init_mean_vel_std
+Fixed0.0 m/s
+87
+
+===== PAGE 88 =====
+
+Appendix D: Monte Carlo Results in Tables
+88
+
+===== PAGE 89 =====
+
+D.1 Training case:u max = 0.1,v max = 1,v IC
+max = 0.05
+D.1.1 HCW
+D.1.1.1 20 meter radius arena
+Table D.1: Monte Carlo outcomes: HCW, 20 meter radius arena,umax = 0.1, vmax = 1,
+vIC
+max = 0.05. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1272;26.5±0.6%4216;87.8±0.5%852;17.8±0.6%4441;92.5±0.4%
+Att. wall 18;0.4±0.1%15;0.3±0.1%0;0.0±0.0%4;0.1±0.0%
+Attacker wins:
+Att. hit OI 3367;70.1±0.7%382;8.0±0.4%3808;79.3±0.6%224;4.7±0.3%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 14;0.3±0.1%11;0.2±0.1%13;0.3±0.1%1;0.0±0.0%
+Ties:
+Timeout 129;2.7±0.2%176;3.7±0.3%127;2.6±0.2%130;2.7±0.2%
+Delta-v statistics:
+Def. total∆v3.50 [1.90,4.19] m/s 1.73 [1.54,1.97] m/s 3.96 [3.26,4.35] m/s 1.78 [1.59,2.00] m/s
+Att. total∆v3.22 [1.84,3.84] m/s 1.71 [1.49,1.97] m/s 3.64 [3.02,4.00] m/s 1.67 [1.48,1.88] m/s
+Totaln4800
+Step time0.0895 [0.0752,0.1145]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1875;39.1±0.7%4580;95.4±0.3%1731;36.1±0.7%4399;91.6±0.4%
+Att. wall 0;0.0±0.0%0;0.0±0.0%13;0.3±0.1%3;0.1±0.0%
+Attacker wins:
+Att. hit OI 2729;56.9±0.7%98;2.0±0.2%2847;59.3±0.7%258;5.4±0.3%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%2;0.0±0.0%4;0.1±0.0%
+Ties:
+Timeout 196;4.1±0.3%122;2.5±0.2%207;4.3±0.3%136;2.8±0.2%
+Delta-v statistics:
+Def. total∆v2.71 [1.59,3.70] m/s 1.62 [1.46,1.82] m/s 3.66 [1.69,4.45] m/s 1.76 [1.54,2.02] m/s
+Att. total∆v2.40 [1.49,3.38] m/s 1.56 [1.37,1.78] m/s 3.27 [1.59,3.97] m/s 1.65 [1.41,1.96] m/s
+Totaln4800
+Step time3.7445 [3.7192,3.7721]ms
+89
+
+===== PAGE 90 =====
+
+D.1.1.2 100 meter radius arena
+Table D.2: Monte Carlo outcomes: HCW, 100 meter radius arena, umax = 0 .1,
+vmax = 1,v IC
+max = 0.05. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1163;12.1±0.3%6632;69.1±0.5%1876;19.5±0.4%5480;57.1±0.5%
+Att. wall 36;0.4±0.1%27;0.3±0.1%269;2.8±0.2%257;2.7±0.2%
+Attacker wins:
+Att. hit OI 8350;87.0±0.3%2923;30.4±0.5%7390;77.0±0.4%3813;39.7±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%1;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 51;0.5±0.1%18;0.2±0.0%64;0.7±0.1%50;0.5±0.1%
+Delta-v statistics:
+Def. total∆v6.35 [5.21,7.46] m/s 4.40 [3.47,6.33] m/s 6.52 [5.08,7.68] m/s 4.96 [3.53,7.22] m/s
+Att. total∆v5.33 [4.33,6.45] m/s 4.26 [3.27,5.77] m/s 5.46 [4.22,6.81] m/s 4.38 [3.02,6.32] m/s
+Totaln9600
+Step time0.1032 [0.0803,0.1419]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture2825;29.4±0.5%6156;64.1±0.5%2338;24.4±0.4%6527;68.0±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%41;0.4±0.1%39;0.4±0.1%
+Attacker wins:
+Att. hit OI 6710;69.9±0.5%3408;35.5±0.5%7157;74.6±0.4%2995;31.2±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 65;0.7±0.1%36;0.4±0.1%64;0.7±0.1%39;0.4±0.1%
+Delta-v statistics:
+Def. total∆v5.80 [4.49,7.06] m/s 4.45 [3.39,6.02] m/s 6.28 [4.89,7.54] m/s 4.36 [3.44,6.01] m/s
+Att. total∆v4.52 [3.55,5.59] m/s 3.74 [2.86,4.83] m/s 4.83 [3.64,6.05] m/s 3.71 [2.75,4.98] m/s
+Totaln9600
+Step time3.8276 [3.7969,3.8537]ms
+90
+
+===== PAGE 91 =====
+
+D.1.2 Elliptic LTV
+D.1.2.1 20 meter radius arena
+Table D.3: Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 0.1,
+vmax = 1,v IC
+max = 0.05. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1219;25.4±0.6%4237;88.3±0.5%907;18.9±0.6%4440;92.5±0.4%
+Att. wall 9;0.2±0.1%14;0.3±0.1%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 3439;71.6±0.7%408;8.5±0.4%3779;78.7±0.6%238;5.0±0.3%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 12;0.2±0.1%9;0.2±0.1%6;0.1±0.1%4;0.1±0.0%
+Ties:
+Timeout 121;2.5±0.2%132;2.8±0.2%108;2.2±0.2%118;2.5±0.2%
+Delta-v statistics:
+Def. total∆v3.53 [2.02,4.19] m/s 1.73 [1.54,1.97] m/s 3.97 [3.23,4.34] m/s 1.78 [1.60,2.00] m/s
+Att. total∆v3.26 [1.95,3.87] m/s 1.73 [1.51,1.98] m/s 3.64 [3.00,4.01] m/s 1.68 [1.49,1.88] m/s
+Totaln4800
+Step time0.1087 [0.0915,0.1405]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1833;38.2±0.7%4573;95.3±0.3%1649;34.4±0.7%4433;92.4±0.4%
+Att. wall 0;0.0±0.0%0;0.0±0.0%15;0.3±0.1%9;0.2±0.1%
+Attacker wins:
+Att. hit OI 2713;56.5±0.7%97;2.0±0.2%2928;61.0±0.7%223;4.6±0.3%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%5;0.1±0.0%6;0.1±0.1%
+Ties:
+Timeout 254;5.3±0.3%130;2.7±0.2%203;4.2±0.3%129;2.7±0.2%
+Delta-v statistics:
+Def. total∆v2.75 [1.58,3.70] m/s 1.63 [1.46,1.81] m/s 3.70 [1.72,4.47] m/s 1.76 [1.55,2.02] m/s
+Att. total∆v2.44 [1.50,3.38] m/s 1.57 [1.38,1.78] m/s 3.34 [1.61,3.99] m/s 1.66 [1.42,1.96] m/s
+Totaln4800
+Step time3.7595 [3.7363,3.7845]ms
+91
+
+===== PAGE 92 =====
+
+D.1.2.2 100 meter radius arena
+Table D.4: Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax = 0.1,
+vmax = 1,v IC
+max = 0.05. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1138;11.9±0.3%6511;67.8±0.5%1866;19.4±0.4%5473;57.0±0.5%
+Att. wall 51;0.5±0.1%33;0.3±0.1%267;2.8±0.2%251;2.6±0.2%
+Attacker wins:
+Att. hit OI 8373;87.2±0.3%3035;31.6±0.5%7418;77.3±0.4%3843;40.0±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%2;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 38;0.4±0.1%21;0.2±0.0%47;0.5±0.1%33;0.3±0.1%
+Delta-v statistics:
+Def. total∆v6.29 [5.18,7.45] m/s 4.43 [3.50,6.37] m/s 6.52 [5.10,7.65] m/s 4.98 [3.53,7.23] m/s
+Att. total∆v5.32 [4.31,6.45] m/s 4.29 [3.31,5.84] m/s 5.45 [4.21,6.70] m/s 4.34 [3.01,6.30] m/s
+Totaln9600
+Step time0.1122 [0.0869,0.1549]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture2730;28.4±0.5%6169;64.3±0.5%2212;23.0±0.4%6515;67.9±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%34;0.4±0.1%34;0.4±0.1%
+Attacker wins:
+Att. hit OI 6799;70.8±0.5%3398;35.4±0.5%7286;75.9±0.4%2992;31.2±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 71;0.7±0.1%33;0.3±0.1%68;0.7±0.1%59;0.6±0.1%
+Delta-v statistics:
+Def. total∆v5.85 [4.53,7.09] m/s 4.50 [3.44,6.00] m/s 6.32 [4.96,7.57] m/s 4.39 [3.49,5.96] m/s
+Att. total∆v4.56 [3.58,5.62] m/s 3.75 [2.89,4.85] m/s 4.85 [3.68,6.07] m/s 3.72 [2.79,4.95] m/s
+Totaln9600
+Step time3.8080 [3.7893,3.8315]ms
+92
+
+===== PAGE 93 =====
+
+D.2 Training case:u max = 0.5,v max = 1.5,v IC
+max = 0.25
+D.2.1 HCW
+D.2.1.1 20 meter radius arena
+Table D.5: Monte Carlo outcomes: HCW, 20 meter radius arena,umax = 0.5, vmax =
+1.5,v IC
+max = 0.25. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1097;22.9±0.6%4693;97.8±0.2%1606;33.5±0.7%4653;96.9±0.2%
+Att. wall 50;1.0±0.1%34;0.7±0.1%2;0.0±0.0%4;0.1±0.0%
+Attacker wins:
+Att. hit OI 3611;75.2±0.6%12;0.2±0.1%3060;63.7±0.7%20;0.4±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%1;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 42;0.9±0.1%61;1.3±0.2%131;2.7±0.2%123;2.6±0.2%
+Delta-v statistics:
+Def. total∆v6.97 [5.67,7.89] m/s 3.98 [3.41,4.59] m/s 9.25 [5.43,10.56] m/s 4.77 [4.02,5.57] m/s
+Att. total∆v6.09 [4.90,7.15] m/s 4.02 [3.31,4.81] m/s 8.13 [5.27,9.79] m/s 4.62 [3.69,5.76] m/s
+Totaln4800
+Step time0.0748 [0.0626,0.0992]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 951;19.8±0.6%4716;98.2±0.2%411;8.6±0.4%4666;97.2±0.2%
+Att. wall 0;0.0±0.0%13;0.3±0.1%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 3659;76.2±0.6%3;0.1±0.0%4269;88.9±0.5%27;0.6±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 190;4.0±0.3%68;1.4±0.2%120;2.5±0.2%107;2.2±0.2%
+Delta-v statistics:
+Def. total∆v8.37 [6.39,9.43] m/s 3.88 [3.42,4.38] m/s 8.09 [7.27,8.83] m/s 4.40 [3.84,5.01] m/s
+Att. total∆v7.65 [5.64,8.78] m/s 4.07 [3.38,4.80] m/s 6.61 [5.76,7.45] m/s 4.21 [3.52,4.95] m/s
+Totaln4800
+Step time3.8351 [3.8156,3.8587]ms
+93
+
+===== PAGE 94 =====
+
+D.2.1.2 100 meter radius arena
+Table D.6: Monte Carlo outcomes: HCW, 100 meter radius arena, umax = 0 .5,
+vmax = 1.5,v IC
+max = 0.25. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 3897;40.6±0.5%5639;58.7±0.5%3409;35.5±0.5%6520;67.9±0.5%
+Att. wall 87;0.9±0.1%10;0.1±0.0%10;0.1±0.0%7;0.1±0.0%
+Attacker wins:
+Att. hit OI 5596;58.3±0.5%3932;41.0±0.5%6142;64.0±0.5%3039;31.7±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 20;0.2±0.0%19;0.2±0.0%39;0.4±0.1%34;0.4±0.1%
+Delta-v statistics:
+Def. total∆v10.81 [8.63,13.09] m/s 9.64 [7.58,12.13] m/s 11.94 [9.33,14.49] m/s 9.93 [8.05,12.44] m/s
+Att. total∆v8.90 [7.16,10.96] m/s 7.79 [6.21,9.92] m/s 9.63 [7.59,11.83] m/s 8.14 [6.50,10.21] m/s
+Totaln9600
+Step time0.0888 [0.0710,0.1192]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1742;18.1±0.4%6505;67.8±0.5%1362;14.2±0.4%6278;65.4±0.5%
+Att. wall 9;0.1±0.0%23;0.2±0.0%90;0.9±0.1%93;1.0±0.1%
+Attacker wins:
+Att. hit OI 7771;80.9±0.4%3058;31.9±0.5%7917;82.5±0.4%3178;33.1±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 78;0.8±0.1%14;0.1±0.0%231;2.4±0.2%51;0.5±0.1%
+Delta-v statistics:
+Def. total∆v15.00 [11.76,19.21] m/s 9.62 [7.71,12.18] m/s 11.71 [9.72,13.58] m/s 9.79 [7.88,12.51] m/s
+Att. total∆v11.33 [8.90,13.94] m/s 8.16 [6.37,10.44] m/s 8.96 [7.32,10.66] m/s 7.81 [6.17,9.80] m/s
+Totaln9600
+Step time3.8137 [3.7921,3.8388]ms
+94
+
+===== PAGE 95 =====
+
+D.2.2 Elliptic LTV
+D.2.2.1 20 meter radius arena
+Table D.7: Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 0.5,
+vmax = 1.5,v IC
+max = 0.25. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture1054;22.0±0.6%4698;97.9±0.2%1605;33.4±0.7%4649;96.9±0.3%
+Att. wall 49;1.0±0.1%31;0.6±0.1%4;0.1±0.0%8;0.2±0.1%
+Attacker wins:
+Att. hit OI 3630;75.6±0.6%7;0.1±0.1%3064;63.8±0.7%19;0.4±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 67;1.4±0.2%64;1.3±0.2%127;2.6±0.2%124;2.6±0.2%
+Delta-v statistics:
+Def. total∆v6.99 [5.73,7.90] m/s 3.97 [3.39,4.57] m/s 9.24 [5.53,10.58] m/s 4.83 [4.08,5.62] m/s
+Att. total∆v6.06 [4.91,7.18] m/s 4.03 [3.34,4.84] m/s 8.20 [5.48,9.81] m/s 4.67 [3.73,5.82] m/s
+Totaln4800
+Step time0.0987 [0.0828,0.1314]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 924;19.2±0.6%4721;98.4±0.2%422;8.8±0.4%4679;97.5±0.2%
+Att. wall 0;0.0±0.0%12;0.2±0.1%0;0.0±0.0%2;0.0±0.0%
+Attacker wins:
+Att. hit OI 3666;76.4±0.6%4;0.1±0.0%4239;88.3±0.5%30;0.6±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 210;4.4±0.3%63;1.3±0.2%139;2.9±0.2%89;1.9±0.2%
+Delta-v statistics:
+Def. total∆v8.35 [6.42,9.38] m/s 3.87 [3.43,4.39] m/s 8.10 [7.28,8.80] m/s 4.42 [3.85,5.03] m/s
+Att. total∆v7.54 [5.67,8.71] m/s 4.04 [3.36,4.76] m/s 6.63 [5.71,7.41] m/s 4.19 [3.50,4.88] m/s
+Totaln4800
+Step time3.8434 [3.8236,3.8699]ms
+95
+
+===== PAGE 96 =====
+
+D.2.2.2 100 meter radius arena
+Table D.8: Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax = 0.5,
+vmax = 1.5,v IC
+max = 0.25. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 3959;41.2±0.5%5620;58.5±0.5%3390;35.3±0.5%6344;66.1±0.5%
+Att. wall 82;0.9±0.1%20;0.2±0.0%9;0.1±0.0%8;0.1±0.0%
+Attacker wins:
+Att. hit OI 5541;57.7±0.5%3941;41.1±0.5%6142;64.0±0.5%3213;33.5±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 18;0.2±0.0%19;0.2±0.0%59;0.6±0.1%35;0.4±0.1%
+Delta-v statistics:
+Def. total∆v10.81 [8.71,13.07] m/s 9.51 [7.57,12.14] m/s 11.77 [9.28,14.25] m/s 9.90 [8.03,12.46] m/s
+Att. total∆v8.92 [7.27,10.99] m/s 7.84 [6.27,9.99] m/s 9.55 [7.57,11.75] m/s 8.18 [6.58,10.32] m/s
+Totaln9600
+Step time0.0970 [0.0773,0.1299]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1746;18.2±0.4%6495;67.7±0.5%1333;13.9±0.4%6241;65.0±0.5%
+Att. wall 10;0.1±0.0%15;0.2±0.0%97;1.0±0.1%90;0.9±0.1%
+Attacker wins:
+Att. hit OI 7754;80.8±0.4%3075;32.0±0.5%7951;82.8±0.4%3219;33.5±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 90;0.9±0.1%15;0.2±0.0%219;2.3±0.2%50;0.5±0.1%
+Delta-v statistics:
+Def. total∆v14.91 [11.82,18.99] m/s 9.59 [7.68,12.08] m/s 11.75 [9.72,13.60] m/s 9.82 [7.86,12.40] m/s
+Att. total∆v11.29 [8.93,13.89] m/s 8.10 [6.34,10.37] m/s 8.99 [7.38,10.72] m/s 7.83 [6.19,9.83] m/s
+Totaln9600
+Step time3.8357 [3.8135,3.8619]ms
+96
+
+===== PAGE 97 =====
+
+D.3 Training case:u max = 2.0,v max = 1,v IC
+max = 1.0
+D.3.1 HCW
+D.3.1.1 20 meter radius arena
+Table D.9: Monte Carlo outcomes: HCW, 20 meter radius arena,umax = 2.0, vmax = 1,
+vIC
+max = 1.0. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1306;27.2±0.6%4760;99.2±0.1%1710;35.6±0.7%4187;87.2±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%2761;57.5±0.7%539;11.2±0.5%
+Attacker wins:
+Att. hit OI 3389;70.6±0.7%0;0.0±0.0%272;5.7±0.3%3;0.1±0.0%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 105;2.2±0.2%40;0.8±0.1%57;1.2±0.2%71;1.5±0.2%
+Delta-v statistics:
+Def. total∆v20.26 [14.50,26.61] m/s 3.54 [2.96,4.10] m/s 8.39 [6.77,11.05] m/s 9.17 [7.13,12.23] m/s
+Att. total∆v4.68 [3.61,5.79] m/s 2.64 [2.00,3.30] m/s 6.95 [5.63,8.41] m/s 4.93 [4.12,5.89] m/s
+Totaln4800
+Step time0.0843 [0.0696,0.1044]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1786;37.2±0.7%4697;97.9±0.2%3129;65.2±0.7%4738;98.7±0.2%
+Att. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 2551;53.1±0.7%21;0.4±0.1%1224;25.5±0.6%6;0.1±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 463;9.6±0.4%82;1.7±0.2%447;9.3±0.4%56;1.2±0.2%
+Delta-v statistics:
+Def. total∆v17.05 [8.53,23.85] m/s 4.33 [3.56,5.07] m/s 6.47 [4.73,9.03] m/s 5.33 [4.31,6.55] m/s
+Att. total∆v4.10 [2.94,5.31] m/s 2.78 [2.05,3.57] m/s 4.62 [2.99,7.46] m/s 3.45 [2.53,4.57] m/s
+Totaln4800
+Step time3.8856 [3.8552,3.9203]ms
+97
+
+===== PAGE 98 =====
+
+D.3.1.2 100 meter radius arena
+Table D.10: Monte Carlo outcomes: HCW, 100 meter radius arena, umax = 2 .0,
+vmax = 1,v IC
+max = 1.0. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 4738;49.4±0.5%9001;93.8±0.2%1931;20.1±0.4%5028;52.4±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%3145;32.8±0.5%1577;16.4±0.4%
+Attacker wins:
+Att. hit OI 4851;50.5±0.5%587;6.1±0.2%4282;44.6±0.5%2900;30.2±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%181;1.9±0.1%35;0.4±0.1%
+Ties:
+Timeout 11;0.1±0.0%12;0.1±0.0%61;0.6±0.1%60;0.6±0.1%
+Delta-v statistics:
+Def. total∆v45.11 [14.23,86.52] m/s 7.54 [6.04,9.32] m/s 11.70 [9.05,15.94] m/s 14.70 [10.21,23.49] m/s
+Att. total∆v7.80 [5.91,10.01] m/s 4.76 [3.60,6.00] m/s 7.45 [5.94,9.20] m/s 6.57 [5.21,8.31] m/s
+Totaln9600
+Step time0.0939 [0.0731,0.1228]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 3711;38.7±0.5%6272;65.3±0.5%3108;32.4±0.5%4998;52.1±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 5660;59.0±0.5%3161;32.9±0.5%6004;62.5±0.5%4494;46.8±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 229;2.4±0.2%167;1.7±0.1%488;5.1±0.2%108;1.1±0.1%
+Delta-v statistics:
+Def. total∆v26.77 [8.02,66.33] m/s 10.03 [7.61,14.53] m/s 12.59 [9.54,16.08] m/s 12.23 [9.19,16.92] m/s
+Att. total∆v6.68 [4.85,9.42] m/s 5.72 [4.37,7.56] m/s 6.55 [5.05,8.28] m/s 5.85 [4.34,7.48] m/s
+Totaln9600
+Step time3.8542 [3.8296,3.8836]ms
+98
+
+===== PAGE 99 =====
+
+D.3.2 Elliptic LTV
+D.3.2.1 20 meter radius arena
+Table D.11: Monte Carlo outcomes: Elliptic LTV, 20 meter radius arena,umax = 2.0,
+vmax = 1,v IC
+max = 1.0. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1329;27.7±0.6%4774;99.5±0.1%1742;36.3±0.7%4197;87.4±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%2787;58.1±0.7%512;10.7±0.4%
+Attacker wins:
+Att. hit OI 3349;69.8±0.7%0;0.0±0.0%236;4.9±0.3%6;0.1±0.1%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 122;2.5±0.2%26;0.5±0.1%35;0.7±0.1%85;1.8±0.2%
+Delta-v statistics:
+Def. total∆v20.55 [14.70,26.44] m/s 3.54 [2.97,4.11] m/s 8.42 [6.74,11.03] m/s 9.49 [7.36,12.20] m/s
+Att. total∆v4.66 [3.57,5.78] m/s 2.68 [2.02,3.32] m/s 6.97 [5.64,8.38] m/s 4.98 [4.14,5.98] m/s
+Totaln4800
+Step time0.1042 [0.0864,0.1285]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 1719;35.8±0.7%4691;97.7±0.2%3056;63.7±0.7%4725;98.4±0.2%
+Att. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 2621;54.6±0.7%16;0.3±0.1%1233;25.7±0.6%5;0.1±0.0%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 460;9.6±0.4%93;1.9±0.2%511;10.6±0.4%70;1.5±0.2%
+Delta-v statistics:
+Def. total∆v17.08 [8.77,23.46] m/s 4.31 [3.57,5.06] m/s 6.69 [4.78,9.14] m/s 5.40 [4.32,6.64] m/s
+Att. total∆v4.14 [2.95,5.35] m/s 2.82 [2.07,3.57] m/s 4.75 [3.09,7.59] m/s 3.48 [2.55,4.65] m/s
+Totaln4800
+Step time3.8833 [3.8564,3.9201]ms
+99
+
+===== PAGE 100 =====
+
+D.3.2.2 100 meter radius arena
+Table D.12: Monte Carlo outcomes: Elliptic LTV, 100 meter radius arena,umax = 2.0,
+vmax = 1,v IC
+max = 1.0. Cells: count; %±SE.∆vand time: median [Q1, Q3].
+KF off
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 4906;51.1±0.5%9025;94.0±0.2%1895;19.7±0.4%4938;51.4±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%3043;31.7±0.5%1589;16.6±0.4%
+Attacker wins:
+Att. hit OI 4675;48.7±0.5%567;5.9±0.2%4453;46.4±0.5%2984;31.1±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%162;1.7±0.1%26;0.3±0.1%
+Ties:
+Timeout 19;0.2±0.0%8;0.1±0.0%47;0.5±0.1%63;0.7±0.1%
+Delta-v statistics:
+Def. total∆v46.20 [16.15,88.24] m/s 7.52 [6.07,9.33] m/s 12.02 [9.17,16.71] m/s 15.49 [10.52,24.75] m/s
+Att. total∆v7.89 [6.03,10.04] m/s 4.81 [3.65,6.08] m/s 7.51 [6.01,9.31] m/s 6.62 [5.27,8.46] m/s
+Totaln9600
+Step time0.1016 [0.0790,0.1335]ms
+KF on
+Outcomeπ def,0 vsπ att,1 π def,1 vsπ att,1 π def,1 vsπ att,2 π def,2 vsπ att,2
+Defender wins:
+Def. capture 3686;38.4±0.5%6292;65.5±0.5%3144;32.8±0.5%5076;52.9±0.5%
+Att. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Attacker wins:
+Att. hit OI 5704;59.4±0.5%3119;32.5±0.5%5948;62.0±0.5%4401;45.8±0.5%
+Def. hit OI 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Def. wall 0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%0;0.0±0.0%
+Ties:
+Timeout 210;2.2±0.1%189;2.0±0.1%508;5.3±0.2%123;1.3±0.1%
+Delta-v statistics:
+Def. total∆v25.84 [7.91,64.81] m/s 9.94 [7.55,14.33] m/s 12.60 [9.49,15.99] m/s 12.21 [9.17,16.66] m/s
+Att. total∆v6.61 [4.88,9.42] m/s 5.71 [4.34,7.58] m/s 6.57 [5.05,8.36] m/s 5.82 [4.34,7.48] m/s
+Totaln9600
+Step time3.8319 [3.8105,3.8572]ms
+100
+
+===== PAGE 101 =====
+
+Text here.
+D.4 Appendix section
+Text here.
+D.4.1 Appendix section
+Text here.
+D.4.1.1 Appendix section
+Text here.
+101
+
+===== PAGE 102 =====
+
+Appendix E: Another Appendix
+102
+
+===== PAGE 103 =====
+
+Glossary
+Gus Santaella A hard-working graduate student, nearing the end of this chapter of your education!
+Master of Science in EngineeringGus Santaella is about to earn this. Congratulations!
+103
+
+===== PAGE 104 =====
+
+Works Cited
+Vincent J. Aidala. Kalman filter behavior in bearings-only tracking applications.IEEE
+Transactions on Aerospace and Electronic Systems, AES-15(1):29–39, 1979. doi: 10.1109/TAES.
+1979.308793.
+Aaron D. Ames, Xiangru Xu, Jessy W. Grizzle, and Paulo Tabuada. Control barrier function
+based quadratic programs for safety critical systems.IEEE Transactions on Automatic Control,
+62(8):3861–3876, 2017. doi: 10.1109/TAC.2016.2638961.
+A. Bajcsy, A. Loquercio, A. Kumar, and J. Malik. Learning vision-based pursuit-evasion robot
+policies. InProceedings of the IEEE International Conference on Robotics and Automation
+(ICRA), 2024.
+F. Berkenkamp, M. Turchetta, A. P. Schoellig, and A. Krause. Safe model-based reinforcement
+learning with stability guarantees. InAdvances in Neural Information Processing Systems 30
+(NeurIPS 2017), 2017.
+X. Cao, X. Ning, X. Lian, T. Zhang, S. Li, G. Zhang, and Z. Chen. A non-fixed-duration
+turn-based orbital game algorithm based on history-aware and predictive result reward proximal
+policy optimization.IEEE Transactions on Aerospace and Electronic Systems, 2026. doi:
+10.1109/TAES.2026.3657323. Accepted / in press.
+W. H. Clohessy and R. S. Wiltshire. Terminal guidance system for satellite rendezvous.Journal
+of the Aerospace Sciences, 27(9):653–658, 1960. doi: 10.2514/8.8704.
+Y. Drucker and V. Shaferman. Low-thrust orbital differential games with speed constraint
+enforcement using cost weighting.arXiv preprint arXiv:2606.17594, 2026. doi: 10.48550/arXiv.
+2606.17594.
+Y. Emam, G. Notomista, P. Glotfelter, Z. Kira, and M. Egerstedt. Safe reinforcement learning
+using robust control barrier functions.arXiv preprint arXiv:2110.05415, 2021. doi: 10.48550/
+arXiv.2110.05415.
+104
+
+===== PAGE 105 =====
+
+V. François-Lavet, P. Henderson, R. Islam, M. G. Bellemare, and J. Pineau. An introduction to
+deep reinforcement learning.Foundations and Trends in Machine Learning, 11(3–4):219–354,
+2018. doi: 10.1561/2200000071.
+H. Gong, S. Gong, and J. Li. Pursuit-evasion game for satellites based on continuous thrust
+reachable domain.IEEE Transactions on Aerospace and Electronic Systems, 56(6):4626–4637,
+2020. doi: 10.1109/TAES.2020.2998197.
+George William Hill. Researches in the lunar theory.American Journal of Mathematics, 1(1):
+5–26, 1878.
+M. Igl, L. Zintgraf, T. A. Le, F. Wood, and S. Whiteson. Deep variational reinforcement
+learning for pomdps.arXiv preprint arXiv:1806.02426, 2018. doi: 10.48550/arXiv.1806.02426.
+L. P. Kaelbling, M. L. Littman, and A. R. Cassandra. Planning and acting in partially observable
+stochastic domains.Artificial Intelligence, 101(1–2):99–134, 1998. doi: 10.1016/S0004-3702(98)
+00023-X.
+RudolphEmilKalman. Anewapproachtolinearfilteringandpredictionproblems.Transactions
+of the ASME–Journal of Basic Engineering, 82(Series D):35–45, 1960.
+T. Koller, F. Berkenkamp, M. Turchetta, J. Boedecker, and A. Krause. Learning-based
+model predictive control for safe exploration and reinforcement learning.arXiv preprint
+arXiv:1906.12189, 2019. doi: 10.48550/arXiv.1906.12189.
+X. Li and X. Wang. Online solution for orbital pursuit-evasion game via heterogeneous
+proximal policy optimization.IEEE Transactions on Aerospace and Electronic Systems, 61(5):
+12044–12058, 2025. doi: 10.1109/TAES.2025.3570663.
+Y. Liu, Y. Zhang, J. Jiang, and C. Li. Multiple-to-one orbital pursuit: A computational game
+strategy.IEEE Transactions on Aerospace and Electronic Systems, 61(2):2213–2225, 2025. doi:
+10.1109/TAES.2024.3471497.
+Stephane Ross, Geoffrey Gordon, and Drew Bagnell. A reduction of imitation learning and
+structured prediction to no-regret online learning. InProceedings of the Fourteenth International
+105
+
+===== PAGE 106 =====
+
+Conference on Artificial Intelligence and Statistics, volume 15 ofProceedings of Machine Learning
+Research, pages 627–635. PMLR, 2011.
+Max Rudolph, Nathan Lichtle, Sobhan Mohammadpour, Alexandre Bayen, J. Zico Kolter,
+Amy Zhang, Gabriele Farina, Eugene Vinitsky, and Samuel Sokota. Reevaluating policy
+gradient methods for imperfect-information games.arXiv preprint arXiv:2502.08938, 2025. doi:
+10.48550/arXiv.2502.08938.
+J. Schulman, F. Wolski, P. Dhariwal, A. Radford, and O. Klimov. Proximal policy optimization
+algorithms.arXiv preprint arXiv:1707.06347, 2017. doi: 10.48550/arXiv.1707.06347.
+J. Selvakumar and E. Bakolas. A pursuit-evasion game in the orbital plane. In27th AAS/AIAA
+Space Flight Mechanics Meeting, 2017. AAS 17-474.
+J. Tschauner and P. Hempel. Rendezvous zu einem in elliptischer bahn umlaufenden ziel.
+Astronautica Acta, 11(2):104–109, 1965.
+N. Ye, A. Somani, D. Hsu, and W. S. Lee. Despot: Online pomdp planning with regularization.
+Journal of Artificial Intelligence Research, 58:231–266, 2017. doi: 10.1613/jair.5348.
+J. Zhang, K. Zhang, Y. Zhang, H. Shi, L. Tang, and M. Li. Near-optimal interception strategy
+for orbital pursuit-evasion using deep reinforcement learning.Acta Astronautica, 198:9–25, 2022.
+doi: 10.1016/j.actaastro.2022.05.057.
+M. Zhang, Z. McCarthy, C. Finn, S. Levine, and P. Abbeel. Learning deep neural network
+policies with continuous memory states.arXiv preprint arXiv:1507.01273, 2015. doi: 10.48550/
+arXiv.1507.01273.
+L. Zhao, Y. Zhang, and Z. Dang. PRD-MADDPG: An efficient learning-based algorithm for
+orbital pursuit-evasion game with impulsive maneuvers.Advances in Space Research, 72(2):
+211–230, 2023. doi: 10.1016/j.asr.2023.03.014.
+106
+
+===== PAGE 107 =====
+
+Vita
+Gus Santaella will graduate in August 2026 with his Masters of Science in Engineering (MSE)
+degree in Aerospace Engineering, with an emphasis in Controls, Autonomy, and Robotics and a
+graduate certificate in Robotics, at the University of Texas at Austin. He’s been a full-time graduate
+research assistant at the Controls Group for Distributed and Uncertain Systems since August 2025,
+advised by Dr. Maruthi Akella.
+During his master’s program, he completed two internships in guidance, navigation, and
+controls engineering. The first was at Blue Origin in Kent, Washington where he worked on the
+flight and ground autonomy team testing launch readiness protocols for New Glenn orbital launch
+rocket, from January 2025 to May 2025. The second was at Intuitive Machines, where he worked on
+the optical navigation team and tested algorithmic improvements to the terrain relative navigation
+(TRN) protocols for the Nova-C lander.
+Before his graduate degree, Gus graduated with his Bachelor of Arts in Physics from the
+University of Colorado at Boulder in May of 2022. While there, he worked at JILA/NIST as an
+experimental physics research assistant under Eric Cornell and Jun Ye in the JILA eEDM Generation
+III experiment, measuring the electron’s electric dipole moment in ThF+ to test the standard model
+of physics, from September 2020 until February 2023. As part of his involvement in the group,
+graduated with a thesis on using magnetic coils for the Zeeman splitting of and guarantee ambient
+field homogeneity of the ThF+ ions.
+After he graduates from his MSE degree, he’ll start full-time employment at Blue Origin in
+September 2026, where he’ll work on the guidance, navigation, and controls algorithm team for the
+Blue Moon MK1 autonomous lunar lander.
+Address: gussantaella@utexas.edu
+This thesis was typeset with LATEX† by the author.
+†LATEX is a document preparation system developed by Leslie Lamport as a special version of
+Donald Knuth’s TEX Program.
+107

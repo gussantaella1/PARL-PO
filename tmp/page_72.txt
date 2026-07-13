@@ -1,0 +1,32 @@
+===== PAGE 72 =====
+
+On the 100m radius arena though, things become quite different. For HCW 100
+m radius, the defender win rate is 41.9%- 47.1%, the attacker win rate is 50.3%-57.1%,
+and tie cases are 0.5% to 2.6%. This means that the attacker is overall better than
+the defender at this arena, aided by the prospect of being able to plan under partial
+observability across a larger volume. On the 100m radius elliptical LTV arena, the
+defender win rate is 41.7%-47.4%, attacker win rate is 49.9%-57.3%, and ties are
+0.6%-2.7%. All of these are consistent with the HCW results.
+Compute-wise, policies had a compute time of0.062–0.145 ms per timestep in
+the full-state case and3.72–3.91 ms per timestep in the KF-on case, the latter which
+the EKF update time inside the evaluation rollout loop, across all primary evaluation
+runs.
+Overall, we see pretty coherent and consistent results throughout these eval-
+uation cases that help us prove the competency of the trained policies and their
+competitiveness at the time of evaluation. We note that actuation and velocity limits
+do affect the overall outcomes, with the best defender results coming from the highest
+actuation settings.
+From the numbers presented of these results, we obtain our figure of merit
+for the abstract and conclusion: where full state policies reached up to 79.9% win
+rate for the defender, dropping down to up to just 74.7% in the EKF-based case
+(signaling a 6.5% relative drop from full observability to partial observability), within
+the bounds of the 20 meter arena it was trained on. On the larger 100 m radius arena,
+which the policies where never trained on, the full state policies reached up to 66.2%,
+while the EKF-based cases struggled at a much more even 47.4% win rate (signaling
+a 28.4% relative drop from going from full observability to partial observability).
+Throughout all of these cases, HCW results and elliptic LTV differed by at most
+a 1.07% relative change, showing that learned policies transferred from the linear
+time invariant dynamics used during training to linear time varying dynamics used
+during evaluation. These results happened with a compute time of up to 0.145 ms
+72
+

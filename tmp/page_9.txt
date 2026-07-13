@@ -1,0 +1,32 @@
+===== PAGE 9 =====
+
+These learned policies train within a closed loop aerospace guidance, navigation,
+and control architecture in the loop. The control piece comes in the form of a Control
+Barrier Function-Quadratic Program (CBF-QP) for velocity saturation within a pre-
+defined safety boundary. Moreover, the navigation piece, which is meant to showcase
+the feasibility of the framework under partial observability simulating real-life sensor
+limitations, is addressed by doing behavior cloning from observations obtained from
+an Extended Kalman Filter in-the-loop.
+We trained three different test cases that resulted in multiple attacker and
+defender policies across consecutive matchups, which showed stability during learning
+and convergent behavior.
+Furthermore, the policies are evaluated via Monte Carlo rollouts across full
+and partial observability, varying arena sizes, and the proper dispersions to randomize
+the starting states of each agent as well as their EKF parameters. While policies are
+trained under Hill-Clohessy-Wiltshire (HCW) linear time invariant relative orbital
+dynamics, we evaluated the policies in both HCW and elliptical Linear-Time-Varying
+(LTV) dynamics to see if the learned policies can transfer to time-varying dynamics
+that were not seen during training.
+The Monte Carlo results show that our proposed framework produces coherent
+and competitive defender and attacker policies for the proposed zero-sum game. Within
+a small, 20 m training arena, full-state policies reached up to a 79.9% defender win
+rate against a competitive, RL attacker with full state access to the opponent’s state
+and a 74.7% defender in the EKF-based policies with bearings-only measurements
+of the opponent’s state, a 6.51% relative drop in performance relative to the fully
+observable policies.
+When evaluating in a larger 100m radius arena, not used or seen by the policies
+during training, full-state results achieved up to a 66.2% defender win rate, a 16.5%
+relative drop in performance from the 20m training arena, whereas EKF-based policies
+struggled more with a 47.4% defender win rate, a 28.4% relative drop from the full
+9
+
