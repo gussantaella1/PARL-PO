@@ -36,10 +36,8 @@ The entire simulation environment was developed by the author of this thesis in 
 
 
 \section{Dynamics models}
-\label{sec:dynamics-models}
 
 \subsection{HCW (Hill--Clohessy--Wiltshire) orbital relative dynamics - \cite{clohessy1960terminal} and \cite{hill1878researches}}
-\label{subsec:dynamics-hcw}
 
 We model the follower in the chief agent's Local Vertical, Local Horizontal (LVLH) frame assuming a circular reference orbit of radius $r_0$ around a body with parameter $\mu$. The mean motion is defined as:
 \[
@@ -99,7 +97,6 @@ B_d \in \mathbb{R}^{6\times 3}
 Do note that HCW is globally Linear Time Invariant (LTI) here only under certain assumptions, which are sufficient given the scope of this research: that the chief agent is following a circular orbit, we're treating with small relative distances relative to the celestial object being orbited $\| (x,y,z)\| \ll r_0$, and that the control accelerations exerted by the agents are small relative to the central gravitational field.
 
 \subsection{Elliptical LTV orbital relative dynamics - \cite{tschauner1965rendezvous}}
-\label{subsec:dynamics-elliptic-ltv}
 
 We have an elliptical dynamics model in order to study how our trained models behave under linear time variant dynamics. This means that instead of the A and B matrices remaining statics as they do with the HCW dynamics model, these A and B matrices change and evolve over time. Note that this model was used exclusively for Monte Carlo rollouts in this work, not for any of the trained policies.  
 
@@ -338,7 +335,6 @@ which define the time evolution of the state in the same way we did with HCW, bu
 Unlike HCW dynamics, however, the model is clearly not globally Linear Time Invariant (LTI) since the chief's orbital radius, true anomaly, and RTN frame angular rate vary along the elliptical orbit. This approximation is valid for small relative separation relative to the chief's orbital radius, control accelerations that are smaller relative to the central gravitational field, and assuming that the Keplerian chief trajectory remains unperturbed.
 
 \subsection{Orbits used in this work}
-\label{subsec:dynamics-orbits-used}
 
 Throughout this thesis, whenever we refer to HCW and Elliptical LTV dynamcis we refer to just one chief orbit per dynamics model to exemplify each case within the context of the work. The commanded motion each agent undergoes then occurs relative to this chief orbit. The parameters of each of these orbits are:
 
@@ -373,7 +369,6 @@ And the following is a visualization for these:
 
 
 \section{Estimation model - Bearing-Only Extended Kalman Filter (EKF)}
-\label{sec:estimation-model-ekf}
 
 An bearings-only EKF model, based on the work in \cite{aidala1979kalman} which is based on the foundational piece by \cite{kalman1960new}, was picked for our state estimation architecture. This bearings-only EKF basically takes azimuth-elevation measurements (essentially acting as a basic optical navigation suite). Ergo, the measurement model is non-linear, even if the dynamics model may be linearized as is the case with HCW. Algorithm \ref{alg:kf-methodology} describes the step of the KF measurement and update process:
 
@@ -440,7 +435,6 @@ While an Unscented Kalman Filter (UKF)  would be more friendly to further sensor
 
 
 \section{Controller model - CBF-QP velocity saturation controller}
-\label{sec:controller-model-cbf-qp}
 
 One of the later additions to this research was the implementation of a CBF-QP controller (\cite{ames2017control}) to saturate the velocities of the agents during training and rollout.
 
@@ -512,7 +506,6 @@ b_t \leftarrow \alpha h_t - 2 \vec{\mathbf{v}}_t^\top \vec{\mathbf{f}}_v(\vec{\m
 
 
 \section{State, action, and observation.}
-\label{sec:state-action-observation}
 
 
 Consider two agents described at the beginning of this chapter, a defender which we refer to as player/agent \#1 and an attacker which we refer to as player/agent \#2. These agents evolve under discretized dynamics (e.g: HCW), relative to a chief orbit, with a discrete time sampling \(\Delta t\).
@@ -561,7 +554,7 @@ And the following for the defender:
 
 Where the quantities with tilde are those measured  via the bearings-only EKF described in algorithm \ref{alg:kf-methodology}. 
 
-For the fully observable setting, we model the proposed zero-sum game as a discrete-time Markov Decision Process (MDP, for short). Here, the state consists of the previously laid out spacecraft states, the action is the agents' commanded control in 3D, and the transition map is provided and filtered by the spacecraft dynamics and the CBF-QP controller logic. The reward function and termination conditions are defined by the game's objectives as described in section \ref{sec:Rewards/Termination}. For the partially obsevable setting via behavior cloning, the full-state MDP is replaced by the bearings only EKF measurement-based approximation, where the agents act based on the measurements they can get of their opponent instead of having access to its full state.
+For the fully observable setting, we model the proposed zero-sum game as a discrete-time Markov Decision Process (MDP, for short). Here, the state consists of the previously laid out spacecraft states, the action is the agents' commanded control in 3D, and the transition map is provided and filtered by the spacecraft dynamics and the CBF-QP controller logic. The reward function and termination conditions are defined by the game's objectives as described in section \ref{}. For the partially obsevable setting via behavior cloning, the full-state MDP is replaced by the bearings only EKF measurement-based approximation, where the agents act based on the measurements they can get of their opponent instead of having access to its full state.
 
 
 One future area for development on the partial observability setting would be the implementation of a self-estimation model from which each agent also has to estimate their own position in space (e.g: essentially using an IMU model), which would add another layer of realism to the research presented in this work. Given the already high degree of complexity of the current research, we decided to not pursue that direction in this work.
@@ -668,7 +661,6 @@ And with episodic terminal rewards defined as:
 \end{itemize}
 
 \subsection{Partial observability via behavior cloning}
-\label{subsec:partial-observability-behavior-cloning}
 
 One must note that the partially observable policies corresponding to observations \ref{eq:EKF_Obs_Agent_1} and \ref{eq:EKF_Obs_Agent_2} also have access this form of a full state reward during training. This is because on the partially observable policies we want to purposefully match the measured observations to the full state reward, a process called behavior cloning, based on the work by \cite{ross2011reduction}.
 

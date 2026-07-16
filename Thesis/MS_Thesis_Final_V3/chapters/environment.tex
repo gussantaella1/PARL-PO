@@ -1,16 +1,16 @@
 \chapter{Environment and Spacecraft Dynamics}
 
-To test our hypothesis for the PARL+BC framework, we propose a constrained zero-sum game, initially based on linear-time-invariant 2nd-order HCW dynamics to model it like an interaction of two agents relative to a chief circular orbit in the Local-Vertical Local-Horizontal (LVLH) frame. We bound these agents into the boundary of an imaginary spherical in space arena centered at the chief of the orbit. In our initial setup, we have two agents and a static element in the environment:
+To test our hypothesis for the PARL+BC framework, we propose a constrained zero-sum game, initially based on linear-time-invariant 2nd-order HCW dynamics to model the interaction of two agents relative to a chief circular orbit in the Local-Vertical Local-Horizontal (LVLH) frame. We bound these agents into an imaginary spherical arena in space centered at the chief of the orbit. In our initial setup, we have two agents and a static element in the environment:
 
 \begin{enumerate}
 \item \textbf{Asset/Object of Interest (OI):} A static object in the LVLH frame that is the "chief" of the orbit. 
-\item \textbf{Player 1 (defender):} Defends an asset of interest by preventing player 2 from intercepting the asset of interest by capturing. If it intercepting player 2 or forces it out of the arena, it wins. 
+\item \textbf{Player 1 (defender):} Defends an asset of interest by preventing player 2 from intercepting the asset of interest by capturing it. If it intercepts player 2 or forces it out of the arena, it wins. 
 \item \textbf{Player 2 (attacker):} Attacks the central chief asset of interest by preventing player 1's defense strategy. If it intercepts the asset of interest, forces the defender to crash into it, or forces the defender out of the arena, it wins.
 \end{enumerate}
 
-The result is an interesting variation of pursuit evasion scenario where the conditions above make it a zero sum, spatially constrained game that simplifies the learning for an online RL algorithm as is  PPO. Figure \ref{fig:3D_Rollout_Double} offers a visual depiction of the proposed game.
+The result is an interesting variation of a pursuit-evasion scenario where the conditions above make it a zero-sum, spatially constrained game that simplifies the learning problem for an online RL algorithm such as PPO. Figure \ref{fig:3D_Rollout_Double} offers a visual depiction of the proposed game.
 
-The states are the positions and velocities of each agent and the actions are continuous control inputs in 3D space, where we assume both spacecraft to be fully actuated in three translational degrees of freedom. For the sake of simplicity, we ignore the attitude evolution in this work, and we assume that the Player 1 and Player 2 are simply looking  at each other at all times.
+The states are the positions and velocities of each agent and the actions are continuous control inputs in 3D space, where we assume both spacecraft to be fully actuated in three translational degrees of freedom. For the sake of simplicity, we ignore the attitude evolution in this work, and we assume that Player 1 and Player 2 are simply looking at each other at all times.
 
 The entire simulation environment was developed by the author of this thesis in Python, using full advantage of the PyTorch library to assist with the RL training. 
 
@@ -101,7 +101,7 @@ Do note that HCW is globally Linear Time Invariant (LTI) here only under certain
 \subsection{Elliptical LTV orbital relative dynamics - \cite{tschauner1965rendezvous}}
 \label{subsec:dynamics-elliptic-ltv}
 
-We have an elliptical dynamics model in order to study how our trained models behave under linear time variant dynamics. This means that instead of the A and B matrices remaining statics as they do with the HCW dynamics model, these A and B matrices change and evolve over time. Note that this model was used exclusively for Monte Carlo rollouts in this work, not for any of the trained policies.  
+We have an elliptical dynamics model in order to study how our trained models behave under linear time-varying dynamics. This means that instead of the A and B matrices remaining static as they do with the HCW dynamics model, these A and B matrices change and evolve over time. Note that this model was used exclusively for Monte Carlo rollouts in this work, not for any of the trained policies.
 
 For this model, we again represent each agent in the chief's local frame. The main difference is that this time around we won't assume that the orbit is perfectly circular as we did in the HCW dynamics model. Instead, the chief follows an unperturbed Keplerian elliptical orbit with gravitational parameter $\mu$, semi-major axis $a$, eccentricity $e$, inclination $i$, right ascension of the ascending node $\Omega$, argument of periapsis $\omega$, and initial true anomaly $\nu_0$. 
 
@@ -436,7 +436,7 @@ P_{t|t-1}^{i\to j}\leftarrow A P_{t-1|t-1}^{i\to j} A^\top + Q + B\Sigma_u B^\to
 
 Note that the EKF needs the opponent's action $\tilde{u}_t^j$ during training and rollout. If this is set to none, the state measurement quality degrades significantly, and early testing of action-less KF policies showed that it produced completely incoherent policies in partial observability. Therefore, one of the big assumptions we make in this research is that, any agent has somehow measured their adversaries action using some other means, recovering the noiseless ground state with no noise or the ground state within a Gaussian noise profile.
 
-While an Unscented Kalman Filter (UKF)  would be more friendly to further sensor fusion within the proposed architecture, an EKF was picked given that early testing of our estimation-in-the-loop training signaled to extremely long training times (on the order of days of training time per phase) with a UKF in the loop, likely due to the high compute utilization of the unscented transform. Furthermore, EKFs are more common seen in real-life aerospace estimation architectures.
+While an Unscented Kalman Filter (UKF) would be more friendly to further sensor fusion within the proposed architecture, an EKF was picked given that early testing of our estimation-in-the-loop training signaled extremely long training times, on the order of days per phase, with a UKF in the loop, likely due to the high compute utilization of the unscented transform. Furthermore, EKFs are more commonly seen in real-life aerospace estimation architectures.
 
 
 \section{Controller model - CBF-QP velocity saturation controller}
@@ -515,7 +515,7 @@ b_t \leftarrow \alpha h_t - 2 \vec{\mathbf{v}}_t^\top \vec{\mathbf{f}}_v(\vec{\m
 \label{sec:state-action-observation}
 
 
-Consider two agents described at the beginning of this chapter, a defender which we refer to as player/agent \#1 and an attacker which we refer to as player/agent \#2. These agents evolve under discretized dynamics (e.g: HCW), relative to a chief orbit, with a discrete time sampling \(\Delta t\).
+Consider two agents described at the beginning of this chapter, a defender which we refer to as player/agent \#1 and an attacker which we refer to as player/agent \#2. These agents evolve under discretized dynamics (e.g., HCW), relative to a chief orbit, with a discrete time sampling \(\Delta t\).
 For each agent \(i\in\{1,2\}\), their state is defined as:
 
 
@@ -564,7 +564,7 @@ Where the quantities with tilde are those measured  via the bearings-only EKF de
 For the fully observable setting, we model the proposed zero-sum game as a discrete-time Markov Decision Process (MDP, for short). Here, the state consists of the previously laid out spacecraft states, the action is the agents' commanded control in 3D, and the transition map is provided and filtered by the spacecraft dynamics and the CBF-QP controller logic. The reward function and termination conditions are defined by the game's objectives as described in section \ref{sec:Rewards/Termination}. For the partially obsevable setting via behavior cloning, the full-state MDP is replaced by the bearings only EKF measurement-based approximation, where the agents act based on the measurements they can get of their opponent instead of having access to its full state.
 
 
-One future area for development on the partial observability setting would be the implementation of a self-estimation model from which each agent also has to estimate their own position in space (e.g: essentially using an IMU model), which would add another layer of realism to the research presented in this work. Given the already high degree of complexity of the current research, we decided to not pursue that direction in this work.
+One future area for development on the partial observability setting would be the implementation of a self-estimation model from which each agent also has to estimate their own position in space (e.g., essentially using an IMU model), which would add another layer of realism to the research presented in this work. Given the already high degree of complexity of the current research, we decided to not pursue that direction in this work.
 
 
 
@@ -674,4 +674,4 @@ One must note that the partially observable policies corresponding to observatio
 
 In this process, we essentially create a measurement-based "student" that must learn from these fully observable rewards, with the intent of matching the behavior of the full state rewards as best as possible despite the sensor noise.
 
-This process proves to be perhaps the simplest way to match sensor measurements to RL rewards, which is why it was chosen. There's other potential methods for training partially observable policies, such as distillation-based methods (e.g: \cite{bajcsy2024learning}). We looked into implementing these methods earlier on, but found them to be too computationally expensive, so we proceeded regular behavior cloning in this form. 
+This process proves to be perhaps the simplest way to match sensor measurements to RL rewards, which is why it was chosen. There are other potential methods for training partially observable policies, such as distillation-based methods (e.g., \cite{bajcsy2024learning}). We looked into implementing these methods earlier on, but found them to be too computationally expensive, so we proceeded with regular behavior cloning in this form.

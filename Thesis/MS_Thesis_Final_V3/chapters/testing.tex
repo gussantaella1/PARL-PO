@@ -1,6 +1,6 @@
 \chapter{Policy Monte Carlo Testing}
 
-To test the validity of these policies, we use a Monte Carlo (MC) method to evaluate the performance of the trained agents. This allows us to run a large number of simulations while dispersing the agents' initial states, namely their starting positions and velocities, within the boundaries of the training arena. By rolling the simulations across many iterations and storing the outcome of each trial, we obtain statistically meaningful results that describe how well the policies perform their assigned tasks. Figure~\ref{fig:starts_side_by_side_att1} shows a sample of the randomized starting positions used for a run inside a $20~\mathrm{m}$-radius arena:
+To run an experiment to test the validity of these policies, we use a Monte Carlo (MC) based method to evaluate the performance of the already trained policies. This way we can run a large amount of simulations on these policies while dispersing different initial states of the agents, namely their starting positions and velocities within the boundaries of the training arena. By rolling the simulations across a large number of iterations and storing the outcome of each simulation index, we can obtain statistically significant results that can tell us about the performance of the policies to do their assigned tasks. Figure~\ref{fig:starts_side_by_side_att1} shows a sample of the randomized starting positions that were used for a run inside a $20~\mathrm{m}$-radius arena:
 
 \begin{figure}[H]
 \centering
@@ -120,12 +120,12 @@ We evaluate each training policy matchup
 ({\boldmath\textbf{$\pi_{\mathrm{def},0}$ vs $\pi_{\mathrm{att},1}$}}, {\boldmath\textbf{$\pi_{\mathrm{def},1}$ vs $\pi_{\mathrm{att},1}$}}, {\boldmath\textbf{$\pi_{\mathrm{def},1}$ vs $\pi_{\mathrm{att},2}$}}, and {\boldmath\textbf{$\pi_{\mathrm{def},2}$ vs $\pi_{\mathrm{att},2}$}})
 
 
-by testing them over a fixed time horizon \(T\) through Monte Carlo testing. Each simulation starts from randomized and dispersed initial conditions for both agents within fixed arena boundaries. In each simulation rollout, we report the following metrics:
+by testing them over a fixed time horizon \(T\) through Monte Carlo testing. Each simulation starts from randomized and dispersed initial conditions for both agents within fixed boundaries for the arena. In each simulation rollout, we report the following metrics:
 
 
 \subsection*{Simulation outcome:}
 
-The main metric we are interested in is the outcome of the game: whether the defender won, whether the attacker won, or whether the agents tied within the limits of the time horizon. As described in section \ref{sec:Rewards/Termination}, we count a defender win when the defender captures the attacker or when the attacker leaves the arena. Moreover, we count an attacker win when the attacker reaches the object of interest (OI), when the defender crashes accidentally into the OI, and when the defender leaves the arena. If the maximum time horizon is reached during a simulation, it is counted as a timeout and a de-facto tie between both agents. For the aggregate number of rollouts within a Monte Carlo set of runs, we report the number of times each outcome occurred, their corresponding percentage, and the standard error.
+The main metric we're interested in is the outcome of the game: whether the defender won, whether the attacker won, or if they tie within the limits of the time horizon. As described in section \ref{sec:Rewards/Termination}, we count a defender win when the defender captures the attacker or when the attacker leaves the arena. Moreover, we count an attacker win when the attacker reaches the object of interest (OI), when the defender crashes accidentally into the OI, and when the defender leaves the arena. If the maximum time horizon is reached during a simulation, it is counted as a timeout and a de-facto tie between both agents. For the aggregate number of rollouts within a Monte Carlo set of runs, we report the number of times in which each outcome occurred, their corresponding percentage, and the standard error.
 
 
 % \paragraph{Trajectory-level metrics.}
@@ -142,12 +142,12 @@ The main metric we are interested in is the outcome of the game: whether the def
 
 \subsection*{Control-effort:}
 
-Each simulation also reports the total \(\Delta v\) budget used by each agent over a given simulation rollout. This gives a measure of the control effort used by each policy during the simulation. The aggregated \(\Delta v\) values are then summarized using the median and interquartile range \([Q_1,Q_3]\)
+Each simulation also reports the total \(\Delta v\) budget used by each agent over any given simulation rollout. This gives a measure of the control effort used by each policy during the simulation. The aggregated \(\Delta v\) values are then summarized using the median and interquartile range \([Q_1,Q_3]\)
 across all trials within a given Monte Carlo set.
 
 \subsection*{Runtime metrics:}
 
-We report the time it took for the policies to compute the rollout at each time step in the simulation in milliseconds. The objective of this is to keep track of the real-time computational cost of running the policies on our hardware. The aggregated values within a given Monte Carlo set are summarized using the median and interquartile range \([Q_1,Q_3]\).
+We report the time it took for the policies to compute the rollout per each time step in the simulation in milliseconds. The objective of this is to keep track of the real-time computational cost of running the policies in our hardware. The aggregated values within a given Monte Carlo set are summarized using the median and interquartile range \([Q_1,Q_3]\).
 
 
 \subsection*{Comparison axes.}
@@ -156,7 +156,7 @@ All of the metrics above are taken for each matchup of
 ({\boldmath\textbf{$\pi_{\mathrm{def},0}$ vs $\pi_{\mathrm{att},1}$}}, {\boldmath\textbf{$\pi_{\mathrm{def},1}$ vs $\pi_{\mathrm{att},1}$}}, {\boldmath\textbf{$\pi_{\mathrm{def},1}$ vs $\pi_{\mathrm{att},2}$}}, and {\boldmath\textbf{$\pi_{\mathrm{def},2}$ vs $\pi_{\mathrm{att},2}$}}) 
 
 
-for each of the training cases in Section~\ref{sec:Net_Training_Curves}. These metrics are then evaluated across (i) HCW versus elliptic LTV rollouts, (ii) full-state versus EKF-based observations via the behavior-cloning framework, and (iii) different arena sizes ($20~\mathrm{m}$ and $100~\mathrm{m}$). These comparisons allow us to assess policy performance across different dynamics models, robustness to partial observability and sensor noise, and the ability to generalize to arenas outside the training regime.
+for each of the training cases in Section~\ref{sec:Net_Training_Curves}. All of these metrics for each matchup are then run across (i) HCW versus elliptic LTV rollouts, (ii) full-state versus EKF-based observations via the behavior-cloning framework, and (iii) different arena sizes ($20~\mathrm{m}$ and $100~\mathrm{m}$). These comparisons allow us to assess the policies' performance across different dynamics models, robustness to partial observability and sensor noise, and ability to generalize to different arenas outside of the training regime.
 
 We do not report {\boldmath\textbf{$\pi_{\mathrm{def},0}$}} versus the rule-based attacker throughout this work because that matchup is intended only as a warm-up phase.
 
@@ -172,19 +172,19 @@ We do not report {\boldmath\textbf{$\pi_{\mathrm{def},0}$}} versus the rule-base
 
 % \textit{Note: Pattern for percentages and times cited corresponds to the following order: Fully Observable (Table \ref{tab:mc_outcomes_phased_training_FO}) / Partially Observable with ground truth (Table \ref{tab:mc_outcomes_phased_training_FO_gt_prior}) / Partially Observable with noise (Table \ref{tab:mc_outcomes_phased_training_FO_noisy_prior}).}
 
-We can note a few patterns throughout the results presented above. First of all, in the 20m radius test case evaluations the defender policies become progressively stronger across the phases, managing to counter newly trained attacker policies throughout the course of training.
+We can note a few patterns throughout the results presented above. First of all, we can see that in the 20m radius test case evaluations the defender policies become progressively stronger across the phases, managing to counter newly trained attacker policies throughout the course of training.
 
 Overall, the aggregate plots tell us a clear story. From the 20m HCW KF off case, we see that the defender manages to win over the attacker in between 56.3\%-79.5\% of the cases in the 20m radius arena that it was trained on, whereas the attacker wins in only 19.1\%-40.7\% of the test cases. Tie cases remain minimal at 1.4\%-2.9\%.
 
 On the 100m radius arena, we note that the results are considerably different, with the defender winning between 41.0\%-66.2\% of the cases, and the attacker winning in 33.4\%-58.5\% of the cases. Tie cases remain minimal at 0.3\%-0.5\%, meaning that the policy matchups were able to reach a termination case in the vast majority of cases within the provided 10 minute time limit.
 
 
-The defender was never trained on $100~\mathrm{m}$-arena observations, so some performance drop is expected. Even so, the results indicate that the policies retain a meaningful degree of performance when evaluated on observations outside the training distribution, likely aided by the symmetry of the problem formulation.
+Do note that the defender was never trained on $100~\mathrm{m}$-arena observations, so the drop off is to be expected. If anything, it's a good result as it signifies a fairly minimal drop off in performance and tells us that the policies were able to interpolate to observations outside the training dataset given the symmetry of the research problem in hand.
 
 For the elliptic LTV results, we see a defender win rate of 56.4\%-79.9\% and an attacker win rate of 18.7\%-41.1\%, with a tie rate of 1.4\%-2.5\% on the 20 m radius arena. On the 100m radius arena, the defender win rate is 40.6\%-66.1\%, the attacker win rate is 33.5\%-59.0\%, and tie cases remain at 0.3\%-0.4\%.
 
 
-We see that the change between the HCW and elliptic LTV results is small, even though the policies were never trained on the elliptic LTV orbit. Under the tested settings, this suggests that the learned policies are not highly sensitive to that change in dynamics.
+We see that the change between the HCW and elliptic LTV results is minimal even though the policies were never trained on the elliptic LTV orbit, let alone a linear time-varying orbit altogether, signaling that the policies are able to adapt to the new orbit within the cases tested here, also given the symmetry of the problem.
 
 On the KF-based results, we see that the trained, behavior-cloned policies follow similar patterns albeit with significantly different results.
 
@@ -196,9 +196,9 @@ Compute-wise, policies had a compute time of $0.062$--$0.145~\mathrm{ms}$ per ti
 in the full-state case and $3.72$--$3.91~\mathrm{ms}$ per timestep in the KF-on case, the latter including the EKF update time inside the evaluation rollout loop,
 across all primary evaluation runs.
 
-Overall, the evaluation cases show coherent and consistent behavior that supports the competitiveness of the trained policies at the time of evaluation. Actuation and velocity limits do affect the outcomes, with the best defender results occurring under the highest actuation settings.
+Overall, we see pretty coherent and consistent results throughout these evaluation cases that help us prove the competency of the trained policies and their competitiveness at the time of evaluation. We note that actuation and velocity limits do affect the overall outcomes, with the best defender results coming from the highest actuation settings.
 
-From the numbers presented in these aggregate four-phase results, we obtain our figure of merit for the abstract and conclusion: full-state policies reached up to 79.9\% win rate for the defender, dropping to 74.7\% in the EKF-based case, signaling a 6.51\% relative drop from full observability to partial observability within the bounds of the 20 meter arena used during training. On the larger 100 m radius arena, which the policies were never trained on, the full-state policies reached up to 66.2\%, while the EKF-based cases struggled at a much more even 47.4\% win rate, signaling a 28.4\% relative drop from full observability to partial observability. Throughout all of these aggregate cases, HCW results and elliptic LTV results differed by at most a 1.29\% relative change, showing that learned policies transferred from the linear time invariant dynamics used during training to the linear time varying dynamics used during evaluation. These results happened with a compute time of up to 0.145 ms per timestep in the full-state inference case and 3.91 ms per timestep in the EKF inference case.
+From the numbers presented in these aggregate four-phase results, we obtain our figure of merit for the abstract and conclusion: full-state policies reached up to 79.9\% win rate for the defender, dropping down to up to 74.7\% in the EKF-based case, signaling a 6.51\% relative drop from full observability to partial observability within the bounds of the 20 meter arena it was trained on. On the larger 100 m radius arena, which the policies were never trained on, the full-state policies reached up to 66.2\%, while the EKF-based cases struggled at a much more even 47.4\% win rate, signaling a 28.4\% relative drop from full observability to partial observability. Throughout all of these aggregate cases, HCW results and elliptic LTV results differed by at most a 1.29\% relative change, showing that learned policies transferred from the linear time invariant dynamics used during training to the linear time varying dynamics used during evaluation. These results happened with a compute time of up to 0.145 ms per timestep in the full-state inference case and 3.91 ms per timestep in the EKF inference case.
 
 
 % Across tables \ref{tab:mc_outcomes_phased_training_FO}, \ref{tab:mc_outcomes_phased_training_FO_gt_prior}, and \ref{tab:mc_outcomes_phased_training_FO_noisy_prior}, Phase 0 shows us that the $\mathbf{\pi_{def,0}}$ RL defender succeeds in capturing the classical attacker in (41.8 \%, 48.4 \%, 99.0 \%) of the runs. The attacker hits the object of interest (OI) in only (3.2 \%, 1.0 \%, 0.0 \%) of the runs. 
@@ -221,7 +221,7 @@ The results in section \ref{sec:mc_results_description} show that the proposed P
 
 The objectives that both spacecraft have to fulfill are well defined, if not over-defined, by the reward function plus the episodic terminal conditions. The zero-sum framing of this problem helps the agents have these defined objectives.
     
-In fact, early on in this research we focused on stand-off games instead of zero-sum games, where the defending agent would have to defend the asset from the attacker without docking onto the attacker, and both agents would be penalized if they docked/crashed into each other. This is inherently a non-zero sum game with shared equality constrains and an open loop, standoff objective.
+In fact, early on in this research we focused on stand-off games instead of zero-sum games, where the defending agent would have to defend the asset from the attacker without docking onto the attacker, and both agents would be penalized if they docked/crashed into each other. This is inherently a non-zero-sum game with shared equality constraints and an open-loop, standoff objective.
 
 The result was fairly underwhelming after months of research, where we couldn't develop successful defender policies. Our conclusion was that you should try to solve not solve open-loop and undefined learning objectives with reinforcement learning. Instead, open-loop Nash equilibrium solvers and other classical optimal control frameworks might best suit these sorts of research tasks.
 
@@ -239,7 +239,7 @@ We suspect that part of this comes from the fact that training from long-proximi
 \subsection*{The trained policies  interpolate to larger arenas during evaluation, even if it was never trained on observations corresponding to larger arenas.}
 
 
-Expanding on the point above, the results show that learning in a small, constrained volume can still yield usable behavior in larger volumes under the same policy architecture. We do not claim that the policies are free from overfitting, but rather that they retain some useful performance when exposed to observations outside the training volume. We believe that this is due in large part to the symmetry of the research problem considered here.
+Expanding on the point above, we show that learning in a small, constrained volume as your environment gives good results, albeit not perfect, in larger volumes using the same learning policies. This is a rather fascinating find, as we show that the learned policies don't simply overfit to the training volume and fail when seeing observations outside of that volume. We believe that this is in big part thanks to the symmetry of the research problem proposed in this paper.
 
 Instead of overfitting to the smaller arena's training data used during training, the trained policies interpolate agentic behavior learned in the smaller arena into the larger space, even though it's never seen the observations corresponding to the larger space during training.
 
@@ -270,12 +270,12 @@ Ergo, the agents may be able to offset whatever environmental dynamics given the
 
 \subsection*{Trained policies hold under partial observability and sensor noise when trained via behavior cloning from the full states}
 
-The behavior-cloning component shows that the main conclusions above still hold under partial observability. By training student policies on observations measured through the bearings-only EKF, we retain broadly similar qualitative behavior relative to the fully observable results, albeit with some degradation in performance.
+The behavior-cloning piece shows that all of the conclusions above hold up under partial observability. By teaching student policies based on the observations measured by the bearings-only EKF, we have minimal performance loss from the fully observable results.
 
 Of course, to point it out once more, this is assuming that you can somehow measure the prior action of your adversary within a certain amount of noise through some other means. Or if using some other measurement strategy not dependent on bearings-only EKFs, for your adversarial state measurements to be highly accurate.
 
 
-Regardless, it is exciting to find that we can develop successful policies for noisy, partially observable adversarial RL with 
+Regardless, it is exciting to find that we can develop successful policies for noisy, partially observable adversarial RL with behavior cloning from EKF-based measurements.
 
 
 \section{Ideas for future development}
@@ -295,14 +295,14 @@ For follow ups on the work presented on this thesis, however, I think that there
 
 It must be noted that the work presented in this thesis is meant to be an extensive proof of concept of certain ideas that could make RL-based GNC interesting in theory and simulation. The zero-sum game presented in this work is just meant to allow us to be a showcase how these RL can be used, whereas there are many other potential uses for these technologies.
 
-The whole point of this thesis is how one can use RL derive deterministic policies for stochastic and unpredictable behaviors within an aerospace context. Even in planning without adversarial opponents, there's other areas where RL=based planning would prove to be resourceful, such as:
+The whole point of this thesis is how one can use RL to derive deterministic policies for stochastic and unpredictable behaviors within an aerospace context. Even in planning without adversarial opponents, there are other areas where RL-based planning would prove to be resourceful, such as:
 
 \begin{itemize}
 
     \item 1) To assist in Earth or celestial-bound terrain relative navigation of aircraft and spacecraft across well-defined start and end points on uncertain terrain.
     
     
-    \item 2) To aid in planning on precision spacecraft landings in GPS-denied environments upon loss of redundancy or function of core navigation sensors. (e.g: laser-based altimetry)
+    \item 2) To aid in planning on precision spacecraft landings in GPS-denied environments upon loss of redundancy or function of core navigation sensors (e.g., laser-based altimetry).
 
     \item 3) Adding more elaborate, realistic control models to simulate the actuators on board the spacecraft with high fidelity.
 \end{itemize}

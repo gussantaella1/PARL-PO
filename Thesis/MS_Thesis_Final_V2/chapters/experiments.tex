@@ -1,10 +1,10 @@
 \chapter{Training Experiments}
 
 
-We trained the policies on NVIDIA GeForce GPUs available in our lab while randomizing the agents' starting states in position and velocity. The initial policies were trained with a relatively myopic discount factor ($\gamma = 0.991$) and a capture radius of $0.75~\mathrm{m}$. The hyperparameters used throughout these experiments are listed in Appendix~\ref{appendix:hyperparameters}. We tested a number of different hyperparameter settings before converging on these values, so the final choices used in this work are empirical.
+We performed the training of our policies in our own NVIDIA GeForce GPUs available in our own lab, we then let the training run while randomizing the starting states (positions and velocities). Initial policies were trained with relatively myopic policies (gamma = 0.991) and a capture radius of 0.75 meters. The hyperparameters utilized throughout these experimetns  are described in appendix \ref{appendix:hyperparameters}. Do note that tested on a number of different hyperparameters before converging on these, so their choice for the trainings in this work is empirical.
 
 
-We chose to focus on three test cases for this thesis. Across them, we varied only the actuation limit $u_{\max}$, the maximum velocity $v_{\max}$, and the maximum initial velocity in each episode $v_{\max}^{\mathrm{IC}}$, while keeping the remaining training hyperparameters the same across the three runs. We evaluated each case with the Kalman filter disabled for the fully observable setting and with the Kalman filter enabled for the partially observable setting via behavior cloning. In the KF-on runs, the prior adversary action was modeled with a measured-control noise standard deviation of $0.025~\mathrm{m/s^2}$.
+We chose to focus on three different test cases for this thesis, where we just varied the actuation limit $u_{\max}$, the max velocity $v_{\max}$, and the max initial velocity in any given episode $v_{\max}^{\mathrm{IC}}$, leaving all other training hyperparameters equivalent between the trhee runs. We run these with a KF off for a full observability run, and with a KF on for a partially observable run via behavior cloning. The KF on results have a (NUMBER needed) noise on the prior adversary action.
 
 The three test cases that we'll focus on in the remainder of this work are:
 
@@ -18,12 +18,10 @@ The three test cases that we'll focus on in the remainder of this work are:
 These values are meant to test the PARL+BC-produced policies and their corresponding Monte Carlo evaluations at different actuation limits and max velocity saturation limits.
 
 
-\section{Training Curves}
+\section{Trainings Curves}
 \label{sec:Net_Training_Curves}
-\label{sec:training-curves}
 
 \section{Training case 1: $u_{\max} = 0.1~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.05~\mathrm{m/s}$}
-\label{sec:training-case-1}
 
 \Needspace{0.45\textheight}
 \begin{figure}[H]
@@ -45,7 +43,6 @@ These values are meant to test the PARL+BC-produced policies and their correspon
 
 
 \section{Training case 2: $u_{\max} = 0.5~\mathrm{m/s^2}$, $v_{\max} = 1.5~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 0.25~\mathrm{m/s}$}
-\label{sec:training-case-2}
 
 \Needspace{0.45\textheight}
 \begin{figure}[H]
@@ -67,7 +64,6 @@ These values are meant to test the PARL+BC-produced policies and their correspon
 
 
 \section{Training Case 3: $u_{\max} = 2.0~\mathrm{m/s^2}$, $v_{\max} = 1.0~\mathrm{m/s}$, $v_{\max}^{\mathrm{IC}} = 1.0~\mathrm{m/s}$}
-\label{sec:training-case-3}
 
 \Needspace{0.45\textheight}
 \begin{figure}[H]
@@ -88,10 +84,10 @@ These values are meant to test the PARL+BC-produced policies and their correspon
 \end{figure}
 
 \subsection{Training Analysis}
-\label{subsec:training-analysis}
 
-By analyzing the curves in Figures~\ref{fig:mc-training-policy-0-1u-1vmax-0-05-icvmax-training-curves-kf}, \ref{fig:mc-training-policy-0-5u-1-5vmax-1-0-icvmax-training-curves-kf}, and \ref{fig:mc-training-policy-2-0u-1vmax-1-0-icvmax-training-curves-kf}, we see that the PARL+BC framework produces stable, convergent policies across multiple phases of training. The partially observable results also broadly follow the same qualitative pattern as the fully observable ones.
+Overall, just from analyzing each curve described in figures \ref{fig:mc-training-policy-0-1u-1vmax-0-05-icvmax-training-curves-kf}, \ref{fig:mc-training-policy-0-5u-1-5vmax-1-0-icvmax-training-curves-kf}, and \ref{fig:mc-training-policy-2-0u-1vmax-1-0-icvmax-training-curves-kf} we see that PARL+BC framework manages to produce strong, convergent policies across the multiple phases of training. Furthermore, the partially observable results follow loosely the same pattern as the fully observable ones.
 
-By studying the mean reward levels at convergence, we see that the defender tends to obtain slightly stronger policies as the phases progress, while the attacker policies become somewhat weaker in response. This is consistent with the intended effect of the opponent-randomization strategy described earlier, namely to make the defender progressively stronger and more resilient across the course of training.
+By studying the mean reward at which the polciies converge, we see that the defender manages to get slightly stronger policies than that of the attacker as the phases progress and, consequently, the attacker policies become slightly weaker. This is a good sign, as it signals that the defender is progressively stronger and more generalizable thanks to the opponent randomization strategy that was described before, allowing it to be resilient throughout the progression of the training.
 
  
+

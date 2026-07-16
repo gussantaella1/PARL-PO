@@ -13,7 +13,6 @@ Throughout this section, we'll be doing an in-depth description of the full guid
 
 
 \section{Single Phase PPO Algorithm}
-\label{sec:single-phase-ppo}
 
 We collect on-policy results via the PPO algorithm, based on the foundational work by \cite{schulman2017ppo} and adapted to our dynamics and environment models, where the batches are a fixed length from \(N\) vectorized environments, each of length \(H\), and hence yielding \(B=NH\) transitions per update on each policy. Algorithm \ref{alg:ppo_full_obs} describes the single phase PPO training with full-state observations, whereas algorithm \ref{alg:ppo_kf_on} describes the modifications that are made to the latter when doing partial observability trainings with the bearings-only EKF measurements: 
 
@@ -105,7 +104,6 @@ We collect on-policy results via the PPO algorithm, based on the foundational wo
 
 
 \subsection{Policy development}
-\label{subsec:policy-development}
 
 
 Given an observation \(\vec{\mathbf{o}}\) (equations \ref{eq:Full_Obs_Both_Agents}, \ref{eq:EKF_Obs_Agent_1}, and \ref{eq:EKF_Obs_Agent_2}), we obtain an action $\vec{\boldsymbol{\mu}}(\vec{\mathbf{o}})$ for the queried role \(\mathrm{who}\in\{\mathrm{def},\mathrm{att}\}\). From there, the action is sampled from a factorized normal distribution and squashed to enforce the actuation bound:
@@ -131,7 +129,6 @@ The critic \(V_\theta(\vec{\mathbf{o}})\) then maps the full observation \(\vec{
 
 
 \subsection{Advantage Estimation and PPO Objective}
-\label{subsec:advantage-estimation-ppo}
 We use generalized advantage estimation (GAE) in the following form:
 \[
 \begin{aligned}
@@ -157,7 +154,6 @@ where \(r_t=\exp\!\left(\log\pi_\theta(\vec{\mathbf{a}}_t \mid \vec{\mathbf{o}}_
 
 
 \section{Phased Stationary Training Schedule}
-\label{sec:phased-stationary-training}
 
 The process described in algorithm \ref{alg:ppo_full_obs} (and the KF specifics from algorithm \ref{alg:ppo_kf_on}) is then replicated in independent phases of training. Following a 0th phase where the defender is trained interchangeably against a rule-based attacker to warm-start the training, each attacker or defender policy is trained against a combination of the resulting trained defender or attacker policies from previous phases. This process is called domain randomization, where training the agents against different versions of their opponents allows for the progressive development of sequentially stronger and smarter defender and attacker policies. By training against multiple policies at once, we mitigate overfitting to any one policy, one of the core issues of RL algorithms as described in the introduction. Therefore, this allows for the creation of create smarter, more generalizable policies  for the attacker and defender. Algorithm \ref{alg:ppo_phases} describes the phased training schedule.
 
@@ -209,7 +205,6 @@ Most importantly though, by freezing the opposing policy on each training phase 
 Other approaches that we experimented with were the use of residual networks with Nash differentials or classical controller priors, which could be a potential future direction for this work. Nevertheless, we found but that skipping residual networks and letting giving full power to the PPO to carry on with the optimization ended up being much simpler to iterate on and interpret results for.
 
 \subsection{Rule-Based Attacker for phase 0 defender warm start}
-\label{subsec:rule-based-attacker-warm-start}
 To warm start the training, the attacker control input in the initial warm up phase phase (phase 0) is not defined by a PPO policy, but rather by an arbitrary, saturated convex combination with predefined weights.
 
 First we obtain $u_{\text{center}}$, a one-step ridge least-squares action that pulls \(p_2\) towards \(c\) (the asset/object of interest). Considering the position projection (\(P=[I\ \ 0]\in\mathbb{R}^{D\times 2D}\) ), the next step position error (\(E_2:= P A_d x_2 - c\), given \(x_2=\begin{bmatrix}p_2\\ v_2\end{bmatrix}\)), and the position influence matrix (\(F := P B_d \in\mathbb{R}^{D\times D}\)), we obtain the least squares solution for, $u_{\text{center}}$ takes the form: 
@@ -247,7 +242,6 @@ w_c\,u_{\text{center}} + w_r\,u_{\text{repulse}} - w_d\,v_2\right)},
 
 
 \section{Inference.}
-\label{sec:inference}
 At inference during policy evaluation, we translate observations into actuator commands that can be used by the spacecraft relative to a bounded commanded acceleration. at eval time we use the same 5D observation vectors as described in \ref{eq:Full_Obs_Both_Agents}, \ref{eq:EKF_Obs_Agent_1}, or \ref{eq:EKF_Obs_Agent_2} depending on the case.
 
 By default we run a deterministic evaluation, \(u_t^{\mathrm{raw}}=\mu_\theta(o_t)\), where
@@ -311,6 +305,7 @@ This commanded acceleration then passes through the CBF-QP velocity filter. Cons
     \caption{Diagram showing the inference desribed in algorithm \ref{alg:actuation_interface}}
     \label{fig:Inference_Flowchart}
 \end{figure}
+
 
 
 

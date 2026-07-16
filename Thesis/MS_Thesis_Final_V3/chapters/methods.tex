@@ -126,7 +126,7 @@ From there, the corrected log-probability for PPO is
 \]
 
 
-The critic \(V_\theta(\vec{\mathbf{o}})\) then maps the full observation \(\vec{\mathbf{o}}\) to a scalar value
+The critic \(V_\theta(\vec{\mathbf{o}})\) then maps the full observation \(\vec{\mathbf{o}}\) to a scalar value estimate used in the advantage and return calculations during PPO updates.
 
 
 
@@ -159,7 +159,7 @@ where \(r_t=\exp\!\left(\log\pi_\theta(\vec{\mathbf{a}}_t \mid \vec{\mathbf{o}}_
 \section{Phased Stationary Training Schedule}
 \label{sec:phased-stationary-training}
 
-The process described in algorithm \ref{alg:ppo_full_obs} (and the KF specifics from algorithm \ref{alg:ppo_kf_on}) is then replicated in independent phases of training. Following a 0th phase where the defender is trained interchangeably against a rule-based attacker to warm-start the training, each attacker or defender policy is trained against a combination of the resulting trained defender or attacker policies from previous phases. This process is called domain randomization, where training the agents against different versions of their opponents allows for the progressive development of sequentially stronger and smarter defender and attacker policies. By training against multiple policies at once, we mitigate overfitting to any one policy, one of the core issues of RL algorithms as described in the introduction. Therefore, this allows for the creation of create smarter, more generalizable policies  for the attacker and defender. Algorithm \ref{alg:ppo_phases} describes the phased training schedule.
+The process described in algorithm \ref{alg:ppo_full_obs} (and the KF specifics from algorithm \ref{alg:ppo_kf_on}) is then replicated in independent phases of training. Following a 0th phase where the defender is trained interchangeably against a rule-based attacker to warm-start the training, each attacker or defender policy is trained against a combination of the resulting trained defender or attacker policies from previous phases. This process is called domain randomization, where training the agents against different versions of their opponents allows for the progressive development of sequentially stronger and smarter defender and attacker policies. By training against multiple policies at once, we mitigate overfitting to any one policy, one of the core issues of RL algorithms as described in the introduction. Therefore, this allows for the creation of smarter, more generalizable policies for the attacker and defender. Algorithm \ref{alg:ppo_phases} describes the phased training schedule.
 
 
 
@@ -204,13 +204,13 @@ $\texttt{opp\_mix}\gets\{(\pi_{att,1}^{\text{full}},0.5),(\pi_{att,1}^{\text{wea
 \end{algorithm}
 
 
-Most importantly though, by freezing the opposing policy on each training phase we ensure that the stationary of the Markov chain in the decision process during the learning. Other published methods on zero-sum games attempt to skip this phased approach in favor of a simultaneous self-play method, where both agents train their policies at once and they learn within the same phase using entropy regularization methods (such as that of \cite{rudolph2025reevaluating}), but these methods tend to be unstable in certain contexts. In fact, we unsuccessfully attempted to do a similar simultaneous self-play approach in this context in the earlier stages of this research, and unfavorable results were what led us to pursue this phased stationary method.
+Most importantly though, by freezing the opposing policy on each training phase we ensure the stationarity of the Markov chain in the decision process during learning. Other published methods on zero-sum games attempt to skip this phased approach in favor of a simultaneous self-play method, where both agents train their policies at once and learn within the same phase using entropy regularization methods, such as that of \cite{rudolph2025reevaluating}, but these methods tend to be unstable in certain contexts. In fact, we unsuccessfully attempted to do a similar simultaneous self-play approach in this context in the earlier stages of this research, and unfavorable results were what led us to pursue this phased stationary method.
 
-Other approaches that we experimented with were the use of residual networks with Nash differentials or classical controller priors, which could be a potential future direction for this work. Nevertheless, we found but that skipping residual networks and letting giving full power to the PPO to carry on with the optimization ended up being much simpler to iterate on and interpret results for.
+Other approaches that we experimented with were the use of residual networks with Nash differentials or classical controller priors, which could be a potential future direction for this work. Nevertheless, we found that skipping residual networks and giving full power to PPO to carry on with the optimization ended up being much simpler to iterate on and interpret results for.
 
 \subsection{Rule-Based Attacker for phase 0 defender warm start}
 \label{subsec:rule-based-attacker-warm-start}
-To warm start the training, the attacker control input in the initial warm up phase phase (phase 0) is not defined by a PPO policy, but rather by an arbitrary, saturated convex combination with predefined weights.
+To warm start the training, the attacker control input in the initial warm-up phase (phase 0) is not defined by a PPO policy, but rather by an arbitrary, saturated convex combination with predefined weights.
 
 First we obtain $\vec{\mathbf{u}}_{\text{center}}$, a one-step ridge least-squares action that pulls \(\vec{\mathbf{p}}_2\) towards \(\vec{\mathbf{c}}\) (the asset/object of interest). Considering the position projection (\(P=[I\ \ 0]\in\mathbb{R}^{D\times 2D}\) ), the next-step position error (\(\vec{\mathbf{E}}_2:= P A_d \vec{\mathbf{x}}_2 - \vec{\mathbf{c}}\), given \(\vec{\mathbf{x}}_2=\begin{bmatrix}\vec{\mathbf{p}}_2\\ \vec{\mathbf{v}}_2\end{bmatrix}\)), and the position influence matrix (\(F := P B_d \in\mathbb{R}^{D\times D}\)), we obtain the least-squares solution, so that $\vec{\mathbf{u}}_{\text{center}}$ takes the form:
 
@@ -254,7 +254,7 @@ By default we run a deterministic evaluation, \(\vec{\mathbf{u}}_t^{\mathrm{raw}
 
 This commanded acceleration then passes through the CBF-QP velocity filter. Consequently, the spacecraft state evolves under the realized acceleration rather than directly under the unsquashed or pre-filter policy output.
 
- Algorithm \ref{alg:actuation_interface} describes the policy inference process while figure \ref{fig:Inference_Flowchart} visualizes the same process.
+Algorithm \ref{alg:actuation_interface} describes the policy inference process while figure \ref{fig:Inference_Flowchart} visualizes the same process.
 
 \begin{algorithm}[H]
 \caption{Policy Interface + Spacecraft Actuation: Policy Action $\rightarrow$ Applied Acceleration}
@@ -304,9 +304,8 @@ This commanded acceleration then passes through the CBF-QP velocity filter. Cons
 \begin{figure}[H]
     \centering
     \includegraphics[width=1.0\linewidth]{Figures/Inference_Flattened.png}
-    \caption{Diagram showing the inference desribed in algorithm \ref{alg:actuation_interface}}
+    \caption{Diagram showing the inference described in algorithm \ref{alg:actuation_interface}}
     \label{fig:Inference_Flowchart}
 \end{figure}
-
 
 
