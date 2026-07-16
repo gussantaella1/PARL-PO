@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+#
+# Rerun the thesis-priority non-KF Elliptic LTV Monte Carlo suites for the
+# three selected policy folders, writing into corrected output roots so the
+# existing Elliptic LTV results remain untouched.
+#
+# Outputs:
+#   MC_eval_20m_elliptic_ltv_CORRECTED
+#   MC_eval_100m_elliptic_ltv_CORRECTED
+#
+# Use FORCE_RERUN=true to overwrite an already created corrected case.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+source ./run_eval_sequence_lib.sh
+
+SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
+CONFIG_MODULE="${CONFIG_MODULE:-config_rl}"
+
+RUN_SPECS=(
+  "Training_Policy_0.1u_1vmax_0.05_icVmax:elliptic_ltv"
+  "Training_Policy_0.5u_1.5vmax_0.25_icVmax:elliptic_ltv"
+  "Training_Policy_2.0u_1vmax_1.0_icVmax:elliptic_ltv"
+)
+
+MATCHUPS=(
+  "def0_vs_att1:def0_teacher.pt:att1_teacher.pt"
+  "def1_vs_att1:def1_teacher.pt:att1_teacher.pt"
+  "def1_vs_att2:def1_teacher.pt:att2_teacher.pt"
+  "def2_vs_att2:def2_teacher.pt:att2_teacher.pt"
+)
+
+case_completed() {
+  local out_dir="$1"
+
+  if [[ "${FORCE_RERUN:-false}" == "true" || "${FORCE_RERUN:-0}" == "1" ]]; then
+    return 1
+  fi
+  [[ -s "${out_dir}/results.json" && -s "${out_dir}/trials.csv" ]]
+}
+
+suite_out_root() {
+  local suite="$1"
+  case "${suite}" in
+    20m) printf '%s\n' "MC_eval_20m_elliptic_ltv_CORRECTED" ;;
+    100m) printf '%s\n' "MC_eval_100m_elliptic_ltv_CORRECTED" ;;
+    *)
+      echo "[${SCRIPT_NAME}] Unknown suite: ${suite}" >&2
+      return 1
+      ;;
+  esac
+}
+
+build_common_args() {
+  local suite="$1"
+  local -n out_args_ref="$2"
+
+  out_args_ref=(
+    --auto_shell_grid
+    --grid_mode cartesian
+    --index 15000
+    --shell_fracs 0.2,0.4,0.6,0.8
+    --steps 6000
+    --points_per_shell 40
+    --velocity_controller_enabled true
+    --advantage_scale 1.0
+    --save_rollout_error_cases
+    --device cuda
+    --config_module "${CONFIG_MODULE}"
+    --use_kf false
+    --dynamics elliptic_ltv
+  )
+
+  case "${suite}" in
+    20m) out_args_ref+=(--arena_radius 20.0) ;;
+    100m) out_args_ref+=(--arena_radius 100.0) ;;
+  esac
+}
+
+run_case() {
+  local suite="$1"
+  local run_dir="$2"
+  local matchup="$3"
+  local case_name def_ckpt att_ckpt out_root out_dir
+  local common_args=()
+
+  IFS=: read -r case_name def_ckpt att_ckpt <<< "${matchup}"
+  out_root="$(suite_out_root "${suite}")"
+  out_dir="${run_dir}/${out_root}/${case_name}"
+
+  if case_completed "${out_dir}"; then
+    echo "[${SCRIPT_NAME}] Skipping ${suite} ${run_dir} :: ${case_name}; existing corrected results found."
+    return 0
+  fi
+
+  build_common_args "${suite}" common_args
+
+  echo "[${SCRIPT_NAME}] Starting ${suite} ${run_dir} :: ${case_name} dynamics=elliptic_ltv out_root=${out_root}"
+  python evaluate_policy.py \
+    --run_dir "${run_dir}" \
+    --def_ckpt_path "${run_dir}/${def_ckpt}" \
+    --att_ckpt_path "${run_dir}/${att_ckpt}" \
+    --out_dir "${out_dir}" \
+    "${common_args[@]}"
+}
+
+echo "[${SCRIPT_NAME}] CONFIG_MODULE=${CONFIG_MODULE}"
+echo "[${SCRIPT_NAME}] OUT_DIR_ROOTS=MC_eval_20m_elliptic_ltv_CORRECTED,MC_eval_100m_elliptic_ltv_CORRECTED"
+
+prewarm_elliptic_ltv_cache_if_needed "${SCRIPT_NAME}" "" "elliptic_ltv" "${CONFIG_MODULE}" "6000" "${RUN_SPECS[@]}"
+
+for run_spec in "${RUN_SPECS[@]}"; do
+  parse_run_spec "${run_spec}" run_dir run_dyn
+  if [[ "${run_dyn}" != "elliptic_ltv" ]]; then
+    echo "[${SCRIPT_NAME}] Refusing non-elliptic_ltv run spec: ${run_spec}" >&2
+    exit 1
+  fi
+
+  for suite in 20m 100m; do
+    echo "[${SCRIPT_NAME}] Queueing suite=${suite} ${run_dir} dynamics=elliptic_ltv"
+    for matchup in "${MATCHUPS[@]}"; do
+      run_case "${suite}" "${run_dir}" "${matchup}"
+    done
+  done
+done
+
+echo "[${SCRIPT_NAME}] Done"

@@ -2877,8 +2877,8 @@ class TorchVecEnv:
             dyn_name=self._velocity_cbf_dyn_name,
             dt=self.dt,
             D=self.D,
-            Ad_t=self.Ad_t,
-            Bd_t=self.Bd_t,
+            Ad_t=Ad_t,
+            Bd_t=Bd_t,
             hcw_n=self._velocity_cbf_hcw_n,
         )
         return project_box_halfspace_torch(u_nom, self.u_lo_t, self.u_hi_t, a, b)

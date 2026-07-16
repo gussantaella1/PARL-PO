@@ -20,10 +20,13 @@ from config_rl import build_dyn, config_for_train
 
 if torch is not None:
     from core.env import Env, TorchVecEnv
+    from core.safety_filter import project_box_halfspace_torch, velocity_cbf_halfspace_torch
     from core.utils import set_seed
 else:
     Env = None
     TorchVecEnv = None
+    project_box_halfspace_torch = None
+    velocity_cbf_halfspace_torch = None
     set_seed = None
 
 
@@ -104,6 +107,66 @@ class TorchVecEkfTests(unittest.TestCase):
             self.assertIn(key, info_t)
             self.assertIn(key, info_s)
             self.assertAlmostEqual(float(info_t[key]), float(info_s[key]), places=5)
+
+    @unittest.skipIf(torch is None, "torch is not installed in this environment")
+    def test_torch_vec_velocity_cbf_uses_current_ltv_mats(self):
+        """Verify that torch vec velocity cbf uses the current ltv matrices passed into the filter."""
+        cfg = copy.deepcopy(config_for_train())
+        cfg["device"] = "cpu"
+        cfg["use_kf"] = False
+        cfg["reward_type"] = "zero_sum"
+        cfg["num_envs"] = 1
+        cfg["vec_backend"] = "torch"
+        cfg["train_ic_mode"] = "fixed"
+        cfg["x0_jitter"] = {"pos": 0.0, "vel": 0.0}
+        cfg["dynamics"] = "elliptic_ltv"
+        cfg["dyn"]["type"] = "ltv"
+
+        dim = 2 * int(cfg["D"])
+        D = int(cfg["D"])
+        dt = float(cfg["dt"])
+
+        Ad_base = np.eye(dim, dtype=np.float32)
+        Bd_base = np.zeros((dim, D), dtype=np.float32)
+
+        Ad_cur = np.eye(dim, dtype=np.float32)
+        Bd_cur = np.zeros((dim, D), dtype=np.float32)
+        Bd_cur[D:, :] = np.eye(D, dtype=np.float32) * dt
+
+        cfg["dyn"]["Ad"] = Ad_base
+        cfg["dyn"]["Bd"] = Bd_base
+        cfg["dyn"]["Ad_seq"] = np.stack([Ad_cur], axis=0)
+        cfg["dyn"]["Bd_seq"] = np.stack([Bd_cur], axis=0)
+        cfg["safety_filter"] = {
+            "enabled": True,
+            "kind": "velocity_cbf_qp",
+            "alpha": 5.0,
+            "vmax": 1.0,
+        }
+
+        env = TorchVecEnv(copy.deepcopy(cfg), num_envs=1, device="cpu")
+
+        x = torch.tensor([[0.0, 0.0, 0.0, 1.0, 0.0, 0.0]], dtype=env.dtype, device=env.device)
+        u_nom = torch.tensor([[0.5, 0.0, 0.0]], dtype=env.dtype, device=env.device)
+        Ad_t = torch.as_tensor(Ad_cur, dtype=env.dtype, device=env.device)
+        Bd_t = torch.as_tensor(Bd_cur, dtype=env.dtype, device=env.device)
+
+        u_filtered = env._apply_velocity_cbf_filter_batch(x, u_nom, Ad_t=Ad_t, Bd_t=Bd_t)
+        a, b = velocity_cbf_halfspace_torch(
+            x,
+            vmax=env.velocity_cbf_vmax,
+            alpha=env.velocity_cbf_alpha,
+            dyn_name=env._velocity_cbf_dyn_name,
+            dt=env.dt,
+            D=env.D,
+            Ad_t=Ad_t,
+            Bd_t=Bd_t,
+            hcw_n=env._velocity_cbf_hcw_n,
+        )
+        expected = project_box_halfspace_torch(u_nom, env.u_lo_t, env.u_hi_t, a, b)
+
+        self.assertTrue(torch.allclose(u_filtered, expected, atol=1e-6, rtol=1e-6))
+        self.assertLessEqual(float(u_filtered[0, 0].item()), 1e-6)
 
 
 if __name__ == "__main__":

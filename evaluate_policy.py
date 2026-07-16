@@ -3766,6 +3766,12 @@ def main():
                 pending_items = []
                 return
             except Exception as batch_exc:
+                if any(_is_elliptic_ltv_dynamics(item["cfg_run"]) for item in pending_items):
+                    raise RuntimeError(
+                        "Batched CUDA rollout failed for elliptic_ltv, and scalar fallback is "
+                        "disabled for this dynamics mode because the scalar CBF path does not "
+                        "use the evolving LTV matrices."
+                    ) from batch_exc
                 log(f"[eval] batched CUDA rollout failed; retrying pending trials one-by-one. reason={batch_exc}")
 
         for item in pending_items:
