@@ -269,8 +269,8 @@ def add_step_time_table(ax, stats: MetricStats) -> None:
         cell.set_facecolor("#fbfbfb")
 
 
-def set_case_title(ax, case_label: str) -> None:
-    ax.set_title(case_label, fontsize=13.2, fontweight="bold", y=1.18, pad=0)
+def set_case_title(ax, case_label: str, *, y: float = 1.18, pad: float = 0) -> None:
+    ax.set_title(case_label, fontsize=13.2, fontweight="bold", y=y, pad=pad)
 
 
 def add_group_separators(ax, x_positions: Iterable[float]) -> None:
@@ -416,7 +416,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
                     color="#555555",
                 )
 
-        set_case_title(ax, case_label)
+        set_case_title(ax, case_label, y=1.035, pad=6)
         ax.set_xticks(x)
         ax.set_xticklabels([label for _, label in POLICIES], fontsize=9.3)
         for tick in ax.get_xticklabels():
@@ -449,7 +449,7 @@ def plot_histogram(repo_root: Path, out_dir: Path, use_kf: bool) -> Path:
         right=0.99,
         top=0.86,
         bottom=0.12,
-        hspace=0.47,
+        hspace=0.62,
         wspace=0.08,
     )
     fig.savefig(output_path, dpi=220)
