@@ -44,8 +44,8 @@ POLICIES = (
 TEST_CASES = (
     ("HCW - 20 m radius", "MC_eval_20m"),
     ("HCW - 100 m radius", "MC_eval_100m"),
-    ("Elliptic LTV - 20 m radius", "MC_eval_20m_elliptic_ltv"),
-    ("Elliptic LTV - 100 m radius", "MC_eval_100m_elliptic_ltv"),
+    ("Elliptic - 20 m radius", "MC_eval_20m_elliptic_ltv"),
+    ("Elliptic - 100 m radius", "MC_eval_100m_elliptic_ltv"),
 )
 
 MATCHUPS = (

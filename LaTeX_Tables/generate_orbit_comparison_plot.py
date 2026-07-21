@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot the HCW and Elliptic LTV chief orbits used by the evaluations."""
+"""Plot the HCW and elliptic chief orbits used by the evaluations."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def main() -> None:
         y_ell * km,
         color="#b8463a",
         linewidth=2.0,
-        label="Elliptic LTV chief orbit (evaluation only)",
+        label="Elliptic chief orbit (evaluation only)",
     )
 
     ax.scatter([rp * km], [0.0], color="#b8463a", s=36, zorder=4)
@@ -139,7 +139,7 @@ def main() -> None:
     info = (
         "Parameters used:\n"
         f"HCW: r0 = {r_hcw * km:.0f} km, T = {t_hcw / 60.0:.2f} min\n"
-        f"Elliptic LTV: a = {a * km:.0f} km, e = {e:.4f}, T = {t_ell / 60.0:.2f} min"
+        f"Elliptic: a = {a * km:.0f} km, e = {e:.4f}, T = {t_ell / 60.0:.2f} min"
     )
     ax.text(
         0.02,
@@ -158,7 +158,7 @@ def main() -> None:
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("Inertial x (km)")
     ax.set_ylabel("Inertial y (km)")
-    ax.set_title("Chief Orbit Geometry Used for HCW and Elliptic LTV Dynamics", pad=12)
+    ax.set_title("Chief Orbit Geometry Used for HCW and Elliptic Dynamics", pad=12)
     ax.grid(True, color="#dddddd", linewidth=0.8)
     ax.legend(loc="upper right", frameon=False)
     ax.set_axisbelow(True)
