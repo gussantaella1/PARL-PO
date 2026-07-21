@@ -16,8 +16,14 @@ source ./run_eval_sequence_lib.sh
 
 SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-512}"
-DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions_kf_batched}"
+DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions}"
 CONFIG_MODULE="${CONFIG_MODULE:-config_rl}"
+MAX_JOBS="${MAX_JOBS:-1}"
+
+if ! [[ "${MAX_JOBS}" =~ ^[0-9]+$ ]] || (( MAX_JOBS < 1 )); then
+  echo "[${SCRIPT_NAME}] MAX_JOBS must be a positive integer, got '${MAX_JOBS}'." >&2
+  exit 1
+fi
 
 RUN_SPECS=(
   "Training_Policy_0.1u_1vmax_0.05_icVmax_KF_ON:elliptic_ltv"
@@ -108,9 +114,42 @@ run_case() {
     "${common_args[@]}"
 }
 
+ACTIVE_JOBS=0
+FAILED_JOBS=0
+
+wait_for_one_case() {
+  local status=0
+
+  if wait -n; then
+    status=0
+  else
+    status=$?
+  fi
+
+  ACTIVE_JOBS=$((ACTIVE_JOBS - 1))
+  if (( status != 0 )); then
+    FAILED_JOBS=$((FAILED_JOBS + 1))
+    echo "[${SCRIPT_NAME}] A background case failed with exit status ${status}." >&2
+  fi
+}
+
+launch_case() {
+  if (( MAX_JOBS == 1 )); then
+    run_case "$@"
+    return
+  fi
+
+  run_case "$@" &
+  ACTIVE_JOBS=$((ACTIVE_JOBS + 1))
+  if (( ACTIVE_JOBS >= MAX_JOBS )); then
+    wait_for_one_case
+  fi
+}
+
 echo "[${SCRIPT_NAME}] DISPERSIONS_MODULE=${DISPERSIONS_MODULE}"
 echo "[${SCRIPT_NAME}] CONFIG_MODULE=${CONFIG_MODULE}"
 echo "[${SCRIPT_NAME}] EVAL_BATCH_SIZE=${EVAL_BATCH_SIZE}"
+echo "[${SCRIPT_NAME}] MAX_JOBS=${MAX_JOBS}"
 echo "[${SCRIPT_NAME}] OUT_DIR_ROOTS=MC_eval_20m_elliptic_ltv_CORRECTED,MC_eval_100m_elliptic_ltv_CORRECTED"
 
 prewarm_elliptic_ltv_cache_if_needed "${SCRIPT_NAME}" "" "elliptic_ltv" "${CONFIG_MODULE}" "6000" "${RUN_SPECS[@]}"
@@ -125,9 +164,18 @@ for run_spec in "${RUN_SPECS[@]}"; do
   for suite in 20m 100m; do
     echo "[${SCRIPT_NAME}] Queueing suite=${suite} ${run_dir} dynamics=elliptic_ltv"
     for matchup in "${MATCHUPS[@]}"; do
-      run_case "${suite}" "${run_dir}" "${matchup}"
+      launch_case "${suite}" "${run_dir}" "${matchup}"
     done
   done
 done
+
+while (( ACTIVE_JOBS > 0 )); do
+  wait_for_one_case
+done
+
+if (( FAILED_JOBS > 0 )); then
+  echo "[${SCRIPT_NAME}] ${FAILED_JOBS} background case(s) failed." >&2
+  exit 1
+fi
 
 echo "[${SCRIPT_NAME}] Done"

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# Resume the KF-on corrected Elliptic LTV 20 m / 100 m priority suite.
+#
+# This wrapper intentionally uses the regular dispersions.py KF setup and
+# defaults to one scalar eval at a time. The underlying launcher skips any case
+# whose corrected output folder already has both results.json and trials.csv.
+#
+# Use FORCE_RERUN=true only if you intentionally want to overwrite completed
+# corrected cases.
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+export DISPERSIONS_MODULE="${DISPERSIONS_MODULE:-dispersions}"
+export MAX_JOBS="${MAX_JOBS:-1}"
+export RUN_EVAL_SCRIPT_NAME="${RUN_EVAL_SCRIPT_NAME:-$(basename "$0")}"
+
+exec ./run_eval_kf_priority_20m_100m_elliptic_ltv_corrected
