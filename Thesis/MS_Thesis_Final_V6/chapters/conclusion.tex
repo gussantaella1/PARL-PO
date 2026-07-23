@@ -1,0 +1,21 @@
+\chapter{Conclusion}
+
+Throughout this thesis we showed that the proposed \acs{parlbc} method for \acs{rl}-based adversarial planning can work within the constraints of a navigation and control architecture. With the appropriate hyperparameters, the method delivered convergent policies through phased learning with opponent randomization across a number of testing scenarios. By doing this, we showed that it is possible to apply \acs{rl} formulations in a dynamic adversarial problem with physical constraints. 
+
+Our Monte Carlo evaluations of the resulting policies indicate that, in a Target-Attacker-Defender constrained zero-sum game with 1 defender versus 1 attacker, we achieved highly performing policies. These results were obtained across numerous Monte Carlo runs per spherical arena, with 4800 runs on the 20 m radius arena and 9600 runs on the 100 m radius arena. In total, this amounts to 57,600 Monte Carlo runs across all matchups within a single policy test set, 172,800 runs across all thesis test cases per observability setting, and 345,600 runs across both the fully observable and KF-based evaluations presented in this work.
+
+In this evaluation, defender policies succeeded in up to 79.9\% in the full-state policies. Furthermore, defender policies succeeded in up to 74.7\% in the partially observable, \acs{ekf}-based policies against a competitive \acs{rl} attacker, a 6.51\% relative drop in performance relative to the fully observable aggregate four-phase result.
+
+When testing the policies in a larger 100m radius spherical arena, which was not seen by the policies during training, full-state results achieved up to a 66.2\% defender win rate, a 17.15\% relative drop in performance from the 20m radius training arena, whereas \acs{ekf}-based policies struggled more with a 47.4\% defender win rate, a 28.4\% relative drop in performance from the full state case. 
+
+Evaluating all of these matchups both \acs{hcw} and elliptic dynamics, even though the policies were never exposed to the latter during training, resulted in at most a 1.29\% relative change between results in both dynamics models. This shows that the trained policies can adapt to unmodeled dynamics.
+
+Therefore, across the cases tested in this work, the policies trained under linear time-invariant dynamics transferred effectively to the linear time-varying dynamics and with some success to larger arena sizes used during evaluation. 
+
+
+The compute time for these pre-trained policies during inference and rollout was 0.145 ms median per timestep for the full-state policies and 3.91 ms per timestep on the \acs{ekf}-based policies across all documented runs, providing fast compute speeds that showcase the potential computational advantages of such a method not only in adversarial space scenarios but in other space autonomy regimes where fast compute times are required.
+
+These results helped us confirm our initial hypothesis to conclude that \acs{rl} architectures can be used in zero-sum adversarial scenarios, can learn coherent policies while subject to classical navigation filtering and control in the loop, can remain robust under full and partial observability, interpolate outside of the training dataset given a symmetric problem, and provide convergent and highly performing behavior despite the stochasticity.
+
+
+Overall, this project showcases that, as long as they're applied within contexts with well-defined objectives, deep reinforcement-learning based methods have a feasible implementation in certain areas of aerospace decision making, without needing to resort or fallback to classical optimization methods in the process. The fact that we showed that these results hold under partial observability justifies a potential hardware application for algorithms along this line of work beyond the theoretical experiment. This could open the door for further implementations of such aerospace decision-making algorithms in the future as well as their coupling with existing classical control architectures.
