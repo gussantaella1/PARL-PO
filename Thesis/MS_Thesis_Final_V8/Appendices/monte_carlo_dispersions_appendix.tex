@@ -1,0 +1,65 @@
+% Auto-generated thesis appendix table for Monte Carlo dispersion settings.
+% Source: dispersions.py
+% Requires: \usepackage{booktabs}, \usepackage{float}
+
+\section{State Dispersions}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Monte Carlo dispersion summary used for the presented evaluation results. The starting positions came from a shell-grid test, ensuring feasible starting positions within the spherical arena boundaries given a separation condition, while the starting velocities were randomly drawn from the training initial-velocity range on each case.}
+\label{tab:mc-dispersions-initial-state}
+\begin{tabular}{@{}p{0.24\textwidth}p{0.18\textwidth}p{0.30\textwidth}p{0.18\textwidth}@{}}
+\toprule
+\textbf{Term} & \textbf{Distribution} & \textbf{Value} & \textbf{Applies to} \\
+\midrule
+Starting position selection & Shell-grid sampling & Defender and attacker starts are selected from the valid shell-grid pairs for each spherical arena. The defender-advantage condition is already built into this valid-pair set. & Defender and attacker \\
+Starting velocity draw & Uniform & Each velocity component is drawn from $U[-v_{\max}^{\mathrm{IC}},\,v_{\max}^{\mathrm{IC}}]~\mathrm{m/s}$. & Defender and attacker \\
+Velocity limit after sampling & Projection & The sampled velocity is projected so that $\|\mathbf{v}_0\| \leq v_{\max}$. & Defender and attacker \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Test-Case-Specific Dispersions}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Case-specific values for the velocity dispersion and the KF measured noise on the adversary's control action. For the three KF-on runs considered here, the measured-control noise was the same across all test cases.}
+\label{tab:mc-dispersions-policy-specific}
+\begin{tabular}{@{}p{0.25\textwidth}p{0.13\textwidth}p{0.13\textwidth}p{0.15\textwidth}p{0.25\textwidth}@{}}
+\toprule
+\textbf{Training case} & \textbf{$u_{\max}$} & \textbf{$v_{\max}$} & \textbf{$v_{\max}^{\mathrm{IC}}$} & \textbf{Measured-control noise in KF-on runs} \\
+\midrule
+$u_{\max}=0.1$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=0.05$ & $0.1~\mathrm{m/s^2}$ & $1~\mathrm{m/s}$ & $0.05~\mathrm{m/s}$ & $\mathcal{N}(0,\,0.025^2)\ \mathrm{m/s^2}$ \\
+
+$u_{\max}=0.5$; $v_{\max}=1.5$; $v_{\max}^{\mathrm{IC}}=0.25$ 
+& $0.5~\mathrm{m/s^2}$ 
+& $1.5~\mathrm{m/s}$ 
+& $0.25~\mathrm{m/s}$ 
+& $\mathcal{N}(0,\,0.025^2)\ \mathrm{m/s^2}$ \\
+
+$u_{\max}=2.0$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=1.0$ & $2.0~\mathrm{m/s^2}$ & $1~\mathrm{m/s}$ & $1.0~\mathrm{m/s}$ & $\mathcal{N}(0,\,0.025^2)\ \mathrm{m/s^2}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{KF Dispersions}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{KF-on estimator parameter settings used in the root-repo Monte Carlo rollouts. The parameter values below were kept fixed across all three training cases. During rollout, Gaussian bearing-measurement noise and Gaussian measured-control noise were sampled using these fixed standard deviations. No additional initial estimator-mean perturbation was applied in the reported KF-on evaluations.}
+\label{tab:mc-dispersions-kf}
+\begin{tabular}{@{}p{0.36\textwidth}p{0.16\textwidth}p{0.14\textwidth}p{0.24\textwidth}@{}}
+\toprule
+\textbf{KF-on term} & \textbf{Distribution} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+Azimuth bearing noise, $\sigma_{\mathrm{az}}$ & Gaussian & $0.5^\circ$ & Mean is $0$; std. is $8.73\times10^{-3}~\mathrm{rad}$. \\
+Elevation bearing noise, $\sigma_{\mathrm{el}}$ & Gaussian & $0.5^\circ$ & Mean is $0$; std. is $8.73\times10^{-3}~\mathrm{rad}$. \\
+Measured-control noise, \texttt{action\_meas\_std} & Gaussian & $0.025~\mathrm{m/s^2}$ & Mean is $0$. \\
+Initial covariance position std., \texttt{pos\_std0} & Fixed & $4.0$ & $\mathrm{m}$ \\
+Initial covariance velocity std., \texttt{vel\_std0} & Fixed & $0.01$ & $\mathrm{m/s}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

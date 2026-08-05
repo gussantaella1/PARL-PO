@@ -1,0 +1,163 @@
+% This is the body of your document. You may copy-paste it into your main document
+% (dissertation.tex, masterreport.tex, masterthesis.tex, treatise.tex), or edit it here.
+
+
+\copyrightpage  % Produces the copyright page. Optional.
+
+\commcertpage   % Produces the Committee Certification
+			%   of Approved Version page (doctoral)
+			%   or Signature page (masters).
+			%		20 Mar 2002	cwm
+                % Required.
+
+\titlepage      % Produces the title page. Required.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Dedication and/or epigraph are optional, but must occur here.      %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{dedication}		% Optional
+To my family.
+
+\end{dedication}
+
+\begin{epigraph}		% Optional
+\begin{center}
+    \textit{Merece lo que sueñas.}
+    \\\hspace{4em}---Octavio Paz
+\end{center}
+\end{epigraph}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Acknowledgements and/or preface are optional, but must occur here. %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{acknowledgments}		% Optional
+
+
+I'm incredibly grateful to have received extensive support from friends, professors, and peers at the University of Texas at Austin while developing this thesis, and this work wouldn't have been possible without them.
+
+First and foremost, I'd like to thank Professor Maruthi Akella for supporting my research throughout the last year or so, as well as for the incredible amount of freedom and trust I was given to develop this project from the ground up. I'd also like to thank my thesis reader, David Fridovich-Keil, for all his support and the numerous conversations we had while setting up the game-theoretic aspects of this work.
+
+I also want to thank the groupmates I interacted with the most during the development of this project, namely Anand Agrawal and Andrew Martin, for their technical help with the computational aspects of my project, and research engineers Henry Cappel and Marcelino Almeida for helping me review my thesis manuscript in depth. 
+
+Among former professors at the university, I'd like to thank Amy Zhang, from the electrical and computer engineering department, as well as Volkan Isler, from the computer science department, for helping me frame the deep reinforcement learning and sensor planning portions of this work. In addition, I'd like to thank Todd Humphreys, whose aerial robotics course triggered my interest in pursuing autonomous vehicles work and whom I credit with giving me a career, and who also helped give me guidance on the Kalman Filter implementation presented in this project. 
+
+Among my University of Texas friends, I'd like to thank Juan Arellano, Miguel Gonzalez, Cuauhtemoc Macias, Mario Reyes, Josh Caratao, Alberto Rayon, and my mentee Andres Beltran for all their non-technical, non-thesis-related support during this time.
+
+
+Most importantly, though, I'd like to thank my great friend and groupmate Pete Lealiiee for his immense amount of support in developing this work. The extensive and intellectually rewarding conversations we had during the course of this project helped me greatly mature this thesis project. I'm incredibly thankful for all the kind support I got from him throughout this time, as he was instrumental to making this work possible.
+
+\end{acknowledgments}
+
+\begin{preface}		% Optional
+
+Dear reader,
+
+Thank you for reading my master's thesis! The work presented in this manuscript is the result of a year-long process, where we tried many different methods before converging on the thesis topic presented: the development and evaluation of the \acs{parlpo} framework for adversarial planning under realistic guidance, navigation, and control constraints in orbital spacecraft.
+
+Working on this thesis project was an intellectually rewarding process from which I, as well as our Controls Group for Distributed and Uncertain Systems, learned plenty. I hope you enjoy reading through the content of this thesis as much as we did developing it. We are incredibly excited about the findings we obtained from this research and we hope you find it interesting, and perhaps even useful to continue expanding the scope of this work.
+
+- Gus Santaella
+% This thesis presents 
+\end{preface}
+
+% The abstract is required. Note the use of ``utabstract'' instead of
+% ``abstract''! This was necessary to fix a page numbering problem.
+% The abstract heading is generated automatically.
+% Do NOT use \begin{abstract} ... \end{abstract}.
+%
+\utabstract
+\input{chapters/abstract}    % this includes the text from `abstract.tex`
+
+\tableofcontents   % Table of Contents will be automatically
+                   % generated and placed here. Required.
+
+\listoftables      % Optional.
+\listoffigures     % Optional.
+
+%%%%%%%%%%%%%%%%%%%%%
+% Optional glossary. May also be moved between the Table of Contents and the Text.
+%%%%%%%%%%%%%%%%%%%%%
+\begin{glossary}
+\input{structural/acronyms}
+\end{glossary}
+
+% \listofillustrations     % Optional.
+% \listofmaps      % Optional.
+% \listofslides    % Optional.
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Actual text starts here.					     %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%
+% Including external files for each chapter makes this document simpler,
+% makes each chapter simpler, and allows for generating test documents
+% with as few as zero chapters (by commenting out the include statements).
+% Can even change the chapter order by merely interchanging the order
+% of the include statements (something past contributors found helpful in their own
+% dissertations =) ).
+%
+
+\include{chapters/introduction}
+
+\include{chapters/environment}
+
+\include{chapters/literature_review}
+
+
+
+\include{chapters/methods}
+
+\include{chapters/experiments}
+
+\include{chapters/testing}
+
+\include{chapters/conclusion}
+
+% \include{chapters/main}
+
+
+
+
+% NOTE: If you have only one appendix, use the command \appendix instead
+% of \appendices.
+%
+% \appendix
+\appendices
+
+\include{chapters/appendix}
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Generate the bibliography.					     %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% \nocite{*}    % This command causes all items in the 		     %
+                % bibliographic database to be added to 	     %
+                % the bibliography, even if they are not 	     %
+                % explicitly cited in the text. 		     %
+\bibliographystyle{plainnat}  % Here the bibliography 		     %
+\bibliography{references}        % is inserted.			     %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Vita page.							     %
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\begin{vita}
+
+\theauthor\ will graduate in August 2026 with his Master of Science in Engineering (\acs{mse}) degree in Aerospace Engineering, with an emphasis in Controls, Autonomy, and Robotics and a graduate certificate in Robotics, at the University of Texas at Austin. He's been a full-time graduate research assistant at the Controls Group for Distributed and Uncertain Systems since August 2025, advised by Dr. Maruthi Akella.
+
+During his master's program, he completed two internships in guidance, navigation, and controls engineering. The first was at Blue Origin in Kent, Washington where he worked on the flight and ground autonomy team testing launch readiness protocols for New Glenn orbital launch rocket, from January 2025 to May 2025. The second was at Intuitive Machines, where he worked on the optical navigation team and tested algorithmic improvements to the terrain relative navigation (\acs{trn}) protocols for the Nova-C lander.
+
+Before his graduate degree, Gus earned his Bachelor of Arts in Physics from the University of Colorado Boulder in May 2022. While there, he worked at JILA/\acs{nist} as an experimental physics research assistant under Eric Cornell and Jun Ye in the JILA \acs{eedm} Generation III experiment, measuring the electron's electric dipole moment in ThF+ to test the Standard Model of physics, from September 2020 until February 2023. As part of his involvement in the group, he completed a thesis on using magnetic coils for Zeeman splitting and for maintaining ambient-field homogeneity of the ThF+ ions.
+
+After he graduates from his \acs{mse} degree, he'll start full-time employment at Blue Origin in September 2026, where he'll work on the guidance, navigation, and controls algorithm team for the Blue Moon MK1 autonomous lunar lander.
+
+
+
+
+\end{vita}

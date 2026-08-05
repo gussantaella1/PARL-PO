@@ -1,0 +1,80 @@
+% Thesis appendix table for training hyperparameters.
+% Source: run_manifest.json files in the three base Training_Policy folders.
+% Requires: \usepackage{booktabs}, \usepackage{float}, \usepackage{longtable}
+
+\section{Shared Hyperparameters}
+
+\footnotesize
+\begin{longtable}{@{}p{0.42\textwidth}p{0.22\textwidth}p{0.26\textwidth}@{}}
+\caption{Shared training hyperparameters used for all training policy cases. This table purposefully omits the training case-specific values $u_{\max}$, $v_{\max}$, and $v_{\max}^{\mathrm{IC}}$.}
+\label{tab:training-hyperparameters-shared}
+\\
+\toprule
+\textbf{Term} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+\endfirsthead
+\caption[]{Shared training hyperparameters used for the three policy training cases (continued).}\\
+\toprule
+\textbf{Term} & \textbf{Value} & \textbf{Notes} \\
+\midrule
+\endhead
+\midrule
+\multicolumn{3}{r@{}}{\textit{Continued on next page}}\\
+\endfoot
+\bottomrule
+\endlastfoot
+Training dynamics & \acs{hcw} & Training dynamics for the base policies \\
+Spatial dimension & $D=3$ & Three-dimensional relative motion \\
+Simulation time step & $\Delta t = 0.1~\mathrm{s}$ & Discrete propagation step \\
+Episode horizon & $T=600$ steps & Maximum training rollout length \\
+Training phases & $0,1,2,3,4$ & Alternating defender and attacker phases \\
+Vectorized environments & $N_{\mathrm{env}}=256$ & Rollouts advanced in parallel \\
+ \acs{ppo} updates per phase & $1000$ & Used for each training phase \\
+ \acs{ppo} epochs per update & $3$ & Optimization epochs per rollout batch \\
+Minibatch size & $4096$ & \acs{ppo} minibatch size \\
+Discount factor & $\gamma=0.991$ & Return discount factor \\
+ \acs{gae} parameter & $\lambda_{\mathrm{GAE}}=0.95$ & Generalized advantage estimation trace parameter \\
+ \acs{ppo} clipping parameter & $\epsilon_{\mathrm{PPO}}=0.2$ & Clipping half-width \\
+Policy learning rate & $3.0\times10^{-4}$ & Initial actor learning rate \\
+Value learning rate & $1.0\times10^{-3}$ & Initial critic learning rate \\
+Learning-rate schedule & Linear to $0.1$ of initial value & Applied during training \\
+Value loss coefficient & $0.5$ & Critic loss weight \\
+Entropy coefficient & $0.01$ & Exploration regularization weight \\
+Maximum gradient norm & $1.0$ & Gradient clipping value \\
+Reward type & Zero-sum & Attacker reward is the negative defender reward \\
+Reward normalization radius & $20~\mathrm{m}$ & Fixed geometry normalization radius \\
+Reward geometry power & $2$ & Squared normalized distance terms \\
+Target-hit reward/penalty & $10.0$ & Terminal event magnitude \\
+Capture reward/penalty & $10.0$ & Terminal event magnitude \\
+Wall reward/penalty & $2.5$ & Terminal event magnitude \\
+Fuel-depletion penalty & $5.0$ & Terminal event penalty \\
+Collision radius & $0.75~\mathrm{m}$ & Defender-attacker capture radius \\
+Defender effort penalty & $0.01$ & Per-step control-effort penalty \\
+Attacker effort penalty & $0.01$ & Per-step control-effort penalty \\
+Initial-condition mode & Random shell advantage & Shell starts with the defender starting closer \\
+Minimum initial separation & $2.0~\mathrm{m}$ & Minimum defender-attacker starting separation \\
+Defender advantage scale & $1.0$ & Defender-advantage setting used in training \\
+Defender start shell & $0$ to $16~\mathrm{m}$ & For the $20~\mathrm{m}$ training arena \\
+Attacker start shell, defender phases & $6$ to $19~\mathrm{m}$ & Used when training defender phases \\
+Attacker start shell, attacker phases & $0$ to $19~\mathrm{m}$ & Used when training attacker phases \\
+Vectorized backend & Torch & \acs{gpu}-backed vectorized rollout backend \\
+Training device & \acs{cuda} & Training was run on \acs{gpu} \\
+\end{longtable}
+
+\section{Test-Case-Specific Hyperparameters}
+
+\begin{table}[H]
+\centering
+\footnotesize
+\caption{Training hyperparameters that changed between the three policy cases, excluding $u_{\max}$, $v_{\max}$, and $v_{\max}^{\mathrm{IC}}$. These values adjust with the actuation scale of each training case so that rollout length and reward shaping remain reasonable throughout.}
+\label{tab:training-hyperparameters-case-specific}
+\begin{tabular}{@{}p{0.35\textwidth}ccc@{}}
+\toprule
+\textbf{Training case} & \textbf{Steps per env.} & \textbf{$k_{\mathrm{pos}}$} & \textbf{$k_{\mathrm{dock}}$} \\
+\midrule
+$u_{\max}=0.1$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=0.05$ & $2048$ & $0.025$ & $0.00625$ \\
+$u_{\max}=0.5$; $v_{\max}=1.5$; $v_{\max}^{\mathrm{IC}}=0.25$ & $1024$ & $0.050$ & $0.01250$ \\
+$u_{\max}=2.0$; $v_{\max}=1$; $v_{\max}^{\mathrm{IC}}=1.0$ & $512$ & $0.100$ & $0.02500$ \\
+\bottomrule
+\end{tabular}
+\end{table}
