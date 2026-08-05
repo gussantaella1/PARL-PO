@@ -53,6 +53,9 @@ COMMON_ARGS=(
   --save_rollout_error_cases
   --device "${DEVICE}"
   --use_kf true
+  --estimator_kind ekf
+  --kf_action_access measured
+  --kf_action_meas_std 0.025
 )
 
 run_case() {
