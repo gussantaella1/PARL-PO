@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate V7-only readability figures without overwriting V6/V7 originals."""
+"""Generate V9 readability figures without overwriting the base thesis figures."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Iterable, List, Tuple
 V7_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = V7_ROOT.parents[1]
 SOURCE_FIG_ROOT = V7_ROOT / "Figures" / "Merged_Thesis"
-OUT_FIG_ROOT = V7_ROOT / "Figures" / "Merged_Thesis_V7"
+OUT_FIG_ROOT = V7_ROOT / "Figures" / "Merged_Thesis_V9"
 
 sys.path.insert(0, str(REPO_ROOT / "LaTeX_Tables"))
 
@@ -41,9 +41,9 @@ def _case_slug(eval_dir: str) -> str:
 
 def _style_axis(ax) -> None:
     ax.set_ylim(0, 100)
-    ax.tick_params(axis="x", labelsize=12)
-    ax.tick_params(axis="y", labelsize=12, labelleft=True)
-    ax.grid(axis="y", color="#d9d9d9", linewidth=0.9, alpha=0.8)
+    ax.tick_params(axis="x", labelsize=14.2)
+    ax.tick_params(axis="y", labelsize=14.2, labelleft=True)
+    ax.grid(axis="y", color="#d9d9d9", linewidth=1.0, alpha=0.82)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -56,10 +56,11 @@ def _annotate_bars(ax, bars, values, errors, distributions, fontsize: float = 11
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             min(value + error + 1.0, 98.5),
-            f"{value:.1f}%\n+/-{error:.1f}%",
+            f"{value:.1f}%\n±{error:.1f}%",
             ha="center",
             va="bottom",
             fontsize=fontsize,
+            fontweight="bold",
             rotation=0,
         )
 
@@ -79,7 +80,7 @@ def _add_phase_delta_v_table_readable(ax, stats_by_phase: List[hist.MetricStats]
         colWidths=[0.065, 0.25, 0.25, 0.25, 0.25],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(10.2)
+    table.set_fontsize(12.1)
     for cell in table.get_celld().values():
         cell.PAD = 0.01
         cell.set_edgecolor("#d0d0d0")
@@ -100,7 +101,7 @@ def _add_step_time_table_readable(ax, stats: hist.MetricStats) -> None:
         colWidths=[0.5, 0.5],
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(10.0)
+    table.set_fontsize(11.9)
     for cell in table.get_celld().values():
         cell.PAD = 0.01
         cell.set_edgecolor("#d0d0d0")
@@ -118,8 +119,8 @@ def plot_aggregate_one_column(use_kf: bool) -> Path:
     output_path = OUT_FIG_ROOT / f"outcome_distribution_{state_slug}_one_column.png"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fig, axes = plt.subplots(4, 1, figsize=(11.0, 15.6), sharey=True)
-    bar_width = 0.42
+    fig, axes = plt.subplots(4, 1, figsize=(12.8, 16.5), sharey=True)
+    bar_width = 0.48
     offsets = np.array([-bar_width, 0.0, bar_width])
     x = np.arange(len(hist.POLICIES)) * 2.2
 
@@ -142,26 +143,27 @@ def plot_aggregate_one_column(use_kf: bool) -> Path:
                 zorder=2,
                 error_kw={"ecolor": "#252525", "elinewidth": 0.9, "capsize": 3.0, "capthick": 0.9},
             )
-            _annotate_bars(ax, bars, values, errors, distributions, fontsize=10.8)
+            _annotate_bars(ax, bars, values, errors, distributions, fontsize=13.2)
 
         hist.set_case_title(ax, case_label, y=1.035, pad=7)
         ax.set_xticks(x)
-        ax.set_xticklabels([label for _, label in hist.POLICIES], fontsize=11.2)
+        ax.set_xticklabels([label for _, label in hist.POLICIES], fontsize=13.5)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylabel("Outcome share (%)", fontsize=12.5)
+        ax.set_ylabel("Outcome share (%)", fontsize=14.8, fontweight="bold")
         _style_axis(ax)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.957), ncol=3, frameon=False, fontsize=12.0)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.963), ncol=3, frameon=False, fontsize=14.2)
     fig.suptitle(
         f"Monte Carlo aggregate outcome distributions across four learning phases ({state_label})",
-        fontsize=17.0,
-        y=0.992,
+        fontsize=19.6,
+        fontweight="bold",
+        y=0.987,
     )
     # The bottom subplot uses multiline tick labels, so keep extra canvas below
     # the fourth panel to avoid clipping after LaTeX rescales the exported PNG.
-    fig.subplots_adjust(left=0.095, right=0.985, top=0.90, bottom=0.075, hspace=0.46)
+    fig.subplots_adjust(left=0.095, right=0.985, top=0.895, bottom=0.075, hspace=0.62)
     fig.savefig(output_path, dpi=240, bbox_inches="tight", pad_inches=0.08)
     plt.close(fig)
     return output_path
@@ -179,8 +181,8 @@ def plot_policy_phase_one_column(policy_dir: str, policy_label: str, use_kf: boo
     output_path = output_dir / f"outcome_distribution_by_phase_{state_slug}_one_column.png"
     run_dir = REPO_ROOT / f"{policy_dir}{suffix}"
 
-    fig, axes = plt.subplots(4, 1, figsize=(12.4, 18.8), sharey=True)
-    bar_width = 0.68
+    fig, axes = plt.subplots(4, 1, figsize=(14.2, 18.8), sharey=True)
+    bar_width = 0.74
     offsets = np.array([-bar_width, 0.0, bar_width])
     x = np.arange(len(hist.MATCHUPS)) * 2.7
 
@@ -213,28 +215,29 @@ def plot_policy_phase_one_column(policy_dir: str, policy_label: str, use_kf: boo
                 zorder=2,
                 error_kw={"ecolor": "#252525", "elinewidth": 0.9, "capsize": 3.0, "capthick": 0.9},
             )
-            _annotate_bars(ax, bars, values, errors, distributions, fontsize=10.4)
+            _annotate_bars(ax, bars, values, errors, distributions, fontsize=12.9)
 
-        hist.set_case_title(ax, case_label, y=1.08)
+        hist.set_case_title(ax, case_label, y=1.125)
         ax.set_xticks(x)
-        ax.set_xticklabels([label for _, label in hist.MATCHUPS], fontsize=10.7)
+        ax.set_xticklabels([label for _, label in hist.MATCHUPS], fontsize=13.0)
         for tick in ax.get_xticklabels():
             tick.set_fontweight("bold")
-        ax.set_ylabel("Outcome share (%)", fontsize=12.3)
+        ax.set_ylabel("Outcome share (%)", fontsize=14.6, fontweight="bold")
         _style_axis(ax)
         _add_phase_delta_v_table_readable(ax, phase_stats)
         _add_step_time_table_readable(ax, case_stats)
 
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.947), ncol=3, frameon=False, fontsize=12.0)
+    fig.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.945), ncol=3, frameon=False, fontsize=14.2)
     fig.suptitle(
         f"Monte Carlo outcome distributions across each learning phase\n({state_label}) {policy_label}",
-        fontsize=17.0,
-        y=0.994,
+        fontsize=19.6,
+        fontweight="bold",
+        y=0.978,
     )
     # Keep extra canvas below the final panel so the embedded summary tables
     # remain visibly separated from the image edge after LaTeX rescales them.
-    fig.subplots_adjust(left=0.075, right=0.99, top=0.875, bottom=0.04, hspace=0.70)
+    fig.subplots_adjust(left=0.075, right=0.99, top=0.882, bottom=0.04, hspace=0.56)
     fig.savefig(output_path, dpi=240, bbox_inches="tight", pad_inches=0.12)
     plt.close(fig)
     return output_path
